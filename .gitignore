@@ -1,0 +1,8 @@
+/build/
+/.tools/
+/upstream/
+__pycache__/
+*.pyc
+/.DS_Store
+
+/.idea/

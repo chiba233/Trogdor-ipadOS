@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "sources": {
+    "coreboot": {
+      "url": "https://chromium.googlesource.com/chromiumos/third_party/coreboot.git",
+      "ref": "firmware-trogdor-13577.B",
+      "commit": "29f90de5f72c645a00146e04789896766f28e783"
+    },
+    "depthcharge": {
+      "url": "https://chromium.googlesource.com/chromiumos/platform/depthcharge.git",
+      "ref": "firmware-trogdor-13577.B",
+      "commit": "719118f5e36ea312c33b8f005798b1488f9ec2d1"
+    },
+    "darwinboot": {
+      "url": "https://github.com/UniXNU/DarwinBoot.git",
+      "commit": "3325e352d7df68a9f9ad74832ed94a6acbbd7390"
+    },
+    "ios-sweet": {
+      "url": "https://github.com/dipa-studio/ios-sweet.git",
+      "commit": "45263bee51df4a0f55cdf9c649af886399488ddb"
+    },
+    "imagebuilder": {
+      "url": "https://github.com/velvet-os/imagebuilder.git",
+      "commit": "e2168de1f448ffa9b4383d85a42fd5bec42dabc9"
+    },
+    "velvet-tools": {
+      "url": "https://github.com/velvet-os/velvet-tools.git",
+      "commit": "8517b06dbb7104ef90887066e656d31eabb30d83"
+    }
+  }
+}

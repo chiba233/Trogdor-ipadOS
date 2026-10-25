@@ -1,0 +1,41 @@
+# 首阶段设计：原厂启动链下的 ARM64 探针
+
+## 目标与选择
+
+目标平台为 HP Chromebook x2 11 / Google Coachz（SC7180）。首阶段的成功标准是经原厂 Depthcharge 进入独立引导代码，在 EL1 执行，并取得内存与设备树交接信息。
+
+比较过的路径：
+
+1. **直接 FIT shim（本阶段选择）**：沿用已有开发者模式内核入口，首阶段不需要修改 SPI。需要自己处理 Image ABI、EL2→EL1、FDT、后续 XNU Mach-O / ADT 接口。
+2. **RW_LEGACY → U-Boot → EFI**：有 Coachz 社区代码可参考，更接近 UniXNU 的 EFI 入口；但引入 SPI 更新，且原厂分支在 Legacy 交接时也会关闭显示。还必须确认 EFI 实际运行的 EL，不能假定 DarwinBoot 可直接接受。
+3. **替换原厂固件／移植整套 Mu-Silicium**：当前没有必要先承担这一层工作，不作为首阶段。
+
+## 组件
+
+- `entry.S` 仅负责 Image 头、栈与 BSS、入口状态快照、EL2→EL1、异常向量。
+- `probe.c` 记录诊断状态；不配置 GIC、不启动副核、不加载系统、不访问存储。
+- `fdt.c` 提供有界只读属性查找，不执行设备树提供的指针或地址。
+- UART 是单独构建选项：只在协议、时钟和字长与原厂初始化状态相符时尝试发送；每次轮询有上限。
+- Python 构建工具输出 ELF、原始 Image、最小 DTB、FIT 和哈希清单。签名是独立的文件操作。
+
+## 入口与数据流
+
+输入遵循 Depthcharge 的 ARM64 Linux ABI：`x0 = FDT PA`，`x1..x3 = 0`，当前为 NS EL2，MMU 已关闭。探针也接受已经位于 EL1 的调用。
+
+EL2 分支将 EL1 设置为 AArch64、关闭 stage-2 translation、允许 EL1 使用计时器、配置无 MMU 的 SCTLR_EL1、设置 SP_EL1，再通过 ERET 进入 EL1h。保留上层 EL3 / BL31。此设置只保证本探针需要的执行环境，不声称已经满足完整 XNU、GIC 或 SMP 的初始化契约。
+
+探针将诊断放到 Image 的 BSS 日志区；UART 输出是日志的附加通道。异常处理只写内存日志并停止，避免 UART MMIO 出错时递归访问外设。
+
+## 限制
+
+- 不包含 Apple 固件、XNU 内核或 iPadOS 用户态。
+- 不恢复显示、不提供 eMMC / SD / USB / 触摸 / GPU 驱动。
+- UART 的寄存器来自固定上游源码，实际是否处于可复用状态必须由真机验证。
+- 内存日志不持久化，复位后不能假设仍可读取。需调试器读取或可用的 AP UART 通道。
+- 最小 DTB 仅承载探针交接；后续须从完整 Coachz DTS 和实际原厂交接数据生成 XNU ADT。
+
+## 验证
+
+主机检查覆盖：交叉编译、无未解析外部符号、Image 头和大小、FIT 中实际内嵌字节与哈希、FDT 截断及非法边界。主机检查不能证明 ERET、UART、原厂装载或真机运行。
+
+下一阶段必须先记录硬件日志，再决定显示恢复和 XNU 内存布局。不能用虚拟系统桌面替代此阶段的真机证据。
