@@ -1,6 +1,6 @@
 # 原生探针可读输出：接入调查
 
-更新：2026-10-27。单指令匹配对照已支持 EL1 诊断路径的间接执行证据；下一步需要读取实际寄存器和设备树交接，避免继续只靠复位行为推断。
+更新：2026-10-27。单指令匹配对照提供的间接证据之后，原生 Linux 接收路线已取回直接寄存器与设备树日志，确认 entry EL2、current EL1、stage=3、handoff EL2。显示恢复仍是单独的未完成工作。
 
 ## 直接恢复原厂显示
 
@@ -25,7 +25,7 @@ Linux ARM64 ABI 接受 NS EL1 或 EL2 入口，要求正确的 Image 位置、FD
 
 - [Linux ARM64 引导契约](https://github.com/torvalds/linux/blob/v6.12/Documentation/arch/arm64/booting.rst)
 
-该方案已选定并实现为 [EL1 探针→受控 HVC→EL2 Linux 的日志接收路径](linux-log.md)：让 Linux 保持从原厂 EL2 入口启动，恢复探针修改的 EL2 状态。Image、FDT、initrd、命令行和签名的主机校验及 29 项回归通过；硬件启动仍待验证。
+该方案已选定并实现为 [EL1 探针→受控 HVC→EL2 Linux 的日志接收路径](linux-log.md)：让 Linux 保持从原厂 EL2 入口启动，恢复探针修改的 EL2 状态。Image、FDT、initrd、命令行和签名的主机校验及 29 项回归通过；2026-10-27 已完成真机交接与非空日志读取，见 [硬件记录](hardware-tests.md)。
 
 ## 复位后读取 CBMEM 的限制
 
@@ -33,4 +33,4 @@ Coreboot console 在有效 CBMEM entry 被保留时可继续追加旧内容，�
 
 - [Coreboot CBMEM console](https://chromium.googlesource.com/chromiumos/third_party/coreboot/+/29f90de5f72c645a00146e04789896766f28e783/src/lib/cbmem_console.c)
 
-无论选择哪条路线，都要先取得 current EL、incoming EL、stage、CNTFRQ、FDT 范围；异常时还需 ESR／ELR／FAR，再开展 XNU 装载与 ADT 接入。这里记录的是候选方案与约束，不是已实现的日志通道。
+Linux 路线已取得 current EL、incoming EL、stage、CNTFRQ 和 FDT 交接属性；完整日志私下保存。异常路径的 ESR／ELR／FAR 输出仍需另行验证，显示路线也未实现。后续可以基于已取得的引导信息研究 XNU 装载与 ADT 接入。

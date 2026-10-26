@@ -1,6 +1,6 @@
 # Coachz 硬件尝试记录
 
-记录更新：2026-10-27。以下为外置启动观察，不能替代异常寄存器或探针内存日志。
+记录更新：2026-10-27。包括早期外置启动行为观察，以及后续 Linux 接收的直接探针日志；不同证据层级分开记录。
 
 ## 已观察到的行为
 
@@ -23,7 +23,7 @@
 
 EL1 尝试之后读取的 EC GET_UPTIME_INFO 返回 AP reset count=0，recent_ap_reset 为空。[Linux 协议定义](https://github.com/torvalds/linux/blob/v6.12/include/linux/platform_data/cros_ec_commands.h#L5164-L5208)说明该接口统计 EC 发起的 AP 复位；空记录不能排除 AP 自身、看门狗或其他固件复位。可读的固件日志只覆盖随后一次正常内置启动，没有上一轮探针的 ESR / ELR / FAR。
 
-仅凭普通 memory 对照时，差异仍同时涉及 PSCI_VERSION、计数器等待、SYSTEM_RESET 和编译布局。后续单指令匹配对照保持不重启，而原版会自动重启，因而对最终 SYSTEM_RESET 是复位来源提供了较强的间接证据。按原版的控制流，该调用之前必须满足 current EL=1、stage=3、FDT 合法、PSCI 版本与计时频率检查。因此可以记录 EL1 诊断路径已有间接硬件执行证据，但不能冒充已取回寄存器读数；入口 EL、ERET 本身、精确延时与日志内容仍没有直接观测。显示恢复、XNU 与 iPadOS 尚未实现。
+仅凭普通 memory 对照时，差异仍同时涉及 PSCI_VERSION、计数器等待、SYSTEM_RESET 和编译布局。后续单指令匹配对照保持不重启，而原版会自动重启，因而对最终 SYSTEM_RESET 是复位来源提供了较强的间接证据。按原版的控制流，该调用之前必须满足 current EL=1、stage=3、FDT 合法、PSCI 版本与计时频率检查。因此该轮可以记录 EL1 诊断路径已有间接硬件执行证据，但不能冒充已取回寄存器读数；该轮没有直接观测入口 EL、ERET 本身、精确延时或日志内容。显示恢复、XNU 与 iPadOS 尚未实现。
 
 ## 已执行：不主动复位的对照
 
@@ -46,8 +46,25 @@ EL1 尝试之后读取的 EC GET_UPTIME_INFO 返回 AP reset count=0，recent_ap
 
 [匹配对照](control.md)的 Image 仅在 0x272c 将 SMC #0 的四个字节换为 NOP；其余 Image 字节及 FIT 的非内核数据／哈希属性相同。镜像 SHA-256 为 `03d8e18a0788ff9581d8da33f8e5748ba03d18c92655a30bfe0f7a2e6559fa0c`，签名／body 与全部 64 MiB 介质回读校验通过。硬件反馈为不重启。
 
-这比普通 memory 对照更直接地隔离了最终复位调用。当前里程碑是间接执行证据；完整验收仍需可读日志，不能将其改写为已有 XNU 或 iPadOS 运行结果。
+这比普通 memory 对照更直接地隔离了最终复位调用。该对照的当轮里程碑是间接执行证据；后续直接日志见下一节。两者均不代表已有 XNU 或 iPadOS 运行结果。
+
+## 2026-10-27：原生 Linux 接收成功
+
+源码提交 `bb29e0e`；测试镜像 `linux-log.img` 的 SHA-256 为 `a533cc917bdd55a54c24b6f67e0d83e671890330e1dee989dea17af2c48be8a4`。从外置镜像经原厂开发者模式启动后，原生 Linux 6.12.42-stb-cbq+ 可通过 SSH 访问。
+
+在运行中的 Linux 读取 `/sys/firmware/devicetree/base/chosen/trogdor-ipados,probe-log`，完整 8192 字节属性通过读取器校验：日志头、NUL 终止与尾部零填充有效，四个必需字段唯一且满足：
+
+```text
+entry EL=0x0000000000000002
+current EL=0x0000000000000001
+stage=0x0000000000000003
+handoff EL=0x0000000000000002
+```
+
+日志包含 phase-0 完成标记、入口 SCTLR／HCR、MIDR／MPIDR／CNTFRQ 以及 FDT 内存、initrd 和 Coreboot 表属性。完整原始日志仅私下保存；本地副本与运行中 Linux 属性的 SHA-256 一致，构建清单中的源文件哈希与提交源码一致。
+
+这是原厂 EL2 入口→探针 EL1 诊断→受控 HVC 返回 EL2→原生 Linux 接收日志的直接硬件证据，首阶段探针验收通过。没有观测到异常路径，也没有加载 XNU 或 iPadOS。Linux 自身能恢复显示不等于独立探针已实现显示驱动。
 
 ## 后续待验证
 
-优先取得原生探针的可读日志，见 [可观测性接入调查](observability.md)。不再用重复的相同黑屏测试替代寄存器输出。
+原生探针日志已取回。后续研究 XNU 内存布局、ADT 与装载接口；探针显示恢复和异常日志接收仍需独立验证。

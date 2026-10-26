@@ -26,7 +26,7 @@ Linux 容器、完整 DTB、initrd 和实际日志仅保存在忽略目录，不
 
 主机检查：源签名、FIT hash、DTB 全属性／reservations／boot CPU／版本保留、日志容量、Linux Image ABI、wrapper ELF 标量指令、payload 字节、内存范围、命令行原样传递、签名／GPT 布局。还需验证非链式四种探针行为没有改变。
 
-硬件成功标准是从外置诊断镜像进入 Linux，并通过设备树读取此次探针写入的非空日志；日志必须含 current EL=1、stage=3 与 handoff EL=2。Linux 启动但属性为空不算成功。当前没有执行该路线的硬件测试。
+硬件成功标准是从外置诊断镜像进入 Linux，并通过设备树读取此次探针写入的非空日志；日志必须含 current EL=1、stage=3 与 handoff EL=2。Linux 启动但属性为空不算成功。2026-10-27 已满足这些硬件成功条件，见下方记录。
 
 ## 构建与读取
 
@@ -52,8 +52,14 @@ python3 read_probe.py
 - 实际输入包含 47 份完整 DTB；编解码与加入日志属性后保留全部其他语义属性、空节点、内存保留表、boot CPU 和兼容版本。
 - 实际产物的原 Linux 字节、initrd、FIT configurations 与命令行保持一致，签名与 body 验证通过。
 - wrapper 的 Linux 起点为 0x200000，文件大小 32569856 字节，Image memory size 为 33357824 字节，覆盖原 Linux 的完整内存占用；wrapper 执行范围 1983 条指令通过标量检查。
-- 独立源码和产物审查未发现可操作问题。硬件启动尚待验证。
+- 独立源码和产物审查未发现可操作问题。后续真机结果见下方记录。
 
-这些仅是主机检查，不证明 HVC、Linux 交接或日志读取已在目标 CPU 成功。
+以上是主机检查；与下方实际硬件观察分开记录。
 
-目标系统的 futility 已再次验证签名／body，cgpt 确认 128 MiB 文件中的主备 GPT 和 96 MiB kernel 分区。外置介质写入后的全部 128 MiB 回读 SHA-256 为 `a533cc917bdd55a54c24b6f67e0d83e671890330e1dee989dea17af2c48be8a4`，与待测镜像一致；这仍不代表 Linux 交接已在硬件成功。
+目标系统的 futility 已再次验证签名／body，cgpt 确认 128 MiB 文件中的主备 GPT 和 96 MiB kernel 分区。外置介质写入后的全部 128 MiB 回读 SHA-256 为 `a533cc917bdd55a54c24b6f67e0d83e671890330e1dee989dea17af2c48be8a4`，与待测镜像一致；写入校验本身不能证明 Linux 交接成功；该结论来自后续日志读取。
+
+## 2026-10-27：原生 Linux 接收成功
+
+提交 `bb29e0e` 的外置镜像已交接原生 Linux，并读回完整 8192 字节日志。读取器确认 entry EL=2、current EL=1、stage=3、handoff EL=2；本地副本与运行中设备树属性的 SHA-256 一致。首阶段探针验收通过。镜像哈希、采集方式与证据边界见 [硬件记录](hardware-tests.md#2026-10-27原生-linux-接收成功)。
+
+原始日志私下保存。该结果不包含 XNU／iPadOS 装载，也不代表独立探针已恢复显示或验证异常日志通道。
