@@ -77,4 +77,4 @@ ADT 指针按 kernel VA 填入 boot_args；x0 对应的是 boot_args PA。Video 
 - Xcode 27.1 的实际源码构建和最终链接成功，包含架构平台／CPU、软件 AES、corecrypto 和 pthread 源码组件。源码候选大小 19106336 字节，SHA-256 为 `6b406b8cd4ee5a6c11793256d8cadc5453365e8e8edb5f487953e02e259c7e9b`。
 - 构建报告确认 `source_kernel_built=true`、`prelinked=false`、`hardware_boot_tested=false`。候选为 ARM64-all MH_EXECUTE，含 60204 条 LC_DYSYMTAB 本地重定位记录。后续逐条审计确认全部满足上述零 VA slide 契约，指针已由静态链接器填好；接受这些记录不代表完成组件 prelink。
 
-原生源码 XNU 的 pre-MMU 检查点已在真机执行并返回有效 boot_args 日志，见 [入口检查点](xnu-checkpoint.md)。这只截取冷启动前缀；完整组件 prelink、页表／MMU 初始化、平台驱动与用户态仍待完成。
+原生源码 XNU 的 pre-MMU 检查点已在真机执行并返回有效 boot_args 日志，见 [入口检查点](xnu-checkpoint.md)。这只截取冷启动前缀；后续 [MMU 开启检查点](xnu-mmu-checkpoint.md) 也已通过真机验收。完整组件 prelink、高虚拟地址执行／C 初始化、平台驱动与用户态仍待完成。

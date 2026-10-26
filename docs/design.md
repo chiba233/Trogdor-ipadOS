@@ -63,4 +63,4 @@ EL2 分支将 EL1 设置为 AArch64、关闭 stage-2 translation、允许 EL1 �
 
 ## 下一轮：MMU 开启后的受控返回
 
-[MMU 检查点](xnu-mmu-checkpoint.md) 保留 kernel VA 的块内偏移，在真实源码内核开启 MMU 后立即 HVC 返回 EL2；通过完整页表池与硬件 AT 结果校验后恢复翻译／栈／EL2 状态，交接原生 Linux。已完成主机验证与介质准备，尚无本轮硬件结果；不进入 C 初始化，也不替换原厂固件。
+[MMU 检查点](xnu-mmu-checkpoint.md) 保留 kernel VA 的块内偏移，在真实源码内核开启 MMU 后立即 HVC 返回 EL2；通过完整页表池与硬件 AT 结果校验后恢复翻译／栈／EL2 状态，交接原生 Linux。已取回本轮完整硬件日志，确认 M/C/I 开启、完整表池和硬件 AT 校验成功，随后恢复状态并返回 Linux。实际高虚拟地址取指与 C 初始化仍待验证；本轮不进入 C，也不替换原厂固件。

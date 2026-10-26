@@ -48,4 +48,4 @@ sudo python3 tools/read_probe.py --xnu-checkpoint
 
 返回门在硬件上比较了 XNU 保存的参数指针、virtBase、physBase、memSize、bootFlags、页表物理地址，以及 EL1h 和 SCTLR_EL1 M/C/I；取回的返回 PC 和 boot_args 地址另与实际源码负载独立换算一致。因此可确认真实源码内核已在 EL1 执行该冷启动前缀，正确读取 boot_args，并成功返回 Linux。
 
-日志中较早的 `phase-0 complete; no XNU loaded` 是探针阶段、装载前的记录；后面的 XNU 检查点字段才记录随后的内核执行。本轮没有验证 XNU 读取 ADT、写页表、启用 MMU、进入 C 或启动驱动／用户态。下一阶段的 [MMU 开启检查点](xnu-mmu-checkpoint.md) 已完成主机验证与签名镜像生成，仍待新的硬件结果。
+日志中较早的 `phase-0 complete; no XNU loaded` 是探针阶段、装载前的记录；后面的 XNU 检查点字段才记录随后的内核执行。本轮没有验证 XNU 读取 ADT、写页表、启用 MMU、进入 C 或启动驱动／用户态。下一阶段的 [MMU 开启检查点](xnu-mmu-checkpoint.md) 也已通过新的真机日志验收；它与本节的早期入口结果分别记录。

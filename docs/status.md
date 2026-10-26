@@ -20,8 +20,8 @@
 | 显示恢复 | 未实现 | 原厂停止 timing engine / DSI，不能直接沿用 splash |
 | XNU 源码与装载前检查 | 源码内核已编译链接，51 项回归通过 | XNU 10063.141.1／Darwin 23.6；真实 FDT 已生成最小 ADT；本地链接指针已逐条审计；完整组件 prelink 待接入，见 docs/xnu-preparation.md |
 | 源码 XNU 装载与 boot_args 入口检查点 | 真机验收通过 | EL1 读取参数后 HVC 返回 EL2，Linux 收到唯一且通过校验的 copied／checkpoint／boot_args／current EL 四字段，见 docs/xnu-checkpoint.md |
-| XNU MMU 开启检查点 | 镜像已生成，待真机验证 | 新增偏移装载、完整页表池与硬件 AT 返回门，59 项主机回归通过，见 docs/xnu-mmu-checkpoint.md |
-| XNU C 初始化与 ADT 消费 | 未验证 | 已通过的硬件入口检查点位于页表写入之前；新 MMU 镜像尚无硬件执行结果 |
+| XNU MMU 开启检查点 | 真机验收通过 | 完整 8192 字节日志确认 MMU／表池／硬件 AT 校验均成功，并返回 Linux；见 docs/xnu-mmu-checkpoint.md |
+| XNU 高虚拟地址执行、C 初始化与 ADT 消费 | 未验证 | 当前检查点在 MMU 开启后的 identity 路径立即 HVC 返回；高地址已通过 AT，尚未跳入执行 |
 | eMMC、触摸、GPU 与完整 iPadOS 用户态 | 未实现 | 没有原生桌面或应用运行记录 |
 
 ## 已执行的主机验证
@@ -48,6 +48,6 @@
 3. 已从单独准备的可启动介质，经原厂开发者模式进入探针并交接原生 Linux。
 4. 已读取入口 EL、当前 EL、MIDR / MPIDR / CNTFRQ、FDT 内存与 Coreboot 表属性；原始地址与板级数据私下保存。
 5. 已确认 current EL = 1 且 stage = 3，handoff EL = 2；本次正常路径未触发异常，ESR / ELR / FAR 异常接收仍待单独验证。
-6. 后续已完成：源码 XNU 的运行时段装载与 pre-MMU boot_args 读取检查点，取得有效硬件日志。待完成：MMU／C 初始化、ADT 消费、平台接口与显示恢复。
+6. 后续已完成：源码 XNU 的运行时段装载与 pre-MMU boot_args 读取检查点，取得有效硬件日志。随后 MMU 开启、完整页表池和硬件 AT 检查点也已通过真机验收。待完成：高虚拟地址实际执行、C 初始化、ADT 消费、平台接口与显示恢复。
 
-原生探针与源码 XNU pre-MMU 入口检查点均已取得硬件日志；主机测试仍须单独列出。没有完整 XNU 或 iPadOS 启动结果。
+原生探针、源码 XNU pre-MMU 入口与 MMU 开启检查点均已取得硬件日志；主机测试仍须单独列出。没有完整 XNU 或 iPadOS 启动结果。
