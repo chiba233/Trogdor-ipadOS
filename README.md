@@ -2,7 +2,7 @@
 
 HP Chromebook x2 11（Google Coachz / SC7180）的 **原生 iPadOS 移植实验**。
 
-当前实现是第一阶段引导探针，已在真机取回寄存器日志，确认原厂 EL2 入口、EL1 诊断与 stage=3，并经 EL2 交接原生 Linux；源码 XNU 的 pre-MMU 入口检查点也已通过真机验证，确认在 EL1 读取 boot_args 后返回 Linux。目标用户态是已有社区原生实现可参考的 iPadOS 17；后续独立 MMU 检查点也已通过；高虚拟地址执行、C 初始化、驱动与用户态接入仍待完成。
+当前实现是第一阶段引导探针，已在真机取回寄存器日志，确认原厂 EL2 入口、EL1 诊断与 stage=3，并经 EL2 交接原生 Linux；源码 XNU 的 pre-MMU 入口检查点也已通过真机验证，确认在 EL1 读取 boot_args 后返回 Linux。目标用户态是已有社区原生实现可参考的 iPadOS 17；后续独立 MMU 检查点也已通过；高虚拟地址取指和 C 入口栈读取检查点也已通过，C 初始化正文、驱动与用户态接入仍待完成。
 
 ```text
 原厂 Coreboot → TF-A BL31 → Depthcharge（NS EL2）
@@ -86,6 +86,6 @@ python3 tools/sign.py build/uart/probe.itb \
 
 原生源码 XNU 的 pre-MMU 装载／boot_args 检查点见 [入口检查点](docs/xnu-checkpoint.md)。它已在真机通过单指令 HVC 返回 Linux 取回有效日志；后续 MMU 检查点也已通过；C 初始化、平台驱动与 iPadOS 启动仍待完成。
 
-[MMU 开启检查点](docs/xnu-mmu-checkpoint.md) 已通过真机日志验收：完整页表池、EL1 寄存器和硬件地址翻译校验成功，并返回 Linux。尚未验证高虚拟地址上的实际执行或 C 初始化。
+[MMU 开启检查点](docs/xnu-mmu-checkpoint.md) 已通过真机日志验收：完整页表池、EL1 寄存器和硬件地址翻译校验成功，并返回 Linux。该轮只验证 MMU；随后高地址实际取指与栈读取由独立检查点确认。
 
-[高虚拟地址与 C 入口检查点](docs/xnu-highva-checkpoint.md) 已完成主机回归、审查和签名镜像生成，等待真机验证；该模式读取栈后返回，不执行 C 初始化正文。
+[高虚拟地址与 C 入口检查点](docs/xnu-highva-checkpoint.md) 已通过真机验收：原始 RET 跳入 arm_init 高地址，完成栈帧调整与诊断读取后返回 Linux，未执行 C 初始化正文。
