@@ -1,6 +1,6 @@
 # 无串口 USB 原生检查点
 
-这是独立 ARM64 诊断代码，不含 Linux、XNU 或 iPadOS。当前没有 Coachz 真机执行记录。沿用原厂开发者模式与 Depthcharge 的外置介质启动入口，不替换 SPI 固件。
+这是独立 ARM64 诊断代码，不含 Linux、XNU 或 iPadOS。已有黑屏和自动重启的硬件尝试，但尚未确认检查点执行成功，见 [硬件尝试记录](hardware-tests.md)。沿用原厂开发者模式与 Depthcharge 的外置介质启动入口，不替换 SPI 固件。
 
 ## 已生成的镜像包
 
@@ -61,3 +61,18 @@ lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS
 只有在 FDT 合法、诊断 stage=3、实际 EL 符合目标、PSCI 至少 0.2、计时频率有效时才会等待并请求复位。不满足条件、异常或复位调用意外返回时会停止。一直黑屏不是成功；固件拒绝镜像后回到菜单不是重启；手动复位和不可解释的自动重启也不算通过。必要时用电源键恢复正常开机，随后从内置存储启动。
 
 默认启动目标取决于现有固件设置；测试时手动选择一次外置介质，不把它设置为默认启动。发生意外重复启动时拔掉测试 U 盘。
+
+## 延时差异不明确时的对照
+
+使用既有 `memory` 探针作不复位对照。它沿用 EL2→EL1 和 FDT 诊断路径，返回后停止在 WFE，不调用定时检查点。该镜像不会主动请求重启；若同样自动重启，必须继续调查其他复位来源，不能把重启直接记为诊断通过。黑屏保持也不能证明 EL1 或 FDT 诊断成功。
+
+构建后可创建普通镜像文件：
+
+```sh
+python3 tools/sign.py build/memory/probe.itb \
+  --futility /path/to/futility --key-dir /path/to/devkeys \
+  --output build/halt/memory.kpart
+python3 tools/disk.py build/halt/memory.kpart build/halt/memory.img --label memory-el1-halt
+```
+
+显式指定外部 `futility` 和公开开发者测试密钥目录，替换上面两处路径；该签名命令没有自动查找选项。按前述写盘前确认步骤制作测试介质；从选择外置启动开始观察 30 秒，记录是否自动重启，随后可用电源键恢复并从内置存储启动。

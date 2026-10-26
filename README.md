@@ -16,7 +16,7 @@ HP Chromebook x2 11（Google Coachz / SC7180）的 **原生 iPadOS 移植实验*
 - [设计与阶段边界](docs/design.md)：比较直接 FIT shim、U-Boot EFI 与替换固件，明确首阶段的接口。
 - `boot/`：带 Linux ARM64 Image 头的独立探针、EL2→EL1 入口、内存日志、受限 GENI UART 输出、只读 FDT 解析。
 - `tools/`：交叉编译、FIT 封装、vboot 容器签名、上游版本核对；所有产物都是普通文件。
-- [状态与真机验收](docs/status.md)：区分源码证据、主机检查与尚待执行的硬件验证。
+- [状态与真机验收](docs/status.md)：区分源码证据、主机检查与尚未通过的硬件验收。
 
 ## 构建
 
@@ -47,6 +47,8 @@ python3 -m unittest discover -s tests -v
 ## 无串口测试
 
 见 [USB 测试步骤](docs/usb-test.md)。`reset-el2` 完成 EL2 诊断后等 3 秒复位；`reset-el1` 完成 EL1 诊断后等 10 秒复位。它们都不提供屏幕输出，观测到预期的成对延时重启只算粗粒度执行证据，不包含寄存器读数或 XNU 启动验证。
+
+目前两种镜像都观察到自动重启，但尚未观察到可辨认的延时差异，不能确认通过检查点。见 [硬件尝试记录与不复位对照](docs/hardware-tests.md)。
 
 在 Debian 构建／测试环境中，可使用已安装的 `futility` 和公共开发者测试密钥创建两个 64 MiB GPT 镜像：
 
