@@ -8,10 +8,11 @@ import shutil
 import struct
 import subprocess
 import sys
-from artifacts import diagnostic_dtb, extract_image, fit, inspect_image
+from artifacts import diagnostic_dtb, extract_image, fit, inspect_image, inspect_scalar_code
 from fdt import properties
 
 ROOT = Path(__file__).resolve().parents[1]
+CPU = "generic+el3+strict_align-fp_armv8-neon"
 
 def elf_symbols(data):
     if data[:6] != b"\x7fELF\x02\x01" or struct.unpack_from("<H", data, 18)[0] != 183:
@@ -51,13 +52,13 @@ def main():
     build.mkdir(exist_ok=True)
     dtb = diagnostic_dtb()
     (build / "coachz-probe.dtb").write_bytes(dtb)
-    manifest = {"schema": 1, "toolchain": {"zig": version}, "hardware_tested": False, "artifacts": {}}
+    manifest = {"schema": 1, "toolchain": {"zig": version, "cpu": CPU}, "hardware_tested": False, "artifacts": {}}
     for mode, uart, reset_el in (("memory", 0, 0), ("uart", 1, 0),
                                  ("reset-el2", 0, 2), ("reset-el1", 0, 1)):
         out = build / mode
         out.mkdir(exist_ok=True)
         elf, image = out / "probe.elf", out / "Image"
-        command = [zig, "cc", "-target", "aarch64-freestanding-none", "-mcpu=generic+el3",
+        command = [zig, "cc", "-target", "aarch64-freestanding-none", "-mcpu=" + CPU,
                    "-mgeneral-regs-only", "-ffreestanding", "-fno-builtin", "-fno-pic", "-fno-pie",
                    "-fno-stack-protector", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables",
                    "-Wall", "-Wextra", "-Werror", "-Os", "-g", "-nostdlib", "-static",
@@ -70,6 +71,7 @@ def main():
         image.write_bytes(extract_image(elf.read_bytes()))
         data = image.read_bytes()
         header = inspect_image(data)
+        scalar = inspect_scalar_code(elf.read_bytes())
         symbols = elf_symbols(elf.read_bytes())
         if symbols["_start"]["address"] != 0 or header["memory_size"] != symbols["_image_end"]["address"]:
             raise ValueError("ELF/Image layout mismatch")
@@ -84,7 +86,7 @@ def main():
             manifest["artifacts"][str(path.relative_to(build))] = {
                 "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "bytes": path.stat().st_size}
         manifest[mode] = {"image": header, "probe_log": symbols["probe_log"],
-                          "uart_mmio_enabled": bool(uart), "reset_target_el": reset_el,
+                          "scalar_code": scalar, "uart_mmio_enabled": bool(uart), "reset_target_el": reset_el,
                           "reset_delay_seconds": {0: 0, 1: 10, 2: 3}[reset_el]}
         print(mode + ": Image/FIT built; header and ELF symbols verified; hardware not tested")
     (build / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")

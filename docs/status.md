@@ -9,6 +9,8 @@
 | ARM64 内存日志探针 | 已交叉编译 | ELF、Image、FIT；未真机启动 |
 | 可选 GENI UART 探针 | 已交叉编译 | 仅复用已初始化 UART；未真机启动 |
 | Image 头、ELF 符号与 FIT 内嵌数据 | 主机检查通过 | build/manifest.json；不能证明 CPU 指令在硬件执行成功 |
+| 启动期生成码 | 主机回归通过 | 显式关闭 FP/NEON、启用严格对齐；ELF 指令范围检查通过；修复版待真机复测 |
+| 首次 EL2 USB 尝试 | 未通过 | 黑屏，未观察到预期复位；尚不能确认入口或停止位置 |
 | FDT 解析与原厂 END token 格式兼容 | 主机测试通过 | tests/test_artifacts.py；包含截断和非法边界 |
 | vboot 签名与容器验证 | 主机验证通过 | 使用锁定 vboot 分支构建的 futility / 公开测试密钥；两个检查点容器签名与 body 验证通过，篡改被拒绝；尚未真机启动 |
 | 无串口 EL2 / EL1 复位检查点 | 已交叉编译 | 预期诊断通过后分别等 3 / 10 秒重启；未真机测试 |
@@ -19,6 +21,7 @@
 
 ## 已执行的主机验证
 
+- Zig 0.15.2 的后端特性覆盖问题已定位，详见 docs/codegen.md；17 项主机测试通过，四种 ELF 的指令范围通过标量检查。
 - Zig 0.15.2 构建 memory / uart / reset-el2 / reset-el1 四种 AArch64 freestanding ELF。
 - 从 PT_LOAD 段导出原始 Image，校验 ARM64 magic、跳转、内存大小和 ELF 符号。
 - 生成并核对 FIT 的 Image / DTB 原始字节与 SHA-256。

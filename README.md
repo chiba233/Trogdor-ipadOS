@@ -2,7 +2,7 @@
 
 HP Chromebook x2 11（Google Coachz / SC7180）的 **原生 iPadOS 移植实验**。
 
-当前实现是第一阶段引导探针，尚未接入 XNU，尚无真机启动记录。目标用户态是已有社区原生实现可参考的 iPadOS 17；具体 XNU 构建与驱动接入在后续阶段进行。
+当前实现是第一阶段引导探针，尚未接入 XNU，尚未确认探针在真机执行成功。目标用户态是已有社区原生实现可参考的 iPadOS 17；具体 XNU 构建与驱动接入在后续阶段进行。
 
 ```text
 原厂 Coreboot → TF-A BL31 → Depthcharge（NS EL2）
@@ -41,6 +41,8 @@ python3 -m unittest discover -s tests -v
 | `build/manifest.json` | 实际使用的编译器、产物 SHA-256 与 Image 头信息 |
 
 探针设备树的 `model` / `compatible` 是打包输入，不能当作真机身份探测结果。Depthcharge 会补入实际内存、原厂表位置等数据，探针记录这些交接信息。
+
+构建对最终 ELF 的 AArch64 指令范围执行 [标量生成码检查](docs/codegen.md)，禁止早期探针依赖 FP／SIMD／SVE，并显式启用严格对齐。
 
 ## 无串口测试
 

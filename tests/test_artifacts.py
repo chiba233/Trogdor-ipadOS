@@ -10,7 +10,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
-from artifacts import diagnostic_dtb, extract_image, fit, inspect_image
+from artifacts import diagnostic_dtb, extract_image, fit, inspect_image, inspect_scalar_code
 from fdt import Node, encode, properties, string, u32
 
 class FdtTests(unittest.TestCase):
@@ -114,6 +114,39 @@ class ArtifactTests(unittest.TestCase):
         struct.pack_into("<Q", elf, phoff + 8, len(elf))
         with self.assertRaises(ValueError):
             extract_image(elf)
+
+    def test_compiled_instruction_ranges_are_scalar(self):
+        for mode in ("memory", "uart", "reset-el2", "reset-el1"):
+            data = (ROOT / "build" / mode / "probe.elf").read_bytes()
+            self.assertGreater(inspect_scalar_code(data)["instructions"], 0)
+
+    def test_simd_processing_and_load_instructions_are_rejected(self):
+        original = (ROOT / "build/reset-el2/probe.elf").read_bytes()
+        shoff = struct.unpack_from("<Q", original, 40)[0]
+        stride, count = struct.unpack_from("<HH", original, 58)
+        sections = [struct.unpack_from("<II4QII2Q", original, shoff + i * stride)
+                    for i in range(count)]
+        text = next(section for section in sections if section[2] & 4)
+        for word in (0x3ced6800, 0x6e004001, 0x9e660006):
+            data = bytearray(original)
+            struct.pack_into("<I", data, text[4], word)
+            with self.subTest(instruction=hex(word)), self.assertRaisesRegex(ValueError, "non-scalar"):
+                inspect_scalar_code(data)
+        # The ARM64 Image header after its first branch is $d, not code.
+        data = bytearray(original)
+        struct.pack_into("<I", data, text[4] + 4, 0x3ced6800)
+        self.assertGreater(inspect_scalar_code(data)["instructions"], 0)
+
+    def test_uninspectable_executable_ranges_are_rejected(self):
+        data = bytearray((ROOT / "build/reset-el2/probe.elf").read_bytes())
+        shoff = struct.unpack_from("<Q", data, 40)[0]
+        stride, count = struct.unpack_from("<HH", data, 58)
+        for i in range(count):
+            at = shoff + i * stride
+            if struct.unpack_from("<I", data, at + 4)[0] == 2:
+                struct.pack_into("<I", data, at + 4, 1)
+        with self.assertRaisesRegex(ValueError, "mapping"):
+            inspect_scalar_code(data)
 
     def test_built_probe_layout(self):
         manifest = ROOT / "build/manifest.json"
