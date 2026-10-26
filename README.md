@@ -2,7 +2,7 @@
 
 HP Chromebook x2 11（Google Coachz / SC7180）的 **原生 iPadOS 移植实验**。
 
-当前实现是第一阶段引导探针，尚未接入 XNU，尚未确认探针在真机执行成功。目标用户态是已有社区原生实现可参考的 iPadOS 17；具体 XNU 构建与驱动接入在后续阶段进行。
+当前实现是第一阶段引导探针，已取得 EL1 诊断路径执行的间接硬件证据，尚无可读寄存器日志，尚未接入 XNU。目标用户态是已有社区原生实现可参考的 iPadOS 17；具体 XNU 构建与驱动接入在后续阶段进行。
 
 ```text
 原厂 Coreboot → TF-A BL31 → Depthcharge（NS EL2）
@@ -48,7 +48,7 @@ python3 -m unittest discover -s tests -v
 
 见 [USB 测试步骤](docs/usb-test.md)。`reset-el2` 完成 EL2 诊断后等 3 秒复位；`reset-el1` 完成 EL1 诊断后等 10 秒复位。它们都不提供屏幕输出，观测到预期的成对延时重启只算粗粒度执行证据，不包含寄存器读数或 XNU 启动验证。
 
-目前两种定时镜像都观察到自动重启，不复位对照则保持黑屏。尚未观察到可辨认的成对延时差异，不能确认通过检查点。见 [硬件尝试记录与不复位对照](docs/hardware-tests.md)。进一步区分最终复位调用的 [EL1 匹配对照](docs/control.md)已准备，尚待硬件测试。
+两种定时镜像观察到自动重启，普通内存对照与仅取消最终复位指令的匹配对照均不重启。单指令匹配对照支持原版到达最终复位调用及此前 EL1／诊断门限的间接硬件证据；仍没有直接寄存器读数或精确计时。见 [硬件记录](docs/hardware-tests.md)与 [EL1 匹配对照](docs/control.md)。下一步需建立 [可读日志通道](docs/observability.md)。
 
 在 Debian 构建／测试环境中，可使用已安装的 `futility` 和公共开发者测试密钥创建两个 64 MiB GPT 镜像：
 

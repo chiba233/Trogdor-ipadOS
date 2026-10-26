@@ -41,7 +41,7 @@ python3 tools/disk.py build/usb-control/reset-el1-no-reset.kpart \
 | reset-el1-no-reset.img SHA-256 | 03d8e18a0788ff9581d8da33f8e5748ba03d18c92655a30bfe0f7a2e6559fa0c |
 | reset-el1-no-reset.kpart SHA-256 | fd2cfa75379f9ac18b8375330d098744d104a7c80f09d2ed5e2d17d3f68ccc37 |
 
-21 项主机回归通过；独立检查确认只有上述四个 Image 字节变化，以及两处预期的 FIT 属性变化。签名／body 校验与容器、GPT 中的负载字节一致性检查通过。目标系统的 futility 再次验证签名与 body 成功，写入外置测试介质后的全部 64 MiB 回读 SHA-256 与上述镜像一致。尚未执行该匹配对照的硬件启动测试。
+21 项主机回归通过；独立检查确认只有上述四个 Image 字节变化，以及两处预期的 FIT 属性变化。签名／body 校验与容器、GPT 中的负载字节一致性检查通过。目标系统的 futility 再次验证签名与 body 成功，写入外置测试介质后的全部 64 MiB 回读 SHA-256 与上述镜像一致。硬件启动反馈为不自动重启，与会自动重启的原版形成对照。
 
 ## 执行与解释
 
@@ -50,3 +50,7 @@ python3 tools/disk.py build/usb-control/reset-el1-no-reset.kpart \
 - 原版自动重启、匹配对照不重启，会为最终 SYSTEM_RESET 触发复位提供更直接的证据，也支持原版到达了此前的 EL／stage／计时检查；仍不提供寄存器日志，也不是 XNU 或 iPadOS 启动证明。
 - 若匹配对照也自动重启，应继续分离 PSCI_VERSION 与其他复位路径；不能把它判为最终 SYSTEM_RESET 成功。
 - 黑屏保持本身仍可能来自更早的停机或异常，因此不单独作为 EL1 检查点通过依据。
+
+## 已观察结果（2026-10-27 更新）
+
+匹配对照不自动重启。与此前原版 reset-el1 的自动重启组合，支持原版到达最终 SYSTEM_RESET 及此前 EL1／诊断门限的间接执行证据。该判断来自成对行为及机器码的单指令差异，不是直接读取了 current EL、stage 或异常寄存器。精确计时和完整日志仍未取得。
