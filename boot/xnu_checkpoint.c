@@ -3,7 +3,7 @@
 extern uint8_t _xnu_payload_start[],_xnu_payload_end[],_xnu_window[],_image_end[];
 void probe_value(const char *,uint64_t);
 static struct xnu_expected expected;
-uint64_t xnu_capture[18];
+uint64_t xnu_capture[24];
 struct xnu_handoff xnu_prepare(void) {
     struct xnu_handoff out={0,0};uint64_t cpu,freq,el;
     __asm__ volatile("mrs %0, mpidr_el1":"=r"(cpu));
@@ -22,12 +22,18 @@ struct xnu_handoff xnu_prepare(void) {
 int xnu_checkpoint_complete(void) {
     uint64_t *c=xnu_capture;
     int good=xnu_capture_valid(c,&expected);
-    if (expected.mode==2) {
+    if (expected.mode>=2) {
         int tables=good && xnu_tables_valid((const uint64_t *)(uintptr_t)expected.pages,&expected);
         probe_value("XNU MMU enabled=",(c[2]&0x1005)==0x1005);
         probe_value("XNU tables verified=",(uint64_t)tables);
         probe_value("XNU translations verified=",(uint64_t)good);
         good=good && tables;
+    }
+    if (expected.mode==3) {
+        probe_value("XNU high VA verified=",(uint64_t)good);
+        probe_value("XNU stack read verified=",(uint64_t)good);
+        probe_value("XNU C entry verified=",(uint64_t)good);
+        probe_value("XNU args VA=",c[18]);
     }
     probe_value("XNU checkpoint=",(uint64_t)good);
     probe_value("XNU boot_args verified=",(uint64_t)good);

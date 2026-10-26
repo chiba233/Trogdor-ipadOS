@@ -21,7 +21,8 @@
 | XNU 源码与装载前检查 | 源码内核已编译链接，51 项回归通过 | XNU 10063.141.1／Darwin 23.6；真实 FDT 已生成最小 ADT；本地链接指针已逐条审计；完整组件 prelink 待接入，见 docs/xnu-preparation.md |
 | 源码 XNU 装载与 boot_args 入口检查点 | 真机验收通过 | EL1 读取参数后 HVC 返回 EL2，Linux 收到唯一且通过校验的 copied／checkpoint／boot_args／current EL 四字段，见 docs/xnu-checkpoint.md |
 | XNU MMU 开启检查点 | 真机验收通过 | 完整 8192 字节日志确认 MMU／表池／硬件 AT 校验均成功，并返回 Linux；见 docs/xnu-mmu-checkpoint.md |
-| XNU 高虚拟地址执行、C 初始化与 ADT 消费 | 未验证 | 当前检查点在 MMU 开启后的 identity 路径立即 HVC 返回；高地址已通过 AT，尚未跳入执行 |
+| XNU 高虚拟地址／C 入口栈读取检查点 | 镜像已生成，待真机验证 | 保留原始 RET 和首条栈帧调整，读取栈后 HVC；66 项回归通过，见 docs/xnu-highva-checkpoint.md |
+| XNU C 初始化正文与 ADT 消费 | 未验证 | 已验收的 MMU 检查点仅在 identity 路径执行；高VA新模式尚无硬件结果 |
 | eMMC、触摸、GPU 与完整 iPadOS 用户态 | 未实现 | 没有原生桌面或应用运行记录 |
 
 ## 已执行的主机验证

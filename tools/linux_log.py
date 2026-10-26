@@ -108,7 +108,7 @@ def compile_wrapper(out, kernel, memory, checkpoint=None):
     assembly = out / "payload.S"
     assembly.write_text('.global LINUX_MEMORY_SIZE\n.set LINUX_MEMORY_SIZE, ' + str(memory) + '\n.section .linux, "a"\n.incbin "' + quoted + '"\n')
     if checkpoint is not None:
-        if len(checkpoint)<1152 or checkpoint[:8]!=b'TRXNUC01' or int.from_bytes(checkpoint[8:12],'little') not in (1,2):
+        if len(checkpoint)<1152 or checkpoint[:8]!=b'TRXNUC01' or int.from_bytes(checkpoint[8:12],'little') not in (1,2,3):
             raise ValueError("invalid source-XNU checkpoint payload header")
         payload_path = out / "xnu-checkpoint.bin"
         payload_path.write_bytes(checkpoint)

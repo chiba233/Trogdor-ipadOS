@@ -14,5 +14,5 @@ int xnu_tables_valid(const uint64_t *, const struct xnu_expected *);
 int xnu_range_allowed(const void *, uint64_t, uint64_t);
 struct xnu_handoff xnu_prepare(void);
 int xnu_checkpoint_complete(void);
-extern uint64_t xnu_capture[18];
+extern uint64_t xnu_capture[24];
 #endif

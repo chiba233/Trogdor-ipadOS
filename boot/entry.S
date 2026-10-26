@@ -128,6 +128,10 @@ probe_call:
     str x11, [x10, #72]
     mrs x11, par_el1
     str x11, [x10, #80]
+    mrs x11, cpacr_el1
+    str x11, [x10, #88]
+    mrs x11, tpidr_el1
+    str x11, [x10, #96]
     mov x9, x0
     mov x0, x1
     mov x1, xzr
@@ -171,6 +175,9 @@ vectors:
     vector 15
     .balign 128
 exception_entry:
+#if PROBE_XNU_CHECKPOINT
+    mov x18, x0             /* Preserve the C entry argument before ESR overwrites x0. */
+#endif
     mrs x4, CurrentEL
     cmp x4, #8
     b.eq 3f
@@ -247,6 +254,13 @@ xnu_checkpoint_return:
     stp x20, x22, [x10, #24]
     stp x23, x24, [x10, #40]
     stp x25, x26, [x10, #56]
+    str x18, [x10, #144]
+    str x19, [x10, #152]
+    mrs x9, cpacr_el1
+    str x9, [x10, #160]
+    mrs x9, tpidr_el1
+    str x9, [x10, #168]
+    str x30, [x10, #176]
     mrs x9, tcr_el1
     str x9, [x10, #72]
     mrs x9, ttbr0_el1
@@ -271,12 +285,38 @@ xnu_checkpoint_return:
     mrs x9, par_el1
     str x9, [x10, #128]
     mrs x9, elr_el2
+    tbnz x9, #63, 8f
     add x9, x9, x22
     sub x9, x9, x23
-    at s1e1r, x9
+8:  at s1e1r, x9
     isb
     mrs x9, par_el1
     str x9, [x10, #136]
+    mrs x9, elr_el2
+    tbz x9, #63, 7f
+    mrs x9, sp_el0
+    add x9, x9, #0x70
+    at s1e1r, x9
+    isb
+    mrs x9, par_el1
+    str x9, [x10, #184]
+    /* Invalidate the clean stack-read line before Linux can reuse this RAM.
+       EL2 translation is off, so this cache-maintenance VA is physical. */
+    mrs x9, sp_el0
+    add x9, x9, #0x70
+    add x9, x9, x23
+    sub x9, x9, x22
+    adrp x11, _xnu_window
+    add x11, x11, :lo12:_xnu_window
+    cmp x9, x11
+    b.lo halt
+    adrp x11, _image_end
+    add x11, x11, :lo12:_image_end
+    cmp x9, x11
+    b.hs halt
+    dsb sy
+    dc civac, x9
+    dsb sy
 7:
     /* No cached stores occur between XNU enabling M/C/I and this HVC. */
     mrs x9, sctlr_el1
@@ -312,6 +352,10 @@ xnu_checkpoint_return:
     msr tpidrro_el0, x9
     ldr x9, [x10, #80]
     msr par_el1, x9
+    ldr x9, [x10, #88]
+    msr cpacr_el1, x9
+    ldr x9, [x10, #96]
+    msr tpidr_el1, x9
     ldr x9, [x10]
     msr sctlr_el1, x9
     isb
@@ -330,5 +374,5 @@ xnu_saved:
     .zero 80
 .balign 16
 xnu_el1_saved:
-    .zero 96
+    .zero 112
 #endif

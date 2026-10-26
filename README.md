@@ -87,3 +87,5 @@ python3 tools/sign.py build/uart/probe.itb \
 原生源码 XNU 的 pre-MMU 装载／boot_args 检查点见 [入口检查点](docs/xnu-checkpoint.md)。它已在真机通过单指令 HVC 返回 Linux 取回有效日志；后续 MMU 检查点也已通过；C 初始化、平台驱动与 iPadOS 启动仍待完成。
 
 [MMU 开启检查点](docs/xnu-mmu-checkpoint.md) 已通过真机日志验收：完整页表池、EL1 寄存器和硬件地址翻译校验成功，并返回 Linux。尚未验证高虚拟地址上的实际执行或 C 初始化。
+
+[高虚拟地址与 C 入口检查点](docs/xnu-highva-checkpoint.md) 已完成主机回归、审查和签名镜像生成，等待真机验证；该模式读取栈后返回，不执行 C 初始化正文。
