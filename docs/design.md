@@ -51,3 +51,7 @@ EL2 分支将 EL1 设置为 AArch64、关闭 stage-2 translation、允许 EL1 �
 ## 早期指令集约束
 
 原厂交接时 MMU 已关闭；探针不依赖 FP/SIMD 状态。构建必须在后端 CPU 特性中显式关闭 `fp_armv8` 与 `neon`、开启 `strict_align`，不能只依赖 C 前端的 `-mgeneral-regs-only`。最终 ELF 依据 AArch64 `$x` / `$d` 映射符号区分代码和内嵌数据，再拒绝 FP/SIMD 计算、向量访存与 SVE 指令主类。该检查是早期探针的约束检查，不是完整指令集验证器。
+
+## 匹配对照
+
+`memory` 对照不能区分 PSCI_VERSION、等待和最终复位调用。后续使用 [仅抑制最终复位的匹配对照](control.md)：从已校验的 reset-el1 机器码只替换最终 SMC 为等长 NOP，其余 Image 字节与 FIT 配置保持相同，以减少编译布局干扰。该产物不重新定义原版的成功条件，也不作为启动修复。

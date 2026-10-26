@@ -15,13 +15,14 @@
 | vboot 签名与容器验证 | 主机验证通过 | 使用锁定 vboot 分支构建的 futility / 公开测试密钥；两个检查点容器签名与 body 验证通过，篡改被拒绝；硬件接受与执行位置仍未确认 |
 | 无串口 EL2 / EL1 复位检查点 | 硬件尝试未形成通过证据 | 两轮均报告自动重启，延时差异不明确；不复位对照未自动重启，具体检查点仍未确认；见 docs/hardware-tests.md |
 | GPT 镜像生成 | 主机测试通过 | 主／备 GPT CRC、分区类型、负载布局、文件保护；官方 vboot 对 64 MiB 镜像与模拟 8 GiB 介质的主表校验通过；已用于外置启动尝试，但无检查点通过证据 |
+| 仅抑制最终复位的 EL1 匹配对照 | 主机校验通过，硬件待测 | tools/control.py；Image 仅改一条 SMC 为 NOP，保留 PSCI_VERSION 与等待；见 docs/control.md |
 | 显示恢复 | 未实现 | 原厂停止 timing engine / DSI，不能直接沿用 splash |
 | XNU 装载、ADT、boot_args | 未实现 | 后续接入阶段 |
 | eMMC、触摸、GPU 与完整 iPadOS 用户态 | 未实现 | 没有原生桌面或应用运行记录 |
 
 ## 已执行的主机验证
 
-- Zig 0.15.2 的后端特性覆盖问题已定位，详见 docs/codegen.md；17 项主机测试通过，四种 ELF 的指令范围通过标量检查。
+- Zig 0.15.2 的后端特性覆盖问题已定位，详见 docs/codegen.md；原有 17 项主机测试通过，四种 ELF 的指令范围通过标量检查。
 - Zig 0.15.2 构建 memory / uart / reset-el2 / reset-el1 四种 AArch64 freestanding ELF。
 - 从 PT_LOAD 段导出原始 Image，校验 ARM64 magic、跳转、内存大小和 ELF 符号。
 - 生成并核对 FIT 的 Image / DTB 原始字节与 SHA-256。
@@ -29,6 +30,8 @@
 - 两个检查点已实际签名；核对签名容器／GPT 中的 FIT 原始字节一致，篡改 body 会被 futility 拒绝。
 - 定时复位条件拒绝错误 EL、未完成阶段、不可用 PSCI 和异常计时频率；GPT 格式与仅文件输出限制通过测试。
 - 独立源码审查发现原厂 dt_flatten() 的 structure_size 不计 FDT_END；已增加精确边界兼容与回归用例。
+
+匹配对照增加 4 项回归，合计 21 项通过。实际产物检查确认除最终复位的四个指令字节外 Image 完全相同，FIT 只改变 kernel data 与其哈希。
 
 ## 硬件尝试与待完成验收
 

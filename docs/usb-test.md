@@ -76,3 +76,5 @@ python3 tools/disk.py build/halt/memory.kpart build/halt/memory.img --label memo
 ```
 
 显式指定外部 `futility` 和公开开发者测试密钥目录，替换上面两处路径；该签名命令没有自动查找选项。按前述写盘前确认步骤制作测试介质；从选择外置启动开始观察 30 秒，记录是否自动重启，随后可用电源键恢复并从内置存储启动。
+
+若需保留 PSCI_VERSION 和等待过程、只取消最终复位调用，使用 [EL1 匹配对照](control.md)。它与普通 memory 版本是不同的诊断产物，不能混用各自的观察结论。

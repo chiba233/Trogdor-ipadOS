@@ -43,4 +43,4 @@ EL1 尝试之后读取的 EC GET_UPTIME_INFO 返回 AP reset count=0，recent_ap
 
 ## 后续待验证
 
-本轮停止于不复位对照观察，不继续改写介质或触发设备重启。后续仍需用更明确的计时观察或仅抑制最终 SYSTEM_RESET 的匹配对照，区分 PSCI_VERSION、等待和最终复位调用；不能提前将当前结果升级为 EL1 检查点通过。
+不复位对照观察后没有确认 EL1 检查点通过。后续已准备 [仅抑制最终 SYSTEM_RESET 的匹配对照](control.md)，用于区分 PSCI_VERSION、等待和最终复位调用；尚待硬件验证。
