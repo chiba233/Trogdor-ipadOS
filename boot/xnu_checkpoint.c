@@ -2,8 +2,9 @@
 #include "xnu_checkpoint.h"
 extern uint8_t _xnu_payload_start[],_xnu_payload_end[],_xnu_window[],_image_end[];
 void probe_value(const char *,uint64_t);
-static struct xnu_expected expected;
-uint64_t xnu_capture[24];
+struct xnu_expected xnu_expected;
+#define expected xnu_expected
+uint64_t xnu_capture[27];
 struct xnu_handoff xnu_prepare(void) {
     struct xnu_handoff out={0,0};uint64_t cpu,freq,el;
     __asm__ volatile("mrs %0, mpidr_el1":"=r"(cpu));
@@ -35,9 +36,20 @@ int xnu_checkpoint_complete(void) {
         probe_value("XNU C entry verified=",(uint64_t)good);
         probe_value("XNU args VA=",c[18]);
     }
+    if (expected.mode==4) {
+        int data=good && xnu_cinit_valid(&expected);
+        good=good && data;
+        probe_value("XNU C body verified=",(uint64_t)good);
+        probe_value("XNU stack writes verified=",(uint64_t)data);
+        probe_value("XNU args copy verified=",(uint64_t)data);
+        probe_value("XNU cache maintenance verified=",(uint64_t)good);
+        probe_value("XNU args VA=",expected.virt+expected.args-expected.phys);
+        probe_value("XNU cache line bytes=",c[25]);
+        probe_value("XNU cache lines=",c[26]);
+    }
     probe_value("XNU checkpoint=",(uint64_t)good);
     probe_value("XNU boot_args verified=",(uint64_t)good);
     probe_value("XNU current EL=",((c[1]&15)==4 || (c[1]&15)==5)?1:0);
-    probe_value("XNU ELR=",c[0]);probe_value("XNU args PA=",c[3]);
+    probe_value("XNU ELR=",c[0]);probe_value("XNU args PA=",expected.args);
     return good;
 }

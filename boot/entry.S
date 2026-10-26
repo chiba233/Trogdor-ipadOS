@@ -137,6 +137,17 @@ probe_call:
     mov x1, xzr
     mov x2, xzr
     mov x3, xzr
+    /* Mode4 makes every original C-prologue save independently checkable.
+       The pinned cold path preserves x27/x28/x29; EL2 originals are saved. */
+    adrp x10, xnu_expected
+    add x10, x10, :lo12:xnu_expected
+    ldr x10, [x10, #56]
+    cmp x10, #4
+    b.ne xnu_branch
+    mov x27, xzr
+    mov x28, xzr
+    mov x29, xzr
+xnu_branch:
     dsb sy
     br x9
 xnu_load_failed:
@@ -261,6 +272,7 @@ xnu_checkpoint_return:
     mrs x9, tpidr_el1
     str x9, [x10, #168]
     str x30, [x10, #176]
+    str x29, [x10, #192]
     mrs x9, tcr_el1
     str x9, [x10, #72]
     mrs x9, ttbr0_el1
@@ -278,8 +290,12 @@ xnu_checkpoint_return:
     ldr x9, [x10, #16]
     tbz x9, #0, 7f
     /* AT uses the still-active EL1 regime, while EL2 stays MMU-off. */
-    add x9, x20, x22
-    sub x9, x9, x23
+    adrp x11, xnu_expected
+    add x11, x11, :lo12:xnu_expected
+    ldp x9, x12, [x11, #8]   /* original args PA and linked kernel VA */
+    ldr x13, [x11, #24]      /* owned physical kernel base */
+    add x9, x9, x12
+    sub x9, x9, x13
     at s1e1r, x9
     isb
     mrs x9, par_el1
@@ -300,6 +316,11 @@ xnu_checkpoint_return:
     isb
     mrs x9, par_el1
     str x9, [x10, #184]
+    adrp x11, xnu_expected
+    add x11, x11, :lo12:xnu_expected
+    ldr x9, [x11, #56]      /* mode, stored before XNU executes */
+    cmp x9, #4
+    b.eq xnu_clean_arena
     /* Invalidate the clean stack-read line before Linux can reuse this RAM.
        EL2 translation is off, so this cache-maintenance VA is physical. */
     mrs x9, sp_el0
@@ -317,8 +338,32 @@ xnu_checkpoint_return:
     dsb sy
     dc civac, x9
     dsb sy
+    b 7f
+xnu_clean_arena:
+    /* All C stores in the audited prefix stay inside this owned arena.
+       EL2 M=0: these maintenance VAs equal physical addresses. Never use
+       potentially clobbered EL1 registers as the range bounds. */
+    adrp x9, _xnu_window
+    add x9, x9, :lo12:_xnu_window
+    adrp x11, _image_end
+    add x11, x11, :lo12:_image_end
+    mrs x12, ctr_el0
+    ubfx x12, x12, #16, #4
+    mov x13, #4
+    lsl x12, x13, x12
+    mov x13, #0
+    dsb sy
+xnu_clean_line:
+    dc civac, x9
+    add x9, x9, x12
+    add x13, x13, #1
+    cmp x9, x11
+    b.lo xnu_clean_line
+    dsb sy
+    str x12, [x10, #200]
+    str x13, [x10, #208]
 7:
-    /* No cached stores occur between XNU enabling M/C/I and this HVC. */
+    /* Mode4 has drained all audited cached stores before disabling M/C/I. */
     mrs x9, sctlr_el1
     mov x11, #0x1005
     bic x9, x9, x11

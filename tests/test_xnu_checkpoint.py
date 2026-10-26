@@ -87,7 +87,7 @@ class Handoff(ctypes.Structure):
 
 
 class Expected(ctypes.Structure):
-    _fields_ = [(key, ctypes.c_uint64) for key in ('pc','args','virt','phys','memory','pages','flags','mode','tcr','mair','vbar','sp0','sp1','end')]
+    _fields_ = [(key, ctypes.c_uint64) for key in ('pc','args','virt','phys','memory','pages','flags','mode','tcr','mair','vbar','sp0','sp1','end','c_entry','const_args','boot_args','slide','static_cache','guard')]
 
 
 class XnuCheckpointTests(unittest.TestCase):
@@ -96,7 +96,7 @@ class XnuCheckpointTests(unittest.TestCase):
         cls.temp = tempfile.TemporaryDirectory()
         lib = Path(cls.temp.name)/'loader.dylib'
         subprocess.run(['clang','-shared','-fPIC','-Wall','-Wextra','-Werror',
-                        *[str(ROOT/'boot'/f) for f in ('xnu_load.c','xnu_memory.c','xnu_tables.c','fdt.c')],
+                        *[str(ROOT/'boot'/f) for f in ('xnu_load.c','xnu_memory.c','xnu_tables.c','xnu_cinit.c','fdt.c')],
                         '-o',str(lib)],check=True)
         cls.lib = ctypes.CDLL(str(lib))
         cls.lib.xnu_load.argtypes = [ctypes.c_void_p,ctypes.c_size_t,ctypes.c_void_p,

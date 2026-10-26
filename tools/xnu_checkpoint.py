@@ -96,9 +96,9 @@ def adt_fields(data):
             int.from_bytes(cpus[0]['timebase-frequency'][1], 'little'))
 
 
-def pack(data, adt, command_line='-v debug=0xc cpus=1 keepsyms=1', mmu=False, highva=False):
-    mmu = mmu or highva
-    kernel, names = macho(data), symbols(data, ('_arm_init',) if highva else ())
+def pack(data, adt, command_line='-v debug=0xc cpus=1 keepsyms=1', mmu=False, highva=False, cinit=False):
+    mmu = mmu or highva or cinit
+    kernel, names = macho(data), symbols(data, ('_arm_init',) if highva or cinit else ())
     cold, pages = names['_start_first_cpu'], names['_bootstrap_pagetables']
     branch = struct.unpack_from('<I', data, backed(kernel.segments, kernel.entry, 4))[0]
     immediate = branch & 0x3ffffff
@@ -143,7 +143,7 @@ def pack(data, adt, command_line='-v debug=0xc cpus=1 keepsyms=1', mmu=False, hi
         metadata = MMU_METADATA.pack(tcr, 0x0c0804ff00bb44ff, *pointers, 65536)
         patch_va, version = cold + MMU_OFFSET, 2
     patch_bytes = 4
-    if highva:
+    if highva or cinit:
         prefix_at = backed(kernel.segments, cold, HIGHVA_PREFIX_BYTES)
         if hashlib.sha256(data[prefix_at:prefix_at+HIGHVA_PREFIX_BYTES]).hexdigest() != HIGHVA_PREFIX_SHA256:
             raise ValueError('unsupported high-VA cold-start code; requires instruction audit')
@@ -164,9 +164,13 @@ def pack(data, adt, command_line='-v debug=0xc cpus=1 keepsyms=1', mmu=False, hi
         if any(data[off+slot+i] for i in range(8) if slot+i<length):
             raise ValueError('high-VA stack slot must load zero')
         patch_va, version, patch_bytes = c_entry+8, 3, 8
+    if cinit:
+        from xnu_cinit import audit_metadata, CHECKPOINT_OFFSET
+        metadata += audit_metadata(data, kernel)
+        patch_va, version, patch_bytes = c_entry+CHECKPOINT_OFFSET, 4, 4
     patched = bytearray(data)
-    patch_at = backed(kernel.segments, patch_va-(4 if highva else 0), patch_bytes)
-    if highva:
+    patch_at = backed(kernel.segments, patch_va-(4 if version==3 else 0), patch_bytes)
+    if version==3:
         struct.pack_into('<2I', patched, patch_at, STACK_LOAD, HVC)
     else:
         struct.pack_into('<I', patched, patch_at, HVC)
@@ -195,7 +199,7 @@ def pack(data, adt, command_line='-v debug=0xc cpus=1 keepsyms=1', mmu=False, hi
         'instrumented_kernel_sha256': hashlib.sha256(patched).hexdigest(),
         'local_relocations_audited': kernel.local_relocations,
         'patch_file_offset': patch_at, 'patch_bytes': patch_bytes, 'checkpoint_va': patch_va,
-        'mmu_checkpoint': mmu, 'highva_checkpoint': highva, 'kernel_alignment_bias': bias,
+        'mmu_checkpoint': mmu, 'highva_checkpoint': highva or cinit, 'cinit_checkpoint': cinit, 'kernel_alignment_bias': bias,
         'kernel_span': span, 'arena_bytes': WINDOW, 'payload_sha256': hashlib.sha256(payload).hexdigest(),
         'hardware_boot_tested': False, 'prelinked': False}
 
@@ -208,6 +212,7 @@ def main():
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--mmu', action='store_true', help='checkpoint immediately after enabling MMU')
     p.add_argument('--highva', action='store_true', help='checkpoint at high-VA C entry after a stack read')
+    p.add_argument('--cinit', action='store_true', help='checkpoint after original C boot_args copy and pointer store')
     a = p.parse_args()
     data = a.kernel.read_bytes()
     source = json.loads(a.kernel_report.read_text())
@@ -219,11 +224,11 @@ def main():
     if (a.output.resolve() == sidecar.resolve() or sidecar.exists() or
             a.output.exists() or a.output.resolve().is_relative_to(Path('/dev'))):
         p.error('output must be a new ordinary file')
-    payload, report = pack(data, a.adt.read_bytes(), mmu=a.mmu, highva=a.highva)
+    payload, report = pack(data, a.adt.read_bytes(), mmu=a.mmu, highva=a.highva, cinit=a.cinit)
     a.output.parent.mkdir(parents=True, exist_ok=True)
     a.output.write_bytes(payload)
     a.output.with_suffix('.json').write_text(json.dumps(report, indent=2) + '\n')
-    print('Built source-XNU ' + ('high-VA' if a.highva else 'MMU-on' if a.mmu else 'pre-MMU') +
+    print('Built source-XNU ' + ('C-initialization' if a.cinit else 'high-VA' if a.highva else 'MMU-on' if a.mmu else 'pre-MMU') +
           ' checkpoint payload; no full XNU boot is implied.')
 
 

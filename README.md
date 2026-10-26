@@ -89,3 +89,5 @@ python3 tools/sign.py build/uart/probe.itb \
 [MMU 开启检查点](docs/xnu-mmu-checkpoint.md) 已通过真机日志验收：完整页表池、EL1 寄存器和硬件地址翻译校验成功，并返回 Linux。该轮只验证 MMU；随后高地址实际取指与栈读取由独立检查点确认。
 
 [高虚拟地址与 C 入口检查点](docs/xnu-highva-checkpoint.md) 已通过真机验收：原始 RET 跳入 arm_init 高地址，完成栈帧调整与诊断读取后返回 Linux，未执行 C 初始化正文。
+
+[早期 C 初始化与参数复制检查点](docs/xnu-cinit-checkpoint.md) 已通过 74 项主机回归和独立审查，外置签名镜像已准备，等待真机日志；它运行原始栈保存、参数复制与全局指针设置，在 cpu_data_init 前返回。

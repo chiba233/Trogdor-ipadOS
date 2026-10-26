@@ -22,7 +22,8 @@
 | 源码 XNU 装载与 boot_args 入口检查点 | 真机验收通过 | EL1 读取参数后 HVC 返回 EL2，Linux 收到唯一且通过校验的 copied／checkpoint／boot_args／current EL 四字段，见 docs/xnu-checkpoint.md |
 | XNU MMU 开启检查点 | 真机验收通过 | 完整 8192 字节日志确认 MMU／表池／硬件 AT 校验均成功，并返回 Linux；见 docs/xnu-mmu-checkpoint.md |
 | XNU 高虚拟地址／C 入口栈读取检查点 | 真机验收通过 | 原始 RET 与栈帧调整执行，高地址／栈读取／C 入口三个字段为 1；完整 8192 字节日志通过校验，见 docs/xnu-highva-checkpoint.md |
-| XNU C 初始化正文与 ADT 消费 | 未验证 | 最新检查点在 arm_init 诊断序言读取栈后返回；尚未执行原始寄存器保存／C 正文或验证栈写入 |
+| XNU 早期 C 正文／参数复制检查点 | 74 项主机回归与独立审查通过，真机待验收 | 原始栈写入、memmove 和 BootArgs 设置后返回；签名镜像已写入外置介质并全量回读，见 docs/xnu-cinit-checkpoint.md |
+| XNU 后续 C 初始化与 ADT 消费 | 未验证 | 新检查点在 cpu_data_init 前返回，未进入平台初始化或读取 ADT |
 | eMMC、触摸、GPU 与完整 iPadOS 用户态 | 未实现 | 没有原生桌面或应用运行记录 |
 
 ## 已执行的主机验证
