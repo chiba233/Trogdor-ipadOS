@@ -18,7 +18,8 @@
 | 仅抑制最终复位的 EL1 匹配对照 | 已观察到不自动重启 | Image 仅改一条 SMC 为 NOP，其余字节相同；与原版形成硬件对照，见 docs/control.md |
 | 原生 Linux 日志接收 | 真机验收通过 | EL1 探针→受控 HVC→EL2 Linux；8192 字节日志完整读回并校验，29 项主机测试通过，见 docs/linux-log.md |
 | 显示恢复 | 未实现 | 原厂停止 timing engine / DSI，不能直接沿用 splash |
-| XNU 装载、ADT、boot_args | 未实现 | 后续接入阶段 |
+| XNU 源码与装载前检查 | 源码内核已编译链接，41 项回归通过 | XNU 10063.141.1／Darwin 23.6；真实 FDT 已生成最小 ADT；prelink／重定位仍待接入，见 docs/xnu-preparation.md |
+| XNU 装载、ADT、boot_args 的硬件交接 | 未实现 | 候选窗口尚未在固件分配，尚未执行 XNU 入口 |
 | eMMC、触摸、GPU 与完整 iPadOS 用户态 | 未实现 | 没有原生桌面或应用运行记录 |
 
 ## 已执行的主机验证

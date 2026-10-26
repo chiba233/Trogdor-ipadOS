@@ -1,0 +1,6 @@
+# Source-only CPU/GIC baseline. No peripheral driver is qualified on Coachz.
+# CONFIG_XNU_NATIVE_UFS is not set
+# CONFIG_XNU_NATIVE_ADRENO is not set
+# CONFIG_XNU_NATIVE_VIRTIO_BLOCK is not set
+# CONFIG_XNU_NATIVE_RAM_BLOCK is not set
+# CONFIG_XNU_BOOT_PROGRESS is not set

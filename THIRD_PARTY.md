@@ -14,3 +14,12 @@ by this project. Their tracked revisions and origins are in upstream.lock.json.
 
 No upstream source trees, toolchain binaries, firmware dumps, developer keys,
 Apple firmware, kernelcache, or system images are included in tracked files.
+
+- UniXNU ae687009: imported at runtime from the separately fetched, pinned
+  checkout for source build orchestration and ADT generation; its licenses
+  and component licenses remain in that checkout. No implementation is vendored.
+- Apple XNU 10063.141.1: separately fetched Apple open-source reference, subject
+  to its original license notices; the ARM64 boot header is used for an optional
+  compile-time ABI test. Source kernel products remain in ignored build output.
+- Optional project-local CMake 3.31.6 (BSD-3-Clause) and Ninja 1.11.1.4
+  (Apache-2.0 for Ninja) are build dependencies, never bundled in tracked files.

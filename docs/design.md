@@ -55,3 +55,7 @@ EL2 分支将 EL1 设置为 AArch64、关闭 stage-2 translation、允许 EL1 �
 ## 匹配对照
 
 `memory` 对照不能区分 PSCI_VERSION、等待和最终复位调用。后续使用 [仅抑制最终复位的匹配对照](control.md)：从已校验的 reset-el1 机器码只替换最终 SMC 为等长 NOP，其余 Image 字节与 FIT 配置保持相同，以减少编译布局干扰。该产物不重新定义原版的成功条件，也不作为启动修复。
+
+## 下一阶段：源码与装载前检查
+
+沿用直接 FIT shim 的既定路线，先完成 [源码与装载前准备](xnu-preparation.md)：从当前探针日志和完整 FDT 规划连续内存，复用固定版本 UniXNU 的架构源码和 ADT 生成器，核对 Darwin 23 Mach-O 与 boot_args。主机生成的候选地址必须在真正装载的同次引导中重新验证和占有；当前没有新的硬件内存写入或 XNU 跳转。
