@@ -11,6 +11,9 @@ from xnu_macho import backed, macho
 MAGIC = b'TRXNUC01'
 HEADER = struct.Struct('<8sII14Q1024s')
 WINDOW = 24 * 1024 * 1024
+MMU_PREFIX_SHA256 = '446bb7c37baf4bb0e367ad4543779b42ef8c0d4757905e8aca57c6a9b7629571'
+MMU_OFFSET = 0x2fc
+MMU_METADATA = struct.Struct('<6Q')
 HVC = 0xd4000002 | (0x584e << 5)
 
 
@@ -88,7 +91,7 @@ def adt_fields(data):
             int.from_bytes(cpus[0]['timebase-frequency'][1], 'little'))
 
 
-def pack(data, adt, command_line='-v debug=0xc cpus=1 keepsyms=1'):
+def pack(data, adt, command_line='-v debug=0xc cpus=1 keepsyms=1', mmu=False):
     kernel, names = macho(data), symbols(data)
     cold, pages = names['_start_first_cpu'], names['_bootstrap_pagetables']
     branch = struct.unpack_from('<I', data, backed(kernel.segments, kernel.entry, 4))[0]
@@ -112,8 +115,30 @@ def pack(data, adt, command_line='-v debug=0xc cpus=1 keepsyms=1'):
         raise ValueError('bootstrap page-table symbol and instruction disagree')
     if struct.pack('<I', HVC) in data:
         raise ValueError('ambiguous preexisting checkpoint HVC')
+    patch_va, version, metadata = cold + 48, 1, b''
+    if mmu:
+        prefix_at = backed(kernel.segments, cold, MMU_OFFSET + 4)
+        if hashlib.sha256(data[prefix_at:prefix_at + MMU_OFFSET + 4]).hexdigest() != MMU_PREFIX_SHA256:
+            raise ValueError('unsupported MMU cold-start code; requires independent instruction audit')
+        helper = backed(kernel.segments, names['_set_mmu_ttb'], 16)
+        if data[helper:helper+16] != bytes.fromhex('9f3b03d5002018d5df3f03d5c0035fd6'):
+            raise ValueError('unsupported TTBR0 helper')
+        if names['__mh_execute_header'] != kernel.base or struct.unpack_from('<I', data, 24)[0] & 0x80000000:
+            raise ValueError('MMU checkpoint requires an ordinary standalone Mach header')
+        if not any(va <= pages and pages + 65536 <= va + size and not prot & 4
+                   for va, size, _, _, prot in kernel.segments):
+            raise ValueError('bootstrap table pool is not inside non-executable kernel memory')
+        tcr = struct.unpack_from('<Q', data, backed(kernel.segments, names['_sysreg_restore'], 8))[0]
+        if tcr != 0x22a51a251a:
+            raise ValueError('unsupported native 4K initial TCR')
+        pointers = [names[key] for key in ('_ExceptionVectorsBase', '_intstack_top', '_excepstack_top')]
+        if any(not kernel.base <= va < kernel.end or va & 15 for va in pointers):
+            raise ValueError('invalid MMU vector/stack symbols')
+        metadata = MMU_METADATA.pack(tcr, 0x0c0804ff00bb44ff, *pointers, 65536)
+        patch_va, version = cold + MMU_OFFSET, 2
     patched = bytearray(data)
-    struct.pack_into('<I', patched, offset + 48, HVC)
+    patch_at = backed(kernel.segments, patch_va, 4)
+    struct.pack_into('<I', patched, patch_at, HVC)
     if macho(patched) != kernel:
         raise ValueError('checkpoint unexpectedly changes Mach-O metadata')
     base_field, size_field, affinity, frequency = adt_fields(adt)
@@ -124,20 +149,22 @@ def pack(data, adt, command_line='-v debug=0xc cpus=1 keepsyms=1'):
     if len(raw) >= 1024 or b'\0' in raw: raise ValueError('invalid command line')
     table = b''.join(struct.pack('<5Q', va - kernel.base, size, off, length, prot)
                      for va, size, off, length, prot in kernel.segments)
-    raw_at = (HEADER.size + len(table) + 15) & ~15
+    raw_at = (HEADER.size + len(table) + len(metadata) + 15) & ~15
     adt_at = (raw_at + len(patched) + 15) & ~15
     span = kernel.end - kernel.base
-    if ((span + 0x3fff) & ~0x3fff) + 4096 + len(adt) + 0x4000 > WINDOW:
+    bias = kernel.base & 0x1fffff if mmu else 0
+    if ((span + bias + 0x3fff) & ~0x3fff) + 4096 + len(adt) + 0x4000 > WINDOW:
         raise ValueError('source kernel exceeds the bounded checkpoint arena')
-    header = HEADER.pack(MAGIC, 1, len(kernel.segments), kernel.base, kernel.entry,
-        cold + 48, pages & ~4095, raw_at, len(patched), adt_at, len(adt), span, WINDOW,
+    header = HEADER.pack(MAGIC, version, len(kernel.segments), kernel.base, kernel.entry,
+        patch_va, pages & ~4095, raw_at, len(patched), adt_at, len(adt), span, WINDOW,
         base_field, size_field, affinity, frequency, raw)
-    payload = header + table + bytes(raw_at - HEADER.size - len(table)) + patched
+    payload = header + table + metadata + bytes(raw_at - HEADER.size - len(table) - len(metadata)) + patched
     payload += bytes(adt_at - len(payload)) + adt
     return payload, {'kernel_sha256': hashlib.sha256(data).hexdigest(),
         'instrumented_kernel_sha256': hashlib.sha256(patched).hexdigest(),
         'local_relocations_audited': kernel.local_relocations,
-        'patch_file_offset': offset + 48, 'patch_bytes': 4, 'checkpoint_va': cold + 48,
+        'patch_file_offset': patch_at, 'patch_bytes': 4, 'checkpoint_va': patch_va,
+        'mmu_checkpoint': mmu, 'kernel_alignment_bias': bias,
         'kernel_span': span, 'arena_bytes': WINDOW, 'payload_sha256': hashlib.sha256(payload).hexdigest(),
         'hardware_boot_tested': False, 'prelinked': False}
 
@@ -148,6 +175,7 @@ def main():
     p.add_argument('--kernel-report', type=Path, required=True)
     p.add_argument('--adt', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
+    p.add_argument('--mmu', action='store_true', help='checkpoint immediately after enabling MMU')
     a = p.parse_args()
     data = a.kernel.read_bytes()
     source = json.loads(a.kernel_report.read_text())
@@ -159,11 +187,12 @@ def main():
     if (a.output.resolve() == sidecar.resolve() or sidecar.exists() or
             a.output.exists() or a.output.resolve().is_relative_to(Path('/dev'))):
         p.error('output must be a new ordinary file')
-    payload, report = pack(data, a.adt.read_bytes())
+    payload, report = pack(data, a.adt.read_bytes(), mmu=a.mmu)
     a.output.parent.mkdir(parents=True, exist_ok=True)
     a.output.write_bytes(payload)
     a.output.with_suffix('.json').write_text(json.dumps(report, indent=2) + '\n')
-    print('Built source-XNU pre-MMU checkpoint payload; no full XNU boot is implied.')
+    print('Built source-XNU ' + ('MMU-on' if a.mmu else 'pre-MMU') +
+          ' checkpoint payload; no full XNU boot is implied.')
 
 
 if __name__ == '__main__': main()

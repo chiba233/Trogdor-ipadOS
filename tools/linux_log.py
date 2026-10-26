@@ -108,6 +108,8 @@ def compile_wrapper(out, kernel, memory, checkpoint=None):
     assembly = out / "payload.S"
     assembly.write_text('.global LINUX_MEMORY_SIZE\n.set LINUX_MEMORY_SIZE, ' + str(memory) + '\n.section .linux, "a"\n.incbin "' + quoted + '"\n')
     if checkpoint is not None:
+        if len(checkpoint)<1152 or checkpoint[:8]!=b'TRXNUC01' or int.from_bytes(checkpoint[8:12],'little') not in (1,2):
+            raise ValueError("invalid source-XNU checkpoint payload header")
         payload_path = out / "xnu-checkpoint.bin"
         payload_path.write_bytes(checkpoint)
         quoted_xnu = str(payload_path).replace("\\", "\\\\").replace('"', '\\"')
@@ -124,7 +126,7 @@ def compile_wrapper(out, kernel, memory, checkpoint=None):
                "-Wl,-T," + str(ROOT / ("boot/xnu-chain.ld" if checkpoint is not None else "boot/chain.ld")),
                *[str(ROOT / "boot" / name) for name in ("entry.S", "probe.c", "fdt.c", "checkpoint.c")],
                *([str(ROOT / "boot" / name) for name in
-                  ("xnu_checkpoint.c", "xnu_load.c", "xnu_memory.c")] if checkpoint is not None else []),
+                  ("xnu_checkpoint.c", "xnu_load.c", "xnu_memory.c", "xnu_tables.c")] if checkpoint is not None else []),
                str(assembly), "-o", str(elf)]
     subprocess.run(command, env=env, check=True)
     linked = elf.read_bytes()
@@ -138,7 +140,8 @@ def compile_wrapper(out, kernel, memory, checkpoint=None):
         expected_memory = arena + 24 * 1024 * 1024
         if arena % 0x200000 or arena < start + memory:
             raise ValueError("XNU arena overlaps Linux memory")
-        extra = {"xnu_payload_sha256": sha(checkpoint), "xnu_window_offset": arena, "xnu_window_bytes": 24 * 1024 * 1024}
+        extra = {"xnu_checkpoint_version": int.from_bytes(checkpoint[8:12],"little"),
+                 "xnu_payload_sha256": sha(checkpoint), "xnu_window_offset": arena, "xnu_window_bytes": 24 * 1024 * 1024}
     if (start % 0x200000 or start < symbols["_stack_top"]["address"] or
             header["memory_size"] != expected_memory or
             image[start:start + len(kernel)] != kernel or len(image) != start + len(kernel)):
@@ -220,10 +223,10 @@ def main():
     create_image(kpart, image, "EL1 probe Linux log", disk_mib=128, kernel_mib=96)
     code_files = ("boot/entry.S", "boot/probe.c", "boot/fdt.c", "boot/checkpoint.c", "boot/chain.ld",
                   "tools/linux_log.py", "tools/fdt.py", "tools/build.py", "tools/artifacts.py",
-                  "tools/sign.py", "tools/disk.py")
+                  "tools/sign.py", "tools/disk.py", "tools/read_probe.py")
     if a.xnu_checkpoint:
         code_files += ("boot/xnu_checkpoint.h", "boot/xnu_checkpoint.c", "boot/xnu_load.c",
-                       "boot/xnu_memory.c", "boot/xnu-chain.ld", "tools/xnu_checkpoint.py", "tools/xnu_macho.py")
+                       "boot/xnu_memory.c", "boot/xnu_tables.c", "boot/xnu-chain.ld", "tools/xnu_checkpoint.py", "tools/xnu_macho.py")
     report = {"schema": 1, "xnu_checkpoint": bool(a.xnu_checkpoint), "hardware_boot_tested": False,
               "toolchain": {"zig": "0.15.2", "cpu": CPU},
               "code_sha256": {name: sha((ROOT / name).read_bytes()) for name in code_files},

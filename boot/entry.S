@@ -103,11 +103,37 @@ probe_call:
 #if PROBE_XNU_CHECKPOINT
     bl xnu_prepare
     cbz x0, xnu_load_failed
+    /* Snapshot the EL1 state; XNU will switch both stacks and translations. */
+    adrp x10, xnu_el1_saved
+    add x10, x10, :lo12:xnu_el1_saved
+    mrs x11, sctlr_el1
+    str x11, [x10]
+    mrs x11, tcr_el1
+    str x11, [x10, #8]
+    mrs x11, ttbr0_el1
+    str x11, [x10, #16]
+    mrs x11, ttbr1_el1
+    str x11, [x10, #24]
+    mrs x11, mair_el1
+    str x11, [x10, #32]
+    mrs x11, vbar_el1
+    str x11, [x10, #40]
+    mrs x11, sp_el0
+    str x11, [x10, #48]
+    mov x11, sp
+    str x11, [x10, #56]
+    mrs x11, tpidr_el0
+    str x11, [x10, #64]
+    mrs x11, tpidrro_el0
+    str x11, [x10, #72]
+    mrs x11, par_el1
+    str x11, [x10, #80]
     mov x9, x0
     mov x0, x1
     mov x1, xzr
     mov x2, xzr
     mov x3, xzr
+    dsb sy
     br x9
 xnu_load_failed:
 #endif
@@ -221,8 +247,74 @@ xnu_checkpoint_return:
     stp x20, x22, [x10, #24]
     stp x23, x24, [x10, #40]
     stp x25, x26, [x10, #56]
+    mrs x9, tcr_el1
+    str x9, [x10, #72]
+    mrs x9, ttbr0_el1
+    str x9, [x10, #80]
+    mrs x9, ttbr1_el1
+    str x9, [x10, #88]
+    mrs x9, mair_el1
+    str x9, [x10, #96]
+    mrs x9, sp_el0
+    str x9, [x10, #104]
+    mrs x9, sp_el1
+    str x9, [x10, #112]
+    mrs x9, vbar_el1
+    str x9, [x10, #120]
+    ldr x9, [x10, #16]
+    tbz x9, #0, 7f
+    /* AT uses the still-active EL1 regime, while EL2 stays MMU-off. */
+    add x9, x20, x22
+    sub x9, x9, x23
+    at s1e1r, x9
+    isb
+    mrs x9, par_el1
+    str x9, [x10, #128]
+    mrs x9, elr_el2
+    add x9, x9, x22
+    sub x9, x9, x23
+    at s1e1r, x9
+    isb
+    mrs x9, par_el1
+    str x9, [x10, #136]
+7:
+    /* No cached stores occur between XNU enabling M/C/I and this HVC. */
+    mrs x9, sctlr_el1
+    mov x11, #0x1005
+    bic x9, x9, x11
+    dsb sy
+    msr sctlr_el1, x9
+    isb
+    tlbi vmalle1
+    dsb sy
+    isb
     bl xnu_checkpoint_complete
     cbz w0, halt
+    adrp x10, xnu_el1_saved
+    add x10, x10, :lo12:xnu_el1_saved
+    ldr x9, [x10, #8]
+    msr tcr_el1, x9
+    ldr x9, [x10, #16]
+    msr ttbr0_el1, x9
+    ldr x9, [x10, #24]
+    msr ttbr1_el1, x9
+    ldr x9, [x10, #32]
+    msr mair_el1, x9
+    ldr x9, [x10, #40]
+    msr vbar_el1, x9
+    ldr x9, [x10, #48]
+    msr sp_el0, x9
+    ldr x9, [x10, #56]
+    msr sp_el1, x9
+    ldr x9, [x10, #64]
+    msr tpidr_el0, x9
+    ldr x9, [x10, #72]
+    msr tpidrro_el0, x9
+    ldr x9, [x10, #80]
+    msr par_el1, x9
+    ldr x9, [x10]
+    msr sctlr_el1, x9
+    isb
     adrp x10, xnu_saved
     add x10, x10, :lo12:xnu_saved
     ldp x19, x20, [x10]
@@ -236,4 +328,7 @@ xnu_checkpoint_return:
 .global xnu_saved
 xnu_saved:
     .zero 80
+.balign 16
+xnu_el1_saved:
+    .zero 96
 #endif

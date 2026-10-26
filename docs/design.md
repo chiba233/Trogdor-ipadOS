@@ -59,3 +59,8 @@ EL2 分支将 EL1 设置为 AArch64、关闭 stage-2 translation、允许 EL1 �
 ## 下一阶段：源码与装载前检查
 
 沿用直接 FIT shim 的既定路线，先完成 [源码与装载前准备](xnu-preparation.md)：从当前探针日志和完整 FDT 规划连续内存，复用固定版本 UniXNU 的架构源码和 ADT 生成器，核对 Darwin 23 Mach-O 与 boot_args。主机生成的候选地址必须在真正装载的同次引导中重新验证和占有；源码 XNU 的有限入口实验现已实现，见 [pre-MMU 检查点](xnu-checkpoint.md)。包装 Image 声明并占有独立装载区间，运行时重新排除当次 FDT 中的其他拥有者；单指令 HVC 在页表写入前返回，校验实际 boot_args 读取值后交接 Linux。该轮已取回真机检查点日志，确认源码 XNU 在 EL1 读取 boot_args 后返回 Linux；尚未验证 MMU、ADT 消费或 C 初始化。
+
+
+## 下一轮：MMU 开启后的受控返回
+
+[MMU 检查点](xnu-mmu-checkpoint.md) 保留 kernel VA 的块内偏移，在真实源码内核开启 MMU 后立即 HVC 返回 EL2；通过完整页表池与硬件 AT 结果校验后恢复翻译／栈／EL2 状态，交接原生 Linux。已完成主机验证与介质准备，尚无本轮硬件结果；不进入 C 初始化，也不替换原厂固件。

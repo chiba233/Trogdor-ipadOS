@@ -85,3 +85,5 @@ python3 tools/sign.py build/uart/probe.itb \
 下一阶段的源码入口、单核架构组件和主机装载检查见 [XNU 准备说明](docs/xnu-preparation.md)。`tools/kernel_source.py` 准备固定版本源码，`--build` 编译源码内核；`tools/xnu_prepare.py` 使用私有原厂 FDT／探针日志规划连续内存并生成最小 ADT，可选检查预链接 Mach-O 与 Darwin 23 boot_args。它们不生成新的可启动镜像，也不执行 XNU。
 
 原生源码 XNU 的 pre-MMU 装载／boot_args 检查点见 [入口检查点](docs/xnu-checkpoint.md)。它已在真机通过单指令 HVC 返回 Linux 取回有效日志；MMU、平台驱动与 iPadOS 启动仍待完成。
+
+下一轮 [MMU 开启检查点](docs/xnu-mmu-checkpoint.md) 已生成镜像，主机回归与审查通过，等待真机验证。
