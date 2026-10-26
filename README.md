@@ -48,7 +48,7 @@ python3 -m unittest discover -s tests -v
 
 见 [USB 测试步骤](docs/usb-test.md)。`reset-el2` 完成 EL2 诊断后等 3 秒复位；`reset-el1` 完成 EL1 诊断后等 10 秒复位。它们都不提供屏幕输出，观测到预期的成对延时重启只算粗粒度执行证据，不包含寄存器读数或 XNU 启动验证。
 
-目前两种镜像都观察到自动重启，但尚未观察到可辨认的延时差异，不能确认通过检查点。见 [硬件尝试记录与不复位对照](docs/hardware-tests.md)。
+目前两种定时镜像都观察到自动重启，不复位对照则保持黑屏。尚未观察到可辨认的成对延时差异，不能确认通过检查点。见 [硬件尝试记录与不复位对照](docs/hardware-tests.md)。
 
 在 Debian 构建／测试环境中，可使用已安装的 `futility` 和公共开发者测试密钥创建两个 64 MiB GPT 镜像：
 
