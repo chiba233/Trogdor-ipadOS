@@ -2,6 +2,10 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "fdt.h"
+#include "checkpoint.h"
+#ifndef PROBE_RESET_EL
+#define PROBE_RESET_EL 0
+#endif
 #ifndef PROBE_UART
 #define PROBE_UART 0
 #endif
@@ -113,7 +117,7 @@ void probe_main(const void *dt, uint64_t incoming_el, uint64_t sctlr, uint64_t h
     property(dt, "/firmware/coreboot", "reg");
     property(dt, "/firmware/coreboot", "board-id");
     property(dt, "/firmware/coreboot", "sku-id");
-    text("phase-0 complete; no XNU loaded; halting\n");
+    text("phase-0 complete; no XNU loaded\n");
     probe_log.stage = 3;
     /* All state is already in RAM if UART probing itself faults. */
     uart_enabled = uart_available();
@@ -124,5 +128,10 @@ void probe_main(const void *dt, uint64_t incoming_el, uint64_t sctlr, uint64_t h
         if (c == '\n') uart_byte('\r');
         uart_byte(c);
     }
+#if PROBE_RESET_EL
+    text("diagnostic checkpoint; requesting timed reset\n");
+    probe_log.stage = (uint32_t)checkpoint_run((unsigned)(current >> 2),
+                                              PROBE_RESET_EL, probe_log.stage);
+#endif
     __asm__ volatile("dsb sy" ::: "memory");
 }

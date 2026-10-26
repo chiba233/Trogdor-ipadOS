@@ -26,6 +26,11 @@
     "velvet-tools": {
       "url": "https://github.com/velvet-os/velvet-tools.git",
       "commit": "8517b06dbb7104ef90887066e656d31eabb30d83"
+    },
+    "vboot": {
+      "url": "https://chromium.googlesource.com/chromiumos/platform/vboot_reference.git",
+      "ref": "firmware-trogdor-13577.B",
+      "commit": "2fa78d95c968831a5a28d15e895be4d80cd506ec"
     }
   }
 }

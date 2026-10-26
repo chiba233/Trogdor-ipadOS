@@ -64,7 +64,7 @@ Coreboot ramstage 已包含 SC7180 DSI、TI SN65DSI86、EDID 和面板初始化�
 2. 等待约 20 ms。
 3. 写 DSI control 0x0AE94004 = 0。
 
-原厂维护分支对 Legacy 交接同样执行 stop；当前主线对 Legacy 的处理已有变化，不能混用。恢复显示需要重建被关闭的状态，仅向原 framebuffer 写像素不够。本阶段只记录，不写这些显示寄存器。
+原厂维护分支对 Legacy 交接同样执行 stop；当前主线对 Legacy 的处理已有变化，不能混用。恢复显示需要重建被关闭的状态，仅向原 framebuffer 写像素不够。现有探针只记录，不写这些显示寄存器。
 
 - [Coreboot 面板初始化](https://chromium.googlesource.com/chromiumos/third_party/coreboot/+/29f90de5f72c645a00146e04789896766f28e783/src/mainboard/google/trogdor/mainboard.c)
 - [libpayload framebuffer 分配](https://chromium.googlesource.com/chromiumos/third_party/coreboot/+/29f90de5f72c645a00146e04789896766f28e783/payloads/libpayload/arch/arm64/mmu.c)
@@ -83,3 +83,13 @@ SC7180 的原厂 console 使用 QUP instance 8，基地址 0x00A88000。原厂�
 
 - [Trogdor 存储配置](https://chromium.googlesource.com/chromiumos/platform/depthcharge/+/719118f5e36ea312c33b8f005798b1488f9ec2d1/src/board/trogdor/board.c)
 - [MSM SDHCI](https://chromium.googlesource.com/chromiumos/platform/depthcharge/+/719118f5e36ea312c33b8f005798b1488f9ec2d1/src/drivers/storage/sdhci_msm.c)
+
+## 无串口复位观察
+
+原厂 Trogdor 配置启用 `DRIVER_VIDEO_EC_PWM_BACKLIGHT`。显示清理还通过 EC 把 PWM 设为零，所以仅重新打开背光 GPIO 和 DSI 不保证有可见图像。
+
+原厂 `drivers/power/psci.c` 使用 SMC `0x84000009` 请求系统复位。独立检查点复用这一 ABI，先检查 PSCI 版本，再用物理计数器延时。EL2 与 EL1 的不同延时用于区分两个执行路径；该通道不传递寄存器值，也不把固件错误返回菜单认作探针成功。
+
+- [原厂 PWM 配置](https://chromium.googlesource.com/chromiumos/platform/depthcharge/+/719118f5e36ea312c33b8f005798b1488f9ec2d1/board/trogdor/defconfig)
+- [原厂 EC 背光 PWM](https://chromium.googlesource.com/chromiumos/platform/depthcharge/+/719118f5e36ea312c33b8f005798b1488f9ec2d1/src/drivers/video/ec_pwm_backlight.c)
+- [原厂 PSCI 复位](https://chromium.googlesource.com/chromiumos/platform/depthcharge/+/719118f5e36ea312c33b8f005798b1488f9ec2d1/src/drivers/power/psci.c)

@@ -30,7 +30,7 @@ python3 -m unittest discover -s tests -v
 
 也可用环境变量 `ZIG` 指定已有的 Zig 可执行文件。
 
-默认同时生成：
+默认生成 memory、uart、reset-el2、reset-el1 四种探针：
 
 | 产物 | 用途 |
 | --- | --- |
@@ -41,6 +41,18 @@ python3 -m unittest discover -s tests -v
 | `build/manifest.json` | 实际使用的编译器、产物 SHA-256 与 Image 头信息 |
 
 探针设备树的 `model` / `compatible` 是打包输入，不能当作真机身份探测结果。Depthcharge 会补入实际内存、原厂表位置等数据，探针记录这些交接信息。
+
+## 无串口测试
+
+见 [USB 测试步骤](docs/usb-test.md)。`reset-el2` 完成 EL2 诊断后等 3 秒复位；`reset-el1` 完成 EL1 诊断后等 10 秒复位。它们都不提供屏幕输出，观测到预期的成对延时重启只算粗粒度执行证据，不包含寄存器读数或 XNU 启动验证。
+
+在 Debian 构建／测试环境中，可使用已安装的 `futility` 和公共开发者测试密钥创建两个 64 MiB GPT 镜像：
+
+```sh
+python3 tools/prepare_usb.py
+```
+
+默认查找 `/usr/share/vboot/devkeys`、`/usr/share/vboot/devkeys-pkc` 和锁定的上游 `tests/devkeys`；也可用 `--key-dir` 指定。该命令只签名并创建文件，拒绝设备输出路径和覆盖已有文件。
 
 ## 签名
 
@@ -56,6 +68,6 @@ python3 tools/sign.py build/uart/probe.itb \
 
 ## 当前可观测结果
 
-探针在静态符号 `probe_log` 对应的内存中记录入口 EL、SCTLR、HCR、切换后的 EL、计时器频率、FDT 校验和交接属性；记录完成后停在 `WFE` 循环。UART 版本只复用已初始化的 SC7180 QUPv3 UART，不下载固件，不改时钟或引脚；不可用时保留内存日志。
+探针在静态符号 `probe_log` 对应的内存中记录入口 EL、SCTLR、HCR、切换后的 EL、计时器频率、FDT 校验和交接属性；memory / uart 版本记录完成后停在 `WFE` 循环；定时复位版本在满足检查条件后请求重启。UART 版本只复用已初始化的 SC7180 QUPv3 UART，不下载固件，不改时钟或引脚；不可用时保留内存日志。
 
 这一步不会恢复屏幕。原厂 Depthcharge 会停止 timing engine、关闭背光并复位 DSI，显示恢复需要独立验证。

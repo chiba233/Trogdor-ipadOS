@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build both native probes and their unsigned FIT containers."""
+"""Build native probes and their unsigned FIT containers."""
 import hashlib
 import json
 import os
@@ -52,17 +52,19 @@ def main():
     dtb = diagnostic_dtb()
     (build / "coachz-probe.dtb").write_bytes(dtb)
     manifest = {"schema": 1, "toolchain": {"zig": version}, "hardware_tested": False, "artifacts": {}}
-    for mode, uart in (("memory", 0), ("uart", 1)):
+    for mode, uart, reset_el in (("memory", 0, 0), ("uart", 1, 0),
+                                 ("reset-el2", 0, 2), ("reset-el1", 0, 1)):
         out = build / mode
         out.mkdir(exist_ok=True)
         elf, image = out / "probe.elf", out / "Image"
-        command = [zig, "cc", "-target", "aarch64-freestanding-none", "-mcpu=generic",
+        command = [zig, "cc", "-target", "aarch64-freestanding-none", "-mcpu=generic+el3",
                    "-mgeneral-regs-only", "-ffreestanding", "-fno-builtin", "-fno-pic", "-fno-pie",
                    "-fno-stack-protector", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables",
                    "-Wall", "-Wextra", "-Werror", "-Os", "-g", "-nostdlib", "-static",
-                   "-DPROBE_UART=" + str(uart), "-Wl,--build-id=none", "-Wl,--no-undefined",
+                   "-DPROBE_UART=" + str(uart), "-DPROBE_RESET_EL=" + str(reset_el), "-Wl,--build-id=none", "-Wl,--no-undefined",
                    "-Wl,-z,max-page-size=4096", "-Wl,-T," + str(ROOT / "boot/link.ld"),
                    str(ROOT / "boot/entry.S"), str(ROOT / "boot/probe.c"), str(ROOT / "boot/fdt.c"),
+                   str(ROOT / "boot/checkpoint.c"),
                    "-o", str(elf)]
         subprocess.run(command, env=env, check=True)
         image.write_bytes(extract_image(elf.read_bytes()))
@@ -82,7 +84,8 @@ def main():
             manifest["artifacts"][str(path.relative_to(build))] = {
                 "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "bytes": path.stat().st_size}
         manifest[mode] = {"image": header, "probe_log": symbols["probe_log"],
-                          "uart_mmio_enabled": bool(uart)}
+                          "uart_mmio_enabled": bool(uart), "reset_target_el": reset_el,
+                          "reset_delay_seconds": {0: 0, 1: 10, 2: 3}[reset_el]}
         print(mode + ": Image/FIT built; header and ELF symbols verified; hardware not tested")
     (build / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 

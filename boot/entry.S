@@ -44,6 +44,9 @@ from_el2:
     msr vbar_el1, x9
     mrs x21, sctlr_el2
     mrs x22, hcr_el2
+#if PROBE_RESET_EL == 2
+    b probe_call
+#endif
     /* AArch64 EL1, no stage-2 translation. EL3/BL31 stays installed. */
     mov x9, #0x80000000
     msr hcr_el2, x9
@@ -72,6 +75,7 @@ from_el2:
 
 el1_entry:
     isb
+probe_call:
     mov x0, x19
     mov x1, x20
     mov x2, x21

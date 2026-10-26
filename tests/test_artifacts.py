@@ -119,7 +119,7 @@ class ArtifactTests(unittest.TestCase):
         manifest = ROOT / "build/manifest.json"
         if not manifest.is_file():
             self.skipTest("run tools/build.py for compiled artifact checks")
-        for mode in ("memory", "uart"):
+        for mode in ("memory", "uart", "reset-el2", "reset-el1"):
             image = (ROOT / "build" / mode / "Image").read_bytes()
             header = inspect_image(image)
             self.assertGreater(header["memory_size"], len(image))

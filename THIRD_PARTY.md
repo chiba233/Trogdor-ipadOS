@@ -3,7 +3,7 @@
 Original project source is BSD-2-Clause. Upstream repositories are not relicensed
 by this project. Their tracked revisions and origins are in upstream.lock.json.
 
-- ChromiumOS Coreboot, Depthcharge and Velvet tools: firmware and packaging
+- ChromiumOS Coreboot, Depthcharge, vboot and Velvet tools: firmware and packaging
   interface references; retain their respective GPL and per-file notices.
 - UniXNU DarwinBoot: BSD-2-Clause-Patent; reference for the future XNU handoff.
 - ios-sweet: reference for direct native ARM64 shim loading; consult upstream
