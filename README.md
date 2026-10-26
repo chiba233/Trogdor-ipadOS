@@ -75,3 +75,7 @@ python3 tools/sign.py build/uart/probe.itb \
 探针在静态符号 `probe_log` 对应的内存中记录入口 EL、SCTLR、HCR、切换后的 EL、计时器频率、FDT 校验和交接属性；memory / uart 版本记录完成后停在 `WFE` 循环；定时复位版本在满足检查条件后请求重启。UART 版本只复用已初始化的 SC7180 QUPv3 UART，不下载固件，不改时钟或引脚；不可用时保留内存日志。
 
 这一步不会恢复屏幕。原厂 Depthcharge 会停止 timing engine、关闭背光并复位 DSI，显示恢复需要独立验证。
+
+## 原生 Linux 日志接收
+
+已实现独立诊断路径：探针在 EL1 记录，受控 HVC 返回 EL2，交接保留的原生 Linux，在 chosen 设备树属性中读取日志。见 [构建与验收契约](docs/linux-log.md)。它使用现有原生 Linux 容器作为私有输入，不包含虚拟机，也不改变后续 iPadOS 引导目标；当前仅完成主机验证，等待硬件启动日志。

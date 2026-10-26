@@ -25,7 +25,7 @@ Linux ARM64 ABI 接受 NS EL1 或 EL2 入口，要求正确的 Image 位置、FD
 
 - [Linux ARM64 引导契约](https://github.com/torvalds/linux/blob/v6.12/Documentation/arch/arm64/booting.rst)
 
-该方案需要独立验证 Image 头、装载及内存保留、FDT 日志容量、initrd 范围和所有 CPU 的交接状态。暂未实现或测试。
+该方案已选定并实现为 [EL1 探针→受控 HVC→EL2 Linux 的日志接收路径](linux-log.md)：让 Linux 保持从原厂 EL2 入口启动，恢复探针修改的 EL2 状态。Image、FDT、initrd、命令行和签名的主机校验及 29 项回归通过；硬件启动仍待验证。
 
 ## 复位后读取 CBMEM 的限制
 

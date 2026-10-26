@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""Build a native EL1 probe -> EL2 Linux log receiver from an existing container."""
+import argparse
+import hashlib
+import json
+import lzma
+import os
+from pathlib import Path
+import struct
+import subprocess
+import sys
+import zlib
+
+from artifacts import extract_image, inspect_image, inspect_scalar_code
+from build import CPU, elf_symbols
+from disk import create_image
+from fdt import Node, decode, properties, string
+
+ROOT = Path(__file__).resolve().parents[1]
+LOG_PROPERTY = "trogdor-ipados,probe-log"
+LOG_BYTES = 8192
+MAX_LINUX = 128 * 1024 * 1024
+
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def child(node, name):
+    matches = [c for c in node.children if c.name == name]
+    if len(matches) != 1:
+        raise ValueError("missing/duplicate FIT node: " + name)
+    return matches[0]
+
+
+def cstring(data):
+    if not data.endswith(b"\0") or b"\0" in data[:-1]:
+        raise ValueError("expected a single FIT string")
+    return data[:-1].decode("ascii")
+
+
+def digest(data, algo):
+    if algo == "crc32":
+        return struct.pack(">I", zlib.crc32(data))
+    if algo in ("sha1", "sha256"):
+        return hashlib.new(algo, data).digest()
+    raise ValueError("unsupported FIT hash: " + algo)
+
+
+def hashes(node, update=False):
+    for h in node.children:
+        if h.name.startswith("signature"):
+            raise ValueError("signed FIT nodes are not supported")
+        algo = cstring(h.props["algo"])
+        value = digest(node.props["data"], algo)
+        if update:
+            h.props["value"] = value
+        elif h.props.get("value") != value:
+            raise ValueError("source FIT hash mismatch: " + node.name)
+
+
+def linux_image(data, compression):
+    if compression == "lzma":
+        decoder = lzma.LZMADecompressor()
+        data = decoder.decompress(data, max_length=MAX_LINUX + 1)
+        if not decoder.eof or decoder.unused_data:
+            raise ValueError("oversized or noncanonical compressed Linux Image")
+    elif compression != "none":
+        raise ValueError("unsupported Linux compression")
+    if not 64 <= len(data) <= MAX_LINUX:
+        raise ValueError("invalid Linux Image file size")
+    offset, memory, flags = struct.unpack_from("<3Q", data, 8)
+    if (struct.unpack_from("<I", data, 56)[0] != 0x644d5241 or offset != 0 or
+            not len(data) <= memory <= MAX_LINUX or flags & 1 or not flags & 8):
+        raise ValueError("requires relocatable little-endian ARM64 Image with text_offset=0")
+    return data, memory
+
+
+def add_log(dtb):
+    tree = decode(dtb)
+    chosen = [c for c in tree.root.children if c.name == "chosen"]
+    if not chosen:
+        chosen = [Node("chosen")]
+        tree.root.children.extend(chosen)
+    if LOG_PROPERTY in chosen[0].props:
+        raise ValueError("source DTB already has a probe log")
+    chosen[0].props[LOG_PROPERTY] = bytes(LOG_BYTES)
+    result = tree.encode()
+    if len(result) > 2 * 1024 * 1024:
+        raise ValueError("DTB exceeds ARM64 boot limit")
+    old, new = properties(dtb), properties(result)
+    expected = dict(old)
+    expected[("/chosen", LOG_PROPERTY)] = bytes(LOG_BYTES)
+    if new != expected:
+        raise ValueError("unexpected DTB property changes")
+    return result
+
+
+def compile_wrapper(out, kernel, memory):
+    zig = Path(os.environ.get("ZIG", ROOT / ".tools/ziglang/ziglang/zig")).resolve()
+    env = dict(os.environ, ZIG_GLOBAL_CACHE_DIR=str(ROOT / ".tools/zig-cache"),
+               ZIG_LOCAL_CACHE_DIR=str(ROOT / ".tools/zig-local-cache"))
+    if subprocess.check_output([str(zig), "version"], env=env, text=True).strip() != "0.15.2":
+        raise ValueError("requires pinned Zig 0.15.2")
+    payload = out / "linux.Image"
+    payload.write_bytes(kernel)
+    quoted = str(payload).replace("\\", "\\\\").replace('"', '\\"')
+    assembly = out / "payload.S"
+    assembly.write_text('.global LINUX_MEMORY_SIZE\n.set LINUX_MEMORY_SIZE, ' + str(memory) + '\n.section .linux, "a"\n.incbin "' + quoted + '"\n')
+    elf = out / "probe.elf"
+    command = [str(zig), "cc", "-target", "aarch64-freestanding-none", "-mcpu=" + CPU,
+               "-mgeneral-regs-only", "-ffreestanding", "-fno-builtin", "-fno-pic", "-fno-pie",
+               "-fno-stack-protector", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables",
+               "-Wall", "-Wextra", "-Werror", "-Os", "-g", "-nostdlib", "-static",
+               "-DPROBE_UART=0", "-DPROBE_RESET_EL=0", "-DPROBE_LINUX_CHAIN=1",
+               "-Wl,--build-id=none", "-Wl,--no-undefined", "-Wl,-z,max-page-size=4096",
+               "-Wl,-T," + str(ROOT / "boot/chain.ld"),
+               *[str(ROOT / "boot" / name) for name in ("entry.S", "probe.c", "fdt.c", "checkpoint.c")],
+               str(assembly), "-o", str(elf)]
+    subprocess.run(command, env=env, check=True)
+    linked = elf.read_bytes()
+    image = extract_image(linked)
+    header, scalar, symbols = inspect_image(image), inspect_scalar_code(linked), elf_symbols(linked)
+    start = symbols["_linux_entry"]["address"]
+    if (start % 0x200000 or start < symbols["_stack_top"]["address"] or
+            header["memory_size"] != start + memory or
+            image[start:start + len(kernel)] != kernel or len(image) != start + len(kernel)):
+        raise ValueError("Linux wrapper memory/payload layout mismatch")
+    (out / "Image").write_bytes(image)
+    return image, {"header": header, "scalar_code": scalar, "linux_offset": start}
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--source", type=Path, required=True, help="existing signed native Linux container")
+    p.add_argument("--futility", type=Path, required=True)
+    p.add_argument("--key-dir", type=Path, required=True)
+    p.add_argument("--output", type=Path, default=ROOT / "build/linux-log")
+    a = p.parse_args()
+    out, source, futility = a.output.resolve(), a.source.resolve(), str(a.futility.resolve())
+    if out.exists() or out.is_relative_to(Path("/dev")) or not source.is_file():
+        p.error("source must be a file and output a new ordinary directory outside /dev")
+    subprocess.run([futility, "vbutil_kernel", "--verify", str(source), "--signpubkey",
+                    str((a.key_dir / "kernel_subkey.vbpubk").resolve())], check=True,
+                   stdout=subprocess.DEVNULL)
+    cmdline = subprocess.check_output([futility, "dump_kernel_config", str(source)])
+    if not cmdline.strip() or len(cmdline) > 4096 or b"\0" in cmdline:
+        p.error("invalid source command line")
+    out.mkdir(parents=True)
+    extracted = out / "source.itb"
+    subprocess.run([futility, "vbutil_kernel", "--get-vmlinuz", str(source),
+                    "--vmlinuz-out", str(extracted)], check=True)
+    raw = extracted.read_bytes()
+    total = struct.unpack_from(">I", raw, 4)[0]
+    original = raw[:total]
+    tree = decode(original)
+    images, configs = child(tree.root, "images"), child(tree.root, "configurations")
+    kernels = {cstring(c.props["kernel"]) for c in configs.children}
+    if len(kernels) != 1:
+        p.error("requires configurations sharing one native kernel")
+    for node in images.children:
+        hashes(node)
+    kernel_node = child(images, kernels.pop())
+    kernel, memory = linux_image(kernel_node.props["data"], cstring(kernel_node.props["compression"]))
+    wrapper, layout = compile_wrapper(out, kernel, memory)
+    kernel_node.props["data"], kernel_node.props["compression"] = wrapper, string("none")
+    hashes(kernel_node, True)
+    count = 0
+    for node in images.children:
+        if node.props.get("type") == string("flat_dt"):
+            if node.props.get("compression") != string("none"):
+                p.error("requires uncompressed source DTBs")
+            node.props["data"] = add_log(node.props["data"])
+            hashes(node, True)
+            count += 1
+    if not count:
+        p.error("no complete DTB found")
+    packed = tree.encode()
+    before, after = properties(original), properties(packed)
+    allowed = {(path, key) for path, key in after
+               if path.startswith("/images/" + kernel_node.name + "/") and key == "value"}
+    allowed |= {("/images/" + kernel_node.name, key) for key in ("data", "compression")}
+    for node in images.children:
+        if node.props.get("type") == string("flat_dt"):
+            allowed.add(("/images/" + node.name, "data"))
+            allowed |= {(path, key) for path, key in after
+                        if path.startswith("/images/" + node.name + "/") and key == "value"}
+    changed = {key for key in before.keys() | after.keys() if before.get(key) != after.get(key)}
+    if not changed <= allowed:
+        p.error("unexpected FIT configuration/ramdisk/metadata change")
+    fit_path, cmd_path = out / "probe.itb", out / "cmdline.txt"
+    fit_path.write_bytes(packed)
+    cmd_path.write_bytes(cmdline)
+    kpart, image = out / "linux-log.kpart", out / "linux-log.img"
+    subprocess.run([sys.executable, str(ROOT / "tools/sign.py"), str(fit_path),
+                    "--futility", futility, "--key-dir", str(a.key_dir.resolve()),
+                    "--cmdline", str(cmd_path), "--output", str(kpart)], check=True,
+                   stdout=subprocess.DEVNULL)
+    if subprocess.check_output([futility, "dump_kernel_config", str(kpart)]) != cmdline:
+        p.error("signed command line differs from baseline")
+    create_image(kpart, image, "EL1 probe Linux log", disk_mib=128, kernel_mib=96)
+    code_files = ("boot/entry.S", "boot/probe.c", "boot/fdt.c", "boot/checkpoint.c", "boot/chain.ld",
+                  "tools/linux_log.py", "tools/fdt.py", "tools/build.py", "tools/artifacts.py",
+                  "tools/sign.py", "tools/disk.py")
+    report = {"schema": 1, "hardware_boot_tested": False,
+              "toolchain": {"zig": "0.15.2", "cpu": CPU},
+              "code_sha256": {name: sha((ROOT / name).read_bytes()) for name in code_files},
+              "source_sha256": sha(source.read_bytes()),
+              "linux_sha256": sha(kernel), "cmdline_sha256": sha(cmdline), "dtb_count": count,
+              "log_property": LOG_PROPERTY, "log_bytes": LOG_BYTES, "layout": layout,
+              "artifacts": {f.name: {"sha256": sha(f.read_bytes()), "bytes": f.stat().st_size}
+                            for f in (out / "probe.elf", out / "Image", fit_path, kpart, image)}}
+    (out / "manifest.json").write_text(json.dumps(report, indent=2) + "\n")
+    print("Built native probe/Linux log image; source command line, DTBs and initrd preserved.")
+    print(report["artifacts"][image.name]["sha256"], image.name)
+    print("No device was written; hardware boot remains untested.")
+
+
+if __name__ == "__main__":
+    main()

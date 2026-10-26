@@ -34,12 +34,22 @@ entry:
     b.eq from_el2
     cmp x20, #4
     b.ne halt
+#if PROBE_LINUX_CHAIN
+    b halt                  /* This chain must return Linux to factory EL2. */
+#endif
     msr vbar_el1, x9
     mrs x21, sctlr_el1
     mov x22, #0
     b el1_entry
 
 from_el2:
+#if PROBE_LINUX_CHAIN
+    mrs x23, cptr_el2
+    mrs x24, mdcr_el2
+    mrs x25, cnthctl_el2
+    mrs x26, cntvoff_el2
+    mrs x27, vbar_el2
+#endif
     msr vbar_el2, x9
     msr vbar_el1, x9
     mrs x21, sctlr_el2
@@ -81,6 +91,9 @@ probe_call:
     mov x2, x21
     mov x3, x22
     bl probe_main
+#if PROBE_LINUX_CHAIN
+    hvc #0x5452             /* Only our lower-EL sync vector accepts this. */
+#endif
 halt:
     wfe
     b halt
@@ -119,7 +132,42 @@ exception_entry:
     mrs x2, far_el1
     b 4f
 3:  mrs x0, esr_el2
+#if PROBE_LINUX_CHAIN
+    cmp x3, #8
+    b.ne 5f
+    ubfx x9, x0, #26, #6
+    cmp x9, #0x16           /* HVC64, not SMC, abort, or an IRQ. */
+    b.ne 5f
+    and x9, x0, #0xffff
+    mov x10, #0x5452
+    cmp x9, x10
+    b.eq linux_handoff
+5:
+#endif
     mrs x1, elr_el2
     mrs x2, far_el2
 4:  bl probe_exception
     b halt
+
+#if PROBE_LINUX_CHAIN
+linux_handoff:
+    mov x0, x19
+    bl probe_export_linux_log
+    cbz w0, halt
+    /* Restore the EL2 state changed solely for the EL1 probe. */
+    msr hcr_el2, x22
+    msr cptr_el2, x23
+    msr mdcr_el2, x24
+    msr cnthctl_el2, x25
+    msr cntvoff_el2, x26
+    msr vbar_el2, x27
+    dsb sy
+    isb
+    adrp x9, _linux_entry
+    add x9, x9, :lo12:_linux_entry
+    mov x0, x19
+    mov x1, xzr
+    mov x2, xzr
+    mov x3, xzr
+    br x9
+#endif

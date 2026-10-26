@@ -135,3 +135,22 @@ void probe_main(const void *dt, uint64_t incoming_el, uint64_t sctlr, uint64_t h
 #endif
     __asm__ volatile("dsb sy" ::: "memory");
 }
+
+#if PROBE_LINUX_CHAIN
+int probe_export_linux_log(void *dt) {
+    uint64_t current;
+    __asm__ volatile("mrs %0, CurrentEL" : "=r"(current));
+    if (probe_log.stage != 3 || probe_log.current_el != 1 || (current >> 2) != 2)
+        return 0;
+    uint32_t n;
+    const uint8_t *found = fdt_property(dt, FDT_MAX_SIZE, "/chosen",
+                                      "trogdor-ipados,probe-log", &n);
+    if (!found || n != sizeof(probe_log.text)) return 0;
+    item("stage=", probe_log.stage);
+    item("handoff EL=", current >> 2);
+    volatile uint8_t *dest = (volatile uint8_t *)(uintptr_t)found;
+    for (uint32_t i = 0; i < n; i++) dest[i] = (uint8_t)probe_log.text[i];
+    __asm__ volatile("dsb sy" ::: "memory");
+    return 1;
+}
+#endif

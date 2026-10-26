@@ -16,6 +16,7 @@
 | 无串口 EL2 / EL1 复位检查点 | EL1 诊断路径有间接硬件证据 | 原版重启，最终 SMC 改为 NOP 的匹配对照不重启；支持此前 EL1／stage／FDT 门限；没有直接寄存器日志或精确计时 |
 | GPT 镜像生成 | 主机测试通过 | 主／备 GPT CRC、分区类型、负载布局、文件保护；官方 vboot 对 64 MiB 镜像与模拟 8 GiB 介质的主表校验通过；匹配对照间接支持外置负载执行，完整设备验收待完成 |
 | 仅抑制最终复位的 EL1 匹配对照 | 已观察到不自动重启 | Image 仅改一条 SMC 为 NOP，其余字节相同；与原版形成硬件对照，见 docs/control.md |
+| 原生 Linux 日志接收 | 已构建签名，硬件待测 | EL1 探针→受控 HVC→EL2 Linux；29 项测试通过，保留完整 DTB／initrd／命令行，见 docs/linux-log.md |
 | 显示恢复 | 未实现 | 原厂停止 timing engine / DSI，不能直接沿用 splash |
 | XNU 装载、ADT、boot_args | 未实现 | 后续接入阶段 |
 | eMMC、触摸、GPU 与完整 iPadOS 用户态 | 未实现 | 没有原生桌面或应用运行记录 |

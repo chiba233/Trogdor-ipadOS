@@ -12,6 +12,7 @@ def main():
     parser.add_argument("--futility", required=True, type=Path)
     parser.add_argument("--key-dir", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--cmdline", type=Path, help="explicit native Linux command line file")
     args = parser.parse_args()
     source, output = args.fit.resolve(), args.output.resolve()
     if not source.is_file():
@@ -24,11 +25,14 @@ def main():
     for key in ("kernel.keyblock", "kernel_data_key.vbprivk", "kernel_subkey.vbpubk"):
         if not (args.key_dir / key).is_file():
             parser.error("missing developer key: " + key)
+    cmdline = args.cmdline.read_bytes() if args.cmdline else b"trogdor_ipados.phase=0\n"
+    if not cmdline.strip() or len(cmdline) > 4096 or b"\0" in cmdline:
+        parser.error("invalid command line")
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="vboot-", dir=output.parent) as scratch:
         scratch = Path(scratch)
         (scratch / "bootloader.bin").write_bytes(bytes(512))
-        (scratch / "cmdline").write_text("trogdor_ipados.phase=0\n")
+        (scratch / "cmdline").write_bytes(cmdline)
         packed = scratch / "probe.kpart"
         subprocess.run([str(args.futility.resolve()), "vbutil_kernel", "--pack", str(packed),
                         "--keyblock", str((args.key_dir / "kernel.keyblock").resolve()),
