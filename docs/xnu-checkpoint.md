@@ -1,6 +1,6 @@
 # 源码 XNU 入口检查点
 
-目标是在原厂签名 FIT 路径原生执行源码内核的冷启动前缀，验证实际读取的 boot_args，再回到已有 Linux 接收日志。当前只有主机验证，尚无这轮真机结果。
+目标是在原厂签名 FIT 路径原生执行源码内核的冷启动前缀，验证实际读取的 boot_args，再回到已有 Linux 接收日志。2026-10-27 已取得这轮真机日志，入口检查点通过。
 
 ## 执行边界
 
@@ -39,4 +39,13 @@ sudo python3 tools/read_probe.py --xnu-checkpoint
 
 51 项回归通过，包含合成 Mach-O 的真实指令前缀、零 slide 指针、错误重定位拒绝、段复制与 BSS 清零、boot_args 与 ADT 地址填充、失败前零写入、运行时保留内存排除、逐寄存器／MMU 返回校验、日志重复／缺失字段拒绝，以及 AArch64 标量生成码和 Image 内存布局检查。四种原有探针构建通过。
 
-实际源码负载与签名容器已生成并验证；主机结果不等于硬件执行结果。后续真机观察记录在 hardware-tests.md。
+实际源码负载与签名容器已生成并验证；主机结果不等于硬件执行结果。本轮真机观察记录在 [硬件记录](hardware-tests.md)。
+
+
+## 真机验收
+
+使用源码提交 `d323df8` 对应的签名镜像，经原厂开发者模式启动。原生 Linux 回来后，`read_probe.py --xnu-checkpoint` 校验完整 8192 字节属性成功，四个 XNU 字段均唯一且值为 1，同时满足 entry EL=2、current EL=1、stage=3、handoff EL=2。原始记录在本地私下保存，与目标属性独立计算的 SHA-256 相同。
+
+返回门在硬件上比较了 XNU 保存的参数指针、virtBase、physBase、memSize、bootFlags、页表物理地址，以及 EL1h 和 SCTLR_EL1 M/C/I；取回的返回 PC 和 boot_args 地址另与实际源码负载独立换算一致。因此可确认真实源码内核已在 EL1 执行该冷启动前缀，正确读取 boot_args，并成功返回 Linux。
+
+日志中较早的 `phase-0 complete; no XNU loaded` 是探针阶段、装载前的记录；后面的 XNU 检查点字段才记录随后的内核执行。本轮没有验证 XNU 读取 ADT、写页表、启用 MMU、进入 C 或启动驱动／用户态。下一阶段需要单独设计并验证这些步骤的日志返回路径。

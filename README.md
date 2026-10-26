@@ -2,7 +2,7 @@
 
 HP Chromebook x2 11（Google Coachz / SC7180）的 **原生 iPadOS 移植实验**。
 
-当前实现是第一阶段引导探针，已在真机取回寄存器日志，确认原厂 EL2 入口、EL1 诊断与 stage=3，并经 EL2 交接原生 Linux；源码 XNU 已完成编译，入口检查点镜像已生成，等待真机验证。目标用户态是已有社区原生实现可参考的 iPadOS 17；具体 XNU 构建与驱动接入在后续阶段进行。
+当前实现是第一阶段引导探针，已在真机取回寄存器日志，确认原厂 EL2 入口、EL1 诊断与 stage=3，并经 EL2 交接原生 Linux；源码 XNU 的 pre-MMU 入口检查点也已通过真机验证，确认在 EL1 读取 boot_args 后返回 Linux。目标用户态是已有社区原生实现可参考的 iPadOS 17；MMU 初始化、驱动与用户态接入在后续阶段进行。
 
 ```text
 原厂 Coreboot → TF-A BL31 → Depthcharge（NS EL2）
@@ -84,4 +84,4 @@ python3 tools/sign.py build/uart/probe.itb \
 
 下一阶段的源码入口、单核架构组件和主机装载检查见 [XNU 准备说明](docs/xnu-preparation.md)。`tools/kernel_source.py` 准备固定版本源码，`--build` 编译源码内核；`tools/xnu_prepare.py` 使用私有原厂 FDT／探针日志规划连续内存并生成最小 ADT，可选检查预链接 Mach-O 与 Darwin 23 boot_args。它们不生成新的可启动镜像，也不执行 XNU。
 
-原生源码 XNU 的 pre-MMU 装载／boot_args 检查点见 [入口检查点](docs/xnu-checkpoint.md)。它通过单指令 HVC 返回 Linux 取日志，尚未完成 MMU、平台驱动或 iPadOS 启动。
+原生源码 XNU 的 pre-MMU 装载／boot_args 检查点见 [入口检查点](docs/xnu-checkpoint.md)。它已在真机通过单指令 HVC 返回 Linux 取回有效日志；MMU、平台驱动与 iPadOS 启动仍待完成。
