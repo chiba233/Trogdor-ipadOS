@@ -55,7 +55,9 @@ python3 tools/xnu_prepare.py --dtb /path/to/private-live.dtb \
 
 提供 `--kernel /path/to/qualified-kernel.macho` 后，还会验证 raw ARM64-all MH_EXECUTE、load command 边界、段的文件／内存范围、虚拟段不重叠、4 字节对齐的入口位于可执行文件数据，并生成 `boot_args.bin`。
 
-目前只接受已完成链接／重定位的输入；FAT、IMG4、ARM64e、LC_MAIN、dyld chained fixups、未解析符号、section relocations、非空 DYSYMTAB 重定位表和未知装载命令均拒绝。段标志只接受不改变放置的 SG_NORELOC／SG_READ_ONLY，SG_HIGHVM／受保护内容等明确拒绝。失败不能静默降级为继续启动。
+目前只接受已完成链接／重定位的输入；FAT、IMG4、ARM64e、LC_MAIN、dyld chained fixups、未解析符号、section relocations、外部 DYSYMTAB 重定位表和未知装载命令均拒绝。段标志只接受不改变放置的 SG_NORELOC／SG_READ_ONLY，SG_HIGHVM／受保护内容等明确拒绝。失败不能静默降级为继续启动。
+
+对 LC_DYSYMTAB 的本地记录，只接受虚拟地址 slide=0、以首段为原点的 64 位非 PC-relative ARM64_RELOC_UNSIGNED。每个位置必须唯一、完整落在文件数据内，现有指针必须指向该记录指定的 section（包含合法的尾边界／空 section 边界）；不重写链接指针，不把物理装载偏移加到虚拟地址上。
 
 ADT 指针按 kernel VA 填入 boot_args；x0 对应的是 boot_args PA。Video 保持零，避免假定原厂 splash 仍可用。数据按 16 KiB 对齐放在内核段后方，topOfKernelData 使用 PA，必须完整落在候选窗口内并保留尾部余量。
 
@@ -73,6 +75,6 @@ ADT 指针按 kernel VA 填入 boot_args；x0 对应的是 boot_args PA。Video 
 - 真实私有 FDT／探针日志成功生成连续候选窗口、单核硬件 DTB 和 ADT；另以合成 Mach-O 跑通可选内核参数及 boot_args 文件生成。合成输入不代表真实内核。
 - 独立审查发现并修复了 SG_HIGHVM 文件放置歧义；其余审查没有可操作问题。
 - Xcode 27.1 的实际源码构建和最终链接成功，包含架构平台／CPU、软件 AES、corecrypto 和 pthread 源码组件。源码候选大小 19106336 字节，SHA-256 为 `6b406b8cd4ee5a6c11793256d8cadc5453365e8e8edb5f487953e02e259c7e9b`。
-- 构建报告确认 `source_kernel_built=true`、`prelinked=false`、`hardware_boot_tested=false`。候选为 ARM64-all MH_EXECUTE，但仍含 60204 条 LC_DYSYMTAB 本地重定位记录，当前装载检查明确拒绝。编译成功不能把这些记录当作已完成交接资格；不能假设 prelink 会自动清除它们。
+- 构建报告确认 `source_kernel_built=true`、`prelinked=false`、`hardware_boot_tested=false`。候选为 ARM64-all MH_EXECUTE，含 60204 条 LC_DYSYMTAB 本地重定位记录。后续逐条审计确认全部满足上述零 VA slide 契约，指针已由静态链接器填好；接受这些记录不代表完成组件 prelink。
 
-下一项实际工作是审查 prelink 和重定位契约，并为真实 XNU 入口建立同次启动可取回的早期日志。完成后才能形成新的硬件测试镜像；现有 Linux 日志测试介质保持不变。
+已实现并生成原生源码 XNU 的 pre-MMU 检查点镜像，见 [入口检查点](xnu-checkpoint.md)。这只截取冷启动前缀；完整组件 prelink、页表／MMU 初始化、平台驱动与用户态仍待完成。

@@ -54,6 +54,15 @@ from_el2:
     msr vbar_el1, x9
     mrs x21, sctlr_el2
     mrs x22, hcr_el2
+#if PROBE_XNU_CHECKPOINT
+    adrp x10, xnu_saved
+    add x10, x10, :lo12:xnu_saved
+    stp x19, x20, [x10]
+    stp x21, x22, [x10, #16]
+    stp x23, x24, [x10, #32]
+    stp x25, x26, [x10, #48]
+    str x27, [x10, #64]
+#endif
 #if PROBE_RESET_EL == 2
     b probe_call
 #endif
@@ -91,8 +100,20 @@ probe_call:
     mov x2, x21
     mov x3, x22
     bl probe_main
+#if PROBE_XNU_CHECKPOINT
+    bl xnu_prepare
+    cbz x0, xnu_load_failed
+    mov x9, x0
+    mov x0, x1
+    mov x1, xzr
+    mov x2, xzr
+    mov x3, xzr
+    br x9
+xnu_load_failed:
+#endif
 #if PROBE_LINUX_CHAIN
     hvc #0x5452             /* Only our lower-EL sync vector accepts this. */
+xnu_fallback_return:
 #endif
 halt:
     wfe
@@ -141,7 +162,22 @@ exception_entry:
     and x9, x0, #0xffff
     mov x10, #0x5452
     cmp x9, x10
+#if PROBE_XNU_CHECKPOINT
+    b.ne 6f
+    mrs x9, elr_el2
+    adr x10, xnu_fallback_return
+    cmp x9, x10
     b.eq linux_handoff
+    b 5f
+6:
+#else
+    b.eq linux_handoff
+#endif
+#if PROBE_XNU_CHECKPOINT
+    mov x10, #0x584e
+    cmp x9, x10
+    b.eq xnu_checkpoint_return
+#endif
 5:
 #endif
     mrs x1, elr_el2
@@ -170,4 +206,34 @@ linux_handoff:
     mov x2, xzr
     mov x3, xzr
     br x9
+#endif
+
+#if PROBE_XNU_CHECKPOINT
+xnu_checkpoint_return:
+    adrp x10, xnu_capture
+    add x10, x10, :lo12:xnu_capture
+    mrs x9, elr_el2
+    str x9, [x10]
+    mrs x9, spsr_el2
+    str x9, [x10, #8]
+    mrs x9, sctlr_el1
+    str x9, [x10, #16]
+    stp x20, x22, [x10, #24]
+    stp x23, x24, [x10, #40]
+    stp x25, x26, [x10, #56]
+    bl xnu_checkpoint_complete
+    cbz w0, halt
+    adrp x10, xnu_saved
+    add x10, x10, :lo12:xnu_saved
+    ldp x19, x20, [x10]
+    ldp x21, x22, [x10, #16]
+    ldp x23, x24, [x10, #32]
+    ldp x25, x26, [x10, #48]
+    ldr x27, [x10, #64]
+    b linux_handoff
+.bss
+.balign 16
+.global xnu_saved
+xnu_saved:
+    .zero 80
 #endif

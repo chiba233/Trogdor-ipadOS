@@ -67,4 +67,20 @@ handoff EL=0x0000000000000002
 
 ## 后续待验证
 
-原生探针日志已取回。后续研究 XNU 内存布局、ADT 与装载接口；探针显示恢复和异常日志接收仍需独立验证。
+原生探针日志已取回。源码 XNU 入口检查点已完成主机验证和介质准备，真机执行待确认；探针显示恢复和异常日志接收仍需独立验证。
+
+
+## 2026-10-27：源码 XNU 入口检查点介质准备
+
+这是一轮介质准备记录，尚无检查点启动结果。使用真实源码构建的 XNU 10063.141.1，插入四字节 pre-MMU HVC 检查点，装载与返回门见 [入口检查点](xnu-checkpoint.md)。51 项主机回归与独立源码审查通过；原有四种探针仍可构建。
+
+| 产物 | SHA-256 |
+| --- | --- |
+| 源码内核 | 6b406b8cd4ee5a6c11793256d8cadc5453365e8e8edb5f487953e02e259c7e9b |
+| instrumented kernel | 49426594554a6e07164599c9514d69da340dde7e9dbdfa8b94075835fe718943 |
+| linux-log.kpart | 3357afbe3d1a81ffeaadf669986eb27f09d804e9acd0e83c1efdd2e93ba67abb |
+| linux-log.img | 5a385131f66934983e96e913b4f6e4bc9a39a79256a9da740238fcfafa5910ec |
+
+目标 Debian 独立完成 vboot 签名、body、GPT 与传输哈希校验。写入已核对的可清空外置介质后，完整 128 MiB 回读 SHA-256 一致。写入器验证 USB／removable、容量、根分区、boot、swap 与独占打开；未写固件或内置盘，没有自动重启。
+
+待从原厂开发者模式启动，再用 `read_probe.py --xnu-checkpoint` 验证同次引导日志。仅返回 Linux、保持黑屏或自动重启均不能单独证明 XNU 读取了 boot_args。

@@ -154,3 +154,7 @@ int probe_export_linux_log(void *dt) {
     return 1;
 }
 #endif
+
+#if PROBE_XNU_CHECKPOINT
+void probe_value(const char *name, uint64_t value) { item(name, value); }
+#endif

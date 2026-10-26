@@ -96,7 +96,7 @@ def add_log(dtb):
     return result
 
 
-def compile_wrapper(out, kernel, memory):
+def compile_wrapper(out, kernel, memory, checkpoint=None):
     zig = Path(os.environ.get("ZIG", ROOT / ".tools/ziglang/ziglang/zig")).resolve()
     env = dict(os.environ, ZIG_GLOBAL_CACHE_DIR=str(ROOT / ".tools/zig-cache"),
                ZIG_LOCAL_CACHE_DIR=str(ROOT / ".tools/zig-local-cache"))
@@ -107,27 +107,44 @@ def compile_wrapper(out, kernel, memory):
     quoted = str(payload).replace("\\", "\\\\").replace('"', '\\"')
     assembly = out / "payload.S"
     assembly.write_text('.global LINUX_MEMORY_SIZE\n.set LINUX_MEMORY_SIZE, ' + str(memory) + '\n.section .linux, "a"\n.incbin "' + quoted + '"\n')
+    if checkpoint is not None:
+        payload_path = out / "xnu-checkpoint.bin"
+        payload_path.write_bytes(checkpoint)
+        quoted_xnu = str(payload_path).replace("\\", "\\\\").replace('"', '\\"')
+        with assembly.open('a') as stream:
+            stream.write('.section .xnu_payload, "a"\n.balign 16\n.global _xnu_payload_start, _xnu_payload_end\n_xnu_payload_start:\n.incbin "' + quoted_xnu + '"\n_xnu_payload_end:\n')
     elf = out / "probe.elf"
     command = [str(zig), "cc", "-target", "aarch64-freestanding-none", "-mcpu=" + CPU,
                "-mgeneral-regs-only", "-ffreestanding", "-fno-builtin", "-fno-pic", "-fno-pie",
                "-fno-stack-protector", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables",
                "-Wall", "-Wextra", "-Werror", "-Os", "-g", "-nostdlib", "-static",
                "-DPROBE_UART=0", "-DPROBE_RESET_EL=0", "-DPROBE_LINUX_CHAIN=1",
+               "-DPROBE_XNU_CHECKPOINT=" + str(int(checkpoint is not None)),
                "-Wl,--build-id=none", "-Wl,--no-undefined", "-Wl,-z,max-page-size=4096",
-               "-Wl,-T," + str(ROOT / "boot/chain.ld"),
+               "-Wl,-T," + str(ROOT / ("boot/xnu-chain.ld" if checkpoint is not None else "boot/chain.ld")),
                *[str(ROOT / "boot" / name) for name in ("entry.S", "probe.c", "fdt.c", "checkpoint.c")],
+               *([str(ROOT / "boot" / name) for name in
+                  ("xnu_checkpoint.c", "xnu_load.c", "xnu_memory.c")] if checkpoint is not None else []),
                str(assembly), "-o", str(elf)]
     subprocess.run(command, env=env, check=True)
     linked = elf.read_bytes()
     image = extract_image(linked)
     header, scalar, symbols = inspect_image(image), inspect_scalar_code(linked), elf_symbols(linked)
     start = symbols["_linux_entry"]["address"]
+    expected_memory = start + memory
+    extra = {}
+    if checkpoint is not None:
+        arena = symbols["_xnu_window"]["address"]
+        expected_memory = arena + 24 * 1024 * 1024
+        if arena % 0x200000 or arena < start + memory:
+            raise ValueError("XNU arena overlaps Linux memory")
+        extra = {"xnu_payload_sha256": sha(checkpoint), "xnu_window_offset": arena, "xnu_window_bytes": 24 * 1024 * 1024}
     if (start % 0x200000 or start < symbols["_stack_top"]["address"] or
-            header["memory_size"] != start + memory or
+            header["memory_size"] != expected_memory or
             image[start:start + len(kernel)] != kernel or len(image) != start + len(kernel)):
         raise ValueError("Linux wrapper memory/payload layout mismatch")
     (out / "Image").write_bytes(image)
-    return image, {"header": header, "scalar_code": scalar, "linux_offset": start}
+    return image, {"header": header, "scalar_code": scalar, "linux_offset": start, **extra}
 
 
 def main():
@@ -135,6 +152,7 @@ def main():
     p.add_argument("--source", type=Path, required=True, help="existing signed native Linux container")
     p.add_argument("--futility", type=Path, required=True)
     p.add_argument("--key-dir", type=Path, required=True)
+    p.add_argument("--xnu-checkpoint", type=Path, help="instrumented source-XNU checkpoint payload")
     p.add_argument("--output", type=Path, default=ROOT / "build/linux-log")
     a = p.parse_args()
     out, source, futility = a.output.resolve(), a.source.resolve(), str(a.futility.resolve())
@@ -162,7 +180,8 @@ def main():
         hashes(node)
     kernel_node = child(images, kernels.pop())
     kernel, memory = linux_image(kernel_node.props["data"], cstring(kernel_node.props["compression"]))
-    wrapper, layout = compile_wrapper(out, kernel, memory)
+    wrapper, layout = compile_wrapper(out, kernel, memory,
+        a.xnu_checkpoint.read_bytes() if a.xnu_checkpoint else None)
     kernel_node.props["data"], kernel_node.props["compression"] = wrapper, string("none")
     hashes(kernel_node, True)
     count = 0
@@ -202,7 +221,10 @@ def main():
     code_files = ("boot/entry.S", "boot/probe.c", "boot/fdt.c", "boot/checkpoint.c", "boot/chain.ld",
                   "tools/linux_log.py", "tools/fdt.py", "tools/build.py", "tools/artifacts.py",
                   "tools/sign.py", "tools/disk.py")
-    report = {"schema": 1, "hardware_boot_tested": False,
+    if a.xnu_checkpoint:
+        code_files += ("boot/xnu_checkpoint.h", "boot/xnu_checkpoint.c", "boot/xnu_load.c",
+                       "boot/xnu_memory.c", "boot/xnu-chain.ld", "tools/xnu_checkpoint.py", "tools/xnu_macho.py")
+    report = {"schema": 1, "xnu_checkpoint": bool(a.xnu_checkpoint), "hardware_boot_tested": False,
               "toolchain": {"zig": "0.15.2", "cpu": CPU},
               "code_sha256": {name: sha((ROOT / name).read_bytes()) for name in code_files},
               "source_sha256": sha(source.read_bytes()),
