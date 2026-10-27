@@ -1,0 +1,58 @@
+# XNU 完整早期平台返回检查点
+
+version=7 沿既有真实源码和 ADT 执行完整 PE_init_platform(FALSE)，在 arm_init 的调用返回处以单条 HVC 停止，合并 SoC 属性、CPU 遍历／频率数据、根型号和早期调试配置验收。沿用原厂 FIT、正常零 CPU 初值及 arena 缓存清理后交接 Linux；不进入下一条 timer 配置调用、MMIO、中断或 SMP。
+
+比较仅推进一个属性、完整 FALSE 平台返回和继续进入 VM／设备初始化。选择完整 FALSE 返回：这段调用链可限定为内存解析与自有全局／栈写入，可以减少真机轮次；继续进入设备初始化需要另行审计。
+
+## 固定输入与已知缺口
+
+保留实际最小 ADT；其 arm-io ranges 父地址非零，原始机器识别会遍历唯一 running CPU。装载前由独立 Python／C 解析器限定树大小、节点／深度、规范键／名字、唯一必要节点、正常 state、4 字节 timebase、24 字节 ranges 及有界型号／device_type。只允许审计过的根、chosen、CPU 属性；拒绝会启用未审计分支的可选属性。命令行固定为既有默认值。
+
+现有 ADT 没有 bus／memory／peripheral／fixed／CPU frequency 属性，原始代码最终把相关字段置零；仅 timebase 与 dec 使用实际计数器频率。AArch64 UDIV 的零分母结果为零，不触发异常。这是当前输入的兼容性缺口，不代表硬件频率是零，也不构成时钟驱动验收；不修改 ADT 制造绕过路径。
+
+## 返回契约
+
+保留 mode6 的 PE／DT 全局检查，改用本轮最终根查找游标。完整核对 SoC 缓存指针／字符串／物理基址、平台信息块中的型号和完整时钟结构、未写字段、配置 bitmask=3、debug_enabled=0 与 degradation factor=1。实际 ADT 复制并填入当次 DRAM 字段后计算 FNV-1a 校验值，返回时逐字节重新计算，检测意外修改；它是内存一致性检查，不是密码学认证。
+
+最终只保留 arm_init 活动父帧；子调用帧允许退休残留，父帧低两字仍为 PE 保存的 FP／LR。核对全部活动帧、4 KiB 栈底 guard、x19=CPU 对象、x20=const_boot_args、SP／FP／LR、精确返回 PC 和最终 x0=零扩展 kError。保留完整 CPU、参数复制、表池、硬件 AT 与缓存维护检查。
+
+## 实施与验证
+
+固定完整源内核及实际执行函数哈希；扩展独立 version=7 元数据和只读／可写区域的装载前边界、初值及不重叠检查。所有输入检查必须先于 arena 写入。旧六模式保持可独立构建／解析。
+
+主机回归覆盖：独立树契约、未审计分支和越界拒绝、写入前拒绝、全部新全局／活动父帧／guard 的逐字节破坏拒绝、ADT 修改检测、全部寄存器和严格日志门限、真实源码单字补丁及实际包装器交叉编译。独立审查后生成签名普通文件，外置介质重新核对属性并完整回读；不自动重启。主机成功与真机结果分开记录，原始设备数据继续保持私有。
+
+
+## 主机验证与读取
+
+98 项主机回归通过，四种原有探针仍可构建。新增用例覆盖独立 Python／C 解析结果对照、确定性逐字节畸变与截断、未审计可选分支、任意层级重复兄弟节点拒绝、装载前拒绝、完整新全局／父帧／栈底 guard 及 ADT 的逐字节破坏、全部捕获字段、真实源码单字补丁和旧六模式兼容。独立源码与实现审查通过；最终包装器 6366 条指令、13 段保持标量约束，Image 仍占有 74 MiB。
+
+```sh
+python3 tools/xnu_checkpoint.py --kernel /path/to/source-kernel \
+  --kernel-report build/xnu-source/source-preparation.json \
+  --adt /path/to/generated.adt --output build/xnu-pe/payload.bin --pe-return
+python3 tools/linux_log.py --source /path/to/native-linux.kpart \
+  --futility /path/to/futility --key-dir /path/to/developer-keys \
+  --xnu-checkpoint build/xnu-pe/payload.bin --output build/xnu-pe-usb
+```
+
+工具只生成普通文件。返回 Linux 后运行 `sudo python3 tools/read_probe.py --xnu-pe`，要求既有平台检查点的 19 字段及以下三个唯一且为 1 的字段，共 22 字段：
+
+```text
+XNU SoC properties verified=0x0000000000000001
+XNU clock info verified=0x0000000000000001
+XNU PE return verified=0x0000000000000001
+```
+
+字段成功后还须独立核对 version=7、精确 arm_init 调用返回 PC、参数和清单，不能用此前首次 ADT 查找结果替代。clock info 字段仅表示结构内容符合当前受限输入，不表示缺失频率已补齐或硬件时钟已配置。
+
+| 产物 | SHA-256 |
+| --- | --- |
+| source kernel | 6b406b8cd4ee5a6c11793256d8cadc5453365e8e8edb5f487953e02e259c7e9b |
+| instrumented PE-return kernel | 215b6ee4ea6ad3044c4cc391a14c284c1cfd3627ee648408be908cc9a192275f |
+| checkpoint payload | b2e73dfbfdae5ce5033ea8bf24de37ef0981a9fff00315e5b6ffda5d0775683f |
+| linux-log.kpart | ca3685e83a043df599c1dee4e73de54ce5942ea4f8c9a695b663049cbeb2da9d |
+| linux-log.img | b15cc8ac07b6823835a7edc731b4daa18323c21c3d9da13f19267cd35549733e |
+
+
+主机与目标端签名／body、实际主备 GPT CRC／属性／内嵌容器及最终代码清单匹配；Linux、47 份完整 DTB、initrd 和命令行保留。传输哈希与外置介质全部 128 MiB 回读一致。没有写固件或内置盘，没有自动重启。以上为主机与介质准备结果，本轮真机执行仍待手动启动后取得全部 22 字段及独立清单核对。

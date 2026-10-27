@@ -52,12 +52,19 @@ int xnu_checkpoint_complete(void) {
         good=good && cpu;
         probe_value("XNU CPU data verified=",(uint64_t)cpu);
     }
-    if (expected.mode==6) {
+    if (expected.mode>=6) {
         int platform=good && xnu_platform_valid(&expected);
         good=good && platform;
         probe_value("XNU platform state verified=",(uint64_t)platform);
         probe_value("XNU ADT binding verified=",(uint64_t)platform);
         probe_value("XNU ADT lookup verified=",(uint64_t)platform);
+    }
+    if (expected.mode==7) {
+        int pe=good && xnu_pe_valid(&expected);
+        good=good && pe;
+        probe_value("XNU SoC properties verified=",(uint64_t)pe);
+        probe_value("XNU clock info verified=",(uint64_t)pe);
+        probe_value("XNU PE return verified=",(uint64_t)pe);
     }
     probe_value("XNU checkpoint=",(uint64_t)good);
     probe_value("XNU boot_args verified=",(uint64_t)good);

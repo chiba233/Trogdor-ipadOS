@@ -5,7 +5,7 @@ int xnu_tables_valid(const uint64_t *pool,const struct xnu_expected *e) {
     struct record { uint64_t word,value; } records[32];
     unsigned used=0,page=2;
     uint64_t count=e->memory>>21,physical=e->phys&~0x1fffffull;
-    if (e->mode<2 || e->mode>6 || !count || count>12 || e->phys>=(1ull<<38) ||
+    if (e->mode<2 || e->mode>7 || !count || count>12 || e->phys>=(1ull<<38) ||
         e->virt>>38!=0x3ffffff || (e->phys&0x1fffff)!=(e->virt&0x1fffff) ||
         e->end>physical+(count<<21)) return 0;
     for (unsigned root=0;root<2;root++) {

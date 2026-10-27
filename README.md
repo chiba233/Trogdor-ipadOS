@@ -95,3 +95,5 @@ python3 tools/sign.py build/uart/probe.itb \
 [启动 CPU 数据初始化检查点](docs/xnu-cpu-checkpoint.md) 已通过真机验收：全部 16 字段有效，原始 cpu_data_init 的标量／FP/NEON 写入、完整 CPU 对象、保留哨兵与 guard 通过核对后返回 Linux。该有限检查点停在 PE_init_platform 前，不代表平台／ADT 初始化或完整系统启动。
 
 [平台入口与原生 ADT 查找检查点](docs/xnu-platform-checkpoint.md) 已通过真机验收：完整 19 字段有效，正常 CPU 初值、原始平台状态与 ADT 绑定、原生 arm-io 查找及活动栈帧均通过核对后返回 Linux。检查点仍在后续 SoC 属性读取之前，后续平台／设备初始化与完整系统启动尚未验证。
+
+[完整早期平台返回检查点](docs/xnu-pe-checkpoint.md) 已实现并通过主机回归与独立审查，真机待验收。它合并 SoC 属性、CPU／时钟数据、型号与调试配置，并在完整 PE_init_platform(FALSE) 返回后停止；现有 ADT 缺失的总线／CPU 频率如实保持零，不代表时钟驱动已支持。

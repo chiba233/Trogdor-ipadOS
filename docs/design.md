@@ -84,3 +84,8 @@ EL2 分支将 EL1 设置为 AArch64、关闭 stage-2 translation、允许 EL1 �
 ## 下一轮：原始平台状态与首次 ADT 查找
 
 [平台／ADT 检查点](xnu-platform-checkpoint.md) 使用正常 CPU 初值，运行原始 PE 状态初始化和 SecureDTInit，再沿机器识别调用执行 SecureDTFindEntry，查找 arm-io 成功后 HVC。验收完整 PE／DT 全局、独立节点／游标、四层活动帧及原有 CPU／表池／AT，再按原有缓存返回路径交接 Linux。91 项主机回归与独立审查通过，外置签名镜像已全量回读；本轮真机完整 19 字段通过，原始平台状态、ADT 绑定与原生 arm-io 查找成功，核对完整现场和缓存清理后返回 Linux。后续 SoC 属性读取、平台／设备支持与完整系统启动仍待验收。
+
+
+## 下一轮：完整早期平台函数返回
+
+[完整 PE 返回检查点](xnu-pe-checkpoint.md) 沿实际非零 SoC ranges 输入，完成属性消费、唯一 running CPU 的遍历与频率数据、根型号复制和早期调试配置，在 arm_init 的 PE_init_platform(FALSE) 调用返回处 HVC。把这段已审计的内存操作合并验收，保留完整父栈、PE／DT／CPU 全局、ADT 一致性、表池／AT、缓存维护和 Linux 返回；不进入下一条 timer 配置调用。缺失的五项频率属性原样保留缺口。98 项主机回归与独立审查通过，真机结果待验收。

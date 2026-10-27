@@ -302,3 +302,16 @@ XNU ADT lookup verified=0x0000000000000001
 返回门确认正常零 CPU 初值下的完整 CPU 对象、PE_state、page_protection_type、DT 根／大小／末尾／初始化标志、查找游标与输出节点均符合期望；四层活动栈帧、4 KiB 栈范围底部 guard、原有参数复制、完整表池和硬件 AT 通过。随后完成状态恢复并返回 Linux。原始地址、设备树、完整日志及日志哈希未公开。
 
 这确认原始平台状态初始化、SecureDTInit 和首次原生 SecureDTFindEntry 遍历成功，不再只是主机解析树。检查点停在查找返回后、后续 SoC 属性读取前；MMIO、中断、SMP、平台驱动与完整 XNU／iPadOS 启动尚未验证。
+
+
+## 2026-10-27：完整早期平台返回介质准备
+
+本节记录启动前准备，不是 version=7 的真机执行结果。沿现有非零 SoC ranges 和唯一 running CPU，保留完整 PE_init_platform(FALSE) 路径，在 arm_init 的调用返回处单条 HVC；合并 SoC 属性、CPU／时钟信息、根型号与早期调试配置。缺失的五项频率属性保持零字段，不能视为时钟支持；详见 [完整 PE 返回检查点](xnu-pe-checkpoint.md)。
+
+98 项主机回归、四种既有探针构建与独立源码／实现审查通过。任意层级重复兄弟节点的 Python／C 拒绝规则已统一并回归。最终包装器 6366 条指令、13 段满足标量约束，实际补丁只替换平台调用返回后的 timer 配置 BL；完整平台函数及此前源码保留。
+
+镜像 SHA-256 `b15cc8ac07b6823835a7edc731b4daa18323c21c3d9da13f19267cd35549733e`，签名容器 SHA-256 `ca3685e83a043df599c1dee4e73de54ce5942ea4f8c9a695b663049cbeb2da9d`。实际主备 GPT CRC／分区属性／内嵌容器、最终源码清单和全部产物哈希匹配。主机及目标端 vboot 签名与 body 校验通过，传输哈希一致，保留 Linux、47 份完整 DTB、initrd 和命令行。
+
+重新核对 USB／removable、容量、root／boot／swap 后，固定哈希写入器独占打开外置介质并完成全部 128 MiB 写入和回读，哈希一致。没有写固件或内置盘，没有自动重启；私有写入器与原始设备数据不进入公开仓库。
+
+待手动启动后，以 `read_probe.py --xnu-pe` 要求全部 22 字段，并独立核对精确 arm_init 返回 PC、version=7、参数地址和负载清单。此前 version=6 的 19 字段不能代替本轮完整平台返回验收。

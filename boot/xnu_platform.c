@@ -17,8 +17,9 @@ static int frame(const struct xnu_expected *e,uint64_t va,const uint64_t *want,u
     return 1;
 }
 int xnu_platform_valid(const struct xnu_expected *e) {
-    if (e->mode!=6 || e->end<e->phys || e->end-e->phys>XNU_ARENA_BYTES ||
-        e->sp0<0xe00 || (e->sp0&15) || !range(e,e->sp0-0xe00,4096) ||
+    uint64_t below=e->mode==7?0xf30u:0xe00u;
+    if ((e->mode!=6 && e->mode!=7) || e->end<e->phys || e->end-e->phys>XNU_ARENA_BYTES ||
+        e->sp0<below || (e->sp0&15) || !range(e,e->sp0-below,4096) ||
         !range(e,e->pe_state,0xb0) || (e->pe_state&7) || !range(e,e->protection,4) ||
         !range(e,e->dt_root,28) || !range(e,e->dt_cursor,8) || (e->dt_root&7) || (e->dt_cursor&7) ||
         !range(e,e->tree,e->tree_size) || e->tree_size>65536 || e->node>e->tree_size ||
@@ -29,10 +30,11 @@ int xnu_platform_valid(const struct xnu_expected *e) {
     for (unsigned i=0;i<sizeof(pixel);i++) state[0x38+i]=(uint8_t)pixel[i];
     put(state+0x98,e->tree);put(state+0xa0,e->const_args);put(state+0xa8,e->tree_size);
     put(dt,e->tree);put(dt+8,e->tree_size);put(dt+16,e->tree+e->tree_size);dt[24]=1;
-    put(cursor,e->tree+e->cursor);
+    put(cursor,e->tree+(e->mode==7?56u:e->cursor));
     if (!same(address(e,e->pe_state),state,sizeof(state)) || !same(address(e,e->dt_root),dt,sizeof(dt)) ||
         !same(address(e,e->dt_cursor),cursor,8) || !same(address(e,e->protection),zero,4) ||
-        !same(address(e,e->sp0-0xe00),zero,64)) return 0;
+        !same(address(e,e->sp0-below),zero,64)) return 0;
+    if (e->mode==7) return 1; /* Only arm_init remains active; checked by xnu_cinit_valid. */
     /* Complete active SoC, identify and PE frames. Retired recursive frames
        below SP are allowed; their maximum extent was bounded by the input. */
     uint64_t soc[8]={0},identify[22]={0},pe[8]={0};
