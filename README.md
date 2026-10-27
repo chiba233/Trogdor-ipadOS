@@ -2,7 +2,7 @@
 
 HP Chromebook x2 11（Google Coachz / SC7180）的 **原生 iPadOS 移植实验**。
 
-当前实现是第一阶段引导探针，已在真机取回寄存器日志，确认原厂 EL2 入口、EL1 诊断与 stage=3，并经 EL2 交接原生 Linux；源码 XNU 的 pre-MMU 入口检查点也已通过真机验证，确认在 EL1 读取 boot_args 后返回 Linux。目标用户态是已有社区原生实现可参考的 iPadOS 17；后续独立 MMU 检查点也已通过；高虚拟地址取指和 C 入口栈读取检查点也已通过；早期 C 正文的完整栈保存、参数复制与缓存清理返回也已真机验收，后续 CPU／平台初始化、驱动与用户态接入仍待完成。
+当前实现是第一阶段引导探针，已在真机取回寄存器日志，确认原厂 EL2 入口、EL1 诊断与 stage=3，并经 EL2 交接原生 Linux；源码 XNU 的 pre-MMU 入口检查点也已通过真机验证，确认在 EL1 读取 boot_args 后返回 Linux。目标用户态是已有社区原生实现可参考的 iPadOS 17；后续独立 MMU 检查点也已通过；高虚拟地址取指和 C 入口栈读取检查点也已通过；早期 C 正文的完整栈保存、参数复制与缓存清理返回也已真机验收，启动 CPU 数据的原始标量／FP/NEON 初始化也已通过；平台初始化、驱动与用户态接入仍待完成。
 
 ```text
 原厂 Coreboot → TF-A BL31 → Depthcharge（NS EL2）
@@ -84,12 +84,12 @@ python3 tools/sign.py build/uart/probe.itb \
 
 下一阶段的源码入口、单核架构组件和主机装载检查见 [XNU 准备说明](docs/xnu-preparation.md)。`tools/kernel_source.py` 准备固定版本源码，`--build` 编译源码内核；`tools/xnu_prepare.py` 使用私有原厂 FDT／探针日志规划连续内存并生成最小 ADT，可选检查预链接 Mach-O 与 Darwin 23 boot_args。它们不生成新的可启动镜像，也不执行 XNU。
 
-原生源码 XNU 的 pre-MMU 装载／boot_args 检查点见 [入口检查点](docs/xnu-checkpoint.md)。它已在真机通过单指令 HVC 返回 Linux 取回有效日志；后续 MMU 与早期 C 参数复制检查点也已通过；后续 CPU／平台初始化、平台驱动与 iPadOS 启动仍待完成。
+原生源码 XNU 的 pre-MMU 装载／boot_args 检查点见 [入口检查点](docs/xnu-checkpoint.md)。它已在真机通过单指令 HVC 返回 Linux 取回有效日志；后续 MMU、早期 C 参数复制与启动 CPU 数据检查点也已通过；平台初始化、平台驱动与 iPadOS 启动仍待完成。
 
 [MMU 开启检查点](docs/xnu-mmu-checkpoint.md) 已通过真机日志验收：完整页表池、EL1 寄存器和硬件地址翻译校验成功，并返回 Linux。该轮只验证 MMU；随后高地址实际取指与栈读取由独立检查点确认。
 
 [高虚拟地址与 C 入口检查点](docs/xnu-highva-checkpoint.md) 已通过真机验收：原始 RET 跳入 arm_init 高地址，完成栈帧调整与诊断读取后返回 Linux，未执行 C 初始化正文。
 
-[早期 C 初始化与参数复制检查点](docs/xnu-cinit-checkpoint.md) 已通过真机日志验收：原始栈保存、完整参数复制、全局指针设置与缓存维护四个新字段及原有 11 字段全部通过，在 cpu_data_init 前返回 Linux；后续 CPU／平台初始化及 ADT 消费仍待验证。
+[早期 C 初始化与参数复制检查点](docs/xnu-cinit-checkpoint.md) 已通过真机日志验收：原始栈保存、完整参数复制、全局指针设置与缓存维护四个新字段及原有 11 字段全部通过，在 cpu_data_init 前返回 Linux；后续启动 CPU 数据检查点见下节，平台初始化及 ADT 消费仍待验证。
 
-[启动 CPU 数据初始化检查点](docs/xnu-cpu-checkpoint.md) 已通过 82 项主机回归和独立审查，外置签名镜像已全量回读，等待真机日志；它执行原始 cpu_data_init 及其 FP/NEON 写入，在 PE_init_platform 前返回。
+[启动 CPU 数据初始化检查点](docs/xnu-cpu-checkpoint.md) 已通过真机验收：全部 16 字段有效，原始 cpu_data_init 的标量／FP/NEON 写入、完整 CPU 对象、保留哨兵与 guard 通过核对后返回 Linux。该有限检查点停在 PE_init_platform 前，不代表平台／ADT 初始化或完整系统启动。

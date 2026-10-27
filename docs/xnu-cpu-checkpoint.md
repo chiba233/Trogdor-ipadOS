@@ -1,6 +1,6 @@
 # XNU 启动 CPU 数据初始化检查点
 
-沿用已验收的原厂 FIT → 原始 XNU → HVC → Linux 路线。version=5 放行原始 cpu_data_init 调用，在其返回后、PE_init_platform 之前停止。实现、82 项主机回归与独立审查已通过，外置签名镜像已完整回读；CPU 初始化真机执行仍待验收。
+沿用已验收的原厂 FIT → 原始 XNU → HVC → Linux 路线。version=5 放行原始 cpu_data_init 调用，在其返回后、PE_init_platform 之前停止。实现、82 项主机回归与独立审查已通过；2026-10-27 已取得完整真机日志，原始启动 CPU 数据初始化检查点通过。
 
 比较过只放行函数首条 SIMD、运行完整 cpu_data_init、以及直接运行 PE_init_platform。选择完整 CPU 数据初始化：该固定内核中的函数是没有子调用／栈调整／MMIO 的叶函数，全部写入限定在 BootCpuData 的 0x500 字节对象内，可以完整核对。平台初始化会引入 ADT 与更多调用，另行验收。
 
@@ -55,6 +55,17 @@ XNU CPU data verified=0x0000000000000001
 
 包装 Image 仍申请 74 MiB，Linux、47 份完整 DTB、initrd 和命令行保留。实际镜像主备 GPT CRC／分区属性／内嵌容器通过，主机与目标端 vboot 密钥签名及 body 校验通过，传输哈希一致；固定哈希写入器已完成外置介质全部 128 MiB 回读。没有写入固件或内置盘，没有自动重启。原始源码二进制、ADT 和设备记录继续留在忽略目录。
 
-非对齐访问的架构依据见 [Armv8-A memory model，第 12 章](https://developer.arm.com/-/media/Arm%20Developer%20Community/PDF/Learn%20the%20Architecture/Armv8-A%20memory%20model%20guide.pdf?revision=58b1dd0a-3800-4218-b21a-f95a0332034c)：Normal 内存允许非对齐访问，SCTLR.A 可使其触发异常；向量访存也遵循元素对齐规则。本模式固定完整启动页表和 MAIR，返回时新增检查 A=0；主机解释与生成码检查不能代替真机 SIMD 与缓存返回验收。
+非对齐访问的架构依据见 [Armv8-A memory model，第 12 章](https://developer.arm.com/-/media/Arm%20Developer%20Community/PDF/Learn%20the%20Architecture/Armv8-A%20memory%20model%20guide.pdf?revision=58b1dd0a-3800-4218-b21a-f95a0332034c)：Normal 内存允许非对齐访问，SCTLR.A 可使其触发异常；向量访存也遵循元素对齐规则。本模式固定完整启动页表和 MAIR，返回时新增检查 A=0；主机解释、生成码和本轮真机结果分列记录；本轮已通过该原始 SIMD 写入与缓存返回路径，不能外推至其他平台初始化调用。
 
-本轮仍等待手动从原厂开发者模式启动并取回新的完整日志。诊断哨兵不适用于继续运行平台初始化；下一步须移除该输入并为 PE_init_platform／ADT 单独建立契约。
+本轮真机结果见下节。诊断哨兵不适用于继续运行平台初始化；下一步须移除该输入并为 PE_init_platform／ADT 单独建立契约。
+
+
+## 真机验收
+
+执行源码版本 `4541792`；镜像 SHA-256 为 `baae4bfebea2d3a7174be3f63785c058c0f47d9a3b3b89cfdfe90a7d68b1a1c3`。经原厂开发者模式启动后成功返回原生 Linux 6.12.42-stb-cbq+。完整 8192 字节同次引导日志通过 `read_probe.py --xnu-cpu`：既有 15 字段与新增 CPU 数据字段均唯一且满足预期，日志头／NUL 终止／零填充有效。设备属性与本地私有原始副本的独立 SHA-256 一致。
+
+独立核对 version=5、精确 CPU 调用后返回 PC、boot_args VA／PA 与块内偏移关系，以及源内核／补丁内核／负载／镜像和实际构建代码哈希均匹配。负载中的 CPU 对象与时钟指针符号对应实际固定源码；本轮原始记录与前一轮 C 参数复制不同，没有借用旧日志。缓存记录为 64 字节 × 393216 行，完整覆盖自有 24 MiB arena。
+
+硬件返回门通过全部 0x500 字节 CPU 对象和前后共 32 字节 guard：原始标量与 FP/NEON 指令清零的字段、五处常量／指针均符合预期，未写字段保留 0xa5，guard 保持零。现场同时确认 FPEN、SCTLR.A=0、x0/x19 为 CPU 对象、LR 为精确调用返回地址，并通过原有完整参数复制、父／子栈帧、完整表池和参数／代码／栈 AT 校验。随后执行状态恢复并交接 Linux。
+
+因此本轮确认原始 cpu_data_init 叶函数及其向量写入已原生执行，并在 arena 缓存清理后读回正确结果。该结论仅覆盖有限诊断输入下的启动 CPU 对象初始化；没有运行 PE_init_platform、消费 ADT、建立后续 CPU／中断／SMP 平台支持或启动 iPadOS。下一阶段须移除 CPU 哨兵并单独审计平台／ADT 初始化路径。

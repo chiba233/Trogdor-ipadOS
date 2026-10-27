@@ -229,4 +229,34 @@ XNU cache maintenance verified=0x0000000000000001
 
 镜像 SHA-256 `baae4bfebea2d3a7174be3f63785c058c0f47d9a3b3b89cfdfe90a7d68b1a1c3`，签名容器 SHA-256 `898eb0b2065b8e9c2b122a334bb497576ee460822c69f1356a323f57d54aaf49`。主机与目标端签名／body、传输哈希、实际 GPT 主备 CRC 和内嵌容器通过。重新核对外置介质的 USB／removable、容量、root／boot／swap 后，固定哈希写入器独占打开并完成全部 128 MiB 写入与回读；没有写入固件或内置盘，没有自动重启。
 
-尚未执行本轮真机启动。待手动启动后，以 `read_probe.py --xnu-cpu` 要求既有 C 初始化 15 字段和新的 CPU 数据字段，并独立核对本轮精确返回 PC、version=5 和负载清单。前一轮 C 参数复制验收不能代替本轮原生 SIMD／CPU 初始化验收；诊断哨兵不能用于继续平台启动。
+本节为启动前准备记录；随后真机结果见下节。`read_probe.py --xnu-cpu` 要求既有 C 初始化 15 字段和新的 CPU 数据字段，并独立核对本轮精确返回 PC、version=5 和负载清单。前一轮 C 参数复制验收不能代替本轮原生 SIMD／CPU 初始化验收；诊断哨兵不能用于继续平台启动。
+
+
+## 2026-10-27：原始启动 CPU 数据与 SIMD 写入成功
+
+执行源码版本 `4541792`，镜像 SHA-256 `baae4bfebea2d3a7174be3f63785c058c0f47d9a3b3b89cfdfe90a7d68b1a1c3`。经原厂开发者模式启动后，原生 Linux 6.12.42-stb-cbq+ 可访问，完整 8192 字节日志通过 `read_probe.py --xnu-cpu`：
+
+```text
+entry EL=0x0000000000000002
+current EL=0x0000000000000001
+stage=0x0000000000000003
+handoff EL=0x0000000000000002
+XNU copied=0x0000000000000001
+XNU checkpoint=0x0000000000000001
+XNU boot_args verified=0x0000000000000001
+XNU current EL=0x0000000000000001
+XNU MMU enabled=0x0000000000000001
+XNU tables verified=0x0000000000000001
+XNU translations verified=0x0000000000000001
+XNU C body verified=0x0000000000000001
+XNU stack writes verified=0x0000000000000001
+XNU args copy verified=0x0000000000000001
+XNU cache maintenance verified=0x0000000000000001
+XNU CPU data verified=0x0000000000000001
+```
+
+16 字段唯一且满足预期，日志头、终止与零填充有效；设备属性和私有原始副本的独立 SHA-256 一致。精确 CPU 调用返回 PC、version=5、参数地址与对齐偏移、CPU／时钟符号，以及源内核／补丁内核／负载／镜像／实际代码清单独立核对通过。新记录与前一轮不同，64 字节缓存行 × 393216 行覆盖全部 24 MiB 自有区间。没有公开原始地址、设备树或完整日志。
+
+返回门验证完整 0x500 字节 CPU 对象与两侧共 32 字节 guard；应清零字段、五处常量／指针、未写字段的 0xa5 和 guard 零值全部匹配。现场确认 FPEN、A=0、实际 CPU 参数与 LR，原有完整参数复制、父／子栈帧、完整表池和硬件 AT 也通过，随后恢复状态并返回 Linux。
+
+由此确认原始 cpu_data_init 叶函数、标量与 FP/NEON 写入在有限诊断输入下执行成功。仍停在 PE_init_platform 前；诊断哨兵不能用于继续平台启动，ADT、中断、SMP、平台驱动与完整 iPadOS 均未验证。
