@@ -268,4 +268,37 @@ XNU CPU data verified=0x0000000000000001
 
 镜像 SHA-256 `5fef36cd41fc2f53890f89266bbb4f557f8ded4b0f12dd44b1bd2965d5b1f399`，签名容器 SHA-256 `f87c09aa0b8c827107c902c9e7b579812868ea93b5333d84c2a822caf367c95e`。主机与目标端签名／body、传输哈希、实际主备 GPT CRC、内嵌容器和代码清单通过。重新核对外置介质 USB／removable、容量、root／boot／swap 后，固定哈希写入器独占打开并完成全部 128 MiB 写入和回读；没有写入固件或内置盘，没有自动重启。
 
-尚未执行本轮真机启动。待手动启动后，以 `read_probe.py --xnu-platform` 要求既有 16 字段和平台状态／ADT 绑定／ADT 查找三个新字段，并独立核对本轮精确返回 PC、version=6 和负载清单。此前 CPU 初始化通过不能代替本轮原生 ADT 遍历验收。
+本节为启动前准备记录；随后真机结果见下节。`read_probe.py --xnu-platform` 要求既有 16 字段和平台状态／ADT 绑定／ADT 查找三个新字段，并独立核对本轮精确返回 PC、version=6 和负载清单。此前 CPU 初始化通过不能代替本轮原生 ADT 遍历验收。
+
+
+## 2026-10-27：原始平台状态、ADT 绑定与原生查找成功
+
+执行源码版本 `f30464b`，镜像 SHA-256 `5fef36cd41fc2f53890f89266bbb4f557f8ded4b0f12dd44b1bd2965d5b1f399`。经原厂开发者模式启动并交接原生 Linux 6.12.42-stb-cbq+，完整 8192 字节日志通过 `read_probe.py --xnu-platform`：
+
+```text
+entry EL=0x0000000000000002
+current EL=0x0000000000000001
+stage=0x0000000000000003
+handoff EL=0x0000000000000002
+XNU copied=0x0000000000000001
+XNU checkpoint=0x0000000000000001
+XNU boot_args verified=0x0000000000000001
+XNU current EL=0x0000000000000001
+XNU MMU enabled=0x0000000000000001
+XNU tables verified=0x0000000000000001
+XNU translations verified=0x0000000000000001
+XNU C body verified=0x0000000000000001
+XNU stack writes verified=0x0000000000000001
+XNU args copy verified=0x0000000000000001
+XNU cache maintenance verified=0x0000000000000001
+XNU CPU data verified=0x0000000000000001
+XNU platform state verified=0x0000000000000001
+XNU ADT binding verified=0x0000000000000001
+XNU ADT lookup verified=0x0000000000000001
+```
+
+19 字段唯一且满足预期，日志头、终止与零填充有效；设备属性和私有副本的独立 SHA-256 一致。精确原生查找返回 PC、version=6、参数地址与对齐关系、CPU／时钟／平台符号，以及源内核／补丁内核／负载／镜像／实际代码清单独立核对通过；平台元数据的节点与游标偏移和主机独立 ADT 解析一致。新记录与前一轮 CPU 检查点不同，64 字节缓存行 × 393216 行覆盖全部 24 MiB 自有区间。
+
+返回门确认正常零 CPU 初值下的完整 CPU 对象、PE_state、page_protection_type、DT 根／大小／末尾／初始化标志、查找游标与输出节点均符合期望；四层活动栈帧、4 KiB 栈范围底部 guard、原有参数复制、完整表池和硬件 AT 通过。随后完成状态恢复并返回 Linux。原始地址、设备树、完整日志及日志哈希未公开。
+
+这确认原始平台状态初始化、SecureDTInit 和首次原生 SecureDTFindEntry 遍历成功，不再只是主机解析树。检查点停在查找返回后、后续 SoC 属性读取前；MMIO、中断、SMP、平台驱动与完整 XNU／iPadOS 启动尚未验证。

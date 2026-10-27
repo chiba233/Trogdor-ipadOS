@@ -1,6 +1,6 @@
 # XNU 平台入口与原生 ADT 查找检查点
 
-version=6 沿原始 arm_init → PE_init_platform(FALSE) → SecureDTInit → pe_identify_machine → pe_arm_get_soc_base_phys → SecureDTFindEntry 调用链运行，在首次查找 name=arm-io 成功返回后停止。它验证平台状态初始化、ADT 绑定和真实树遍历；不进入 SoC 属性读取、MMIO、中断或 SMP 初始化。实现、91 项主机回归与独立审查已通过；外置签名镜像已完整回读，平台入口与原生 ADT 查找的真机执行仍待验收。
+version=6 沿原始 arm_init → PE_init_platform(FALSE) → SecureDTInit → pe_identify_machine → pe_arm_get_soc_base_phys → SecureDTFindEntry 调用链运行，在首次查找 name=arm-io 成功返回后停止。它验证平台状态初始化、ADT 绑定和真实树遍历；不进入 SoC 属性读取、MMIO、中断或 SMP 初始化。实现、91 项主机回归与独立审查已通过；外置签名镜像已完整回读，真机日志的全部 19 字段及独立返回位置／清单核对通过。
 
 比较过仅在 SecureDTInit 后停止、直接运行整个 PE_init_platform 和在首次真实查找后停止。选择最后一种：不仅保存树指针，而且运行原生边界检查、递归遍历和 strcmp，同时仍停在机器识别后续读取与设备访问之前。补丁只替换 pe_arm_get_soc_base_phys 中该调用返回后的 MOV X8,X0，各旧模式保持独立。
 
@@ -62,4 +62,12 @@ XNU ADT lookup verified=0x0000000000000001
 
 包装 Image 仍申请 74 MiB，Linux、47 份完整 DTB、initrd 和命令行保留。实际镜像主备 GPT CRC／分区属性／内嵌容器及代码清单匹配，主机与目标端 vboot 签名和 body 校验通过，传输哈希一致；固定哈希写入器完成外置介质全部 128 MiB 回读。没有写固件或内置盘，没有自动重启。原始二进制、ADT 和设备记录继续留在忽略目录。
 
-本轮仍等待手动从原厂开发者模式启动并取回完整新日志。主机解析成功和此前 CPU 检查点通过，都不能证明本轮 native ADT 查找已执行；没有完整平台、驱动或 iPadOS 启动结果。
+## 真机验收：2026-10-27
+
+执行源码版本 `f30464b` 和上表镜像，经原厂开发者模式启动后返回原生 Linux，完整 8192 字节日志通过 `read_probe.py --xnu-platform` 的 19 字段门限。三个新字段均唯一且为 1；日志头、终止、零填充及设备属性与私有副本的独立 SHA-256 一致。
+
+独立核对 version=6、精确原生查找返回 PC、参数地址与对齐关系、CPU／时钟／平台符号及主机解析的 arm-io 节点／游标偏移，源内核、补丁内核、负载、镜像与实际代码清单全部匹配。新记录与此前 CPU 检查点不同，64 字节缓存行 × 393216 行覆盖完整 24 MiB arena。
+
+返回门确认正常零 CPU 初值下的完整 CPU 对象、PE 状态、DT 全局、原生查找结果、四层活动栈帧、栈底 guard、完整表池和硬件 AT 校验成功；完成缓存维护与现场恢复后交接 Linux。原始地址、设备树、完整日志及日志哈希保持私有。
+
+这确认有限原始平台初始化、ADT 绑定与首次原生树遍历已在真机执行。检查点仍停在后续 SoC 属性读取前；没有后续平台、MMIO、中断、SMP、驱动或完整 XNU／iPadOS 启动结果。详细字段见 [硬件记录](hardware-tests.md)。
