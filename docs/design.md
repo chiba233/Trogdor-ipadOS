@@ -88,4 +88,4 @@ EL2 分支将 EL1 设置为 AArch64、关闭 stage-2 translation、允许 EL1 �
 
 ## 下一轮：完整早期平台函数返回
 
-[完整 PE 返回检查点](xnu-pe-checkpoint.md) 沿实际非零 SoC ranges 输入，完成属性消费、唯一 running CPU 的遍历与频率数据、根型号复制和早期调试配置，在 arm_init 的 PE_init_platform(FALSE) 调用返回处 HVC。把这段已审计的内存操作合并验收，保留完整父栈、PE／DT／CPU 全局、ADT 一致性、表池／AT、缓存维护和 Linux 返回；不进入下一条 timer 配置调用。缺失的五项频率属性原样保留缺口。98 项主机回归与独立审查通过，真机结果待验收。
+[完整 PE 返回检查点](xnu-pe-checkpoint.md) 沿实际非零 SoC ranges 输入，完成属性消费、唯一 running CPU 的遍历与频率数据、根型号复制和早期调试配置，在 arm_init 的 PE_init_platform(FALSE) 调用返回处 HVC。把这段已审计的内存操作合并验收，保留完整父栈、PE／DT／CPU 全局、ADT 一致性、表池／AT、缓存维护和 Linux 返回；不进入下一条 timer 配置调用。缺失的五项频率属性原样保留缺口。首次真机尝试持续黑屏，恢复内置 Linux 后未取得本轮日志，停止位置尚未确认。随后诊断对照通过 99 项主机回归与独立审查：不改变 XNU 路径，保留完整捕获／页表硬门限，仅使普通数据校验失败时能携带失败字段返回 Linux；仍不算真机验收通过。

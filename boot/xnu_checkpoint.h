@@ -16,6 +16,7 @@ int xnu_load(const uint8_t *, size_t, void *, size_t, uint64_t, uint64_t,
 int xnu_capture_valid(const uint64_t *, const struct xnu_expected *);
 int xnu_pe_contract(const uint8_t *,size_t,uint64_t [8]);
 uint64_t xnu_pe_checksum(const volatile uint8_t *,size_t);
+int xnu_pe_return_valid(const uint64_t *,const uint64_t *,const struct xnu_expected *);
 int xnu_pe_valid(const struct xnu_expected *);
 int xnu_platform_valid(const struct xnu_expected *);
 int xnu_cpu_valid(const struct xnu_expected *);

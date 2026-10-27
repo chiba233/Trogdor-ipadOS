@@ -70,5 +70,11 @@ int xnu_checkpoint_complete(void) {
     probe_value("XNU boot_args verified=",(uint64_t)good);
     probe_value("XNU current EL=",((c[1]&15)==4 || (c[1]&15)==5)?1:0);
     probe_value("XNU ELR=",c[0]);probe_value("XNU args PA=",expected.args);
+    if (expected.mode==7) {
+        int boundary=xnu_pe_return_valid(c,(const uint64_t *)(uintptr_t)expected.pages,&expected);
+        probe_value("XNU return boundary verified=",(uint64_t)boundary);
+        probe_value("XNU diagnostic return=",(uint64_t)(boundary && !good));
+        return good || boundary;
+    }
     return good;
 }

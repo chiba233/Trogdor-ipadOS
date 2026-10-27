@@ -156,12 +156,37 @@ class XnuPeTests(unittest.TestCase):
             data=('Trogdor-ipadOS native phase-0 probe\n'+''.join(f'{k}=0x{v:016x}\n' for k,v in items)).encode()
             return data+bytes(8192-len(data))
         self.assertEqual(len(keys),22);self.assertEqual(read_record(record(keys.items()),xnu_pe=True)[1],keys)
+        # A diagnostic failure marker can never be accepted as a successful PE boot.
+        for extra in ([('XNU diagnostic return',1)], [('XNU return boundary verified',0)],
+                      [('XNU diagnostic return',0),('XNU diagnostic return',0)]):
+            with self.assertRaises(ValueError):read_record(record([*keys.items(),*extra]),xnu_pe=True)
+        self.assertEqual(read_record(record([*keys.items(),('XNU return boundary verified',1),
+            ('XNU diagnostic return',0)]),xnu_pe=True)[1],keys)
         for key in keys:
             for how in ('missing','zero','duplicate'):
                 items=[(k,v) for k,v in keys.items() if k!=key]
                 if how=='zero':items.append((key,0))
                 if how=='duplicate':items.extend([(key,keys[key])]*2)
                 with self.subTest(key=key,how=how),self.assertRaises(ValueError):read_record(record(items),xnu_pe=True)
+
+    def test_diagnostic_return_preserves_every_capture_and_table_gate(self):
+        from test_xnu_mmu import expected_at,tables
+        e=expected_at(0x84000000);e.mode=7;e.const_args=BASE+0x4400;e.cpu_data=BASE+0x5000
+        c=cinittests.capture(e);c[18]=0xffffffff;c[19]=e.cpu_data;c[22]=e.virt+e.pc-e.phys
+        pool=tables(e)
+        api=self.lib.xnu_pe_return_valid
+        api.argtypes=[ctypes.POINTER(ctypes.c_uint64),ctypes.POINTER(ctypes.c_uint64),ctypes.POINTER(Expected)]
+        def valid(v):return api((ctypes.c_uint64*27)(*v),pool,ctypes.byref(e))
+        self.assertEqual(valid(c),1)
+        for i in range(27):
+            bad=c.copy();bad[i]^=1
+            with self.subTest(capture=i):self.assertEqual(valid(bad),0)
+        for i in [j for j in range(8192) if pool[j]]+[8191]:
+            pool[i]^=1
+            with self.subTest(table=i):self.assertEqual(valid(c),0)
+            pool[i]^=1
+        for mode in range(1,7):
+            e.mode=mode;self.assertEqual(valid(c),0)
 
     def test_exact_source_patch_loader_and_old_six_modes(self):
         if not cinittests.SOURCE.exists():self.skipTest('optional exact source absent')

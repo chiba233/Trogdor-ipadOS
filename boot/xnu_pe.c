@@ -126,3 +126,10 @@ int xnu_pe_valid(const struct xnu_expected *e) {
         same(address(e,e->config_bits),bits,4) && same(address(e,e->debug_enabled),zero,4) &&
         same(address(e,e->degradation),factor,4);
 }
+
+/* Diagnostic return never relaxes the original capture, AT, cache or table
+   gates. A failed data check stays failed; only the bounded Linux receiver
+   becomes available after restoring the saved EL1/EL2 state. */
+int xnu_pe_return_valid(const uint64_t *capture,const uint64_t *pool,const struct xnu_expected *e) {
+    return e->mode==7 && xnu_capture_valid(capture,e) && xnu_tables_valid(pool,e);
+}

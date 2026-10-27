@@ -68,6 +68,12 @@ def read_record(data, xnu_checkpoint=False, xnu_mmu=False, xnu_highva=False, xnu
             if len(values)!=1 or int(values[0],16)!=1:
                 raise ValueError('XNU PE return incomplete: '+key)
             fields[key]=1
+        # Legacy mode7 records omit these; present diagnostic markers must be
+        # unique and consistent with a strictly successful checkpoint.
+        for key,want in (('XNU return boundary verified',1),('XNU diagnostic return',0)):
+            values=re.findall(r'^'+re.escape(key)+r'=(.*)$',text,re.M)
+            if values and (len(values)!=1 or not re.fullmatch(r'0x[0-9a-f]{16}',values[0]) or int(values[0],16)!=want):
+                raise ValueError('XNU diagnostic record is not successful: '+key)
     return text, fields
 
 
