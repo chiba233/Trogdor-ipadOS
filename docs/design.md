@@ -79,3 +79,8 @@ EL2 分支将 EL1 设置为 AArch64、关闭 stage-2 translation、允许 EL1 �
 ## 下一轮：启动 CPU 对象与原始 SIMD 初始化
 
 [CPU 数据检查点](xnu-cpu-checkpoint.md) 保留原始 cpu_data_init 叶函数，先以受控 CPACR／ISB 使能 FP，再运行原始标量与向量写入，在 PE_init_platform 前返回。只给自有 CPU 对象设置诊断哨兵，核对全部字节与边界 guard，并保留已验收的 arena 清理和 Linux 返回门。82 项主机回归与独立审查通过；本轮真机完整日志的 16 字段通过，确认原始 CPU 数据标量／SIMD 写入、哨兵／guard 核对及缓存返回成功。平台／ADT 接口、后续中断与 SMP 均待单独验收。
+
+
+## 下一轮：原始平台状态与首次 ADT 查找
+
+[平台／ADT 检查点](xnu-platform-checkpoint.md) 使用正常 CPU 初值，运行原始 PE 状态初始化和 SecureDTInit，再沿机器识别调用执行 SecureDTFindEntry，查找 arm-io 成功后 HVC。验收完整 PE／DT 全局、独立节点／游标、四层活动帧及原有 CPU／表池／AT，再按原有缓存返回路径交接 Linux。91 项主机回归与独立审查通过，外置签名镜像已全量回读；本轮硬件执行与后续平台／设备支持仍待验收。

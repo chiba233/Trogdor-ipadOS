@@ -93,3 +93,5 @@ python3 tools/sign.py build/uart/probe.itb \
 [早期 C 初始化与参数复制检查点](docs/xnu-cinit-checkpoint.md) 已通过真机日志验收：原始栈保存、完整参数复制、全局指针设置与缓存维护四个新字段及原有 11 字段全部通过，在 cpu_data_init 前返回 Linux；后续启动 CPU 数据检查点见下节，平台初始化及 ADT 消费仍待验证。
 
 [启动 CPU 数据初始化检查点](docs/xnu-cpu-checkpoint.md) 已通过真机验收：全部 16 字段有效，原始 cpu_data_init 的标量／FP/NEON 写入、完整 CPU 对象、保留哨兵与 guard 通过核对后返回 Linux。该有限检查点停在 PE_init_platform 前，不代表平台／ADT 初始化或完整系统启动。
+
+[平台入口与原生 ADT 查找检查点](docs/xnu-platform-checkpoint.md) 已通过 91 项主机回归和独立审查，外置签名镜像已全量回读，等待真机日志；它使用正常 CPU 初值，沿原始平台调用查找 arm-io，在后续 SoC 属性读取之前返回。

@@ -47,10 +47,17 @@ int xnu_checkpoint_complete(void) {
         probe_value("XNU cache line bytes=",c[25]);
         probe_value("XNU cache lines=",c[26]);
     }
-    if (expected.mode==5) {
+    if (expected.mode>=5) {
         int cpu=good && xnu_cpu_valid(&expected);
         good=good && cpu;
         probe_value("XNU CPU data verified=",(uint64_t)cpu);
+    }
+    if (expected.mode==6) {
+        int platform=good && xnu_platform_valid(&expected);
+        good=good && platform;
+        probe_value("XNU platform state verified=",(uint64_t)platform);
+        probe_value("XNU ADT binding verified=",(uint64_t)platform);
+        probe_value("XNU ADT lookup verified=",(uint64_t)platform);
     }
     probe_value("XNU checkpoint=",(uint64_t)good);
     probe_value("XNU boot_args verified=",(uint64_t)good);

@@ -108,7 +108,7 @@ def compile_wrapper(out, kernel, memory, checkpoint=None):
     assembly = out / "payload.S"
     assembly.write_text('.global LINUX_MEMORY_SIZE\n.set LINUX_MEMORY_SIZE, ' + str(memory) + '\n.section .linux, "a"\n.incbin "' + quoted + '"\n')
     if checkpoint is not None:
-        if len(checkpoint)<1152 or checkpoint[:8]!=b'TRXNUC01' or int.from_bytes(checkpoint[8:12],'little') not in (1,2,3,4,5):
+        if len(checkpoint)<1152 or checkpoint[:8]!=b'TRXNUC01' or int.from_bytes(checkpoint[8:12],'little') not in (1,2,3,4,5,6):
             raise ValueError("invalid source-XNU checkpoint payload header")
         payload_path = out / "xnu-checkpoint.bin"
         payload_path.write_bytes(checkpoint)
@@ -126,7 +126,7 @@ def compile_wrapper(out, kernel, memory, checkpoint=None):
                "-Wl,-T," + str(ROOT / ("boot/xnu-chain.ld" if checkpoint is not None else "boot/chain.ld")),
                *[str(ROOT / "boot" / name) for name in ("entry.S", "probe.c", "fdt.c", "checkpoint.c")],
                *([str(ROOT / "boot" / name) for name in
-                  ("xnu_checkpoint.c", "xnu_load.c", "xnu_memory.c", "xnu_tables.c", "xnu_cinit.c", "xnu_cpu.c")] if checkpoint is not None else []),
+                  ("xnu_checkpoint.c", "xnu_load.c", "xnu_memory.c", "xnu_tables.c", "xnu_cinit.c", "xnu_cpu.c", "xnu_platform.c")] if checkpoint is not None else []),
                str(assembly), "-o", str(elf)]
     subprocess.run(command, env=env, check=True)
     linked = elf.read_bytes()
@@ -226,7 +226,7 @@ def main():
                   "tools/sign.py", "tools/disk.py", "tools/read_probe.py")
     if a.xnu_checkpoint:
         code_files += ("boot/xnu_checkpoint.h", "boot/xnu_checkpoint.c", "boot/xnu_load.c",
-                       "boot/xnu_memory.c", "boot/xnu_tables.c", "boot/xnu_cinit.c", "boot/xnu_cpu.c", "boot/xnu-chain.ld", "tools/xnu_checkpoint.py", "tools/xnu_macho.py", "tools/xnu_cinit.py", "tools/xnu_cpu.py")
+                       "boot/xnu_memory.c", "boot/xnu_tables.c", "boot/xnu_cinit.c", "boot/xnu_cpu.c", "boot/xnu_platform.c", "boot/xnu-chain.ld", "tools/xnu_checkpoint.py", "tools/xnu_macho.py", "tools/xnu_cinit.py", "tools/xnu_cpu.py", "tools/xnu_platform.py")
     report = {"schema": 1, "xnu_checkpoint": bool(a.xnu_checkpoint), "hardware_boot_tested": False,
               "toolchain": {"zig": "0.15.2", "cpu": CPU},
               "code_sha256": {name: sha((ROOT / name).read_bytes()) for name in code_files},

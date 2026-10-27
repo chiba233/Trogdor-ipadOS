@@ -24,7 +24,8 @@
 | XNU 高虚拟地址／C 入口栈读取检查点 | 真机验收通过 | 原始 RET 与栈帧调整执行，高地址／栈读取／C 入口三个字段为 1；完整 8192 字节日志通过校验，见 docs/xnu-highva-checkpoint.md |
 | XNU 早期 C 正文／参数复制检查点 | 真机验收通过 | 完整日志的 C 正文／栈写入／参数复制／缓存维护四字段及原有 11 字段通过，完整父子帧与参数内容核对后返回 Linux；见 docs/xnu-cinit-checkpoint.md |
 | XNU 启动 CPU 数据初始化检查点 | 真机验收通过 | 完整 16 字段通过；原始标量／FP/NEON 写入后的 CPU 对象、保留哨兵和 guard 全部核对，并返回 Linux；见 docs/xnu-cpu-checkpoint.md |
-| XNU 平台初始化与 ADT 消费 | 未验证 | 新检查点在 PE_init_platform 前返回，尚未进入平台初始化或读取 ADT |
+| XNU 平台入口与首次原生 ADT 查找 | 91 项主机回归与独立审查通过，真机待验收 | 正常 CPU 初值，原始平台状态初始化与 arm-io 查找后返回；外置签名镜像已全量回读，见 docs/xnu-platform-checkpoint.md |
+| XNU 后续平台／中断／SMP 初始化 | 未验证 | 本轮仅到首次 ADT 查找返回，后续 SoC 属性、设备和中断初始化尚未进入 |
 | eMMC、触摸、GPU 与完整 iPadOS 用户态 | 未实现 | 没有原生桌面或应用运行记录 |
 
 ## 已执行的主机验证

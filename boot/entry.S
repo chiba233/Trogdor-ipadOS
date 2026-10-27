@@ -148,7 +148,7 @@ probe_call:
     mov x28, xzr
     mov x29, xzr
     cmp x10, #5
-    b.ne xnu_branch
+    b.lo xnu_branch
     /* Save above preceded this override; synchronize before the first SIMD.
        The cold path later writes the same FPEN value. */
     mov x10, #0x300000
