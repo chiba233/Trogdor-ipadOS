@@ -73,4 +73,4 @@ EL2 分支将 EL1 设置为 AArch64、关闭 stage-2 translation、允许 EL1 �
 
 ## 下一轮：早期 C 正文、完整栈与参数复制
 
-[C 初始化检查点](xnu-cinit-checkpoint.md) 放行原始 arm_init 序言和最早的 C 正文，执行完整 boot_args 复制与全局指针设置后、在 cpu_data_init 前受控返回。EL2 先清理整个 Image 自有 arena 的缓存，再关闭 EL1 M/C/I，验证完整父／子栈帧和复制数据。74 项主机回归与独立审查通过，外置签名镜像已完整回读；真机执行与脏缓存返回仍待日志验收。
+[C 初始化检查点](xnu-cinit-checkpoint.md) 放行原始 arm_init 序言和最早的 C 正文，执行完整 boot_args 复制与全局指针设置后、在 cpu_data_init 前受控返回。EL2 先清理整个 Image 自有 arena 的缓存，再关闭 EL1 M/C/I，验证完整父／子栈帧和复制数据。74 项主机回归与独立审查通过；本轮已取得完整硬件日志，15 个验收字段全部通过，确认最早 C 正文、原始栈保存、完整参数复制与缓存清理返回成功。后续 CPU／平台初始化及 ADT 消费仍待单独验收。

@@ -1,6 +1,6 @@
 # XNU C 初始化与参数复制检查点
 
-沿用直接 FIT → 源码 XNU → 受控 HVC → 原生 Linux 的既定路线。下一次检查点保留真实 arm_init 序言和最早的 C 正文，执行完整 boot_args 复制与 BootArgs 全局指针设置，在 cpu_data_init 之前返回。实现、74 项主机回归与独立审查已通过；外置签名镜像已写入并全量回读，C 正文真机执行仍待验收。
+沿用直接 FIT → 源码 XNU → 受控 HVC → 原生 Linux 的既定路线。本检查点保留真实 arm_init 序言和最早的 C 正文，执行完整 boot_args 复制与 BootArgs 全局指针设置，在 cpu_data_init 之前返回。实现、74 项主机回归与独立审查已通过；2026-10-27 已取得完整真机日志，早期 C 正文／完整栈写入／参数复制／缓存清理返回检查点通过。
 
 比较过仅放行寄存器保存、直接放行 PE_init_platform 和在参数复制后停止。选择参数复制后停止：它同时覆盖原始栈写入、memmove 的子调用栈帧和全局写入，边界明确；平台初始化与 ADT 消费留待下一轮单独验收。
 
@@ -57,6 +57,17 @@ XNU cache maintenance verified=0x0000000000000001
 
 包装 Image 文件与内存申请分别仍为 51444224／77594624 字节；Linux、47 份完整 DTB、initrd、命令行保持不变。签名／body、实际主备 GPT CRC 和内嵌容器检查通过，目标端传输哈希一致；外置介质完整 128 MiB 回读哈希匹配。没有写入固件或内置盘，没有自动重启。完整源码二进制、ADT 和原始设备记录留在忽略目录。
 
-缓存操作语义参考 [Arm DC CIVAC](https://support.arm.com/documentation/ddi0601/2026-09/AArch64-Instructions/DC-CIVAC--Data-or-unified-Cache-line-Clean-and-Invalidate-by-VA-to-PoC?lang=en)：按 VA 清理并失效到 PoC，地址可能需要翻译。本轮实际维护区间由 EL2 的链接符号给出，EL2 MMU 关闭；生成码确认整个有界循环及其前后 DSB 位于关闭 EL1 M/C/I 之前。此为主机生成码证据，尚不能代替真机脏缓存返回验收。
+缓存操作语义参考 [Arm DC CIVAC](https://support.arm.com/documentation/ddi0601/2026-09/AArch64-Instructions/DC-CIVAC--Data-or-unified-Cache-line-Clean-and-Invalidate-by-VA-to-PoC?lang=en)：按 VA 清理并失效到 PoC，地址可能需要翻译。本轮实际维护区间由 EL2 的链接符号给出，EL2 MMU 关闭；生成码确认整个有界循环及其前后 DSB 位于关闭 EL1 M/C/I 之前。生成码证据与本轮真机日志分列记录；本轮硬件确已通过该清理与恢复路径返回 Linux，不能外推至其他 C 初始化写入范围。
 
-当前待手动从原厂开发者模式启动并取得新的 Linux 日志；仅返回 Linux、黑屏或重启都不能单独证明 C 初始化成功。此模式不消费 ADT，不进入平台初始化，不代表完整 XNU 或 iPadOS 启动。
+本轮真机结果见下节。此模式不消费 ADT，不进入平台初始化，不代表完整 XNU 或 iPadOS 启动。
+
+
+## 真机验收
+
+执行源码版本 `92fe75d`；镜像 SHA-256 为 `5ce7714eacccd5e527b9b1d6e0d4ee05626e83ce1f0c069f617c9de9227ab119`。经原厂开发者模式启动后成功返回原生 Linux 6.12.42-stb-cbq+。完整 8192 字节日志通过 `read_probe.py --xnu-cinit`：原有 11 个路径／XNU／MMU 字段和四个新增字段全部唯一且满足预期，NUL 终止与零填充有效。本地私有原始记录与设备属性的独立 SHA-256 一致。
+
+独立核对确认：version=4、精确 C 复制后返回 PC、boot_args VA／PA 与块内偏移关系、源码内核／补丁内核／负载／镜像哈希以及实际构建代码清单均一致。日志中的缓存行大小为 64 字节，维护计数为 393216 行，恰好覆盖自有 24 MiB arena；本轮记录与此前高 VA 模式不同，没有以旧日志代替验收。
+
+硬件返回门通过完整 0x480 字节参数复制、BootArgs 全局指针、两个 slide 路径全局、stack guard 与完整 0xe0 字节父／子栈帧核对；同时通过精确 EL1 现场、完整 64 KiB 表池和参数／代码／栈的硬件 AT 检查。随后状态恢复并交接 Linux，确认原始 arm_init 序言、最早 C 正文、原始 memmove 与 BootArgs 设置确实执行，并在缓存清理后读回正确写入内容。
+
+此验收边界仍在 cpu_data_init 之前；完整 C 初始化、PE_init_platform、ADT 消费、平台驱动和 iPadOS 用户态尚未执行。下一阶段应单独审计 CPU 数据初始化及随后平台／ADT 接口的写入和调用范围。
