@@ -91,3 +91,5 @@ python3 tools/sign.py build/uart/probe.itb \
 [高虚拟地址与 C 入口检查点](docs/xnu-highva-checkpoint.md) 已通过真机验收：原始 RET 跳入 arm_init 高地址，完成栈帧调整与诊断读取后返回 Linux，未执行 C 初始化正文。
 
 [早期 C 初始化与参数复制检查点](docs/xnu-cinit-checkpoint.md) 已通过真机日志验收：原始栈保存、完整参数复制、全局指针设置与缓存维护四个新字段及原有 11 字段全部通过，在 cpu_data_init 前返回 Linux；后续 CPU／平台初始化及 ADT 消费仍待验证。
+
+[启动 CPU 数据初始化检查点](docs/xnu-cpu-checkpoint.md) 已通过 82 项主机回归和独立审查，外置签名镜像已全量回读，等待真机日志；它执行原始 cpu_data_init 及其 FP/NEON 写入，在 PE_init_platform 前返回。

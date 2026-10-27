@@ -9,7 +9,7 @@ static uint64_t word(const struct xnu_expected *e,uint64_t va) {
     return *(const volatile uint64_t *)(uintptr_t)(e->phys+va-e->virt);
 }
 int xnu_cinit_valid(const struct xnu_expected *e) {
-    if (e->mode!=4 || (e->phys&7) || (e->virt&7) || e->end<e->phys ||
+    if ((e->mode<4 || e->mode>5) || (e->phys&7) || (e->virt&7) || e->end<e->phys ||
         e->end-e->phys>XNU_ARENA_BYTES || (e->sp0&15) || e->sp0<16 ||
         !range(e,e->sp0-16,0xe0) || !range(e,e->const_args,0x480) ||
         !range(e,e->boot_args,8) || !range(e,e->slide,8) || !range(e,e->static_cache,1) ||
@@ -24,7 +24,7 @@ int xnu_cinit_valid(const struct xnu_expected *e) {
        child frame. x27/x28/x29 were normalized before the cold path;
        x19 was set to the C-entry LR by its audited TTBR helper sequence. */
     uint64_t frame[28]={0};
-    frame[0]=e->sp0+0xc0;frame[1]=e->virt+e->pc-e->phys-8;
+    frame[0]=e->sp0+0xc0;frame[1]=e->c_entry+0x58c;
     frame[(0x80+16)/8]=e->flags;frame[(0x88+16)/8]=e->pages;
     frame[(0x90+16)/8]=e->memory;frame[(0x98+16)/8]=e->phys;
     frame[(0xa0+16)/8]=e->virt;frame[(0xb0+16)/8]=e->args;

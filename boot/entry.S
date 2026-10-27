@@ -137,16 +137,23 @@ probe_call:
     mov x1, xzr
     mov x2, xzr
     mov x3, xzr
-    /* Mode4 makes every original C-prologue save independently checkable.
+    /* C-body modes make every original C-prologue save independently checkable.
        The pinned cold path preserves x27/x28/x29; EL2 originals are saved. */
     adrp x10, xnu_expected
     add x10, x10, :lo12:xnu_expected
     ldr x10, [x10, #56]
     cmp x10, #4
-    b.ne xnu_branch
+    b.lo xnu_branch
     mov x27, xzr
     mov x28, xzr
     mov x29, xzr
+    cmp x10, #5
+    b.ne xnu_branch
+    /* Save above preceded this override; synchronize before the first SIMD.
+       The cold path later writes the same FPEN value. */
+    mov x10, #0x300000
+    msr cpacr_el1, x10
+    isb
 xnu_branch:
     dsb sy
     br x9
@@ -320,7 +327,7 @@ xnu_checkpoint_return:
     add x11, x11, :lo12:xnu_expected
     ldr x9, [x11, #56]      /* mode, stored before XNU executes */
     cmp x9, #4
-    b.eq xnu_clean_arena
+    b.hs xnu_clean_arena
     /* Invalidate the clean stack-read line before Linux can reuse this RAM.
        EL2 translation is off, so this cache-maintenance VA is physical. */
     mrs x9, sp_el0
@@ -363,7 +370,7 @@ xnu_clean_line:
     str x12, [x10, #200]
     str x13, [x10, #208]
 7:
-    /* Mode4 has drained all audited cached stores before disabling M/C/I. */
+    /* C-body modes have drained all audited cached stores before disabling M/C/I. */
     mrs x9, sctlr_el1
     mov x11, #0x1005
     bic x9, x9, x11

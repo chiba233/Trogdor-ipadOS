@@ -23,7 +23,8 @@
 | XNU MMU 开启检查点 | 真机验收通过 | 完整 8192 字节日志确认 MMU／表池／硬件 AT 校验均成功，并返回 Linux；见 docs/xnu-mmu-checkpoint.md |
 | XNU 高虚拟地址／C 入口栈读取检查点 | 真机验收通过 | 原始 RET 与栈帧调整执行，高地址／栈读取／C 入口三个字段为 1；完整 8192 字节日志通过校验，见 docs/xnu-highva-checkpoint.md |
 | XNU 早期 C 正文／参数复制检查点 | 真机验收通过 | 完整日志的 C 正文／栈写入／参数复制／缓存维护四字段及原有 11 字段通过，完整父子帧与参数内容核对后返回 Linux；见 docs/xnu-cinit-checkpoint.md |
-| XNU 后续 C 初始化与 ADT 消费 | 未验证 | 新检查点在 cpu_data_init 前返回，未进入平台初始化或读取 ADT |
+| XNU 启动 CPU 数据初始化检查点 | 82 项主机回归与独立审查通过，真机待验收 | version=5 原始 cpu_data_init 返回后停止，逐字节核对诊断哨兵、写入值与 guard；外置签名镜像已全量回读，见 docs/xnu-cpu-checkpoint.md |
+| XNU 平台初始化与 ADT 消费 | 未验证 | 新检查点在 PE_init_platform 前返回，尚未进入平台初始化或读取 ADT |
 | eMMC、触摸、GPU 与完整 iPadOS 用户态 | 未实现 | 没有原生桌面或应用运行记录 |
 
 ## 已执行的主机验证

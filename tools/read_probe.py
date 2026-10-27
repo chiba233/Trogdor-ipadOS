@@ -7,7 +7,8 @@ import re
 DEFAULT = Path('/sys/firmware/devicetree/base/chosen/trogdor-ipados,probe-log')
 
 
-def read_record(data, xnu_checkpoint=False, xnu_mmu=False, xnu_highva=False, xnu_cinit=False):
+def read_record(data, xnu_checkpoint=False, xnu_mmu=False, xnu_highva=False, xnu_cinit=False, xnu_cpu=False):
+    xnu_cinit = xnu_cinit or xnu_cpu
     if len(data) != 8192 or b'\0' not in data:
         raise ValueError('invalid probe log capacity or missing terminator')
     text, rest = data.split(b'\0', 1)
@@ -47,6 +48,12 @@ def read_record(data, xnu_checkpoint=False, xnu_mmu=False, xnu_highva=False, xnu
             if len(values) != 1 or int(values[0], 16) != 1:
                 raise ValueError('XNU C initialization checkpoint incomplete: ' + key)
             fields[key] = 1
+    if xnu_cpu:
+        key = 'XNU CPU data verified'
+        values = re.findall(r'^' + re.escape(key) + r'=(0x[0-9a-f]{16})$', text, re.M)
+        if len(values) != 1 or int(values[0], 16) != 1:
+            raise ValueError('XNU CPU initialization checkpoint incomplete: ' + key)
+        fields[key] = 1
     return text, fields
 
 
@@ -57,10 +64,11 @@ def main():
     parser.add_argument('--xnu-mmu', action='store_true')
     parser.add_argument('--xnu-highva', action='store_true')
     parser.add_argument('--xnu-cinit', action='store_true')
+    parser.add_argument('--xnu-cpu', action='store_true')
     args = parser.parse_args()
     with args.input.open('rb') as source:
         data = source.read(8193)
-    text, _ = read_record(data, args.xnu_checkpoint, args.xnu_mmu, args.xnu_highva, args.xnu_cinit)
+    text, _ = read_record(data, args.xnu_checkpoint, args.xnu_mmu, args.xnu_highva, args.xnu_cinit, args.xnu_cpu)
     print(text, end='')
 
 
