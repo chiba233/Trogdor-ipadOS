@@ -59,18 +59,20 @@ int xnu_checkpoint_complete(void) {
         probe_value("XNU ADT binding verified=",(uint64_t)platform);
         probe_value("XNU ADT lookup verified=",(uint64_t)platform);
     }
-    if (expected.mode==7) {
+    if (expected.mode>=7) {
         int pe=good && xnu_pe_valid(&expected);
         good=good && pe;
         probe_value("XNU SoC properties verified=",(uint64_t)pe);
-        probe_value("XNU clock info verified=",(uint64_t)pe);
-        probe_value("XNU PE return verified=",(uint64_t)pe);
+        if (expected.mode==7) {
+            probe_value("XNU clock info verified=",(uint64_t)pe);
+            probe_value("XNU PE return verified=",(uint64_t)pe);
+        }
     }
     probe_value("XNU checkpoint=",(uint64_t)good);
     probe_value("XNU boot_args verified=",(uint64_t)good);
     probe_value("XNU current EL=",((c[1]&15)==4 || (c[1]&15)==5)?1:0);
     probe_value("XNU ELR=",c[0]);probe_value("XNU args PA=",expected.args);
-    if (expected.mode==7) {
+    if (expected.mode>=7) {
         int boundary=xnu_pe_return_valid(c,(const uint64_t *)(uintptr_t)expected.pages,&expected);
         probe_value("XNU return boundary verified=",(uint64_t)boundary);
         probe_value("XNU diagnostic return=",(uint64_t)(boundary && !good));

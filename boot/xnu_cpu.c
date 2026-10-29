@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 #include "xnu_checkpoint.h"
 int xnu_cpu_valid(const struct xnu_expected *e) {
-    if ((e->mode<5 || e->mode>7) || e->end<e->phys || e->end-e->phys>XNU_ARENA_BYTES || e->cpu_data<e->virt ||
+    if ((e->mode<5 || e->mode>8) || e->end<e->phys || e->end-e->phys>XNU_ARENA_BYTES || e->cpu_data<e->virt ||
         e->cpu_data-e->virt<16 || (e->cpu_data&15) || e->cpu_data-e->virt>e->end-e->phys ||
         0x510>e->end-e->phys-(e->cpu_data-e->virt) || e->rtclock<e->virt ||
         e->rtclock-e->virt>e->end-e->phys || 8>e->end-e->phys-(e->rtclock-e->virt)) return 0;

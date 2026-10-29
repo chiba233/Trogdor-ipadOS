@@ -9,8 +9,8 @@ static uint64_t word(const struct xnu_expected *e,uint64_t va) {
     return *(const volatile uint64_t *)(uintptr_t)(e->phys+va-e->virt);
 }
 int xnu_cinit_valid(const struct xnu_expected *e) {
-    uint64_t frame_sp=e->sp0+(e->mode==6?0x130u:0u);
-    if ((e->mode<4 || e->mode>7) || (e->phys&7) || (e->virt&7) || e->end<e->phys ||
+    uint64_t frame_sp=e->sp0+((e->mode==6 || e->mode==8)?0x130u:0u);
+    if ((e->mode<4 || e->mode>8) || (e->phys&7) || (e->virt&7) || e->end<e->phys ||
         e->end-e->phys>XNU_ARENA_BYTES || (frame_sp&15) || frame_sp<16 ||
         !range(e,frame_sp-16,0xe0) || !range(e,e->const_args,0x480) ||
         !range(e,e->boot_args,8) || !range(e,e->slide,8) || !range(e,e->static_cache,1) ||

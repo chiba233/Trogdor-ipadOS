@@ -90,6 +90,23 @@ int xnu_pe_contract(const uint8_t *p,size_t n,uint64_t out[8]) {
     for (unsigned i=0;i<8;i++) { if (!w.out[i]) return 0;out[i]=w.out[i]; }
     return 1;
 }
+/* Independently rescan the prevalidated node; never trust an offset supplied
+   by the packer without checking its real property header and bounds. */
+uint64_t xnu_soc_ranges_offset(const uint8_t *p,size_t n,uint64_t node) {
+    if (node>n || n-node<8) return 0;
+    unsigned count=u32(p+node);uint64_t at=node+8;
+    if (!count || count>32) return 0;
+    for (unsigned i=0;i<count;i++) {
+        if (at>n || n-at<36) return 0;
+        uint64_t bytes=u32(p+at+32),value=at+36,padded=(bytes+3)&~3ull;
+        if (padded>n-value) return 0;
+        const char key[]="ranges";int match=1;
+        for (unsigned j=0;j<32;j++) if (p[at+j]!=(j<sizeof(key)?(uint8_t)key[j]:0)) match=0;
+        if (match) return bytes==24?value:0;
+        at=value+padded;
+    }
+    return 0;
+}
 uint64_t xnu_pe_checksum(const volatile uint8_t *p,size_t n) {
     uint64_t h=14695981039346656037ull;
     for (size_t i=0;i<n;i++) h=(h^p[i])*1099511628211ull;
@@ -108,20 +125,23 @@ static int same(const volatile uint8_t *p,const uint8_t *q,unsigned n) {
     return 1;
 }
 int xnu_pe_valid(const struct xnu_expected *e) {
-    if (e->mode!=7 || !range(e,e->tree,e->tree_size) || !range(e,e->soc_data,48) ||
+    if ((e->mode!=7 && e->mode!=8) || !range(e,e->tree,e->tree_size) || !range(e,e->soc_data,48) ||
         !range(e,e->pe_info,0x208) || !range(e,e->config_bits,4) ||
         !range(e,e->debug_enabled,4) || !range(e,e->degradation,4) ||
         (e->soc_data&7) || (e->pe_info&7) || (e->config_bits&3) || (e->debug_enabled&3) || (e->degradation&3)) return 0;
     const uint8_t *tree=address(e,e->tree);uint64_t v[8];
     if (!xnu_pe_contract(tree,e->tree_size,v) || xnu_pe_checksum(tree,e->tree_size)!=e->adt_checksum) return 0;
-    uint8_t soc[48]={0},info[0x208]={0},bits[4]={3},zero[4]={0},factor[4]={1};
+    uint8_t soc[48]={0},info[0x208]={0},bits[4]={0},zero[4]={0},factor[4]={1};
     put(soc,e->soc_data+8);put(soc+40,v[4]);
     for (uint64_t i=0;i<v[3];i++) soc[8+i]=tree[v[2]+i];
+    if (e->mode==7) {
+    bits[0]=3;
     for (uint64_t i=0;i<v[1];i++) info[0x110+i]=tree[v[0]+i];
     /* Independent byte model of the original missing-frequency branch.
        UDIV 0/0 yields zero on AArch64; no hardware clock programming occurs. */
     put(info+0x140+0x10,v[5]);put(info+0x140+0x20,1);put(info+0x140+0x30,2);
     put(info+0x140+0x38,1);put(info+0x140+0x48,v[5]);
+    }
     return same(address(e,e->soc_data),soc,sizeof(soc)) && same(address(e,e->pe_info),info,sizeof(info)) &&
         same(address(e,e->config_bits),bits,4) && same(address(e,e->debug_enabled),zero,4) &&
         same(address(e,e->degradation),factor,4);
@@ -131,5 +151,5 @@ int xnu_pe_valid(const struct xnu_expected *e) {
    gates. A failed data check stays failed; only the bounded Linux receiver
    becomes available after restoring the saved EL1/EL2 state. */
 int xnu_pe_return_valid(const uint64_t *capture,const uint64_t *pool,const struct xnu_expected *e) {
-    return e->mode==7 && xnu_capture_valid(capture,e) && xnu_tables_valid(pool,e);
+    return (e->mode==7 || e->mode==8) && xnu_capture_valid(capture,e) && xnu_tables_valid(pool,e);
 }

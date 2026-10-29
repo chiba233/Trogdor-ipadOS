@@ -87,7 +87,7 @@ class Handoff(ctypes.Structure):
 
 
 class Expected(ctypes.Structure):
-    _fields_ = [(key, ctypes.c_uint64) for key in ('pc','args','virt','phys','memory','pages','flags','mode','tcr','mair','vbar','sp0','sp1','end','c_entry','const_args','boot_args','slide','static_cache','guard','cpu_data','rtclock','pe_state','protection','dt_root','dt_cursor','pe_init','identify','soc','node','cursor','tree','tree_size','soc_data','pe_info','config_bits','debug_enabled','degradation','adt_checksum')]
+    _fields_ = [(key, ctypes.c_uint64) for key in ('pc','args','virt','phys','memory','pages','flags','mode','tcr','mair','vbar','sp0','sp1','end','c_entry','const_args','boot_args','slide','static_cache','guard','cpu_data','rtclock','pe_state','protection','dt_root','dt_cursor','pe_init','identify','soc','node','cursor','tree','tree_size','soc_data','pe_info','config_bits','debug_enabled','degradation','adt_checksum','soc_ranges','soc_base')]
 
 
 class XnuCheckpointTests(unittest.TestCase):

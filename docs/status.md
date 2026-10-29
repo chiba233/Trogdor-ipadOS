@@ -25,7 +25,8 @@
 | XNU 早期 C 正文／参数复制检查点 | 真机验收通过 | 完整日志的 C 正文／栈写入／参数复制／缓存维护四字段及原有 11 字段通过，完整父子帧与参数内容核对后返回 Linux；见 docs/xnu-cinit-checkpoint.md |
 | XNU 启动 CPU 数据初始化检查点 | 真机验收通过 | 完整 16 字段通过；原始标量／FP/NEON 写入后的 CPU 对象、保留哨兵和 guard 全部核对，并返回 Linux；见 docs/xnu-cpu-checkpoint.md |
 | XNU 平台入口与首次原生 ADT 查找 | 真机验收通过 | 完整 19 字段通过；正常 CPU 初值、PE／DT 全局、原生 arm-io 查找、独立节点／游标及完整活动栈帧核对后返回 Linux，见 docs/xnu-platform-checkpoint.md |
-| XNU 完整早期平台返回 | 首轮黑屏，未取得日志；诊断对照已通过 99 项主机回归、独立审查及介质全量回读，待手动启动 | 停止位置未确认；保留原始 XNU 路径与严格捕获／完整页表门限，允许数据校验失败时返回 Linux 取日志，不算验收通过；见 docs/xnu-pe-checkpoint.md |
+| XNU 完整早期平台返回 | 首轮与诊断对照均黑屏，未取得日志 | 停止位置未确认；保留原始 XNU 路径与严格捕获／完整页表门限，允许数据校验失败时返回 Linux 取日志，不算验收通过；见 docs/xnu-pe-checkpoint.md |
+| XNU SoC 属性诊断中点 | 106 项主机回归、实际指令主机对照和介质全量回读通过；真机待验收 | 完整平台路径故障二分，保留严格捕获／页表门与四层活动帧；只要求 20 字段，见 docs/xnu-soc-checkpoint.md |
 | XNU 后续平台／中断／SMP 初始化 | 未验证 | 本轮仅到首次 ADT 查找返回，后续 SoC 属性、设备和中断初始化尚未进入 |
 | eMMC、触摸、GPU 与完整 iPadOS 用户态 | 未实现 | 没有原生桌面或应用运行记录 |
 

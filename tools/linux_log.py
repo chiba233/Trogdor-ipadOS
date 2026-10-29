@@ -108,7 +108,7 @@ def compile_wrapper(out, kernel, memory, checkpoint=None):
     assembly = out / "payload.S"
     assembly.write_text('.global LINUX_MEMORY_SIZE\n.set LINUX_MEMORY_SIZE, ' + str(memory) + '\n.section .linux, "a"\n.incbin "' + quoted + '"\n')
     if checkpoint is not None:
-        if len(checkpoint)<1152 or checkpoint[:8]!=b'TRXNUC01' or int.from_bytes(checkpoint[8:12],'little') not in (1,2,3,4,5,6,7):
+        if len(checkpoint)<1152 or checkpoint[:8]!=b'TRXNUC01' or int.from_bytes(checkpoint[8:12],'little') not in (1,2,3,4,5,6,7,8):
             raise ValueError("invalid source-XNU checkpoint payload header")
         payload_path = out / "xnu-checkpoint.bin"
         payload_path.write_bytes(checkpoint)
@@ -226,7 +226,7 @@ def main():
                   "tools/sign.py", "tools/disk.py", "tools/read_probe.py")
     if a.xnu_checkpoint:
         code_files += ("boot/xnu_checkpoint.h", "boot/xnu_checkpoint.c", "boot/xnu_load.c",
-                       "boot/xnu_memory.c", "boot/xnu_tables.c", "boot/xnu_cinit.c", "boot/xnu_cpu.c", "boot/xnu_platform.c", "boot/xnu_pe.c", "boot/xnu-chain.ld", "tools/xnu_checkpoint.py", "tools/xnu_macho.py", "tools/xnu_cinit.py", "tools/xnu_cpu.py", "tools/xnu_platform.py", "tools/xnu_pe.py")
+                       "boot/xnu_memory.c", "boot/xnu_tables.c", "boot/xnu_cinit.c", "boot/xnu_cpu.c", "boot/xnu_platform.c", "boot/xnu_pe.c", "boot/xnu-chain.ld", "tools/xnu_checkpoint.py", "tools/xnu_macho.py", "tools/xnu_cinit.py", "tools/xnu_cpu.py", "tools/xnu_platform.py", "tools/xnu_pe.py", "tools/xnu_soc.py")
     report = {"schema": 1, "xnu_checkpoint": bool(a.xnu_checkpoint), "hardware_boot_tested": False,
               "toolchain": {"zig": "0.15.2", "cpu": CPU},
               "code_sha256": {name: sha((ROOT / name).read_bytes()) for name in code_files},

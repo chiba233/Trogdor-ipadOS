@@ -18,7 +18,7 @@ static int frame(const struct xnu_expected *e,uint64_t va,const uint64_t *want,u
 }
 int xnu_platform_valid(const struct xnu_expected *e) {
     uint64_t below=e->mode==7?0xf30u:0xe00u;
-    if ((e->mode!=6 && e->mode!=7) || e->end<e->phys || e->end-e->phys>XNU_ARENA_BYTES ||
+    if ((e->mode<6 || e->mode>8) || e->end<e->phys || e->end-e->phys>XNU_ARENA_BYTES ||
         e->sp0<below || (e->sp0&15) || !range(e,e->sp0-below,4096) ||
         !range(e,e->pe_state,0xb0) || (e->pe_state&7) || !range(e,e->protection,4) ||
         !range(e,e->dt_root,28) || !range(e,e->dt_cursor,8) || (e->dt_root&7) || (e->dt_cursor&7) ||
@@ -38,6 +38,12 @@ int xnu_platform_valid(const struct xnu_expected *e) {
     /* Complete active SoC, identify and PE frames. Retired recursive frames
        below SP are allowed; their maximum extent was bounded by the input. */
     uint64_t soc[8]={0},identify[22]={0},pe[8]={0};
+    if (e->mode==8) {
+        uint64_t properties[8];
+        if (!xnu_pe_contract((const uint8_t *)address(e,e->tree),(size_t)e->tree_size,properties) ||
+            !e->soc_ranges || e->soc_ranges!=xnu_soc_ranges_offset((const uint8_t *)address(e,e->tree),(size_t)e->tree_size,e->node)) return 0;
+        soc[0]=e->tree+properties[2];soc[1]=24ull<<32;soc[2]=e->tree+e->soc_ranges;
+    }
     soc[3]=e->tree+e->node;soc[5]=e->const_args;soc[6]=e->sp0+0xe0;soc[7]=e->identify+0x24;
     identify[0x68/8]=e->pages;identify[0x70/8]=e->memory;identify[0x78/8]=e->phys;
     identify[0x80/8]=e->virt;identify[0x98/8]=e->const_args;
