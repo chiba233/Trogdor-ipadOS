@@ -54,3 +54,14 @@ python3 tools/qemu_probe.py --qemu path/to/qemu-system-aarch64 \
 普通测试不自动安装 QEMU。真实目标仍为原厂启动链上的原生执行；修复后的同一 version10 BRK 负载应重新验收，随后再运行 version9 定位后续路径。
 
 修复后的同负载 version10 已完成目标端签名／传输验证及全部 128 MiB 介质写入、同步和完整回读，摘要见 [本轮准备记录](hardware-tests.md)。尚未手动启动验收。
+
+
+## 2026-10-30：主动同步异常通道已真机验收
+
+修复代码 `93c9e22` 的同负载 version10 沿已全量回读的外置介质手动启动，原生 Linux 收到完整 8192 字节 probe-log。严格诊断读取的 46 项必需字段唯一且一致；精确 BRK 位置、预期 ESR、SP0 同步向量首条 HVC 和原始 EL1t／捕获 EL1h 模式均匹配。完整表池与独立诊断传输门通过，64 字节缓存行 × 393216 行覆盖整个 24 MiB arena，状态恢复后交接原生 Linux。独立核对清单／负载的虚实布局、参数、页表地址和 AT 结果；设备树属性与私有副本重复读取摘要一致。
+
+预期结果为 reason=1、fault received=1、transport verified=1、table pool verified=1、checkpoint=0、diagnostic return=1、capture verified=0；最后三项是故障对照的正确失败状态，不能视作 SoC／平台数据成功。该轮证明真实同步异常经过诊断门返回 Linux；version9 的正常 SoC 路径、其他故障种类及完整平台／系统启动仍待分别验证。历史无日志轮次的精确停止位置仍未知。
+
+下一份 version9 使用同一包装器与源内核／ADT，仅把 version10 的主动 BRK 恢复为原 MOV 并变更版本标签，保留两处同步向量 HVC 与 SoC 中点 HVC。成功时必须同时通过诊断读取和全部 20 个严格 SoC 字段；失败记录仅用于定位，不能据 Linux 返回就报告 SoC 通过。
+
+上述 version9 已完成签名／传输校验与全部 128 MiB 介质写入、同步和完整回读；实际 SoC 路径仍待手动真机验收，摘要见 [本轮准备记录](hardware-tests.md)。

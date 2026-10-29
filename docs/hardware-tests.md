@@ -407,3 +407,23 @@ version10 镜像 SHA-256 `f52001559f29faab8071f731106ae1e0fc3d87b33ee5529eba2824
 再次核对既有可清空外置 USB 的 removable／容量，排除当前 root／boot／swap 后，以固定镜像哈希的私有写入器独占打开介质。全部 128 MiB 写入、同步与完整回读完成，摘要与修复镜像一致。没有写固件或内置盘，没有自动重启；没有公开原始设备数据、私有地址或写入工具。
 
 本节仅证明修复介质准备完成。待手动启动后，用 `read_probe.py --xnu-diagnostic` 和本轮清单核对精确 BRK 现场，预期仍为 reason=1、fault received=1、checkpoint=0、diagnostic return=1，传输与完整页表门通过。此对照的真机异常回收以及后续 version9／完整平台成功均尚未验收。
+
+
+## 2026-10-30：version10 主动同步异常通道真机通过
+
+运行时代码与准备记录 `93c9e22`，镜像 SHA-256 `9bfd2071c48fa77c8f079fec42c1eaf196881001d9f00ee3e2460b5a93d1e7f4`。沿已全量回读的外置介质手动启动后返回原生 Linux，设备树提供完整 8192 字节 probe-log。日志头、终止符与零填充有效，严格诊断读取器的 46 个必需字段唯一且一致；设备属性与私有副本的独立重复读取摘要匹配，没有公开原始记录或其摘要。目标端保存的镜像／容器／读取器与本轮清单和主机文件一致。
+
+精确 BRK 指令与故障 PC、预期 ESR、SP0 同步向量 HVC、原始 EL1t 和捕获 EL1h 状态相符。结果 reason=1、fault received=1、diagnostic transport verified=1、table pool verified=1；64 字节缓存行 × 393216 行覆盖完整 24 MiB arena。独立检查确认捕获的虚实内存布局、参数／页表位置、TCR／MAIR／VBAR、AT 结果和边界栈状态与该清单／负载一致，状态恢复后完成原生 Linux 交接。
+
+checkpoint=0、diagnostic return=1、capture verified=0 符合主动故障对照；普通 CPU／PE／SoC 成功字段不会因故障传输而通过。因此本轮仅验收同步异常回收通道，不验收 SoC 属性或完整平台函数，也不据此确定此前每轮黑屏的精确停止位置。读取并保存本轮证据时没有写介质或自动重启；下一份 version9 的介质准备另外记录。
+
+
+## 2026-10-30：version9 实际 SoC 路径诊断介质准备
+
+在 version10 主动异常通道验收后，准备 version9，继续原始 SoC 属性读取／缓存写入路径，在既定 SoC 中点返回。未修改 `93c9e22` 的运行时代码；实际 Image 在负载区之外与本轮已验收 version10 逐字节相同。负载仅变更版本标签、把主动 BRK 恢复为原 MOV，保留两处同步向量 HVC 与原 SoC 中点 HVC；当前打包器从固定源码／ADT 重建出的字节与输入一致。该 version9 已有相同源码和负载的 TCG 严格 20 字段结果，仍只算主机证据。没有运行时代码或测试变更，本次未重复运行此前通过的 118 项回归。
+
+version9 payload SHA-256 `4a105ea36986bdeeb5a7b91acc7d29237d7231fe774130f1db1673792a5560b4`，镜像 SHA-256 `649fcee53bb78b4eb3c7d62a2fefb770bd58b2c4c4d62ee3eda29965b4950c58`，签名容器 SHA-256 `6a49aba9e1526501bc72063c365aa60763e4098ba4bb67abf8f8def71b73cbdc`。最终源码／产物清单、ELF 导出字节、完整内嵌负载、12 个实际 C 对象的重定位审计、7142 条指令／14 段标量约束、74 MiB 内存布局、Linux／47 份 DTB／initrd／命令行、实际主备 GPT CRC／分区属性／容器及独立审查均通过。
+
+主机与目标端 vboot 签名／body 和传输摘要验证通过。再次确认既有可清空 USB 的 removable／容量并排除 root／boot／swap 后，以固定哈希私有写入器独占打开介质，完成全部 128 MiB 写入、同步与完整回读，摘要与本 version9 镜像一致。没有写固件或内置盘，没有自动重启。
+
+本节仅证明 version9 介质准备完成，尚未取得其真机运行记录。手动启动后的成功要求严格诊断读取通过，并同时满足全部 20 个 SoC 字段、reason=0、checkpoint=1、fault received=0、diagnostic return=0 及清单／精确停止点核对；其他诊断结果只表示回收失败现场。完整平台返回和完整系统启动继续未验收。
