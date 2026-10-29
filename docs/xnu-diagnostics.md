@@ -65,3 +65,10 @@ python3 tools/qemu_probe.py --qemu path/to/qemu-system-aarch64 \
 下一份 version9 使用同一包装器与源内核／ADT，仅把 version10 的主动 BRK 恢复为原 MOV 并变更版本标签，保留两处同步向量 HVC 与 SoC 中点 HVC。成功时必须同时通过诊断读取和全部 20 个严格 SoC 字段；失败记录仅用于定位，不能据 Linux 返回就报告 SoC 通过。
 
 上述 version9 已完成签名／传输校验与全部 128 MiB 介质写入、同步和完整回读；实际 SoC 路径仍待手动真机验收，摘要见 [本轮准备记录](hardware-tests.md)。
+
+
+## 2026-10-30：version9 正常 SoC 路径已真机验收
+
+继 version10 主动异常后，version9 沿真实属性读取和缓存写入路径到达预期中点，完整硬件日志通过 46 项诊断必需字段及全部 20 个严格 SoC 字段：reason=0、checkpoint=1、fault received=0、capture verified=1、table pool verified=1、transport verified=1、diagnostic return=0。四个异常寄存器全零，精确正常 HVC、参数／寄存器、完整表池、硬件 AT 和缓存覆盖与清单一致，状态恢复后返回原生 Linux。该轮仅验收 SoC 属性中点，完整 PE 函数返回仍未验证，详见 [硬件记录](hardware-tests.md)。
+
+后续复用已审计的原始 version7 完整 PE 负载；该版本保留原生同步向量，并使用既有完整捕获／表池门后的返回策略，读取须通过全部 22 个 PE 字段。version9／10 的原始异常 46 字段不能自动套用到 version7。主机 `qemu_probe.py` 已增加 version7 严格 PE 读取分支，完整 PE 的 22 字段及 mode6／9／10 回归通过；板级准入、真实日志导出、Linux 启动与物理缓存仍不属于主机模型证据。

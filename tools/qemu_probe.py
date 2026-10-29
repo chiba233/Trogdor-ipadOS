@@ -33,8 +33,8 @@ def main():
     if len(data) < 16 or data[:8] != b'TRXNUC01':
         parser.error('unrecognized source-XNU payload')
     version = struct.unpack_from('<I', data, 8)[0]
-    if version not in (6, 9, 10):
-        parser.error('this system regression accepts platform6 or diagnostic9/10 only')
+    if version not in (6, 7, 9, 10):
+        parser.error('this system regression accepts platform6, PE7 or diagnostic9/10 only')
     if args.load_address % 0x200000 or not 0x40200000 <= args.load_address <= 0x58000000:
         parser.error('load address must be 2-MiB aligned inside modeled RAM, above the QEMU DTB')
     out.mkdir(parents=True)
@@ -88,8 +88,11 @@ def main():
     if len(log) >= 8192:
         raise ValueError('modeled log exceeds receiver capacity')
     record = log.ljust(8192, b'\0')
-    _, fields = read_record(record, xnu_platform=True) if version == 6 else read_diagnostic_record(record)
-    if version != 6 and fields['XNU payload version'] != version:
+    if version in (6, 7):
+        _, fields = read_record(record, xnu_platform=version == 6, xnu_pe=version == 7)
+    else:
+        _, fields = read_diagnostic_record(record)
+    if version in (9, 10) and fields['XNU payload version'] != version:
         raise ValueError('runtime diagnostic version differs from requested payload')
     if version == 9:
         read_record(record, xnu_soc=True)

@@ -427,3 +427,25 @@ version9 payload SHA-256 `4a105ea36986bdeeb5a7b91acc7d29237d7231fe774130f1db1673
 主机与目标端 vboot 签名／body 和传输摘要验证通过。再次确认既有可清空 USB 的 removable／容量并排除 root／boot／swap 后，以固定哈希私有写入器独占打开介质，完成全部 128 MiB 写入、同步与完整回读，摘要与本 version9 镜像一致。没有写固件或内置盘，没有自动重启。
 
 本节仅证明 version9 介质准备完成，尚未取得其真机运行记录。手动启动后的成功要求严格诊断读取通过，并同时满足全部 20 个 SoC 字段、reason=0、checkpoint=1、fault received=0、diagnostic return=0 及清单／精确停止点核对；其他诊断结果只表示回收失败现场。完整平台返回和完整系统启动继续未验收。
+
+
+## 2026-10-30：version9 SoC 属性中点真机通过
+
+运行时代码 `93c9e22`、准备记录 `3e72b91`，镜像 SHA-256 `649fcee53bb78b4eb3c7d62a2fefb770bd58b2c4c4d62ee3eda29965b4950c58`。沿已全量回读介质手动启动后，原生 Linux 收到完整 8192 字节日志，头／终止符／零填充有效；46 个诊断必需字段及全部 20 个严格 SoC 字段唯一且通过。实时设备树属性与私有副本的独立重复读取摘要一致，目标保存的镜像／容器／读取器和主机清单匹配；没有公开原始记录或其摘要。
+
+version9 的结果为 reason=0、checkpoint=1、fault received=0、capture verified=1、table pool verified=1、diagnostic transport verified=1、diagnostic return=0，四个原始异常寄存器为零。精确 SoC 中点 HVC、原始 ADT 边界 MOV、参数／CPU／PE／DT／SoC 数据及四层活动帧符合预期；独立核对 SoC 基址与真实 ADT ranges、TCR／MAIR／VBAR／页表、虚实地址与硬件 AT、栈状态和返回地址，缓存行 64 字节 × 393216 行覆盖完整 24 MiB arena。恢复状态后成功交接原生 Linux。
+
+这确认原生 SoC 属性读取与缓存写入、完整验证及正常返回，没有访问 SoC MMIO；SoC 中点之后的 CPU／时钟／型号／调试工作、完整 PE 返回和设备支持仍需分别验证。历史 version8 黑屏尝试不据此改记成功。保存证据期间没有写介质或自动重启；后续完整 PE 的介质准备另外记录。
+
+
+## 2026-10-30：修复包装器后的完整 PE 返回介质准备
+
+在 version9 SoC 属性中点真机验收后，回到此前已审计的 version7 完整 PE 返回负载。原 payload SHA-256 `b2e73dfbfdae5ce5033ea8bf24de37ef0981a9fff00315e5b6ffda5d0775683f` 与首轮逐字节相同，当前打包器从固定源码／ADT 重新生成的字节也完全一致；运行时 C 代码沿用 `93c9e22` 的修复，不增加执行阶段或放松返回门。保留原生 EL1 同步向量，停止于完整 PE_init_platform(FALSE) 的原有返回点，尚不进入 timer／设备初始化。
+
+主机系统工具只增加 version7 的严格 22 字段读取分支。完整 PE 的 22 字段与 mode6／9／10 系统 CPU 模型回归均通过，独立核对报告与当前源码、输入负载匹配；板级准入／日志导出／Linux 入口为桩，物理缓存与真机结果继续单独验收。本轮没有修改运行时代码或普通回归用例，未重复此前通过的 118 项完整测试。
+
+镜像 SHA-256 `a4453bb9c721dd26e6d7035a1459dc7c0e9b8753e4c629a4354e7ced49278046`，签名容器 SHA-256 `3a6393dba5708dca5a246d5886617b98411981c4194a1038b04bcd21045e5dff`。最终源码／产物摘要、ELF 导出与 Image、原样完整负载、12 个 C 对象重定位审计、7142 条指令／14 段标量约束、74 MiB 内存布局、Linux／47 份 DTB／initrd／命令行、实际主备 GPT CRC／分区属性／容器及独立审查通过。主机与目标端 vboot 签名／body、传输摘要一致。
+
+再次核对既有可清空 USB 的 removable／容量，排除 root／boot／swap 后，以固定哈希私有写入器独占打开介质，完成全部 128 MiB 写入、同步与完整回读，摘要与本镜像一致。没有写固件或内置盘，没有自动重启。
+
+本节仅证明完整 PE 介质准备完成，尚未取得本镜像的真机运行日志。成功须通过 `read_probe.py --xnu-pe` 的全部 22 字段及本轮清单、精确返回 PC／参数核对；失败诊断不能算完整平台通过。当前缺失频率仍按受限 ADT 合约保留为零，clock info 字段不表示硬件时钟已配置，完整系统启动也仍未验收。
