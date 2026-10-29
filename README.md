@@ -96,8 +96,8 @@ python3 tools/sign.py build/uart/probe.itb \
 
 [平台入口与原生 ADT 查找检查点](docs/xnu-platform-checkpoint.md) 已通过真机验收：完整 19 字段有效，正常 CPU 初值、原始平台状态与 ADT 绑定、原生 arm-io 查找及活动栈帧均通过核对后返回 Linux。检查点仍在后续 SoC 属性读取之前，后续平台／设备初始化与完整系统启动尚未验证。
 
-[完整早期平台返回检查点](docs/xnu-pe-checkpoint.md) 已实现并通过主机回归与独立审查；首轮持续黑屏，尚未取得真机日志，诊断返回对照也持续黑屏且没有恢复日志，停止位置仍未知。它合并 SoC 属性、CPU／时钟数据、型号与调试配置，并在完整 PE_init_platform(FALSE) 返回后停止；现有 ADT 缺失的总线／CPU 频率如实保持零，不代表时钟驱动已支持。
+[完整早期平台返回检查点](docs/xnu-pe-checkpoint.md) 已通过真机 22 个严格字段：完整 PE_init_platform(FALSE) 返回、SoC／型号／时钟结构／调试配置、父帧与缓存／页表返回均通过，随后进入 Linux。当前 ADT 缺失的总线／CPU 频率仍为零，clock info 只验证结构内容，不代表时钟驱动已支持。下一段 WFE／CPU 拓扑／线程／VM 的依赖和恢复契约见 [后续审计](docs/post-pe-audit.md)。
 
 [SoC 属性诊断中点](docs/xnu-soc-checkpoint.md) 已由 version9 的真机日志验收：原始属性读取与缓存写入、全部 20 个严格字段、完整捕获／页表／硬件 AT 与缓存返回通过，随后交接 Linux。此前 version8 的无日志尝试保留为失败历史；本轮不覆盖后续 CPU／时钟／型号／调试配置或 SoC MMIO。
 
-[同步异常与返回失败诊断](docs/xnu-diagnostics.md) 在修复包装器的绝对字符串指针缺陷后，已取得真机完整 BRK 异常记录并返回 Linux：精确故障位置／ESR、完整页表池与诊断传输均通过。此轮只验收异常回收通道，主动故障的 checkpoint=0 符合设计；随后 version9 的真实 SoC 属性路径也通过全部 20 个严格字段并正常返回 Linux。完整平台返回与系统启动仍待验收，时钟／设备驱动尚未支持；主机验证证据单独保留。
+[同步异常与返回失败诊断](docs/xnu-diagnostics.md) 在修复包装器的绝对字符串指针缺陷后，已取得真机完整 BRK 异常记录并返回 Linux：精确故障位置／ESR、完整页表池与诊断传输均通过。此轮只验收异常回收通道，主动故障的 checkpoint=0 符合设计；随后 version9 的真实 SoC 属性路径也通过全部 20 个严格字段并正常返回 Linux。完整早期 PE 返回已在随后单独验收；完整系统启动、时钟／设备驱动仍未支持，主机验证证据单独保留。

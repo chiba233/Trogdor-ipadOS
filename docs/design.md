@@ -112,3 +112,6 @@ EL2 分支将 EL1 设置为 AArch64、关闭 stage-2 translation、允许 EL1 �
 
 
 2026-10-30 version9 的正常 SoC 属性路径取得完整硬件日志，严格诊断字段及全部 20 个 SoC 字段通过，reason=0、checkpoint=1、fault=0，精确停止点、捕获／表池／硬件 AT／缓存与 Linux 返回均匹配。下一轮复用此前已审计的原始 version7 负载，使用修复后的同一包装器完成完整 PE 返回检查；主机系统工具增加该版本的严格 22 字段分支，未改变运行时或返回门。
+
+
+2026-10-30 修复包装器的 version7 原负载取得完整真机日志，全部 22 个严格字段、精确完整 PE 返回 PC、正常 boundary=1／diagnostic return=0 及缓存覆盖通过并交接 Linux。既有前 VM 平台阶段已验收；推进到后续 WFE 会修改尚未纳入恢复快照的 CNTKCTL_EL1，先完成 [后续状态／依赖审计](post-pe-audit.md)，再设计下一份镜像。

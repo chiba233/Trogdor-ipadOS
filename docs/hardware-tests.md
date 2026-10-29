@@ -449,3 +449,12 @@ version9 的结果为 reason=0、checkpoint=1、fault received=0、capture verif
 再次核对既有可清空 USB 的 removable／容量，排除 root／boot／swap 后，以固定哈希私有写入器独占打开介质，完成全部 128 MiB 写入、同步与完整回读，摘要与本镜像一致。没有写固件或内置盘，没有自动重启。
 
 本节仅证明完整 PE 介质准备完成，尚未取得本镜像的真机运行日志。成功须通过 `read_probe.py --xnu-pe` 的全部 22 字段及本轮清单、精确返回 PC／参数核对；失败诊断不能算完整平台通过。当前缺失频率仍按受限 ADT 合约保留为零，clock info 字段不表示硬件时钟已配置，完整系统启动也仍未验收。
+
+
+## 2026-10-30：version7 完整早期 PE 返回真机通过
+
+运行时代码 `93c9e22`、准备记录 `c1adc3c`，镜像 SHA-256 `a4453bb9c721dd26e6d7035a1459dc7c0e9b8753e4c629a4354e7ced49278046`。沿已完整回读的外置介质手动启动，原生 Linux 收到完整 8192 字节 probe-log；日志头／终止符／零填充有效，全部 22 个 PE 必需字段唯一且通过。实时属性与私有副本重复读取摘要匹配；目标保存的镜像／签名容器／读取器与本轮清单一致。原始记录及其摘要继续私有。
+
+原样 version7 payload 的完整 PE 返回 HVC／ELR、参数虚实关系和自有 arena 对齐布局匹配；全部 CPU／PE／DT／SoC／时钟结构／型号／调试配置／活动父帧、完整表池和硬件 AT 验证通过，64 字节缓存行 × 393216 行覆盖全部 24 MiB arena。checkpoint=1、return boundary verified=1、diagnostic return=0，恢复状态后完成原生 Linux 交接。独立核对支持这次受限 PE_init_platform(FALSE) 调用成功，不包含 version9／10 的原始异常 46 字段。
+
+缺失频率依旧按当前 ADT 合约为零，clock info 不是时钟驱动验收；timer／WFE、CPU 拓扑／线程／VM、中断／SMP 和完整系统启动仍未验证。此前无日志轮次仍无法确定精确停止位置。此次仅读取／保存证据，没有改写介质或自动重启，也没有生成新的真机测试镜像；下一阶段的源码与生成码依赖见 [后续审计](post-pe-audit.md)。本轮未修改运行时代码或测试，没有重复运行已有主机回归。
