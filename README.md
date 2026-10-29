@@ -98,4 +98,4 @@ python3 tools/sign.py build/uart/probe.itb \
 
 [完整早期平台返回检查点](docs/xnu-pe-checkpoint.md) 已实现并通过主机回归与独立审查；首轮持续黑屏，尚未取得真机日志，诊断返回对照也持续黑屏且没有恢复日志，停止位置仍未知。它合并 SoC 属性、CPU／时钟数据、型号与调试配置，并在完整 PE_init_platform(FALSE) 返回后停止；现有 ADT 缺失的总线／CPU 频率如实保持零，不代表时钟驱动已支持。
 
-[SoC 属性诊断中点](docs/xnu-soc-checkpoint.md) 将未确认路径二分，停在原始属性读取与缓存写入完成处；完整主机回归和实际指令主机对照通过，真机仍待独立验收。
+[SoC 属性诊断中点](docs/xnu-soc-checkpoint.md) 将未确认路径二分，停在原始属性读取与缓存写入完成处；完整主机回归和实际指令主机对照通过；真机仍黑屏且没有日志，下一轮先用当前包装器回放已验收的原样 mode6 负载。
