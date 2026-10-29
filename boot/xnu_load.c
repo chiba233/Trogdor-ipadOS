@@ -21,8 +21,8 @@ int xnu_load(const uint8_t *p, size_t len, void *window, size_t capacity,
              struct xnu_expected *expected) {
     const char magic[]="TRXNUC01";
     out->entry=out->args=0;
-    if (len<HEADER || (le32(p+8)<1 || le32(p+8)>8)) return 0;
-    uint32_t mode=le32(p+8);
+    if (len<HEADER || (le32(p+8)<1 || le32(p+8)>10)) return 0;
+    uint32_t version=le32(p+8),mode=version>=9?8:version;
     for (unsigned i=0;i<8;i++) if (p[i]!=(uint8_t)magic[i]) return 0;
     uint32_t count=le32(p+12);
     if (!count || count>64 || !bounded(HEADER,(uint64_t)count*40,len)) return 0;
@@ -119,6 +119,8 @@ int xnu_load(const uint8_t *p, size_t len, void *window, size_t capacity,
         }
     }
     int executable_entry=0,executable_checkpoint=0,pool=0,stack=0;
+    unsigned fault_vectors=0;uint64_t diagnostic_code=0;int control_checked=0;
+    if (version>=9 && (extra[2]&2047)) return 0;
     uint64_t last=0;
     for (unsigned i=0;i<count;i++) {
         const uint8_t *s=p+HEADER+40*i;
@@ -137,6 +139,22 @@ int xnu_load(const uint8_t *p, size_t len, void *window, size_t capacity,
             if (le32(code)!=0xd10343ff || le32(code+4)!=0xa9076ffc || le32(code+8)!=0xa90867fa) return 0;
             stack=1;
         }
+        if (version>=9 && (prot&4)) {
+            diagnostic_code|=xnu_diagnostic_code_mask(base+off,bytes);
+            uint64_t va=platform[6]+0x34;
+            if (va>=base+off && bounded(va-base-off,4,bytes)) {
+                uint32_t want=version==10?(0xd4200000u|(0x5846u<<5)):0xaa0003e8u;
+                if (le32(p+raw+file+va-base-off)!=want) return 0;
+                control_checked=1;
+            }
+        }
+        if (version>=9 && (prot&4)) for (unsigned slot=0;slot<2;slot++) {
+            uint64_t va=extra[2]+slot*0x200u;
+            if (va>=base+off && bounded(va-base-off,4,bytes)) {
+                if (le32(p+raw+file+va-base-off)!=(0xd4000002u|(0x5846u<<5))) return 0;
+                fault_vectors|=1u<<slot;
+            }
+        }
         if ((prot&4) && entry>=base+off && bounded(entry-base-off,4,bytes)) executable_entry=1;
         if ((prot&4) && checkpoint>=base+off && bounded(checkpoint-base-off,4,bytes)) {
             if (le32(p+raw+file+checkpoint-base-off)!=(0xd4000002u|(0x584eu<<5))) return 0;
@@ -147,6 +165,7 @@ int xnu_load(const uint8_t *p, size_t len, void *window, size_t capacity,
         }
     }
     if ((mode>=3 && !stack) || (mode>=2 && !pool) || last!=span || !executable_entry || !executable_checkpoint || (entry&3) || (checkpoint&3)) return 0;
+    if (version>=9 && (fault_vectors!=3 || diagnostic_code!=((1ull<<18)-1) || !control_checked)) return 0;
     /* All writes stay in the Image-owned arena, after every input is checked. */
     volatile uint64_t *zero=window;for (uint64_t i=0;i<top/8;i++) zero[i]=0;
     for (unsigned i=0;i<count;i++) {
@@ -168,6 +187,7 @@ int xnu_load(const uint8_t *p, size_t len, void *window, size_t capacity,
     expected->pc=phys+bias+checkpoint-base;expected->args=out->args;
     expected->virt=base;expected->phys=phys+bias;expected->memory=memory-bias;
     expected->pages=phys+bias+pages-base;expected->flags=0;
+    expected->diagnostics=version>=9?version:0;expected->kernel_end=base+span;
     expected->mode=mode;expected->tcr=extra[0];expected->mair=extra[1];
     expected->vbar=extra[2];expected->sp0=extra[3]-((mode==6 || mode==8)?0x200u:mode>=3?0xd0u:0u);expected->sp1=extra[4];expected->end=phys+top;
     expected->c_entry=cinit[0];expected->const_args=cinit[1];expected->boot_args=cinit[2];

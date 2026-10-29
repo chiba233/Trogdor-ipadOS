@@ -4,7 +4,7 @@ extern uint8_t _xnu_payload_start[],_xnu_payload_end[],_xnu_window[],_image_end[
 void probe_value(const char *,uint64_t);
 struct xnu_expected xnu_expected;
 #define expected xnu_expected
-uint64_t xnu_capture[27];
+uint64_t xnu_capture[27],xnu_fault[5];
 struct xnu_handoff xnu_prepare(void) {
     struct xnu_handoff out={0,0};uint64_t cpu,freq,el;
     __asm__ volatile("mrs %0, mpidr_el1":"=r"(cpu));
@@ -22,7 +22,11 @@ struct xnu_handoff xnu_prepare(void) {
 }
 int xnu_checkpoint_complete(void) {
     uint64_t *c=xnu_capture;
-    int good=xnu_capture_valid(c,&expected);
+    int capture=xnu_capture_valid(c,&expected);
+    int fault=xnu_fault[4]!=0;
+    int good=!fault && expected.diagnostics!=10 && capture;
+    const uint64_t *pool=(const uint64_t *)(uintptr_t)expected.pages;
+    int raw_tables=expected.diagnostics?xnu_tables_valid(pool,&expected):0;
     if (expected.mode>=2) {
         int tables=good && xnu_tables_valid((const uint64_t *)(uintptr_t)expected.pages,&expected);
         probe_value("XNU MMU enabled=",(c[2]&0x1005)==0x1005);
@@ -73,7 +77,26 @@ int xnu_checkpoint_complete(void) {
     probe_value("XNU current EL=",((c[1]&15)==4 || (c[1]&15)==5)?1:0);
     probe_value("XNU ELR=",c[0]);probe_value("XNU args PA=",expected.args);
     if (expected.mode>=7) {
-        int boundary=xnu_pe_return_valid(c,(const uint64_t *)(uintptr_t)expected.pages,&expected);
+        int boundary=!fault && expected.diagnostics!=10 && xnu_pe_return_valid(c,pool,&expected);
+        if (expected.diagnostics) {
+            int transport=xnu_diagnostic_return_valid(c,pool,&expected,xnu_fault);
+            probe_value("XNU diagnostic schema=",1);
+            probe_value("XNU payload version=",expected.diagnostics);
+            probe_value("XNU diagnostic transport verified=",(uint64_t)transport);
+            probe_value("XNU capture verified=",(uint64_t)capture);
+            probe_value("XNU table pool verified=",(uint64_t)raw_tables);
+            probe_value("XNU fault received=",(uint64_t)fault);
+            probe_value("XNU diagnostic reason=",fault?1u:!capture?2u:!good?3u:0u);
+            const char *names[]={"XNU fault ESR=","XNU fault ELR=","XNU fault FAR=","XNU fault SPSR="};
+            for (unsigned i=0;i<4;i++) probe_value(names[i],xnu_fault[i]);
+            for (unsigned i=0;i<27;i++) {
+                char name[]="XNU capture 00=";name[12]=(char)('0'+i/10);name[13]=(char)('0'+i%10);
+                probe_value(name,c[i]);
+            }
+            probe_value("XNU return boundary verified=",(uint64_t)boundary);
+            probe_value("XNU diagnostic return=",(uint64_t)!good);
+            return transport;
+        }
         probe_value("XNU return boundary verified=",(uint64_t)boundary);
         probe_value("XNU diagnostic return=",(uint64_t)(boundary && !good));
         return good || boundary;

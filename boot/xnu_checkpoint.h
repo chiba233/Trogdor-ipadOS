@@ -10,7 +10,7 @@ struct xnu_expected { uint64_t pc, args, virt, phys, memory, pages, flags;
     uint64_t c_entry, const_args, boot_args, slide, static_cache, guard;
     uint64_t cpu_data, rtclock;
     uint64_t pe_state, protection, dt_root, dt_cursor, pe_init, identify, soc, node, cursor, tree, tree_size;
-    uint64_t soc_data, pe_info, config_bits, debug_enabled, degradation, adt_checksum, soc_ranges, soc_base; };
+    uint64_t soc_data, pe_info, config_bits, debug_enabled, degradation, adt_checksum, soc_ranges, soc_base, diagnostics, kernel_end; };
 int xnu_load(const uint8_t *, size_t, void *, size_t, uint64_t, uint64_t,
              struct xnu_handoff *, struct xnu_expected *);
 int xnu_capture_valid(const uint64_t *, const struct xnu_expected *);
@@ -18,6 +18,8 @@ uint64_t xnu_soc_ranges_offset(const uint8_t *,size_t,uint64_t);
 int xnu_pe_contract(const uint8_t *,size_t,uint64_t [8]);
 uint64_t xnu_pe_checksum(const volatile uint8_t *,size_t);
 int xnu_pe_return_valid(const uint64_t *,const uint64_t *,const struct xnu_expected *);
+uint64_t xnu_diagnostic_code_mask(uint64_t,uint64_t);
+int xnu_diagnostic_return_valid(const uint64_t *,const uint64_t *,const struct xnu_expected *,const uint64_t *);
 int xnu_pe_valid(const struct xnu_expected *);
 int xnu_platform_valid(const struct xnu_expected *);
 int xnu_cpu_valid(const struct xnu_expected *);

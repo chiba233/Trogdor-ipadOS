@@ -96,7 +96,9 @@ def adt_fields(data):
             int.from_bytes(cpus[0]['timebase-frequency'][1], 'little'))
 
 
-def pack(data, adt, command_line='-v debug=0xc cpus=1 keepsyms=1', mmu=False, highva=False, cinit=False, cpu_init=False, platform=False, pe_return=False, soc_properties=False):
+def pack(data, adt, command_line='-v debug=0xc cpus=1 keepsyms=1', mmu=False, highva=False, cinit=False, cpu_init=False, platform=False, pe_return=False, soc_properties=False, diagnostics=False, diagnostic_control=False):
+    diagnostics = diagnostics or diagnostic_control
+    soc_properties = soc_properties or diagnostics
     if pe_return and soc_properties: raise ValueError('choose one PE return or SoC properties checkpoint')
     platform = platform or pe_return or soc_properties
     cpu_init = cpu_init or platform
@@ -197,6 +199,15 @@ def pack(data, adt, command_line='-v debug=0xc cpus=1 keepsyms=1', mmu=False, hi
         struct.pack_into('<2I', patched, patch_at, STACK_LOAD, HVC)
     else:
         struct.pack_into('<I', patched, patch_at, HVC)
+    fault_patches=[]
+    if diagnostics:
+        from xnu_diagnostics import instrument_vectors
+        fault_patches=instrument_vectors(data,patched,kernel,names['_ExceptionVectorsBase'])
+        version=9
+        if diagnostic_control:
+            from xnu_diagnostics import instrument_control
+            fault_patches.append(instrument_control(data,patched,kernel,patch_va-0xb8+0x34))
+            version=10
     if macho(patched) != kernel:
         raise ValueError('checkpoint unexpectedly changes Mach-O metadata')
     base_field, size_field, affinity, frequency = adt_fields(adt)
@@ -222,6 +233,7 @@ def pack(data, adt, command_line='-v debug=0xc cpus=1 keepsyms=1', mmu=False, hi
         'instrumented_kernel_sha256': hashlib.sha256(patched).hexdigest(),
         'local_relocations_audited': kernel.local_relocations,
         'patch_file_offset': patch_at, 'patch_bytes': patch_bytes, 'checkpoint_va': patch_va,
+        'fault_vector_patches': fault_patches, 'diagnostic_checkpoint': diagnostics, 'diagnostic_control': diagnostic_control,
         'mmu_checkpoint': mmu, 'highva_checkpoint': highva or cinit, 'cinit_checkpoint': cinit, 'cpu_checkpoint': cpu_init, 'platform_checkpoint': platform, 'pe_return_checkpoint': pe_return, 'soc_properties_checkpoint': soc_properties, 'kernel_alignment_bias': bias,
         'kernel_span': span, 'arena_bytes': WINDOW, 'payload_sha256': hashlib.sha256(payload).hexdigest(),
         'hardware_boot_tested': False, 'prelinked': False}
@@ -237,6 +249,8 @@ def main():
     p.add_argument('--highva', action='store_true', help='checkpoint at high-VA C entry after a stack read')
     p.add_argument('--cinit', action='store_true', help='checkpoint after original C boot_args copy and pointer store')
     p.add_argument('--cpu-init', action='store_true', help='checkpoint after native boot CPU data initialization')
+    p.add_argument('--diagnostic-control', action='store_true', help='deliberate BRK at previously accepted ADT boundary')
+    p.add_argument('--diagnostics', action='store_true', help='SoC midpoint with synchronous-fault and failed-capture diagnostics')
     p.add_argument('--soc-properties', action='store_true', help='diagnostic midpoint after native SoC properties')
     p.add_argument('--pe-return', action='store_true', help='checkpoint after full pre-VM platform return')
     p.add_argument('--platform', action='store_true', help='checkpoint after first original platform ADT search')
@@ -251,11 +265,11 @@ def main():
     if (a.output.resolve() == sidecar.resolve() or sidecar.exists() or
             a.output.exists() or a.output.resolve().is_relative_to(Path('/dev'))):
         p.error('output must be a new ordinary file')
-    payload, report = pack(data, a.adt.read_bytes(), mmu=a.mmu, highva=a.highva, cinit=a.cinit, cpu_init=a.cpu_init, platform=a.platform, pe_return=a.pe_return, soc_properties=a.soc_properties)
+    payload, report = pack(data, a.adt.read_bytes(), mmu=a.mmu, highva=a.highva, cinit=a.cinit, cpu_init=a.cpu_init, platform=a.platform, pe_return=a.pe_return, soc_properties=a.soc_properties, diagnostics=a.diagnostics, diagnostic_control=a.diagnostic_control)
     a.output.parent.mkdir(parents=True, exist_ok=True)
     a.output.write_bytes(payload)
     a.output.with_suffix('.json').write_text(json.dumps(report, indent=2) + '\n')
-    print('Built source-XNU ' + ('SoC-properties' if a.soc_properties else 'PE-return' if a.pe_return else 'platform-ADT' if a.platform else 'CPU-initialization' if a.cpu_init else 'C-initialization' if a.cinit else 'high-VA' if a.highva else 'MMU-on' if a.mmu else 'pre-MMU') +
+    print('Built source-XNU ' + ('diagnostic fault-control' if a.diagnostic_control else 'diagnostic SoC-properties' if a.diagnostics else 'SoC-properties' if a.soc_properties else 'PE-return' if a.pe_return else 'platform-ADT' if a.platform else 'CPU-initialization' if a.cpu_init else 'C-initialization' if a.cinit else 'high-VA' if a.highva else 'MMU-on' if a.mmu else 'pre-MMU') +
           ' checkpoint payload; no full XNU boot is implied.')
 
 

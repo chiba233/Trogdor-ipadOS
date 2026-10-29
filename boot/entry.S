@@ -132,6 +132,14 @@ probe_call:
     str x11, [x10, #88]
     mrs x11, tpidr_el1
     str x11, [x10, #96]
+    mrs x11, esr_el1
+    str x11, [x10, #104]
+    mrs x11, elr_el1
+    str x11, [x10, #112]
+    mrs x11, far_el1
+    str x11, [x10, #120]
+    mrs x11, spsr_el1
+    str x11, [x10, #128]
     mov x9, x0
     mov x0, x1
     mov x1, xzr
@@ -228,6 +236,9 @@ exception_entry:
     mov x10, #0x584e
     cmp x9, x10
     b.eq xnu_checkpoint_return
+    mov x10, #0x5846
+    cmp x9, x10
+    b.eq xnu_fault_return
 #endif
 5:
 #endif
@@ -260,6 +271,23 @@ linux_handoff:
 #endif
 
 #if PROBE_XNU_CHECKPOINT
+xnu_fault_return:
+    /* Freeze the original EL1 fault before any C, AT or cache maintenance.
+       The patched vector's first HVC performs no stack or data access. */
+    adrp x10, xnu_fault
+    add x10, x10, :lo12:xnu_fault
+    ldr x9, [x10, #32]
+    cbnz x9, halt
+    mrs x9, esr_el1
+    str x9, [x10]
+    mrs x9, elr_el1
+    str x9, [x10, #8]
+    mrs x9, far_el1
+    str x9, [x10, #16]
+    mrs x9, spsr_el1
+    str x9, [x10, #24]
+    mov x9, #1
+    str x9, [x10, #32]
 xnu_checkpoint_return:
     adrp x10, xnu_capture
     add x10, x10, :lo12:xnu_capture
@@ -309,12 +337,17 @@ xnu_checkpoint_return:
     str x9, [x10, #128]
     mrs x9, elr_el2
     tbnz x9, #63, 8f
-    add x9, x9, x22
-    sub x9, x9, x23
+    add x9, x9, x12
+    sub x9, x9, x13
 8:  at s1e1r, x9
     isb
     mrs x9, par_el1
     str x9, [x10, #136]
+    adrp x11, xnu_fault
+    add x11, x11, :lo12:xnu_fault
+    ldr x9, [x11, #32]
+    str xzr, [x10, #184]
+    cbnz x9, xnu_clean_arena
     mrs x9, elr_el2
     tbz x9, #63, 7f
     mrs x9, sp_el0
@@ -408,6 +441,14 @@ xnu_clean_line:
     msr cpacr_el1, x9
     ldr x9, [x10, #96]
     msr tpidr_el1, x9
+    ldr x9, [x10, #104]
+    msr esr_el1, x9
+    ldr x9, [x10, #112]
+    msr elr_el1, x9
+    ldr x9, [x10, #120]
+    msr far_el1, x9
+    ldr x9, [x10, #128]
+    msr spsr_el1, x9
     ldr x9, [x10]
     msr sctlr_el1, x9
     isb
@@ -426,5 +467,5 @@ xnu_saved:
     .zero 80
 .balign 16
 xnu_el1_saved:
-    .zero 112
+    .zero 144
 #endif

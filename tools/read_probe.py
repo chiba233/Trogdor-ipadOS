@@ -86,6 +86,46 @@ def read_record(data, xnu_checkpoint=False, xnu_mmu=False, xnu_highva=False, xnu
     return text, fields
 
 
+
+def read_diagnostic_record(data):
+    text,fields=read_record(data)
+    def word(key):
+        values=re.findall(r'^'+re.escape(key)+r'=(.*)$',text,re.M)
+        if len(values)!=1 or not re.fullmatch(r'0x[0-9a-f]{16}',values[0]):
+            raise ValueError('missing/duplicate/malformed diagnostic field: '+key)
+        value=int(values[0],16);fields[key]=value;return value
+    for key in ('XNU copied','XNU diagnostic schema','XNU diagnostic transport verified','XNU table pool verified'):
+        if word(key)!=1:raise ValueError('diagnostic transport incomplete: '+key)
+    version=word('XNU payload version')
+    if version not in (9,10):raise ValueError('unknown diagnostic payload')
+    capture=word('XNU capture verified');fault=word('XNU fault received')
+    checkpoint=word('XNU checkpoint');returned=word('XNU diagnostic return')
+    boundary=word('XNU return boundary verified');reason=word('XNU diagnostic reason')
+    if any(v not in (0,1) for v in (capture,fault,checkpoint,returned,boundary)):
+        raise ValueError('nonboolean diagnostic status')
+    want=1 if fault else 2 if not capture else 3 if not checkpoint else 0
+    if reason!=want or returned!=1-checkpoint or boundary!=int(capture and not fault) or (fault and (capture or checkpoint)):
+        raise ValueError('contradictory diagnostic result')
+    if checkpoint and (not capture or not boundary):raise ValueError('incomplete successful diagnostic')
+    if version==10 and not fault:raise ValueError('deliberate fault control did not fault')
+    regs=[word('XNU fault '+name) for name in ('ESR','ELR','FAR','SPSR')]
+    if not fault and any(regs):raise ValueError('normal checkpoint has fault registers')
+    if fault and ((regs[3]&31) not in (4,5) or regs[1]&3):raise ValueError('invalid original fault context')
+    if version==10 and regs[0]!=(0xf2000000|0x5846):raise ValueError('wrong deliberate BRK syndrome')
+    raw=[word(f'XNU capture {i:02}') for i in range(27)]
+    if (raw[1]&31)!=(5 if fault else 4):raise ValueError('wrong diagnostic HVC origin')
+    if fault:
+        if raw[0]!=raw[15]+(4 if (regs[3]&31)==4 else 0x204):
+            raise ValueError('wrong synchronous vector HVC')
+        if version==10 and regs[1]!=0xfffffff007948410:raise ValueError('wrong deliberate fault PC')
+    elif raw[0]!=0xfffffff007948498:raise ValueError('wrong SoC checkpoint HVC')
+    if raw[25]<4 or raw[25]>131072 or raw[25]&(raw[25]-1) or raw[26]!=(24*1024*1024)//raw[25]:
+        raise ValueError('incomplete diagnostic cache maintenance')
+    # A successful diagnostic still has to pass every normal SoC field.
+    if checkpoint:read_record(data,xnu_soc=True)
+    return text,fields
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--input', type=Path, default=DEFAULT)
@@ -94,13 +134,19 @@ def main():
     parser.add_argument('--xnu-highva', action='store_true')
     parser.add_argument('--xnu-cinit', action='store_true')
     parser.add_argument('--xnu-cpu', action='store_true')
+    parser.add_argument('--xnu-diagnostic', action='store_true')
     parser.add_argument('--xnu-soc', action='store_true')
     parser.add_argument('--xnu-pe', action='store_true')
     parser.add_argument('--xnu-platform', action='store_true')
     args = parser.parse_args()
     with args.input.open('rb') as source:
         data = source.read(8193)
-    text, _ = read_record(data, args.xnu_checkpoint, args.xnu_mmu, args.xnu_highva, args.xnu_cinit, args.xnu_cpu, args.xnu_platform, args.xnu_pe, args.xnu_soc)
+    if args.xnu_diagnostic:
+        if any((args.xnu_checkpoint,args.xnu_mmu,args.xnu_highva,args.xnu_cinit,args.xnu_cpu,args.xnu_platform,args.xnu_pe,args.xnu_soc)):
+            parser.error('choose diagnostic transport or strict acceptance mode')
+        text, _ = read_diagnostic_record(data)
+    else:
+        text, _ = read_record(data, args.xnu_checkpoint, args.xnu_mmu, args.xnu_highva, args.xnu_cinit, args.xnu_cpu, args.xnu_platform, args.xnu_pe, args.xnu_soc)
     print(text, end='')
 
 
