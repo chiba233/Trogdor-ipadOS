@@ -87,7 +87,7 @@ int xnu_checkpoint_complete(void) {
             probe_value("XNU table pool verified=",(uint64_t)raw_tables);
             probe_value("XNU fault received=",(uint64_t)fault);
             probe_value("XNU diagnostic reason=",fault?1u:!capture?2u:!good?3u:0u);
-            const char *names[]={"XNU fault ESR=","XNU fault ELR=","XNU fault FAR=","XNU fault SPSR="};
+            static const char names[][24]={"XNU fault ESR=","XNU fault ELR=","XNU fault FAR=","XNU fault SPSR="};
             for (unsigned i=0;i<4;i++) probe_value(names[i],xnu_fault[i]);
             for (unsigned i=0;i<27;i++) {
                 char name[]="XNU capture 00=";name[12]=(char)('0'+i/10);name[13]=(char)('0'+i%10);

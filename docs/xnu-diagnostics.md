@@ -32,3 +32,25 @@ version=9 的失败传输门与成功验证分开：要求 EL2 来自精确检�
 构建时使用 `xnu_checkpoint.py --diagnostic-control` 生成 version10；`--diagnostics` 生成 version9，二者均通过 `linux_log.py --xnu-checkpoint` 封装。故障对照读取使用 `read_probe.py --xnu-diagnostic`。要求精确 BRK 故障位置、预期 syndrome、同步向量 HVC、完整缓存清理和诊断传输字段匹配；只算异常记录回收，不算 SoC 成功。正常 version9 若报告成功，还须通过 `read_probe.py --xnu-soc` 的全部 20 字段及该镜像清单核对。
 
 version10 对照的目标端签名／body／传输校验及外置介质全部 128 MiB 写入、同步与完整回读已完成；哈希和准备记录见 [硬件记录](hardware-tests.md)。异常通道尚待手动真机验收。
+
+
+## 2026-10-30：包装器重定位缺陷与系统 CPU 模型
+
+首次 version10 手动尝试仍持续黑屏，恢复内置 Linux 后没有 probe-log，异常通道未验收。补充完整系统模型后，原包装器在进入 XNU 前的 `xnu_pe_contract` 拒绝真实 ADT；mode6 绕过此函数，因此此前的 19 字段对照不能排除此缺陷。
+
+独立检查原始对象与已发出的 ELF：`xnu_pe.c` 的属性白名单、子节点名和 DRAM 键字符串指针聚合产生 34 个已分配节 ABS64 重定位；`xnu_checkpoint.c` 的四个故障标签再产生 4 个。Image 链接到零，加载到非零物理地址后表内值仍是低地址，没有运行时修正。最终 ELF 的重定位已被链接器消耗，原有“无残留重定位”检查不能发现。此前本机 `-shared -fPIC` 测试由动态加载器修正指针，因此漏检。这是确定的生成码缺陷，足以解释早于 XNU 入口的失败；无真机早期日志仍不能证明每轮黑屏的具体停止位置。
+
+修复只把四处聚合改为内联字符数组，保留相同字符串、属性许可和严格返回门。新增 `relocation_audit.py` 在最终链接前审计实际 C 源文件的 AArch64 对象，拒绝加载节的绝对符号地址，并将逐文件结果写入构建清单；旧指针表夹具必须失败，内联数组／PC 相对引用／固定数字 KVA 必须通过。118 项主机回归与四种探针构建通过，修复后对象不存在上述重定位。
+
+`qemu_probe.py` 使用 QEMU 11.1.3 TCG 的完整 CPU／异常级模型运行真实包装器和未改动源码负载。mode6 通过严格 19 字段；version9 的正常 SoC 路径通过全部 20 字段且 reason=0、checkpoint=1；version10 实际 BRK 后经 EL1 同步向量 HVC 返回 EL2，精确 ESR／ELR、完整表池与诊断传输门通过，reason=1、checkpoint=0。version10 在两个非零、2 MiB 对齐加载位置均通过。独立审查重新核对四次结果。
+
+该工具的板级 FDT 准入、日志导出和 Linux 入口使用桩，不模拟 SC7180 外设，也不验证真实 Linux 启动或物理缓存一致性。它验证模型中的 MMU／异常分派／恢复指令，不算硬件通道通过。哈希命名的内嵌负载和链接后逐字节核对避免汇编 `.incbin` 缓存混用；version9 必须额外通过严格 SoC 读取器，不能把失败传输当作正常回归。使用已安装的 QEMU 和既有负载，例如：
+
+```sh
+python3 tools/qemu_probe.py --qemu path/to/qemu-system-aarch64 \
+  --payload build/xnu-fault-control-first/payload.bin --output build/qemu-fault-check
+```
+
+普通测试不自动安装 QEMU。真实目标仍为原厂启动链上的原生执行；修复后的同一 version10 BRK 负载应重新验收，随后再运行 version9 定位后续路径。
+
+修复后的同负载 version10 已完成目标端签名／传输验证及全部 128 MiB 介质写入、同步和完整回读，摘要见 [本轮准备记录](hardware-tests.md)。尚未手动启动验收。

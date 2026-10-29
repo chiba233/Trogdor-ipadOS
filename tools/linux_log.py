@@ -14,6 +14,7 @@ import zlib
 from artifacts import extract_image, inspect_image, inspect_scalar_code
 from build import CPU, elf_symbols
 from disk import create_image
+from relocation_audit import audit_sources
 from fdt import Node, decode, properties, string
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -128,6 +129,9 @@ def compile_wrapper(out, kernel, memory, checkpoint=None):
                *([str(ROOT / "boot" / name) for name in
                   ("xnu_checkpoint.c", "xnu_load.c", "xnu_memory.c", "xnu_tables.c", "xnu_cinit.c", "xnu_cpu.c", "xnu_platform.c", "xnu_pe.c", "xnu_diagnostics.c")] if checkpoint is not None else []),
                str(assembly), "-o", str(elf)]
+    relocations=audit_sources(zig,CPU,[Path(arg) for arg in command if arg.endswith('.c')],env,
+        out/'relocation-audit',('PROBE_UART=0','PROBE_RESET_EL=0','PROBE_LINUX_CHAIN=1',
+        'PROBE_XNU_CHECKPOINT='+str(int(checkpoint is not None))))
     subprocess.run(command, env=env, check=True)
     linked = elf.read_bytes()
     image = extract_image(linked)
@@ -147,7 +151,7 @@ def compile_wrapper(out, kernel, memory, checkpoint=None):
             image[start:start + len(kernel)] != kernel or len(image) != start + len(kernel)):
         raise ValueError("Linux wrapper memory/payload layout mismatch")
     (out / "Image").write_bytes(image)
-    return image, {"header": header, "scalar_code": scalar, "linux_offset": start, **extra}
+    return image, {"header": header, "scalar_code": scalar, "c_relocations": relocations, "linux_offset": start, **extra}
 
 
 def main():
@@ -223,7 +227,7 @@ def main():
     create_image(kpart, image, "EL1 probe Linux log", disk_mib=128, kernel_mib=96)
     code_files = ("boot/entry.S", "boot/probe.c", "boot/fdt.c", "boot/checkpoint.c", "boot/chain.ld",
                   "tools/linux_log.py", "tools/fdt.py", "tools/build.py", "tools/artifacts.py",
-                  "tools/sign.py", "tools/disk.py", "tools/read_probe.py")
+                  "tools/sign.py", "tools/disk.py", "tools/read_probe.py", "tools/relocation_audit.py")
     if a.xnu_checkpoint:
         code_files += ("boot/xnu_checkpoint.h", "boot/xnu_checkpoint.c", "boot/xnu_load.c",
                        "boot/xnu_memory.c", "boot/xnu_tables.c", "boot/xnu_cinit.c", "boot/xnu_cpu.c", "boot/xnu_platform.c", "boot/xnu_pe.c", "boot/xnu_diagnostics.c", "boot/xnu-chain.ld", "tools/xnu_checkpoint.py", "tools/xnu_macho.py", "tools/xnu_cinit.py", "tools/xnu_cpu.py", "tools/xnu_platform.py", "tools/xnu_pe.py", "tools/xnu_soc.py", "tools/xnu_diagnostics.py")

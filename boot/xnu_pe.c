@@ -17,14 +17,14 @@ static const struct property *get(const struct walk *w,const struct property *p,
     return 0;
 }
 static int allowed(const uint8_t *key,unsigned role) {
-    const char *const lists[][10]={
-        {"name","compatible","#address-cells","#size-cells","model",0},
-        {"name","random-seed","dram-base","dram-size","nvram-bank-size","nvram-bank-count","nvram-current-bank","nvram-proxy-data","osenvironment",0},
-        {"name",0},
-        {"name","device_type","#address-cells","#size-cells","ranges",0},
-        {"name","reg","state","device_type","compatible","timebase-frequency",0}};
+    static const char lists[][10][32]={
+        {"name","compatible","#address-cells","#size-cells","model"},
+        {"name","random-seed","dram-base","dram-size","nvram-bank-size","nvram-bank-count","nvram-current-bank","nvram-proxy-data","osenvironment"},
+        {"name"},
+        {"name","device_type","#address-cells","#size-cells","ranges"},
+        {"name","reg","state","device_type","compatible","timebase-frequency"}};
     if (role>=5) return 1;
-    for (unsigned i=0;lists[role][i];i++) if (equal(key,lists[role][i])) return 1;
+    for (unsigned i=0;lists[role][i][0];i++) if (equal(key,lists[role][i])) return 1;
     return 0;
 }
 static int visit(struct walk *w,unsigned depth,unsigned parent,unsigned parent_node) {
@@ -54,7 +54,7 @@ static int visit(struct walk *w,unsigned depth,unsigned parent,unsigned parent_n
     unsigned role=5;
     if (!depth) { if (!equal(name,"device-tree")) return 0;role=0; }
     else if (depth==1) {
-        const char *const names[]={"chosen","cpus","arm-io","defaults","options","product"};
+        static const char names[][12]={"chosen","cpus","arm-io","defaults","options","product"};
         unsigned i=0;while (i<6 && !equal(name,names[i])) i++;
         if (i==6 || (w->seen&(1u<<i))) return 0;
         w->seen|=1u<<i;role=i<3?i+1:5;
@@ -66,7 +66,7 @@ static int visit(struct walk *w,unsigned depth,unsigned parent,unsigned parent_n
         q=get(w,props,count,"model");if (!q || !string(w->p+q->at,q->n)) return 0;
         w->out[0]=q->at;w->out[1]=q->n;
     } else if (role==1) {
-        const char *const keys[]={"dram-base","dram-size"};
+        static const char keys[][10]={"dram-base","dram-size"};
         for (unsigned i=0;i<2;i++) { q=get(w,props,count,keys[i]);if (!q || q->n!=8) return 0;w->out[6+i]=q->at; }
     } else if (role==2) { if (children!=1) return 0; }
     else if (role==3) {

@@ -10,6 +10,7 @@ import subprocess
 import sys
 from artifacts import diagnostic_dtb, extract_image, fit, inspect_image, inspect_scalar_code
 from fdt import properties
+from relocation_audit import audit_sources
 
 ROOT = Path(__file__).resolve().parents[1]
 CPU = "generic+el3+strict_align-fp_armv8-neon"
@@ -67,6 +68,8 @@ def main():
                    str(ROOT / "boot/entry.S"), str(ROOT / "boot/probe.c"), str(ROOT / "boot/fdt.c"),
                    str(ROOT / "boot/checkpoint.c"),
                    "-o", str(elf)]
+        relocations=audit_sources(zig,CPU,[Path(arg) for arg in command if arg.endswith('.c')],env,
+            out/'relocation-audit',('PROBE_UART='+str(uart),'PROBE_RESET_EL='+str(reset_el)))
         subprocess.run(command, env=env, check=True)
         image.write_bytes(extract_image(elf.read_bytes()))
         data = image.read_bytes()
@@ -85,7 +88,7 @@ def main():
         for path in (image, elf, out / "probe.itb", out / "symbols.json"):
             manifest["artifacts"][str(path.relative_to(build))] = {
                 "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "bytes": path.stat().st_size}
-        manifest[mode] = {"image": header, "probe_log": symbols["probe_log"],
+        manifest[mode] = {"image": header, "c_relocations": relocations, "probe_log": symbols["probe_log"],
                           "scalar_code": scalar, "uart_mmio_enabled": bool(uart), "reset_target_el": reset_el,
                           "reset_delay_seconds": {0: 0, 1: 10, 2: 3}[reset_el]}
         print(mode + ": Image/FIT built; header and ELF symbols verified; hardware not tested")
