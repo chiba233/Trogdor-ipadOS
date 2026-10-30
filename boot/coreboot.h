@@ -6,6 +6,7 @@
 #define CB_MAX_RANGES 64
 #define DISPLAY_MAX_FRAME (64u*1024u*1024u)
 #define COACHZ_BACKLIGHT_PORT 0x03d0c000u
+#define COACHZ_DEPTHCHARGE_BASE 0xf1000000u
 struct cb_range { uint64_t base,size;uint32_t type; };
 struct cb_display {
     uint64_t physical;

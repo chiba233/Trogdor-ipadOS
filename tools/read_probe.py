@@ -160,16 +160,19 @@ def main():
     parser.add_argument('--xnu-soc', action='store_true')
     parser.add_argument('--xnu-pe', action='store_true')
     parser.add_argument('--display-discovery', action='store_true')
+    parser.add_argument('--display-discovery-schema1', action='store_true', help='historical 42-field records only')
     parser.add_argument('--xnu-topology', action='store_true')
     parser.add_argument('--xnu-platform', action='store_true')
     args = parser.parse_args()
     with args.input.open('rb') as source:
         data = source.read(8193)
-    if args.display_discovery:
+    if args.display_discovery or args.display_discovery_schema1:
         if any((args.xnu_checkpoint,args.xnu_mmu,args.xnu_highva,args.xnu_cinit,args.xnu_cpu,args.xnu_platform,args.xnu_pe,args.xnu_soc,args.xnu_topology,args.xnu_diagnostic)):
             parser.error("display discovery and XNU require separate strict modes")
-        from read_display import read_display_record
-        text, _ = read_display_record(data)
+        if args.display_discovery and args.display_discovery_schema1:
+            parser.error("choose one display discovery schema")
+        from read_display import read_display_record, read_display_record_schema1
+        text, _ = (read_display_record if args.display_discovery else read_display_record_schema1)(data)
     elif args.xnu_diagnostic:
         if any((args.xnu_checkpoint,args.xnu_mmu,args.xnu_highva,args.xnu_cinit,args.xnu_cpu,args.xnu_platform,args.xnu_pe,args.xnu_soc,args.xnu_topology)):
             parser.error('choose diagnostic transport or strict acceptance mode')

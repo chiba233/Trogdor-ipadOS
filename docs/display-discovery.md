@@ -41,7 +41,7 @@
 
 11 次 TCG 执行验证同一汇编读取与精确异常恢复：两个加载位置的 RAM 成功读取、真实 stage-1 data abort、失败出参不变、全部 callee-saved GPR／四项异常寄存器恢复及 HVC／Linux 入口桩；九种拒绝涵盖 FnV、写故障、错误 PC／FAR／模式／向量、未 armed、保存地址不符和错误 EC。TCG 没有执行 SC7180 外设或真实 Linux。另以当前源码重新执行已验收 version11，严格 40 字段通过且宏关闭的 ELF 不含显示符号。
 
-四种基础探针构建通过。最终原生显示发现 Image 通过标量审计（4206 条指令／9 段）、七个实际 C 对象重定位检查，独立核对精确受保护 LDR、13 项白名单及源／产物摘要、ELF 导出、原始 Linux／47 份 DTB／initrd／配置／命令行、主备 GPT 与签名容器；未携带 XNU 负载。完整发现日志必须通过 `read_probe.py --display-discovery` 的全部 42 项必需字段；候选不可用仍可完成只读发现，不能算画图或显示恢复通过。
+四种基础探针构建通过。最终原生显示发现 Image 通过标量审计（4206 条指令／9 段）、七个实际 C 对象重定位检查，独立核对精确受保护 LDR、13 项白名单及源／产物摘要、ELF 导出、原始 Linux／47 份 DTB／initrd／配置／命令行、主备 GPT 与签名容器；未携带 XNU 负载。schema 1 的完整发现日志须通过 `read_probe.py --display-discovery-schema1`（当时的选项名是 `--display-discovery`）的全部 42 项必需字段；候选不可用仍可完成只读发现，不能算画图或显示恢复通过。
 
 
 ## 测试介质准备
@@ -53,7 +53,7 @@
 
 ## 2026-10-31：独立只读显示发现真机验收
 
-运行时 `abac621`、准备记录 `476ce2e`，使用前述同一镜像与签名容器。目标保存的镜像／容器／清单／两个读取器模块与本地最终产物一致；清单的源码及产物摘要另行重算核对。原生 Linux 收到完整 8192 字节 probe-log，两次独立实时读取字节一致，私有副本通过当前 `read_probe.py --display-discovery` 全部 42 个严格必需字段。入口 EL2、探针 EL1、stage=3、交接 EL2 均匹配。
+运行时 `abac621`、准备记录 `476ce2e`，使用前述同一镜像与签名容器。目标保存的镜像／容器／清单／两个读取器模块与本地最终产物一致；清单的源码及产物摘要另行重算核对。原生 Linux 收到完整 8192 字节 probe-log，两次独立实时读取字节一致，私有副本通过当时的 `read_probe.py --display-discovery`（现为 `--display-discovery-schema1`）全部 42 个严格必需字段。入口 EL2、探针 EL1、stage=3、交接 EL2 均匹配。
 
 Coreboot 表与 framebuffer／GPIO 元数据有效，13 次固定 MMIO 读取完成、故障为零、硬件写入为零，随后正常交接 Linux。TE 与 DSI control 均为零，与源码停机路径相符；本轮不推断其余时钟、PHY、PLL、面板或 SMMU 状态，也没有执行 XNU、SPI 事务、framebuffer 或背光操作。
 
@@ -96,8 +96,8 @@ schema 1 把多个条件合成 `scanout consistent` 和 `FDT range allowed` 两�
 | `Display ownership verified` | 窗口、RAM、FDT 三项为真且无 Image 冲突 |
 | `Display candidate writable` | 元数据、分配关系与归属三项都为真 |
 
-运行时取不到 payload `_end`，窗口下界只能用 Depthcharge 基址；落在 Depthcharge 自身范围内的情况不会被这一项发现。
+运行时取不到 payload `_end`，窗口下界用 Depthcharge 基址，是宽松的界；落在 Depthcharge 自身范围内的情况不会被这一项发现。
 
 `xnu_range_allowed()` 改为先做整体排除、再调用 `fdt_range_clear()`，判断结果和顺序不变，继续只用于 XNU arena。
 
-候选仍只表示通过只读判断，不授权写入，也不表示屏幕可见；图案实验需要单独的契约。schema 1 记录继续按原规则读取，不重新解释：`read_probe.py --display-discovery` 只接受 schema 2，历史记录使用 `--display-discovery-schema1`，两种 schema 互相拒绝。schema 2 不需要为验证规则单独启动一轮，下一个显示镜像会带上这些字段并取得真机记录。
+候选仍只表示通过只读判断，不授权写入，也不表示屏幕可见；图案实验需要单独的契约。schema 1 记录继续按原规则读取，不重新解释：`read_probe.py --display-discovery` 只接受 schema 2，历史记录使用 `--display-discovery-schema1`，两种 schema 互相拒绝。schema 2 不需要为验证规则单独启动一轮，下一个显示镜像会带上这些字段并取得真机记录。schema 2 已实现，尚无真机记录。

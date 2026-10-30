@@ -67,4 +67,4 @@ python3 read_probe.py
 
 ## 独立显示发现模式
 
-在上述构建命令增加 `--display-discovery`，生成不携带 XNU 的只读显示交接快照镜像；该选项与 `--xnu-checkpoint` 互斥。部署读取器时须同时保留 `read_probe.py` 和 `read_display.py`，启动后用 `python3 read_probe.py --display-discovery` 验收。完整契约、42 字段和候选／可见性区别见 [显示发现](display-discovery.md)。默认模式与已有 XNU 模式继续分别验收；显示标记不得混入 XNU 成功或诊断记录。
+在上述构建命令增加 `--display-discovery`，生成不携带 XNU 的只读显示交接快照镜像；该选项与 `--xnu-checkpoint` 互斥。部署读取器时须同时保留 `read_probe.py` 和 `read_display.py`，启动后用 `python3 read_probe.py --display-discovery` 验收（schema 2，45 字段；历史 schema 1 记录用 `--display-discovery-schema1`）。完整契约和候选／可见性区别见 [显示发现](display-discovery.md)。默认模式与已有 XNU 模式继续分别验收；显示标记不得混入 XNU 成功或诊断记录。

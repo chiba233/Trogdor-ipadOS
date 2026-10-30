@@ -7,14 +7,19 @@ REGISTERS=('TE','DSI','source size','output size','source XY','output XY','scano
            'scanout stride','format','unpack','GPIO config','GPIO IO','EC protocol')
 METADATA=('table bytes','table entries','table framebuffer PA','width','height','stride','bpp','orientation',
           'Image PA','Image bytes','frame span','allocation bytes')
-FLAGS=('scanout consistent','Coreboot RAM','FDT range allowed','Image conflict','candidate writable')
-FIXED={'schema':1,'coreboot table verified':1,'framebuffer metadata verified':1,'GPIO metadata verified':1,
+FLAGS=('metadata consistent','allocation relation','allocator window','Coreboot RAM','FDT owners clear',
+       'Image conflict','ownership verified','candidate writable')
+FIXED={'schema':2,'coreboot table verified':1,'framebuffer metadata verified':1,'GPIO metadata verified':1,
        'MMIO reads':13,'MMIO fault':0,'discovery complete':1,'hardware writes':0}
+# Historical records keep their original meaning; they are never reinterpreted.
+SCHEMA1_FLAGS=('scanout consistent','Coreboot RAM','FDT range allowed','Image conflict','candidate writable')
+SCHEMA1_FIXED=dict(FIXED,schema=1)
+DEPTHCHARGE_BASE=0xf1000000
 
-def read_display_record(data):
+def parse(data,fixed,flags):
     text,fields=read_record(data)
     if re.search(r'^(XNU |EXCEPTION)',text,re.M):raise ValueError('display discovery must be separate from XNU/fault records')
-    wanted=set(FIXED)|set(METADATA)|set(REGISTERS)|set(FLAGS)
+    wanted=set(fixed)|set(METADATA)|set(REGISTERS)|set(flags)
     keys=re.findall(r'^Display ([^=\n]+)=',text,re.M)
     if set(keys)!=wanted or len(keys)!=len(wanted):raise ValueError('missing/duplicate/unknown display fields')
     values={}
@@ -22,8 +27,8 @@ def read_display_record(data):
         found=re.findall(r'^Display '+re.escape(key)+r'=(0x[0-9a-f]{16})$',text,re.M)
         if len(found)!=1:raise ValueError('malformed display field: '+key)
         values[key]=int(found[0],16)
-    if any(values[k]!=v for k,v in FIXED.items()):raise ValueError('display discovery is incomplete')
-    if any(values[k] not in (0,1) for k in FLAGS):raise ValueError('nonboolean display result')
+    if any(values[k]!=v for k,v in fixed.items()):raise ValueError('display discovery is incomplete')
+    if any(values[k] not in (0,1) for k in flags):raise ValueError('nonboolean display result')
     if any(values[k]>0xffffffff for k in REGISTERS):raise ValueError('MMIO read is not 32 bits')
     w,h,stride=(values[k] for k in ('width','height','stride'))
     span=stride*h;allocation=(span+4095)&~4095
@@ -34,14 +39,34 @@ def read_display_record(data):
     image,size,pa=(values[k] for k in ('Image PA','Image bytes','scanout PA'))
     if image%0x200000 or not 0x80000000<=image<1<<38 or not 0<size<=130*1024*1024 or image+size>1<<38:
         raise ValueError('invalid discovery Image extent')
-    geometry=w|(h<<16)
-    consistent=(values['source size']==values['output size']==geometry and values['source XY']==values['output XY']==0 and
-        pa!=0 and pa%0x100000==0 and values['scanout stride']==stride and values['format']==0x236ff and values['unpack']==0x03020001 and
-        values['table framebuffer PA'] in (0,pa))
-    conflict=(pa<image+size and image<pa+allocation)
-    if values['scanout consistent']!=consistent or values['Image conflict']!=conflict:
+    if values['Image conflict']!=(pa<image+size and image<pa+allocation):
         raise ValueError('contradictory display snapshot/ownership')
-    candidate=consistent and values['Coreboot RAM'] and values['FDT range allowed'] and not conflict
-    if values['candidate writable']!=candidate:raise ValueError('contradictory display candidate')
     fields.update({'Display '+k:v for k,v in values.items()})
+    return text,fields,values
+
+def metadata_consistent(v):
+    pa=v['scanout PA'];geometry=v['width']|(v['height']<<16)
+    return (v['source size']==v['output size']==geometry and v['source XY']==v['output XY']==0 and
+        pa!=0 and v['scanout stride']==v['stride'] and v['format']==0x236ff and v['unpack']==0x03020001 and
+        v['table framebuffer PA'] in (0,pa))
+
+def read_display_record(data):
+    text,fields,v=parse(data,FIXED,FLAGS)
+    pa=v['scanout PA'];end=pa+v['allocation bytes']
+    metadata=metadata_consistent(v)
+    relation=v['table framebuffer PA']==0 and end%0x100000==0
+    window=pa>=DEPTHCHARGE_BASE and end<=1<<32
+    if (v['metadata consistent'],v['allocation relation'],v['allocator window'])!=(metadata,relation,window):
+        raise ValueError('contradictory display snapshot/ownership')
+    owned=window and v['Coreboot RAM'] and v['FDT owners clear'] and not v['Image conflict']
+    if v['ownership verified']!=owned:raise ValueError('contradictory display ownership')
+    if v['candidate writable']!=(metadata and relation and owned):raise ValueError('contradictory display candidate')
+    return text,fields
+
+def read_display_record_schema1(data):
+    text,fields,v=parse(data,SCHEMA1_FIXED,SCHEMA1_FLAGS)
+    consistent=metadata_consistent(v) and v['scanout PA']%0x100000==0
+    if v['scanout consistent']!=consistent:raise ValueError('contradictory display snapshot/ownership')
+    candidate=consistent and v['Coreboot RAM'] and v['FDT range allowed'] and not v['Image conflict']
+    if v['candidate writable']!=candidate:raise ValueError('contradictory display candidate')
     return text,fields

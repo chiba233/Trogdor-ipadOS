@@ -154,7 +154,7 @@ def compile_wrapper(out, kernel, memory, checkpoint=None, discovery=False):
             image[start:start + len(kernel)] != kernel or len(image) != start + len(kernel)):
         raise ValueError("Linux wrapper memory/payload layout mismatch")
     (out / "Image").write_bytes(image)
-    return image, {"header": header, "scalar_code": scalar, "c_relocations": relocations, "linux_offset": start, **({"display_discovery_schema":1} if discovery else {}), **extra}
+    return image, {"header": header, "scalar_code": scalar, "c_relocations": relocations, "linux_offset": start, **({"display_discovery_schema":2} if discovery else {}), **extra}
 
 
 def main():

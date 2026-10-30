@@ -15,9 +15,9 @@ static int two_cells(const void *dt,const char *path,const char *name) {
     uint32_t n;const void *p=fdt_property(dt,FDT_MAX_SIZE,path,name,&n);
     return p && n==4 && fdt_be32(p)==2;
 }
-int xnu_range_allowed(const void *dt,uint64_t lo,uint64_t size) {
+int fdt_range_clear(const void *dt,uint64_t lo,uint64_t size) {
     const uint8_t *b=dt;uint32_t n;
-    if (!size || lo>UINT64_MAX-size || conflict(lo,size,0xd0000000ull,0x30000000ull) || !fdt_valid(dt,FDT_MAX_SIZE) ||
+    if (!size || lo>UINT64_MAX-size || !fdt_valid(dt,FDT_MAX_SIZE) ||
         !two_cells(dt,"/","#address-cells") || !two_cells(dt,"/","#size-cells")) return 0;
     const uint8_t *mem=fdt_property(dt,FDT_MAX_SIZE,"/memory","reg",&n);
     if (!mem || !n || n%16) return 0;
@@ -98,4 +98,9 @@ int xnu_range_allowed(const void *dt,uint64_t lo,uint64_t size) {
         }
     }
     return 1;
+}
+/* A new XNU arena also stays clear of the whole firmware load and run area. */
+int xnu_range_allowed(const void *dt,uint64_t lo,uint64_t size) {
+    if (!size || lo>UINT64_MAX-size || conflict(lo,size,0xd0000000ull,0x30000000ull)) return 0;
+    return fdt_range_clear(dt,lo,size);
 }

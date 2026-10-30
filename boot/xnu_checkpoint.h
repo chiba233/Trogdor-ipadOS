@@ -27,6 +27,7 @@ int xnu_platform_valid(const struct xnu_expected *);
 int xnu_cpu_valid(const struct xnu_expected *);
 int xnu_cinit_valid(const struct xnu_expected *);
 int xnu_tables_valid(const uint64_t *, const struct xnu_expected *);
+int fdt_range_clear(const void *, uint64_t, uint64_t);
 int xnu_range_allowed(const void *, uint64_t, uint64_t);
 uint64_t xnu_topology_reg_offset(const uint8_t *,size_t);
 uint8_t xnu_topology_initial_byte(unsigned,unsigned,const uint64_t *);
