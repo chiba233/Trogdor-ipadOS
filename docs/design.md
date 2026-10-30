@@ -119,4 +119,4 @@ EL2 分支将 EL1 设置为 AArch64、关闭 stage-2 translation、允许 EL1 �
 
 ## WFE 与单 CPU 拓扑的独立返回
 
-[version11](xnu-topology-checkpoint.md) 合并原始 WFE、chosen／stall、页大小和单 CPU 拓扑解析，停止在下一条启动 CPU 编号调用前。保留全部 PE／页表／AT／缓存门，新增完整拓扑对象模型、CNTKCTL 与 TPIDR 对的入口／运行／恢复核对，使用独立严格 40 字段读取。126 项主机回归、七次系统模型与最终原生产物独立审查通过；真机执行尚未验收，线程和 VM 不在本轮范围。显示复用是独立研究，见 [显示审计](display-reuse-audit.md)。
+[version11](xnu-topology-checkpoint.md) 合并原始 WFE、chosen／stall、页大小和单 CPU 拓扑解析，停止在下一条启动 CPU 编号调用前。保留全部 PE／页表／AT／缓存门，新增完整拓扑对象模型、CNTKCTL 与 TPIDR 对的入口／运行／恢复核对，使用独立严格 40 字段读取。126 项主机回归、七次系统模型与最终原生产物独立审查通过；2026-10-31 真机完整 40 字段通过，精确边界、完整数据／返回门与三个系统寄存器恢复核对后交接 Linux。本次入口寄存器均为零，非零恢复仍是主机模型证据；线程和 VM 不在本轮范围。显示复用是独立研究，见 [显示审计](display-reuse-audit.md)。

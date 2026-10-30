@@ -471,3 +471,14 @@ version9 的结果为 reason=0、checkpoint=1、fault received=0、capture verif
 目标连接恢复后，独立比较镜像／签名容器／清单／读取器／公开密钥／私有写入器全部传输摘要，目标端 vboot 签名与 body 验证通过。再次确认既有可清空外置 USB 的 removable／容量及 root／boot／swap 排除后，固定哈希私有写入器独占打开该介质，完成全部 128 MiB 写入、同步与完整回读，摘要与本镜像一致。没有写固件或内置盘，没有自动重启。
 
 version11 真机执行验收仍待进行，必须取得本轮精确边界和 `read_probe.py --xnu-topology` 全部 40 字段；已有完整 PE 硬件通过不会自动升级为拓扑通过。本轮没有加入显示 MMIO／EC 写入或改变 Video 输入；显示复用仅完成 [独立源码审计](display-reuse-audit.md)。
+
+
+## 2026-10-31：version11 WFE／单 CPU 拓扑真机通过
+
+运行时 `3d6acfd`、准备记录 `2fa1a00`，镜像 SHA-256 `83786588e6d8c06b3256eb253bfcb065edaf35578b08ec734f0442ff1060409a`。沿已全量回读的 USB 手动启动，原生 Linux 收到完整 8192 字节日志；日志头、终止及零填充有效，严格 `--xnu-topology` 的全部 40 个必需字段唯一且通过。两次实时读取与私有副本字节匹配，目标镜像／签名容器／清单／读取器摘要与本轮产物一致。原始日志和摘要保持私有。
+
+独立核对负载 version11、精确 `0xfffffff0079b3d50` 返回 ELR、参数虚实关系和自有 arena／Image 对齐、affinity 与 19.2 MHz timebase。完整 CPU／PE／DT／SoC／型号／时钟结构／调试配置／拓扑对象及未用槽／页大小／stall／活动父帧、完整表池和硬件 AT 通过，64 字节缓存行 × 393216 行覆盖全部 24 MiB arena。checkpoint=1、return boundary verified=1、diagnostic return=0，恢复状态后交接原生 Linux。
+
+WFE EVENTI=4，CNTKCTL 实际运行值符合当次入口值 OR 0x4f；两个 TPIDR 运行值符合唯一逻辑 CPU／cluster，交接前三个系统寄存器的实际回读均与入口一致。本次三个入口值均为零；不同非零初值的恢复仍是主机系统模型证据。该轮验证的是 WFE 配置与单 CPU 拓扑解析，不含睡眠唤醒、计时器中断、线程／VM 或其他核启动。缺失频率与缓存／PIO 属性仍按受限 ADT 缺省模型处理，不能据字段通过宣称设备驱动已支持。
+
+本轮仅读取并私下保存日志、更新脱敏记录；没有改写运行时、测试介质、固件或内置盘，没有自动重启。未修改代码或测试，不重复此前通过的 126 项主机回归。显示恢复仍只有独立源码审计，下一步优先限定 [显示探针范围](display-reuse-audit.md)。
