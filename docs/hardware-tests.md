@@ -526,3 +526,12 @@ Coreboot 表与 framebuffer／GPIO 元数据有效，13 次固定 MMIO 读取完
 写入器重新核对 removable USB、容量及 root／boot／swap 排除后，完成全部 128 MiB 写入、同步与完整回读，摘要与镜像一致。没有写固件或内置盘，没有自动重启。
 
 本节只证明介质准备完成，schema 2 尚无真机记录。手动启动后屏幕仍不点亮；回到 Linux 后用 `read_probe.py --display-discovery` 验收全部 45 字段。候选为真也不授权写入，不代表屏幕可见。
+
+
+## 2026-10-31：schema 2 显示发现真机验收
+
+运行时 `9ae6150`、准备记录 `3dd81fb`，使用前述同一镜像。手动启动后原生 Linux 收到完整 8192 字节 probe-log，两次实时读取字节一致，目标端与本地 `read_probe.py --display-discovery` 都通过全部 45 个严格字段。入口 EL2、探针 EL1、stage=3、交接 EL2 均匹配；13 次读取、零故障、零硬件写入，随后正常交接 Linux。
+
+元数据一致、分配关系、分配窗口、Coreboot RAM、FDT 拥有者、显示归属与最终候选均为真，Image 冲突为假。范围门这次运行在当次启动的原始 FDT 上，补上了上一轮 memreserve 未直接读取的缺口。scanout、分配跨度、几何及其余寄存器读数与上一次启动相同，TE／DSI 仍为零。
+
+候选为真只说明只读判断通过。本轮没有写 framebuffer、显示控制、GPIO 或 EC，屏幕未点亮，没有可见画面记录。已安装固件二进制、SMMU、MDP、缓存及其他 DMA 主设备仍未证实。原始日志、地址及其摘要保持私有。

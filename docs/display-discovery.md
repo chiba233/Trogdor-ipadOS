@@ -100,4 +100,4 @@ schema 1 把多个条件合成 `scanout consistent` 和 `FDT range allowed` 两�
 
 `xnu_range_allowed()` 改为先做整体排除、再调用 `fdt_range_clear()`，判断结果和顺序不变，继续只用于 XNU arena。
 
-候选仍只表示通过只读判断，不授权写入，也不表示屏幕可见；图案实验需要单独的契约。schema 1 记录继续按原规则读取，不重新解释：`read_probe.py --display-discovery` 只接受 schema 2，历史记录使用 `--display-discovery-schema1`，两种 schema 互相拒绝。schema 2 不需要为验证规则单独启动一轮，下一个显示镜像会带上这些字段并取得真机记录。schema 2 已实现，尚无真机记录。
+候选仍只表示通过只读判断，不授权写入，也不表示屏幕可见；图案实验需要单独的契约。schema 1 记录继续按原规则读取，不重新解释：`read_probe.py --display-discovery` 只接受 schema 2，历史记录使用 `--display-discovery-schema1`，两种 schema 互相拒绝。schema 2 不需要为验证规则单独启动一轮，下一个显示镜像会带上这些字段并取得真机记录。schema 2 随后已取得真机 45 字段记录，候选为真，见 [硬件记录](hardware-tests.md)。
