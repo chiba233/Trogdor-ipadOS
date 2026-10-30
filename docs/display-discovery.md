@@ -22,7 +22,7 @@
 
 ## 候选可写性与日志
 
-本轮的候选检查不授权或执行写入。独立比较元数据与 SSPP geometry／XY／stride／format／unpack，非零表 PA 还须与 SSPP 一致。分别计算完整像素跨度和按锁定 libpayload 的 4 KiB GRANULE_SIZE 向上取整的分配跨度，当前候选基址门按锁定源码的动态分配路径限定 1 MiB 对齐（这不是对所有已安装固件的保证，见下方真机差异）；要求落在 Coreboot RAM，沿既有 FDT 运行时范围门排除保留区、动态 alloc-ranges、Coreboot、FDT、initrd 和固件保留区，并以完整分配跨度另行排除整个当前 Image。冲突或不一致时导出明确的 false 标志，不能把“发现完成”解释为“可绘制”或“屏幕可用”。
+本轮的候选检查不授权或执行写入。独立比较元数据与 SSPP geometry／XY／stride／format／unpack，非零表 PA 还须与 SSPP 一致。分别计算完整像素跨度和按锁定 libpayload 的 4 KiB GRANULE_SIZE 向上取整的分配跨度，schema 1 的候选基址门要求 1 MiB 对齐，这是对锁定源码动态分配路径的误读，见下方[分配与归属核实](#2026-10-31真实分配与保留归属核实)；要求落在 Coreboot RAM，沿既有 FDT 运行时范围门排除保留区、动态 alloc-ranges、Coreboot、FDT、initrd 和固件保留区，并以完整分配跨度另行排除整个当前 Image。冲突或不一致时导出明确的 false 标志，不能把“发现完成”解释为“可绘制”或“屏幕可用”。
 
 独立严格读取模式校验基础四字段、schema、完整发现／表与元数据标志、13 次成功读取／无故障／零硬件写入，以及所有必需原始读数、像素／分配跨度、范围标志和关系；独立计算 geometry／格式一致性、Image 冲突与最终候选关系。拒绝重复／缺失／矛盾字段和混入 XNU 记录；故障或早期拒绝记录可留存诊断，不能算完整发现通过。物理地址和原始记录保持私有，公开记录只写结论与公开产物摘要。
 
@@ -59,6 +59,45 @@ Coreboot 表与 framebuffer／GPIO 元数据有效，13 次固定 MMIO 读取完
 
 几何、XY、stride、format、unpack 与有效元数据逐项匹配；原始表 PA 为零，实际 scanout 来自 SSPP。Coreboot RAM 判定为真，与当前 Image 的完整分配范围不冲突。但实际 scanout 仅满足 4 KiB、未满足当前候选的 1 MiB 基址对齐，故现有“scanout consistent”合取结果为假；这不能误写为几何或像素格式错误。FDT 范围门也返回假：复用的 `xnu_range_allowed()` 整体排除固件加载与运行区，当前 scanout 落在该排除带内。该结论并不能单独说明它与某个具体活跃拥有者冲突，仍须检查当次 FDT／Coreboot 分配和完整保留范围。
 
-最终可写候选为假，严格读取器正确接受“只读发现完成、候选不可用”。锁定维护分支的 1 MiB 动态分配假设不能提升为已安装固件的普遍事实。下一步先核实实际分配路径、范围边界及拥有者，分别修订已被证据否定的假设与显示专用范围策略；不能先放宽门限再直接绘制。原始物理地址、表、日志及其摘要保持私有。
+最终可写候选为假，严格读取器正确接受“只读发现完成、候选不可用”。当时把 1 MiB 基址当作锁定分支的动态分配行为；下一节核实确认这是误读。不能先放宽门限再直接绘制。原始物理地址、表、日志及其摘要保持私有。
 
 本轮仅读取、保存证据并更新脱敏记录，没有改写运行时或测试介质，没有写固件或内置盘，没有自动重启；无代码变更，不重复已通过的 137 项测试。该结果验收发现与 Linux 返回，不验收图案可见、背光、XNU Video 或完整系统启动。
+
+
+## 2026-10-31：真实分配与保留归属核实
+
+本节只读，没有写入硬件、改动运行时或自动重启。证据按来源分开记录。
+
+**源码。** 固定 libpayload 的 [`mmu_get_new_range`](https://chromium.googlesource.com/chromiumos/third_party/coreboot/+/29f90de5f72c645a00146e04789896766f28e783/payloads/libpayload/arch/arm64/mmu.c) 先把区间末端向下对齐，再减去长度得到基址。注释称基址也随之对齐，这只在长度是对齐值倍数时成立；完整帧的 4 KiB 分配跨度不是 1 MiB 倍数。因此动态路径的正确关系是“基址加分配跨度按 1 MiB 对齐”，基址本身只到 4 KiB。schema 1 的 1 MiB 基址门来自对这段源码的误读，不是固件差异的证据。同一路径在 32 MiB DMA 区之后分配，只接受 payload `_end` 之上、4 GiB 之下的范围，所以动态 framebuffer 必然落在 `xnu_range_allowed()` 的整体排除带内；这道门对该对象不可能为真。
+
+**模型。** 用私有 Coreboot 内存表按上述逻辑重放分配，结果与真机 SSPP 基址逐位相等；payload `_end` 取多个值结果不变，DMA 大小改为 16 或 64 MiB 则不再相等。这支持当前路径符合锁定源码，不能证明已安装固件二进制与之相同。
+
+**硬件。** 从产生该日志的同一次启动读取设备树，其中的 probe-log 与私有记录逐字节相同。`/memory` 完整覆盖分配范围，并与按 Depthcharge [`update_memory`](https://chromium.googlesource.com/chromiumos/platform/depthcharge/+/719118f5e36ea312c33b8f005798b1488f9ec2d1/src/boot/fit.c) 从内存表推导的结果完全一致；10 个 reserved-memory 节点都不与它重叠，相对 FIT 内 DTB 只多固件加入的 ramoops；没有 simple-framebuffer 节点。Image、initrd 与 FDT 位于其下方，Coreboot 表与 CBMEM 位于其上方。
+
+**主机。** 以该设备树重建 FDT（memreserve 由上述模型生成），运行实际 C 范围门：未改动时返回假，与真机一致；仅在临时副本中移除整体排除后返回真。尾页预留、上下紧邻预留、静态节点、alloc-ranges、CBMEM、initrd、`/memory` 之外共八组反例结果符合预期。
+
+**结论。** 已识别的拥有者只有 Depthcharge／libpayload 结束运行后遗留的旧分配；交接给内核的内存表没有为它预留，Linux 会把它当普通 RAM。因此后续恢复 scanout 必须在交接前停止 TE，XNU 也必须自行排除这段范围。整体排除带继续作为 XNU arena 放置策略保留，不再用来判断现存显示对象的归属。
+
+**未证实。** 当次 memreserve 未直接读取（`/sys/firmware/fdt` 需要 root，本轮未用）；已安装固件二进制未比对；payload `_end` 的实际值未知；SMMU、MDP、缓存及其他 DMA 主设备状态没有证据。以上都不授权写入，也没有可见画面证据。
+
+
+## schema 2：元数据、分配关系与显示归属分开判断
+
+schema 1 把多个条件合成 `scanout consistent` 和 `FDT range allowed` 两位，结果容易误读。schema 2 分开输出；13 个寄存器读取及其异常保护不变，共 45 个严格字段。
+
+| 字段 | 含义 |
+| --- | --- |
+| `Display metadata consistent` | SSPP geometry／XY／stride／format／unpack 与元数据一致，scanout 非零，表 PA 为零或相等；不含对齐条件 |
+| `Display allocation relation` | 表 PA 为零，且 scanout 加分配跨度按 1 MiB 对齐。非零表 PA 走另一条源码路径且没有真机证据，判假 |
+| `Display allocator window` | 完整分配范围位于 Depthcharge 基址与 4 GiB 之间，排除 FIT 和 FDT 缓冲 |
+| `Display Coreboot RAM` | 完整分配范围落在单个 Coreboot RAM 项内 |
+| `Display FDT owners clear` | `fdt_range_clear()`：完整位于 `/memory`，且不碰 FDT 自身、Coreboot 两元组、memreserve、initrd、reserved-memory 的 reg／alloc-ranges |
+| `Display Image conflict` | 与当前 Image 的完整范围重叠 |
+| `Display ownership verified` | 窗口、RAM、FDT 三项为真且无 Image 冲突 |
+| `Display candidate writable` | 元数据、分配关系与归属三项都为真 |
+
+运行时取不到 payload `_end`，窗口下界只能用 Depthcharge 基址；落在 Depthcharge 自身范围内的情况不会被这一项发现。
+
+`xnu_range_allowed()` 改为先做整体排除、再调用 `fdt_range_clear()`，判断结果和顺序不变，继续只用于 XNU arena。
+
+候选仍只表示通过只读判断，不授权写入，也不表示屏幕可见；图案实验需要单独的契约。schema 1 记录继续按原规则读取，不重新解释：`read_probe.py --display-discovery` 只接受 schema 2，历史记录使用 `--display-discovery-schema1`，两种 schema 互相拒绝。schema 2 不需要为验证规则单独启动一轮，下一个显示镜像会带上这些字段并取得真机记录。
