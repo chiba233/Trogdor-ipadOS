@@ -517,3 +517,12 @@ Coreboot 表与 framebuffer／GPIO 元数据有效，13 次固定 MMIO 读取完
 候选为假的两个原因均已查明。1 MiB 基址门误读了锁定 libpayload：分配器对齐的是末端，基址只到 4 KiB；按该逻辑重放私有内存表的结果与真机 SSPP 基址逐位相等。整体排除带必然覆盖动态分配的 framebuffer，这道门对该对象不可能为真；仅移除该项的临时副本在重建 FDT 上返回真，八组反例符合预期，这是主机结果。
 
 当次 `/memory` 覆盖完整分配范围，reserved-memory 节点都不与它重叠，已识别的拥有者只有 Depthcharge／libpayload 遗留的旧分配。当次 memreserve 未直接读取，已安装固件二进制未比对，SMMU、MDP、缓存及其他 DMA 主设备没有证据；没有绘图、背光或 EC 事务，也没有可见画面记录。完整证据与后续字段见 [分配与归属核实](display-discovery.md#2026-10-31真实分配与保留归属核实)。
+
+
+## 2026-10-31：schema 2 显示发现介质准备
+
+运行时 `9ae6150`。镜像 SHA-256 `b70314a11b6fe4bb062df17f4c285e0fdd5e5b4d38e2b3f4bc895350a3d151bd`，签名容器 SHA-256 `4a31c10a2cf8d826fb8bb58d3083ade2bc38ce46528be356d026051636902c80`。相对上一张发现镜像只换包装器，Linux、47 份 DTB、initrd、配置与命令行不变；原生 Image 的 4250 条指令／9 段标量审计、7 个 C 对象重定位审计及主备 GPT 核对通过。目标端传输摘要与 vboot 签名／body 验证通过。
+
+写入器重新核对 removable USB、容量及 root／boot／swap 排除后，完成全部 128 MiB 写入、同步与完整回读，摘要与镜像一致。没有写固件或内置盘，没有自动重启。
+
+本节只证明介质准备完成，schema 2 尚无真机记录。手动启动后屏幕仍不点亮；回到 Linux 后用 `read_probe.py --display-discovery` 验收全部 45 字段。候选为真也不授权写入，不代表屏幕可见。
