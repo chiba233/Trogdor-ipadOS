@@ -4,7 +4,8 @@ extern uint8_t _xnu_payload_start[],_xnu_payload_end[],_xnu_window[],_image_end[
 void probe_value(const char *,uint64_t);
 struct xnu_expected xnu_expected;
 #define expected xnu_expected
-uint64_t xnu_capture[27],xnu_fault[5];
+uint64_t xnu_capture[27],xnu_fault[5],xnu_topology_live[3];
+extern uint64_t xnu_el1_saved[18];
 struct xnu_handoff xnu_prepare(void) {
     struct xnu_handoff out={0,0};uint64_t cpu,freq,el;
     __asm__ volatile("mrs %0, mpidr_el1":"=r"(cpu));
@@ -72,6 +73,14 @@ int xnu_checkpoint_complete(void) {
             probe_value("XNU PE return verified=",(uint64_t)pe);
         }
     }
+    if(expected.topology) {
+        int topo=good && xnu_topology_valid(&expected);
+        int wfe=good && xnu_wfe_valid(xnu_topology_live,xnu_el1_saved);
+        good=good && topo && wfe;
+        probe_value("XNU topology schema=",1);probe_value("XNU payload version=",11);
+        probe_value("XNU CPU topology verified=",(uint64_t)topo);
+        probe_value("XNU WFE state verified=",(uint64_t)wfe);
+    }
     probe_value("XNU checkpoint=",(uint64_t)good);
     probe_value("XNU boot_args verified=",(uint64_t)good);
     probe_value("XNU current EL=",((c[1]&15)==4 || (c[1]&15)==5)?1:0);
@@ -100,6 +109,22 @@ int xnu_checkpoint_complete(void) {
         probe_value("XNU return boundary verified=",(uint64_t)boundary);
         probe_value("XNU diagnostic return=",(uint64_t)(boundary && !good));
         return good || boundary;
+    }
+    return good;
+}
+
+/* Read back the actual restored registers before log export/Linux handoff. */
+int xnu_system_restored(void) {
+    uint64_t a,b,c;__asm__ volatile("mrs %0,cntkctl_el1":"=r"(a));
+    __asm__ volatile("mrs %0,tpidr_el0":"=r"(b));
+    __asm__ volatile("mrs %0,tpidrro_el0":"=r"(c));
+    int good=a==xnu_el1_saved[17] && b==xnu_el1_saved[8] && c==xnu_el1_saved[9];
+    if(expected.topology) {
+        probe_value("XNU system registers restored=",(uint64_t)good);
+        probe_value("XNU WFE EVENTI=",4);
+        probe_value("XNU CNTKCTL before=",xnu_el1_saved[17]);probe_value("XNU CNTKCTL live=",xnu_topology_live[0]);probe_value("XNU CNTKCTL after=",a);
+        probe_value("XNU TPIDR before=",xnu_el1_saved[8]);probe_value("XNU TPIDR live=",xnu_topology_live[1]);probe_value("XNU TPIDR after=",b);
+        probe_value("XNU TPIDRRO before=",xnu_el1_saved[9]);probe_value("XNU TPIDRRO live=",xnu_topology_live[2]);probe_value("XNU TPIDRRO after=",c);
     }
     return good;
 }

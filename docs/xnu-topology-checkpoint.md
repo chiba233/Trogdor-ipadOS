@@ -4,11 +4,11 @@
 
 ## 输入与装载
 
-使用相同固定源码内核、正常 CPU 初值、既有受限 ADT 和命令行。version11 显式选择 mode7 基础语义并携带独立拓扑标记，不能落入 version9／10 的 SoC 诊断分支；旧 version7 的 PC、X0、父帧和读取条件保持独立。保留原生同步向量，不承诺异常现场回收。
+使用相同固定源码内核、正常 CPU 初值、既有受限 ADT 和命令行；version11 限定当前 19.2 MHz timebase。version11 显式选择 mode7 基础语义并携带独立拓扑标记，不能落入 version9／10 的 SoC 诊断分支；旧 version7 的 PC、X0、父帧和读取条件保持独立。保留原生同步向量，不承诺异常现场回收。
 
 PE 元数据后追加十个 64 位字段：topology_info、CPU 数组、cluster 数组、cluster_offsets、cpu_config_correct、arm64_eventi、PAGE_SHIFT_CONST、page_shift_user32、stall 全局的 KVA，以及 CPU reg 在 ADT 中的值偏移。源代码／生成码审计固定新增可达函数前缀和精确补丁指令。
 
-所有新区域在 arena 写入前检查可写非执行段、跨度、对齐及彼此／既有区域不重叠；独立 C 树扫描确认 CPU reg 偏移和数值与当次启动 affinity 相符。初始化逐字节核对：topology_info 的 version=1 和两个固定数组指针、cpu_config_correct=1、arm64_eventi=UINT32_MAX，其余相应区域为零。拒绝错误偏移、长度、初值及重叠时不得修改 arena。
+所有新区域在 arena 写入前检查可读非执行数据段、跨度、对齐及彼此／既有区域不重叠；独立 C 树扫描确认 CPU reg 偏移和数值与当次启动 affinity 相符。初始化逐字节核对：topology_info 的 version=1 和两个固定数组指针、cpu_config_correct=1、arm64_eventi=UINT32_MAX，其余相应区域为零。拒绝错误偏移、长度、初值及重叠时不得修改 arena。实际固定内核将部分拓扑全局放在 SECURITY_READ_ONLY_LATE 的初始只读数据段；早期自有 arena 的块页表仍为可写，写权限由完整 bootstrap 表模型保障，不要求 Mach-O 描述预置写位，也不修改源段权限。
 
 ## 原生运行结果
 
@@ -22,8 +22,10 @@ PE 元数据后追加十个 64 位字段：topology_info、CPU 数组、cluster 
 
 ## 日志与验证
 
-独立 `--xnu-topology` 严格读取：继承完整 PE 的 22 字段，加 WFE 状态、拓扑对象、系统寄存器恢复三个通过标志；要求 version11、精确新 ELR，以及三个寄存器的 before／live／after 字段，逐项验证恢复和值关系。旧 PE／SoC 和诊断读取模式不得将 version11 当作自身检查点通过。
+独立 `--xnu-topology` 严格读取：继承完整 PE 的 22 字段，加 WFE 状态、拓扑对象、系统寄存器恢复三个通过标志；要求 version11、正常 boundary／diagnostic 标记、精确新 ELR，以及三个寄存器的 before／live／after 字段，逐项验证恢复和值关系。旧 PE／SoC 和诊断读取模式不得将 version11 当作自身检查点通过。
 
 验证覆盖所有新增输入初值／范围／重叠的写入前拒绝，完整新对象与未用槽逐字节破坏、全部新增寄存器和父帧／捕获／表池条件、读取器缺失／重复／矛盾／旧模式拒绝，实际 AArch64 对象绝对重定位审计和标量生成码检查。主机系统模型执行真实入口、原生源码、MMU 和返回，使用多组非零 CNTKCTL／TPIDR 初值，独立在 Linux 入口桩核对恢复；旧 mode6／7／9／10 同时回归。
 
-源与主机证据、介质准备及真机验收分别记录。只在完整测试、系统模型、独立审查和产物校验通过后，按既有授权准备可清空外置介质并全量回读；手动启动后取得新版本完整记录才算硬件通过。当前仅为设计，尚未实现或准备 version11 介质。
+源与主机证据、介质准备及真机验收分别记录。只在完整测试、系统模型、独立审查和产物校验通过后，按既有授权准备可清空外置介质并全量回读；手动启动后取得新版本完整记录才算硬件通过。version11 已实现，126 项完整主机测试、四种基础探针构建及七次 TCG 系统模型回归通过；三组新版本分别覆盖零值、非零寄存器初值和不同加载地址，旧 mode6／7／9／10 单独回归。最终原生产物通过 13 个实际 C 对象的重定位审计、标量生成码、原样负载／Linux／47 份 DTB／initrd／配置与 GPT 核对及独立审查。板级准入、日志导出与 Linux 入口在系统模型中仍由桩代替，不能当作 SC7180 物理缓存或真机执行证据。
+
+2026-10-31：最终镜像已通过目标端签名／body 与全部传输摘要核对；重新排除 root／boot／swap 后，已写入既有可清空外置 USB，完整 128 MiB 同步及回读摘要一致。没有自动重启；硬件 version11 执行验收待进行。真机日志必须通过 `read_probe.py --xnu-topology` 全部 40 项必需字段及精确返回位置／参数核对。

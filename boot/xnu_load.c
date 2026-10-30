@@ -21,8 +21,8 @@ int xnu_load(const uint8_t *p, size_t len, void *window, size_t capacity,
              struct xnu_expected *expected) {
     const char magic[]="TRXNUC01";
     out->entry=out->args=0;
-    if (len<HEADER || (le32(p+8)<1 || le32(p+8)>10)) return 0;
-    uint32_t version=le32(p+8),mode=version>=9?8:version;
+    if (len<HEADER || (le32(p+8)<1 || le32(p+8)>11)) return 0;
+    uint32_t version=le32(p+8),topology=version==11,diagnostic=version==9 || version==10,mode=topology?7:diagnostic?8:version;
     for (unsigned i=0;i<8;i++) if (p[i]!=(uint8_t)magic[i]) return 0;
     uint32_t count=le32(p+12);
     if (!count || count>64 || !bounded(HEADER,(uint64_t)count*40,len)) return 0;
@@ -33,7 +33,7 @@ int xnu_load(const uint8_t *p, size_t len, void *window, size_t capacity,
     uint64_t metadata=HEADER+(uint64_t)count*40;
     if (capacity<XNU_ARENA_BYTES || memory!=XNU_ARENA_BYTES || (phys&0x1fffff) ||
         phys>UINT64_MAX-memory || base>UINT64_MAX-memory || (base&4095) ||
-        !span || span>memory || raw<metadata+(mode==8?232u:mode==7?224u:mode==6?184u:mode==5?112u:mode==4?96u:mode>=2?48u:0u) || (raw&15) ||
+        !span || span>memory || raw<metadata+(mode==8?232u:mode==7?(topology?304u:224u):mode==6?184u:mode==5?112u:mode==4?96u:mode>=2?48u:0u) || (raw&15) ||
         !bounded(raw,rawsize,len) || !bounded(adt,adtsize,len) ||
         adt<raw+rawsize || adt+adtsize!=len || !adtsize || adtsize>1048576 ||
         !bounded(v[10],8,adtsize) || !bounded(v[11],8,adtsize) ||
@@ -56,11 +56,11 @@ int xnu_load(const uint8_t *p, size_t len, void *window, size_t capacity,
         for (unsigned i=2;i<5;i++) if (extra[i]<base || extra[i]>=base+span || (extra[i]&15)) return 0;
     }
     uint64_t cinit[6]={0,0,0,0,0,0};
-    uint64_t cpu[2]={0,0},platform[9]={0,0,0,0,0,0,0,0,0},pe[5]={0},soc_ranges=0,soc_base=0;
+    uint64_t cpu[2]={0,0},platform[9]={0,0,0,0,0,0,0,0,0},pe[5]={0},soc_ranges=0,soc_base=0,topo[10]={0};
     if (mode>=4) {
-        if (!bounded(metadata,mode==8?232u:mode==7?224u:mode==6?184u:mode==5?112u:96u,len)) return 0;
+        if (!bounded(metadata,mode==8?232u:mode==7?(topology?304u:224u):mode==6?184u:mode==5?112u:96u,len)) return 0;
         for (unsigned i=0;i<6;i++) cinit[i]=le64(p+metadata+48+i*8);
-        uint64_t stop=mode>=6?0x5b0u:mode==5?0x5a4u:0x594u;
+        uint64_t stop=topology?0x648u:mode>=6?0x5b0u:mode==5?0x5a4u:0x594u;
         if (cinit[0]<base || !bounded(cinit[0]-base,stop+4,span)) return 0;
         if (mode!=6 && mode!=8 && checkpoint!=cinit[0]+stop) return 0;
         if (mode>=5) {
@@ -94,22 +94,29 @@ int xnu_load(const uint8_t *p, size_t len, void *window, size_t capacity,
             const char line[]="-v debug=0xc cpus=1 keepsyms=1";
             for (unsigned i=0;i<1024;i++) if (p[128+i]!=(i<sizeof(line)?(uint8_t)line[i]:0)) return 0;
         }
+        if(topology) {
+            for(unsigned i=0;i<10;i++)topo[i]=le64(p+metadata+224+i*8);
+            if(frequency!=19200000 || affinity>0xffffffffull || !bounded(topo[9],4,adtsize) ||
+                topo[9]!=xnu_topology_reg_offset(p+adt,(size_t)adtsize) || le32(p+adt+topo[9])!=affinity)return 0;
+            for(unsigned i=10;i<12;i++)if(v[i]<topo[9]+4 && topo[9]<v[i]+8)return 0;
+        }
         /* Every read/write region is checked before zeroing or copying anything. */
         uint64_t frame=mode>=6?4096u:0xe0u;
-        uint64_t starts[18]={extra[3]-frame,cinit[1],cinit[2],cinit[3],cinit[4],cinit[5],pages,cpu[0]-16,cpu[1],platform[0],platform[1],platform[2],platform[3],pe[0],pe[1],pe[2],pe[3],pe[4]};
-        uint64_t sizes[18]={frame,0x480,8,8,1,8,65536,0x520,8,0xb0,4,0x1c,8,48,0x208,4,4,4};
-        for (unsigned i=0;i<(mode>=7?18u:mode==6?13u:mode==5?9u:7u);i++) {
-            if (starts[i]<base || !bounded(starts[i]-base,sizes[i],span) || (i!=4 && (starts[i]&(i>=15?3u:7u)))) return 0;
+        uint64_t starts[27]={extra[3]-frame,cinit[1],cinit[2],cinit[3],cinit[4],cinit[5],pages,cpu[0]-16,cpu[1],platform[0],platform[1],platform[2],platform[3],pe[0],pe[1],pe[2],pe[3],pe[4],topo[0],topo[1],topo[2],topo[3],topo[4],topo[5],topo[6],topo[7],topo[8]};
+        uint64_t sizes[27]={frame,0x480,8,8,1,8,65536,0x520,8,0xb0,4,0x1c,8,48,0x208,4,4,4,88,480,72,8,1,4,4,4,8};
+        for (unsigned i=0;i<(topology?27u:mode>=7?18u:mode==6?13u:mode==5?9u:7u);i++) {
+            if (starts[i]<base || !bounded(starts[i]-base,sizes[i],span) || (i<18 && i!=4 && (starts[i]&(i>=15?3u:7u)))) return 0;
+            if(i>=18 && (starts[i]&((i==22?1u:i>=23 && i<=25?4u:8u)-1u)))return 0;
             int inside=0;
             for (unsigned j=0;j<count;j++) {
                 const uint8_t *s=p+HEADER+40*j;
                 uint64_t off=le64(s),n=le64(s+8),file=le64(s+16),bytes=le64(s+24),prot=le64(s+32);
                 if (prot>7 || off>span || n>span-off || bytes>n || !bounded(file,bytes,rawsize)) return 0;
-                if (!(prot&4) && starts[i]>=base+off && bounded(starts[i]-base-off,sizes[i],n)) {
+                if (!(prot&4) && (i<18 || (prot&1)) && starts[i]>=base+off && bounded(starts[i]-base-off,sizes[i],n)) {
                     inside=1;
                     if (i<6 || i==7 || i>=9) for (uint64_t k=0;k<sizes[i];k++) {
                         uint64_t rel=starts[i]-base-off+k;
-                        uint8_t want=(i==17 && !k)?1:0;
+                        uint8_t want=i>=18?xnu_topology_initial_byte(i-18,(unsigned)k,topo):(i==17 && !k)?1:0;
                         if ((rel<bytes?p[raw+file+rel]:0)!=want) return 0;
                     }
                 }
@@ -120,7 +127,7 @@ int xnu_load(const uint8_t *p, size_t len, void *window, size_t capacity,
     }
     int executable_entry=0,executable_checkpoint=0,pool=0,stack=0;
     unsigned fault_vectors=0;uint64_t diagnostic_code=0;int control_checked=0;
-    if (version>=9 && (extra[2]&2047)) return 0;
+    if (diagnostic && (extra[2]&2047)) return 0;
     uint64_t last=0;
     for (unsigned i=0;i<count;i++) {
         const uint8_t *s=p+HEADER+40*i;
@@ -139,7 +146,7 @@ int xnu_load(const uint8_t *p, size_t len, void *window, size_t capacity,
             if (le32(code)!=0xd10343ff || le32(code+4)!=0xa9076ffc || le32(code+8)!=0xa90867fa) return 0;
             stack=1;
         }
-        if (version>=9 && (prot&4)) {
+        if (diagnostic && (prot&4)) {
             diagnostic_code|=xnu_diagnostic_code_mask(base+off,bytes);
             uint64_t va=platform[6]+0x34;
             if (va>=base+off && bounded(va-base-off,4,bytes)) {
@@ -148,7 +155,7 @@ int xnu_load(const uint8_t *p, size_t len, void *window, size_t capacity,
                 control_checked=1;
             }
         }
-        if (version>=9 && (prot&4)) for (unsigned slot=0;slot<2;slot++) {
+        if (diagnostic && (prot&4)) for (unsigned slot=0;slot<2;slot++) {
             uint64_t va=extra[2]+slot*0x200u;
             if (va>=base+off && bounded(va-base-off,4,bytes)) {
                 if (le32(p+raw+file+va-base-off)!=(0xd4000002u|(0x5846u<<5))) return 0;
@@ -165,7 +172,7 @@ int xnu_load(const uint8_t *p, size_t len, void *window, size_t capacity,
         }
     }
     if ((mode>=3 && !stack) || (mode>=2 && !pool) || last!=span || !executable_entry || !executable_checkpoint || (entry&3) || (checkpoint&3)) return 0;
-    if (version>=9 && (fault_vectors!=3 || diagnostic_code!=((1ull<<18)-1) || !control_checked)) return 0;
+    if (diagnostic && (fault_vectors!=3 || diagnostic_code!=((1ull<<18)-1) || !control_checked)) return 0;
     /* All writes stay in the Image-owned arena, after every input is checked. */
     volatile uint64_t *zero=window;for (uint64_t i=0;i<top/8;i++) zero[i]=0;
     for (unsigned i=0;i<count;i++) {
@@ -187,7 +194,7 @@ int xnu_load(const uint8_t *p, size_t len, void *window, size_t capacity,
     expected->pc=phys+bias+checkpoint-base;expected->args=out->args;
     expected->virt=base;expected->phys=phys+bias;expected->memory=memory-bias;
     expected->pages=phys+bias+pages-base;expected->flags=0;
-    expected->diagnostics=version>=9?version:0;expected->kernel_end=base+span;
+    expected->diagnostics=diagnostic?version:0;expected->kernel_end=base+span;
     expected->mode=mode;expected->tcr=extra[0];expected->mair=extra[1];
     expected->vbar=extra[2];expected->sp0=extra[3]-((mode==6 || mode==8)?0x200u:mode>=3?0xd0u:0u);expected->sp1=extra[4];expected->end=phys+top;
     expected->c_entry=cinit[0];expected->const_args=cinit[1];expected->boot_args=cinit[2];
@@ -199,6 +206,9 @@ int xnu_load(const uint8_t *p, size_t len, void *window, size_t capacity,
     expected->soc_data=pe[0];expected->pe_info=pe[1];expected->config_bits=pe[2];
     expected->debug_enabled=pe[3];expected->degradation=pe[4];
     expected->soc_ranges=soc_ranges;expected->soc_base=soc_base;
+    expected->topology=topology;expected->topo_info=topo[0];expected->topo_cpus=topo[1];expected->topo_clusters=topo[2];
+    expected->topo_offsets=topo[3];expected->topo_correct=topo[4];expected->topo_eventi=topo[5];expected->topo_page=topo[6];
+    expected->topo_userpage=topo[7];expected->topo_stall=topo[8];expected->topo_reg=topo[9];expected->topo_affinity=topology?affinity:0;
     expected->adt_checksum=mode>=7?xnu_pe_checksum(t,(size_t)adtsize):0;
     return 1;
 }
@@ -220,7 +230,7 @@ int xnu_capture_valid(const uint64_t *c,const struct xnu_expected *e) {
     if (e->mode==2) return 1;
     if (e->mode>=4) {
         uint64_t line=c[25];
-        return c[18]==(e->mode==8?e->soc_base:e->mode==7?0xffffffffu:e->mode==6?1:e->mode==5?e->cpu_data:e->const_args) &&
+        return c[18]==(e->mode==8?e->soc_base:e->mode==7?(e->topology?0:0xffffffffu):e->mode==6?1:e->mode==5?e->cpu_data:e->const_args) &&
             c[19]==(e->mode==8?e->soc_data+8:e->mode==7?e->cpu_data:e->mode==6?e->const_args:e->mode==5?e->cpu_data:e->virt+(e->args-e->phys)) &&
             c[20]==0x300000 && c[21]==0 && c[22]==(e->mode==8?e->soc+0xa8:e->mode>=5?high_pc:high_pc-8) &&
             (e->mode<5 || !(c[2]&2)) && c[24]==e->sp0+((e->mode==6 || e->mode==8)?0x30u:0xc0u) &&

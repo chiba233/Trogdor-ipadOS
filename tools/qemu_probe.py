@@ -24,6 +24,9 @@ def main():
     parser.add_argument('--qemu', type=Path, required=True)
     parser.add_argument('--payload', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--cntkctl-initial', type=lambda s: int(s,0), default=0x100)
+    parser.add_argument('--tpidr-initial', type=lambda s: int(s,0), default=0x1234567890abcdef)
+    parser.add_argument('--tpidrro-initial', type=lambda s: int(s,0), default=0xfedcba9876543210)
     parser.add_argument('--load-address', type=lambda s: int(s, 0), default=0x40200000)
     args = parser.parse_args()
     qemu, payload, out = args.qemu.resolve(), args.payload.resolve(), args.output.resolve()
@@ -33,8 +36,8 @@ def main():
     if len(data) < 16 or data[:8] != b'TRXNUC01':
         parser.error('unrecognized source-XNU payload')
     version = struct.unpack_from('<I', data, 8)[0]
-    if version not in (6, 7, 9, 10):
-        parser.error('this system regression accepts platform6, PE7 or diagnostic9/10 only')
+    if version not in (6, 7, 9, 10, 11):
+        parser.error('this system regression accepts platform6, PE7, diagnostic9/10 or topology11 only')
     if args.load_address % 0x200000 or not 0x40200000 <= args.load_address <= 0x58000000:
         parser.error('load address must be 2-MiB aligned inside modeled RAM, above the QEMU DTB')
     out.mkdir(parents=True)
@@ -49,9 +52,10 @@ def main():
     env = dict(os.environ, ZIG_GLOBAL_CACHE_DIR=str(ROOT / '.tools/zig-cache'),
                ZIG_LOCAL_CACHE_DIR=str(ROOT / '.tools/zig-local-cache'))
     sources = [ROOT / 'boot' / name for name in ('xnu_checkpoint.c', 'xnu_load.c', 'xnu_tables.c',
-        'xnu_cinit.c', 'xnu_cpu.c', 'xnu_platform.c', 'xnu_pe.c', 'xnu_diagnostics.c')]
+        'xnu_cinit.c', 'xnu_cpu.c', 'xnu_platform.c', 'xnu_pe.c', 'xnu_diagnostics.c', 'xnu_topology.c')]
     sources.append(ROOT / 'tests/qemu_probe.c')
-    defines = ('PROBE_UART=0', 'PROBE_RESET_EL=0', 'PROBE_LINUX_CHAIN=1', 'PROBE_XNU_CHECKPOINT=1')
+    defines = ('PROBE_UART=0', 'PROBE_RESET_EL=0', 'PROBE_LINUX_CHAIN=1', 'PROBE_XNU_CHECKPOINT=1',
+        'HOST_CNTKCTL='+str(args.cntkctl_initial)+'ull','HOST_TPIDR='+str(args.tpidr_initial)+'ull','HOST_TPIDRRO='+str(args.tpidrro_initial)+'ull')
     relocations = audit_sources(zig, CPU, sources, env, out / 'relocation-audit', defines)
     elf, image = out / 'probe.elf', out / 'Image'
     subprocess.run([str(zig), 'cc', '-target', 'aarch64-freestanding-none', '-mcpu=' + CPU,
@@ -88,7 +92,9 @@ def main():
     if len(log) >= 8192:
         raise ValueError('modeled log exceeds receiver capacity')
     record = log.ljust(8192, b'\0')
-    if version in (6, 7):
+    if version == 11:
+        _, fields = read_record(record, xnu_topology=True)
+    elif version in (6, 7):
         _, fields = read_record(record, xnu_platform=version == 6, xnu_pe=version == 7)
     else:
         _, fields = read_diagnostic_record(record)
@@ -101,6 +107,7 @@ def main():
         'excluded': ['board/FDT admission', 'real log export', 'real Linux boot', 'SC7180 devices'],
         'qemu_version': subprocess.check_output([str(qemu), '--version']).decode().splitlines()[0],
         'payload_version': version, 'payload_sha256': hashlib.sha256(data).hexdigest(),
+        'initial_registers': {'CNTKCTL':args.cntkctl_initial,'TPIDR':args.tpidr_initial,'TPIDRRO':args.tpidrro_initial},
         'load_address': args.load_address, 'image': header, 'scalar_code': scalar,
         'c_relocations': relocations, 'fields': fields,
         'code_sha256': {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()

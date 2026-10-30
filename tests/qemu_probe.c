@@ -23,9 +23,18 @@ static void finish(unsigned status) {
     __asm__ volatile("hlt #0xf000":"+r"(op),"+r"(arg)::"memory","cc");
     for(;;)__asm__ volatile("wfe");
 }
-void host_finish(void) {text("HOST_LINUX_ENTRY_REACHED\n");finish(checkpoint||transport?0:2);}
+void host_finish(void) {
+    uint64_t a,b,c;__asm__ volatile("mrs %0,cntkctl_el1":"=r"(a));
+    __asm__ volatile("mrs %0,tpidr_el0":"=r"(b));__asm__ volatile("mrs %0,tpidrro_el0":"=r"(c));
+    probe_value("HOST restored CNTKCTL=",a);probe_value("HOST restored TPIDR=",b);probe_value("HOST restored TPIDRRO=",c);
+    text("HOST_LINUX_ENTRY_REACHED\n");
+    finish((checkpoint||transport) && a==HOST_CNTKCTL && b==HOST_TPIDR && c==HOST_TPIDRRO?0:2);
+}
 void probe_main(const void *dt,uint64_t incoming,uint64_t sctlr,uint64_t hcr) {
     (void)dt;(void)sctlr;(void)hcr;
+    uint64_t seed=HOST_CNTKCTL;__asm__ volatile("msr cntkctl_el1,%0"::"r"(seed):"memory");
+    seed=HOST_TPIDR;__asm__ volatile("msr tpidr_el0,%0"::"r"(seed):"memory");
+    seed=HOST_TPIDRRO;__asm__ volatile("msr tpidrro_el0,%0;isb"::"r"(seed):"memory");
     uint64_t freq,cpu,el;
     __asm__ volatile("mrs %0,cntfrq_el0":"=r"(freq));
     __asm__ volatile("mrs %0,mpidr_el1":"=r"(cpu));

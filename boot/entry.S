@@ -140,6 +140,8 @@ probe_call:
     str x11, [x10, #120]
     mrs x11, spsr_el1
     str x11, [x10, #128]
+    mrs x11, cntkctl_el1
+    str x11, [x10, #136]
     mov x9, x0
     mov x0, x1
     mov x1, xzr
@@ -322,6 +324,14 @@ xnu_checkpoint_return:
     str x9, [x10, #112]
     mrs x9, vbar_el1
     str x9, [x10, #120]
+    adrp x11, xnu_topology_live
+    add x11, x11, :lo12:xnu_topology_live
+    mrs x9, cntkctl_el1
+    str x9, [x11]
+    mrs x9, tpidr_el0
+    str x9, [x11, #8]
+    mrs x9, tpidrro_el0
+    str x9, [x11, #16]
     ldr x9, [x10, #16]
     tbz x9, #0, 7f
     /* AT uses the still-active EL1 regime, while EL2 stays MMU-off. */
@@ -449,9 +459,13 @@ xnu_clean_line:
     msr far_el1, x9
     ldr x9, [x10, #128]
     msr spsr_el1, x9
+    ldr x9, [x10, #136]
+    msr cntkctl_el1, x9
     ldr x9, [x10]
     msr sctlr_el1, x9
     isb
+    bl xnu_system_restored
+    cbz w0, halt
     adrp x10, xnu_saved
     add x10, x10, :lo12:xnu_saved
     ldp x19, x20, [x10]
@@ -466,6 +480,7 @@ xnu_clean_line:
 xnu_saved:
     .zero 80
 .balign 16
+.global xnu_el1_saved
 xnu_el1_saved:
     .zero 144
 #endif
