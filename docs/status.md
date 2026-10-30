@@ -1,6 +1,6 @@
 # 状态与首阶段验收
 
-更新：2026-10-30。
+更新：2026-10-31。
 
 | 项目 | 状态 | 证据／限制 |
 | --- | --- | --- |
@@ -17,7 +17,7 @@
 | GPT 镜像生成 | 主机测试通过 | 主／备 GPT CRC、分区类型、负载布局、文件保护；官方 vboot 对 64 MiB 镜像与模拟 8 GiB 介质的主表校验通过；Linux 接收版本的 128 MiB 镜像已通过完整介质回读与实际启动 |
 | 仅抑制最终复位的 EL1 匹配对照 | 已观察到不自动重启 | Image 仅改一条 SMC 为 NOP，其余字节相同；与原版形成硬件对照，见 docs/control.md |
 | 原生 Linux 日志接收 | 真机验收通过 | EL1 探针→受控 HVC→EL2 Linux；8192 字节日志完整读回并校验，29 项主机测试通过，见 docs/linux-log.md |
-| 显示恢复 | 未实现 | 原厂停止 timing engine / DSI，不能直接沿用 splash |
+| 显示恢复 | 固件复用源码审计完成，尚未实现 | stop 只关背光／TE／DSI control；实际 scanout 地址、交接保留状态、EC 协议和独立测试范围见 [显示审计](display-reuse-audit.md) |
 | XNU 源码与装载前检查 | 源码内核已编译链接，51 项回归通过 | XNU 10063.141.1／Darwin 23.6；真实 FDT 已生成最小 ADT；本地链接指针已逐条审计；完整组件 prelink 待接入，见 docs/xnu-preparation.md |
 | 源码 XNU 装载与 boot_args 入口检查点 | 真机验收通过 | EL1 读取参数后 HVC 返回 EL2，Linux 收到唯一且通过校验的 copied／checkpoint／boot_args／current EL 四字段，见 docs/xnu-checkpoint.md |
 | XNU MMU 开启检查点 | 真机验收通过 | 完整 8192 字节日志确认 MMU／表池／硬件 AT 校验均成功，并返回 Linux；见 docs/xnu-mmu-checkpoint.md |
@@ -29,7 +29,8 @@
 | 当前包装器的 mode6 回归对照 | 真机 19 字段通过（2026-10-30） | 原样已验收负载在当前公共装载／返回路径仍可工作；不验证后续执行或 mode7／8 专属门限，见 docs/hardware-tests.md |
 | XNU SoC 属性诊断中点 | version9 真机 20 字段通过（2026-10-30） | 原生属性读取／缓存对象、CPU／PE／DT、活动帧、表池／AT／缓存返回通过；未访问 SoC MMIO 或验证完整平台返回，见 docs/xnu-soc-checkpoint.md |
 | 同步异常／返回失败诊断 | version10 主动异常传输已真机验收（2026-10-30） | 8192 字节日志通过 46 项必需字段读取，精确 BRK／向量／页表池／缓存传输门匹配并返回 Linux；version10 的 checkpoint=0 符合故障设计，后续 version9 正常 SoC 返回已验收，见 docs/xnu-diagnostics.md |
-| XNU 后续平台／中断／SMP 初始化 | 未验证 | 已验收边界推进至完整 PE_init_platform(FALSE) 返回；WFE／CPU 拓扑／线程／VM 和后续初始化仍待审计与硬件记录 |
+| XNU WFE／单 CPU 拓扑 | version11 主机验证通过，硬件待验收 | 126 项测试、七次 TCG 系统运行、13 个 C 对象与原生产物审查通过；保存／核对／恢复 CNTKCTL 和 TPIDR 对，真机要求 40 字段，见 [契约](xnu-topology-checkpoint.md) |
+| XNU 后续线程／VM／中断／SMP 初始化 | 未验证 | 已验收边界仍为完整 PE_init_platform(FALSE) 返回；新拓扑检查点尚未取得硬件记录，线程与 VM 等另行审计 |
 | eMMC、触摸、GPU 与完整 iPadOS 用户态 | 未实现 | 没有原生桌面或应用运行记录 |
 
 ## 已执行的主机验证
@@ -59,3 +60,5 @@
 6. 后续已完成：源码 XNU 的运行时段装载与 pre-MMU boot_args 读取检查点，取得有效硬件日志。随后 MMU 开启、完整页表池和硬件 AT 检查点也已通过真机验收。随后高虚拟地址取指、C 入口栈帧调整与诊断栈读取也已取得硬件日志。早期 C 正文的原始栈保存、参数复制和缓存清理返回也已取得硬件日志。启动 CPU 对象的原始标量／SIMD 初始化也已通过硬件日志验收。原始平台状态、ADT 绑定及首次原生 arm-io 查找已通过完整 19 字段和独立清单核对。后续 version9 的 SoC 属性读取／缓存写入也已取得严格 20 字段硬件记录。随后 version7 的完整 PE 返回也已取得严格 22 字段硬件记录。待完成：WFE／CPU 拓扑／线程／VM、平台／中断／SMP 初始化、其余 ADT 消费、平台接口与显示恢复。
 
 原生探针、源码 XNU pre-MMU 入口、MMU 开启、高地址入口栈读取、早期 C 参数复制、启动 CPU 数据及首次平台／ADT 查找检查点均已取得硬件日志；主机测试仍须单独列出。没有完整 XNU 或 iPadOS 启动结果。
+
+2026-10-31：version11 已补齐上述 CNTKCTL 生命周期，源与主机系统验证及原生产物审查通过。最终镜像通过目标端签名／传输核验后，已写入既有可清空外置介质并完成全量 128 MiB 回读；没有自动重启，完整 40 字段真机执行验收待进行。

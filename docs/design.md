@@ -115,3 +115,8 @@ EL2 分支将 EL1 设置为 AArch64、关闭 stage-2 translation、允许 EL1 �
 
 
 2026-10-30 修复包装器的 version7 原负载取得完整真机日志，全部 22 个严格字段、精确完整 PE 返回 PC、正常 boundary=1／diagnostic return=0 及缓存覆盖通过并交接 Linux。既有前 VM 平台阶段已验收；推进到后续 WFE 会修改尚未纳入恢复快照的 CNTKCTL_EL1，先完成 [后续状态／依赖审计](post-pe-audit.md)，再设计下一份镜像。
+
+
+## WFE 与单 CPU 拓扑的独立返回
+
+[version11](xnu-topology-checkpoint.md) 合并原始 WFE、chosen／stall、页大小和单 CPU 拓扑解析，停止在下一条启动 CPU 编号调用前。保留全部 PE／页表／AT／缓存门，新增完整拓扑对象模型、CNTKCTL 与 TPIDR 对的入口／运行／恢复核对，使用独立严格 40 字段读取。126 项主机回归、七次系统模型与最终原生产物独立审查通过；真机执行尚未验收，线程和 VM 不在本轮范围。显示复用是独立研究，见 [显示审计](display-reuse-audit.md)。

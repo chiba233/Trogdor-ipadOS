@@ -74,7 +74,7 @@ python3 tools/sign.py build/uart/probe.itb \
 
 探针在静态符号 `probe_log` 对应的内存中记录入口 EL、SCTLR、HCR、切换后的 EL、计时器频率、FDT 校验和交接属性；memory / uart 版本记录完成后停在 `WFE` 循环；定时复位版本在满足检查条件后请求重启。UART 版本只复用已初始化的 SC7180 QUPv3 UART，不下载固件，不改时钟或引脚；不可用时保留内存日志。
 
-这一步不会恢复屏幕。原厂 Depthcharge 会停止 timing engine、关闭背光并复位 DSI，显示恢复需要独立验证。
+这一步不会恢复屏幕。已核对的 Depthcharge 源码会停止 timing engine、关闭背光并清零 DSI control，显示恢复需要独立验证；复用固件显示链的依据与待核对项见 [显示审计](docs/display-reuse-audit.md)。
 
 ## 原生 Linux 日志接收
 
@@ -101,3 +101,5 @@ python3 tools/sign.py build/uart/probe.itb \
 [SoC 属性诊断中点](docs/xnu-soc-checkpoint.md) 已由 version9 的真机日志验收：原始属性读取与缓存写入、全部 20 个严格字段、完整捕获／页表／硬件 AT 与缓存返回通过，随后交接 Linux。此前 version8 的无日志尝试保留为失败历史；本轮不覆盖后续 CPU／时钟／型号／调试配置或 SoC MMIO。
 
 [同步异常与返回失败诊断](docs/xnu-diagnostics.md) 在修复包装器的绝对字符串指针缺陷后，已取得真机完整 BRK 异常记录并返回 Linux：精确故障位置／ESR、完整页表池与诊断传输均通过。此轮只验收异常回收通道，主动故障的 checkpoint=0 符合设计；随后 version9 的真实 SoC 属性路径也通过全部 20 个严格字段并正常返回 Linux。完整早期 PE 返回已在随后单独验收；完整系统启动、时钟／设备驱动仍未支持，主机验证证据单独保留。
+
+[WFE 与单 CPU 拓扑检查点](docs/xnu-topology-checkpoint.md) 已实现 version11，126 项主机测试、七次系统模型回归和原生产物独立审查通过；检查三个系统寄存器的运行值和完整恢复，严格读取要求 40 字段。真机验收尚待进行，不包含线程／VM 初始化。

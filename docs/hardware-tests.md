@@ -458,3 +458,16 @@ version9 的结果为 reason=0、checkpoint=1、fault received=0、capture verif
 原样 version7 payload 的完整 PE 返回 HVC／ELR、参数虚实关系和自有 arena 对齐布局匹配；全部 CPU／PE／DT／SoC／时钟结构／型号／调试配置／活动父帧、完整表池和硬件 AT 验证通过，64 字节缓存行 × 393216 行覆盖全部 24 MiB arena。checkpoint=1、return boundary verified=1、diagnostic return=0，恢复状态后完成原生 Linux 交接。独立核对支持这次受限 PE_init_platform(FALSE) 调用成功，不包含 version9／10 的原始异常 46 字段。
 
 缺失频率依旧按当前 ADT 合约为零，clock info 不是时钟驱动验收；timer／WFE、CPU 拓扑／线程／VM、中断／SMP 和完整系统启动仍未验证。此前无日志轮次仍无法确定精确停止位置。此次仅读取／保存证据，没有改写介质或自动重启，也没有生成新的真机测试镜像；下一阶段的源码与生成码依赖见 [后续审计](post-pe-audit.md)。本轮未修改运行时代码或测试，没有重复运行已有主机回归。
+
+
+## 2026-10-31：version11 WFE／单 CPU 拓扑主机验证及介质准备
+
+独立 version11 的执行／输入／恢复契约见 [说明](xnu-topology-checkpoint.md)。保留原生同步向量，在拓扑解析返回后、下一条 ml_get_boot_cpu_number 调用前以单条 HVC 返回；核对全部原 PE 数据、完整拓扑对象／未用槽／父帧、WFE 值和 CNTKCTL／TPIDR 对入口／运行／恢复关系，不进入线程或 VM。
+
+126 项完整主机测试、四种基础探针构建通过。七次 TCG 系统模型回归使用实际包装器、原生 XNU 与 MMU／HVC 返回，三次 version11 覆盖零值／不同非零系统寄存器初值和不同加载地址，旧 mode6／7／9／10 各自严格回归。version11 全部 40 字段通过，Linux 入口桩另行读取并核对三个恢复寄存器；模型桩和虚拟缓存不代替板级准入、真实 Linux 启动或 SC7180 缓存证据。
+
+设计提交 `cfd8b2f`，运行时提交 `3d6acfd`。镜像 SHA-256 `83786588e6d8c06b3256eb253bfcb065edaf35578b08ec734f0442ff1060409a`，签名容器 SHA-256 `4b6caa9a288dd536b9c2c84c0ecc0bcc688da7cb4babffb73962f87502a40e55`，负载 SHA-256 `23457b14fc4d9971237f05e356015eb2ed8415a424f68dfc7544c801715c76b7`。源与产物摘要、ELF 导出／Image、原样负载、13 个实际 C 对象重定位审计、7883 条指令／15 段标量约束、74 MiB 布局、保留 Linux／47 份 DTB／initrd／配置／命令行、实际主备 GPT CRC／属性／容器、主机 vboot 签名／body 与独立审查通过。
+
+目标连接恢复后，独立比较镜像／签名容器／清单／读取器／公开密钥／私有写入器全部传输摘要，目标端 vboot 签名与 body 验证通过。再次确认既有可清空外置 USB 的 removable／容量及 root／boot／swap 排除后，固定哈希私有写入器独占打开该介质，完成全部 128 MiB 写入、同步与完整回读，摘要与本镜像一致。没有写固件或内置盘，没有自动重启。
+
+version11 真机执行验收仍待进行，必须取得本轮精确边界和 `read_probe.py --xnu-topology` 全部 40 字段；已有完整 PE 硬件通过不会自动升级为拓扑通过。本轮没有加入显示 MMIO／EC 写入或改变 Video 输入；显示复用仅完成 [独立源码审计](display-reuse-audit.md)。
