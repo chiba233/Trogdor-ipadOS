@@ -1,6 +1,6 @@
 # 复用固件显示链：源码审计与独立验证范围
 
-日期：2026-10-31。本文是对固件显示复用路线的源码核对，不表示显示恢复已实现或真机寄存器已测量，也不改变当前 version11 的 WFE／拓扑介质。优先研究 Coreboot／Depthcharge 的小型显示路径；本阶段不移植 Linux msm DRM 的完整初始化框架。
+日期：2026-10-31。本文记录固件显示复用路线的源码核对；后续独立只读发现已取得真机寄存器，显示恢复仍未实现，也不改变 version11 的 WFE／拓扑边界。优先研究 Coreboot／Depthcharge 的小型显示路径；本阶段不移植 Linux msm DRM 的完整初始化框架。
 
 ## 已核对的停机范围
 
@@ -12,7 +12,7 @@
 
 ## framebuffer 发现仍缺一层
 
-当前探针 `boot/probe.c` 只读取并记录 FDT 的 `/firmware/coreboot/reg`、board-id 和 sku-id，尚未解析 Coreboot 表头、校验和、转发表与 framebuffer／GPIO 项。
+初次审计时探针仅记录 FDT 的 Coreboot 位置与板级信息。随后独立显示发现已实现有界表头／校验和／转发表及 framebuffer／GPIO 解析，并取得完整真机快照；这仍未证明 framebuffer 的完整分配与保留归属。
 
 原始表中的地址也不能直接当作最终 scanout：libpayload 的 `libc/coreboot.c:cb_parse_framebuffer` 将表项按值复制进 `lib_sysinfo`；`arch/arm64/mmu.c:mmu_add_fb_range` 可以在 PA 为零时分配 framebuffer，只更新该副本；Depthcharge 从该副本编程 SSPP。因而应先取得校验后的几何／stride／bpp／mask／orientation，再与当次入口的 SSPP 源地址和 stride／format 核对。表项为空、PA 不一致、越界或重叠都应停止，不能猜一个 Android splash 地址或扫描任意物理 RAM。
 
@@ -50,4 +50,4 @@ Coreboot 当前板级显示路径设置 framebuffer 32 bpp，DSI 链路为 RGB88
 4. 确认图案可见后，再加最小字符绘制，供 EL2 已捕获的故障使用。绘制不得分配内存、取锁、调用 kprintf 或访问未经验证的 framebuffer；坏显示描述／显示自身异常仍须保留原日志路径。version11 保留原生 EL1 向量，不能假定所有异常都已能 HVC 回收。
 5. 独立探针验收后，才接 boot_args.Video、XNU VM 映射／排除和现有 console fallback，并为非零 Video 更新状态模型与测试。
 
-version11 拓扑边界现已通过真机验收；随后已按上述第一步实现 [独立只读显示发现](display-discovery.md)，主机验证及原生产物审查通过，尚待真机读取原始交接状态。原始 framebuffer 表 PA 可为零，不能据此直接画图；新发现模式没有恢复显示或执行 EC 事务。图案、背光和 XNU Video 接入仍是后续独立阶段。
+version11 拓扑边界现已通过真机验收；随后已按上述第一步实现 [独立只读显示发现](display-discovery.md)，主机验证、原生产物审查及首轮真机完整 42 字段均通过。13 次读取无异常，TE／DSI 均为零；几何／格式匹配，但实际基址未满足当前 1 MiB 对齐门，且被复用的 XNU 放置范围门整体排除，候选为假。锁定源码不是当前固件的逐字节证明，先查明实际分配和完整拥有者，不能直接删除门限后画图。原始 framebuffer 表 PA 可为零，不能据此直接画图；新发现模式没有恢复显示或执行 EC 事务。图案、背光和 XNU Video 接入仍是后续独立阶段。
