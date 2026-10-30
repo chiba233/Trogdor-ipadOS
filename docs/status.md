@@ -17,6 +17,7 @@
 | GPT 镜像生成 | 主机测试通过 | 主／备 GPT CRC、分区类型、负载布局、文件保护；官方 vboot 对 64 MiB 镜像与模拟 8 GiB 介质的主表校验通过；Linux 接收版本的 128 MiB 镜像已通过完整介质回读与实际启动 |
 | 仅抑制最终复位的 EL1 匹配对照 | 已观察到不自动重启 | Image 仅改一条 SMC 为 NOP，其余字节相同；与原版形成硬件对照，见 docs/control.md |
 | 原生 Linux 日志接收 | 真机验收通过 | EL1 探针→受控 HVC→EL2 Linux；8192 字节日志完整读回并校验，29 项主机测试通过，见 docs/linux-log.md |
+| 原厂显示交接只读发现 | 主机审查通过、介质已全量回读，硬件待验收 | 137 项完整回归、11 次读取／拒绝 CPU 模型及旧 version11 回归通过；13 个只读寄存器、严格 42 字段，不表示画图或背光支持，见 [契约](display-discovery.md) |
 | 显示恢复 | 固件复用源码审计完成，尚未实现 | stop 只关背光／TE／DSI control；实际 scanout 地址、交接保留状态、EC 协议和独立测试范围见 [显示审计](display-reuse-audit.md) |
 | XNU 源码与装载前检查 | 源码内核已编译链接，51 项回归通过 | XNU 10063.141.1／Darwin 23.6；真实 FDT 已生成最小 ADT；本地链接指针已逐条审计；完整组件 prelink 待接入，见 docs/xnu-preparation.md |
 | 源码 XNU 装载与 boot_args 入口检查点 | 真机验收通过 | EL1 读取参数后 HVC 返回 EL2，Linux 收到唯一且通过校验的 copied／checkpoint／boot_args／current EL 四字段，见 docs/xnu-checkpoint.md |

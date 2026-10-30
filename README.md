@@ -103,3 +103,6 @@ python3 tools/sign.py build/uart/probe.itb \
 [同步异常与返回失败诊断](docs/xnu-diagnostics.md) 在修复包装器的绝对字符串指针缺陷后，已取得真机完整 BRK 异常记录并返回 Linux：精确故障位置／ESR、完整页表池与诊断传输均通过。此轮只验收异常回收通道，主动故障的 checkpoint=0 符合设计；随后 version9 的真实 SoC 属性路径也通过全部 20 个严格字段并正常返回 Linux。完整早期 PE 返回已在随后单独验收；完整系统启动、时钟／设备驱动仍未支持，主机验证证据单独保留。
 
 [WFE 与单 CPU 拓扑检查点](docs/xnu-topology-checkpoint.md) 已实现 version11，126 项主机测试、七次系统模型回归和原生产物独立审查通过；检查三个系统寄存器的运行值和完整恢复，严格读取要求 40 字段。2026-10-31 真机完整 40 字段已通过，原始 WFE 配置／单 CPU 拓扑、完整状态核对与寄存器恢复后正常交接 Linux；不包含线程／VM 初始化。
+
+
+[独立显示发现探针](docs/display-discovery.md) 已实现：校验 Coreboot framebuffer／GPIO 元数据，只读快照 13 个显示／GPIO／EC 协议寄存器，计算原 scanout 与整页分配范围的冲突，再 HVC 返回 Linux。137 项主机测试、11 次读异常 CPU 模型、旧 version11 回归及原生产物审查通过；真机发现尚待验收，严格读取要求 42 字段。该镜像不执行 XNU，不写 framebuffer、显示控制或 EC；候选标志不表示屏幕已点亮。

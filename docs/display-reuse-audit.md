@@ -50,4 +50,4 @@ Coreboot 当前板级显示路径设置 framebuffer 32 bpp，DSI 链路为 RGB88
 4. 确认图案可见后，再加最小字符绘制，供 EL2 已捕获的故障使用。绘制不得分配内存、取锁、调用 kprintf 或访问未经验证的 framebuffer；坏显示描述／显示自身异常仍须保留原日志路径。version11 保留原生 EL1 向量，不能假定所有异常都已能 HVC 回收。
 5. 独立探针验收后，才接 boot_args.Video、XNU VM 映射／排除和现有 console fallback，并为非零 Video 更新状态模型与测试。
 
-本文未新建显示运行时代码或显示测试介质。当前先完成并验收 version11 的拓扑边界；显示路线可据此单独设计和实现。
+version11 拓扑边界现已通过真机验收；随后已按上述第一步实现 [独立只读显示发现](display-discovery.md)，主机验证及原生产物审查通过，尚待真机读取原始交接状态。原始 framebuffer 表 PA 可为零，不能据此直接画图；新发现模式没有恢复显示或执行 EC 事务。图案、背光和 XNU Video 接入仍是后续独立阶段。

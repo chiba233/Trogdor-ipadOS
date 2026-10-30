@@ -63,3 +63,8 @@ python3 read_probe.py
 提交 `bb29e0e` 的外置镜像已交接原生 Linux，并读回完整 8192 字节日志。读取器确认 entry EL=2、current EL=1、stage=3、handoff EL=2；本地副本与运行中设备树属性的 SHA-256 一致。首阶段探针验收通过。镜像哈希、采集方式与证据边界见 [硬件记录](hardware-tests.md#2026-10-27原生-linux-接收成功)。
 
 原始日志私下保存。该结果不包含 XNU／iPadOS 装载，也不代表独立探针已恢复显示或验证异常日志通道。
+
+
+## 独立显示发现模式
+
+在上述构建命令增加 `--display-discovery`，生成不携带 XNU 的只读显示交接快照镜像；该选项与 `--xnu-checkpoint` 互斥。部署读取器时须同时保留 `read_probe.py` 和 `read_display.py`，启动后用 `python3 read_probe.py --display-discovery` 验收。完整契约、42 字段和候选／可见性区别见 [显示发现](display-discovery.md)。默认模式与已有 XNU 模式继续分别验收；显示标记不得混入 XNU 成功或诊断记录。
