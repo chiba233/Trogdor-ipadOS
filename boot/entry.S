@@ -203,6 +203,50 @@ vectors:
     vector 15
     .balign 128
 exception_entry:
+#if PROBE_DISPLAY_DISCOVERY
+.global display_fault_dispatch
+display_fault_dispatch:
+    /* Only the armed, precise EL1h read with architecturally valid FAR. */
+    mrs x8, CurrentEL
+    cmp x8, #4
+    b.ne display_not_claimed
+    cmp x3, #4
+    b.ne display_not_claimed
+    mrs x8, esr_el1
+    lsr x9, x8, #26
+    cmp x9, #0x25
+    b.ne display_not_claimed
+    tbnz x8, #6, display_not_claimed
+    tbnz x8, #10, display_not_claimed
+    mrs x9, spsr_el1
+    and x9, x9, #31
+    cmp x9, #5
+    b.ne display_not_claimed
+    mrs x9, elr_el1
+    adr x10, display_read_fault
+    cmp x9, x10
+    b.ne display_not_claimed
+    adrp x10, display_read_guard
+    add x10, x10, :lo12:display_read_guard
+    ldp x11, x12, [x10]
+    cmp x11, #1
+    b.ne display_not_claimed
+    cmp x12, x0
+    b.ne display_not_claimed
+    mrs x9, far_el1
+    cmp x9, x0
+    b.ne display_not_claimed
+    str xzr, [x10]
+    adr x9, display_read_failed
+    msr elr_el1, x9
+    isb
+    eret
+ display_not_claimed:
+    adrp x10, display_read_guard
+    add x10, x10, :lo12:display_read_guard
+    stp xzr, xzr, [x10]
+    dsb sy
+#endif
 #if PROBE_XNU_CHECKPOINT
     mov x18, x0             /* Preserve the C entry argument before ESR overwrites x0. */
 #endif
@@ -483,4 +527,49 @@ xnu_saved:
 .global xnu_el1_saved
 xnu_el1_saved:
     .zero 144
+#endif
+
+#if PROBE_DISPLAY_DISCOVERY
+.text
+.global display_read32,display_read_fault,display_read_failed
+display_read32:
+    sub sp, sp, #32
+    mrs x8, esr_el1
+    mrs x9, elr_el1
+    stp x8, x9, [sp]
+    mrs x8, far_el1
+    mrs x9, spsr_el1
+    stp x8, x9, [sp, #16]
+    mov x2, x1
+    adrp x10, display_read_guard
+    add x10, x10, :lo12:display_read_guard
+    mov x11, #1
+    stp x11, x0, [x10]
+    dsb sy
+ display_read_fault:
+    ldr w1, [x0]
+    str w1, [x2]
+    mov w0, #1
+    b display_read_restore
+ display_read_failed:
+    mov w0, wzr
+ display_read_restore:
+    adrp x10, display_read_guard
+    add x10, x10, :lo12:display_read_guard
+    stp xzr, xzr, [x10]
+    dsb sy
+    ldp x8, x9, [sp]
+    msr esr_el1, x8
+    msr elr_el1, x9
+    ldp x8, x9, [sp, #16]
+    msr far_el1, x8
+    msr spsr_el1, x9
+    add sp, sp, #32
+    isb
+    ret
+.bss
+.balign 16
+.global display_read_guard
+display_read_guard:
+    .zero 16
 #endif

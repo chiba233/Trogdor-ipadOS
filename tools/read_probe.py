@@ -19,6 +19,8 @@ def read_record(data, xnu_checkpoint=False, xnu_mmu=False, xnu_highva=False, xnu
     if any(rest) or not text.startswith(b'Trogdor-ipadOS native phase-0 probe\n'):
         raise ValueError('empty, stale, or unrecognized probe log')
     text = text.decode('ascii')
+    if any((xnu_checkpoint,xnu_mmu,xnu_highva,xnu_cinit,xnu_cpu,xnu_platform,xnu_pe,xnu_soc,xnu_topology)) and re.search(r"^Display ",text,re.M):
+        raise ValueError("display discovery is separate from XNU acceptance")
     if not xnu_topology and any((xnu_checkpoint,xnu_mmu,xnu_highva,xnu_cinit,xnu_cpu,xnu_platform,xnu_pe,xnu_soc)) and (re.search(r'^XNU (topology schema|CPU topology verified|WFE state verified|system registers restored)=',text,re.M) or re.search(r'^XNU payload version=0x000000000000000b$',text,re.M)):
         raise ValueError('topology record requires its own strict mode')
     fields = {}
@@ -108,6 +110,7 @@ def read_record(data, xnu_checkpoint=False, xnu_mmu=False, xnu_highva=False, xnu
 
 def read_diagnostic_record(data):
     text,fields=read_record(data)
+    if re.search(r"^Display ",text,re.M):raise ValueError("display discovery is separate from XNU diagnostics")
     def word(key):
         values=re.findall(r'^'+re.escape(key)+r'=(.*)$',text,re.M)
         if len(values)!=1 or not re.fullmatch(r'0x[0-9a-f]{16}',values[0]):
@@ -156,12 +159,18 @@ def main():
     parser.add_argument('--xnu-diagnostic', action='store_true')
     parser.add_argument('--xnu-soc', action='store_true')
     parser.add_argument('--xnu-pe', action='store_true')
+    parser.add_argument('--display-discovery', action='store_true')
     parser.add_argument('--xnu-topology', action='store_true')
     parser.add_argument('--xnu-platform', action='store_true')
     args = parser.parse_args()
     with args.input.open('rb') as source:
         data = source.read(8193)
-    if args.xnu_diagnostic:
+    if args.display_discovery:
+        if any((args.xnu_checkpoint,args.xnu_mmu,args.xnu_highva,args.xnu_cinit,args.xnu_cpu,args.xnu_platform,args.xnu_pe,args.xnu_soc,args.xnu_topology,args.xnu_diagnostic)):
+            parser.error("display discovery and XNU require separate strict modes")
+        from read_display import read_display_record
+        text, _ = read_display_record(data)
+    elif args.xnu_diagnostic:
         if any((args.xnu_checkpoint,args.xnu_mmu,args.xnu_highva,args.xnu_cinit,args.xnu_cpu,args.xnu_platform,args.xnu_pe,args.xnu_soc,args.xnu_topology)):
             parser.error('choose diagnostic transport or strict acceptance mode')
         text, _ = read_diagnostic_record(data)

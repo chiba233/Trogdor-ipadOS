@@ -3,6 +3,10 @@
 #include <stdint.h>
 #include "fdt.h"
 #include "checkpoint.h"
+#if PROBE_DISPLAY_DISCOVERY
+#include "display.h"
+extern uint8_t _start[],_image_end[];
+#endif
 #ifndef PROBE_RESET_EL
 #define PROBE_RESET_EL 0
 #endif
@@ -119,6 +123,9 @@ void probe_main(const void *dt, uint64_t incoming_el, uint64_t sctlr, uint64_t h
     property(dt, "/firmware/coreboot", "sku-id");
     text("phase-0 complete; no XNU loaded\n");
     probe_log.stage = 3;
+#if PROBE_DISPLAY_DISCOVERY
+    display_discover(dt,(uintptr_t)_start,(uint64_t)(_image_end-_start));
+#endif
     /* All state is already in RAM if UART probing itself faults. */
     uart_enabled = uart_available();
     probe_log.uart_ready = (uint32_t)uart_enabled;
@@ -155,6 +162,6 @@ int probe_export_linux_log(void *dt) {
 }
 #endif
 
-#if PROBE_XNU_CHECKPOINT
+#if PROBE_XNU_CHECKPOINT || PROBE_DISPLAY_DISCOVERY
 void probe_value(const char *name, uint64_t value) { item(name, value); }
 #endif
