@@ -578,3 +578,14 @@ EC 协议 3 在第一次运行就工作：`EC_CMD_HELLO` 回复校验通过，`E
 运行时 `9342745`。镜像 SHA-256 `331b4c4256f2c87c317ae23a23cda66c8555a175e41b08310f5528a77dd6b7ac`，签名容器 SHA-256 `cbcff75e8e6962b5fa3325a2dd680802388e459c10e08780d3c6d737ad733b03`。内核由 `platform/coachz-screen` 单独构建，ADT 与已验收的 version11 负载相同。10645 条指令／20 段标量审计、18 个 C 对象重定位审计通过。目标端传输摘要与 vboot 验证通过。
 
 写入器重新核对 removable USB、容量及 root／boot／swap 排除后，完成全部 128 MiB 写入、同步与完整回读，摘要一致。没有写固件或内置盘，没有自动重启。尚无真机运行记录；这张镜像进入 XNU 后不回 Linux，结果看屏幕。
+
+
+## 2026-10-31：XNU 第一次屏幕输出
+
+运行时 `9342745`、准备记录 `eadbb38`，使用前述同一镜像。手动启动后屏幕亮起，XNU 把启动过程直接画到屏幕上，结果来自屏幕照片，这张镜像不回 Linux，没有日志记录。
+
+屏幕依次显示 `arm_init`、`cpu_data_init`、`PE_init_platform`、`ml_parse_cpu_topology`、`cpu_bootstrap`、`kernel_startup_bootstrap`、`cpu_init`、`arm_vm_init`（含屏幕别名映射、关闭 TTBR0、`pmap_bootstrap`）的完成标记，随后出现 `kprintf initialized` 和 `Serial mode specified`。这是 XNU 第一次在真机上越过 version11 的停止点并完成 VM 初始化，不再有检查点返回或逐字段核对，这些阶段的证据只是屏幕上的进度。
+
+随后内核 panic 并完整显示现场：`Kernel data abort`，PC `0xfffffff007949f74`（`PE_create_console+0x48`，即内联的 `check_for_panic_log`），ESR `0x96000010`（同步外部中止）。当时 `x1` 为 `0x3c0fc000`，是 BCM2837 机器配置固定的 `PLATFORM_PANIC_LOG_PADDR`，在 SC7180 上不是可访问的内存。与 `boot_args.Video` 无关。
+
+修正：在 `platform/coachz-screen` 启用 UniXNU 现成的 `CONFIG_XNU_DT_PANIC_REGION`，改从设备树读取 panic 区域。完整系统启动仍未验收，组件 prelink 仍未接入。

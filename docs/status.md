@@ -31,7 +31,7 @@
 | XNU SoC 属性诊断中点 | version9 真机 20 字段通过（2026-10-30） | 原生属性读取／缓存对象、CPU／PE／DT、活动帧、表池／AT／缓存返回通过；未访问 SoC MMIO 或验证完整平台返回，见 docs/xnu-soc-checkpoint.md |
 | 同步异常／返回失败诊断 | version10 主动异常传输已真机验收（2026-10-30） | 8192 字节日志通过 46 项必需字段读取，精确 BRK／向量／页表池／缓存传输门匹配并返回 Linux；version10 的 checkpoint=0 符合故障设计，后续 version9 正常 SoC 返回已验收，见 docs/xnu-diagnostics.md |
 | XNU WFE／单 CPU 拓扑 | version11 真机 40 字段通过（2026-10-31） | 原始 WFE 配置、完整单 CPU 拓扑与父帧／PE／表池／AT／缓存门通过；三个系统寄存器按入口值恢复，随后交接 Linux，见 [契约](xnu-topology-checkpoint.md) |
-| XNU 后续线程／VM／中断／SMP 初始化 | 未验证 | 已验收边界推进到单 CPU 拓扑解析返回；线程与 VM 等仍需另行审计 |
+| XNU 后续线程／VM／中断／SMP 初始化 | 屏幕输出镜像已跑过 VM 初始化 | 屏幕照片显示完成 `arm_vm_init` 并启动 kprintf，无逐字段核对；之后的中断、SMP 和设备初始化未验证，见 [硬件记录](hardware-tests.md) |
 | eMMC、触摸、GPU 与完整 iPadOS 用户态 | 未实现 | 没有原生桌面或应用运行记录 |
 
 ## 已执行的主机验证
