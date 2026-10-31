@@ -63,9 +63,29 @@ class SmpTreeTests(unittest.TestCase):
         self.assertLess(body.index('ml_set_interrupts_enabled(FALSE)'), body.index('.rept 32'))
         self.assertLess(body.index('.rept 32'), body.index('ml_set_interrupts_enabled(enabled)'))
         self.assertIn('+		thread_bind(processor_array[index]);', patch)
-        self.assertIn('+	thread_bind(PROCESSOR_NULL);', patch)
+        self.assertIn('+		thread_bind(PROCESSOR_NULL);', patch)
         # The A76 domain's state register sits at 0x18325800 + 0x920, beyond a 0x3000 mapping (k36 data abort).
-        self.assertIn('+		freq_regs = ml_io_map(0x18323000, 0x4000);', patch)
+        self.assertIn('+			freq_regs = ml_io_map(0x18323000, 0x4000);', patch)
+
+    def test_wait_report_walks_only_the_thread_kernel_stack(self):
+        patch = (Path(__file__).resolve().parents[1] / 'platform/coachz-prelink/patches/xnu/coachz-prelink-measure.patch').read_text()
+        self.assertIn('+				if (!fp || (fp & 15) || fp < low || fp + 16 > high) {', patch)
+        # backboardd has 65 threads; k36's 32-entry table left its column empty.
+        self.assertIn('coachz_bbd_seen[128]', patch)
+
+    def test_skip_setup_writes_unixnu_preferences_as_mobile(self):
+        patch = (Path(__file__).resolve().parents[1] / 'platform/coachz-prelink/patches/xnu/coachz-prelink-skip-setup.patch').read_text()
+        for key in ('BKNoWatchdogs', 'DMUserDataDisposition', 'LastSystemVersion</key><string>21H461', 'SetupDone',
+                    'SBDisableIdleSleep', 'LockdownActivationIndicatesCloudConfigurationAvailable'):
+            self.assertIn(key, patch)
+        self.assertIn('+		VATTR_SET(&attributes, va_uid, 501);', patch)
+        self.assertIn('+		coachz_setup_prepare();', patch)
+
+    def test_main_os_tree_has_the_ids_for_a_platform_uuid(self):
+        source = (Path(__file__).resolve().parents[1] / 'tools/xnu_screen.py').read_text()
+        self.assertIn("root.child('chosen').set('unique-chip-id', COACHZ_UNIQUE_CHIP_ID)", source)
+        from xnu_screen import COACHZ_UNIQUE_CHIP_ID
+        self.assertEqual(len(COACHZ_UNIQUE_CHIP_ID), 8)
 
     def test_all_cores_share_one_pset(self):
         # The single-cluster Clutch scheduler panics in thread_select() with a second pset.

@@ -1,0 +1,151 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8513,7 +8513,140 @@
+ 	printf("COACHZ MobileGestalt cache removed: %d\n", error);
+ }
+ 
++/*
++ * Skip Setup and the data migration screen, and turn off the BackBoard/FrontBoard watchdogs, on the external Data
++ * (coachz-skip-setup=1). The values are the ones UniXNU's scripts/seed-data-skip-setup.py writes, taken from
++ * ios-sweet's tools/sweet-root-tweaks.py (MIT) and booted on hardware there. Without them backboardd's watchdog
++ * kills the first SpringBoard while it waits to check in (seen here at about 90 s), and the never-migrated Data
++ * stops at the upgrade screen. A file that already holds its marker key is left alone (cfprefsd keeps the key when
++ * it rewrites the file, in XML or binary form); otherwise it is kept as <file>.coachz-prev and replaced, mobile 0600.
++ */
++static bool
++coachz_bytes_contain(const char *data, size_t size, const char *marker)
++{
++	size_t length = strlen(marker);
++	for (size_t at = 0; length <= size && at <= size - length; at++) {
++		if (!memcmp(data + at, marker, length)) {
++			return true;
++		}
++	}
++	return false;
++}
++
+ static int
++coachz_setup_pref(const char *name, const char *marker, const char *body)
++{
++	static const char head[] = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
++	    "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
++	    "<plist version=\"1.0\"><dict>";
++	static const char tail[] = "</dict></plist>\n";
++	vfs_context_t context = vfs_context_kernel();
++	char path[MAXPATHLEN], saved[MAXPATHLEN], plist[1024];
++	struct vnode_attr attributes;
++	vnode_t vnode = NULLVP, target = NULLVP;
++	int length, error, close_error, residual = 0;
++
++	snprintf(path, sizeof(path), "/private/var/mobile/Library/Preferences/%s.plist", name);
++	snprintf(saved, sizeof(saved), "%s.coachz-prev", path);
++	length = snprintf(plist, sizeof(plist), "%s%s%s", head, body, tail);
++	if (length <= 0 || length >= (int)sizeof(plist)) {
++		return EINVAL;
++	}
++	error = vnode_open(path, O_NOFOLLOW | FREAD, 0, 0, &vnode, context);
++	if (!error) {
++		bool present = false;
++		VATTR_INIT(&attributes);
++		VATTR_WANTED(&attributes, va_data_size);
++		error = vnode_getattr(vnode, &attributes, context);
++		if (!error && (vnode_vtype(vnode) != VREG || attributes.va_data_size > (1 << 20))) {
++			error = EFTYPE;
++		}
++		if (!error) {
++			size_t size = (size_t)attributes.va_data_size, allocated = size ? size : 1;
++			char *data = kalloc_data(allocated, Z_WAITOK | Z_NOFAIL);
++			error = size ? vn_rdwr(UIO_READ, vnode, data, (int)size, 0, UIO_SYSSPACE, 0,
++			    vfs_context_ucred(context), &residual, vfs_context_proc(context)) : 0;
++			if (!error && residual) {
++				error = EIO;
++			}
++			present = !error && coachz_bytes_contain(data, size, marker);
++			if (!error && !present) {
++				error = vnode_open(saved, O_CREAT | O_TRUNC | O_NOFOLLOW | FWRITE, 0600, 0, &target, context);
++				if (!error) {
++					if (size) {
++						error = vn_rdwr(UIO_WRITE, target, data, (int)size, 0, UIO_SYSSPACE, IO_UNIT | IO_SYNC,
++						    vfs_context_ucred(context), NULL, vfs_context_proc(context));
++					}
++					close_error = vnode_close(target, FWRITE, context);
++					error = error ? error : close_error;
++				}
++			}
++			kfree_data(data, allocated);
++		}
++		close_error = vnode_close(vnode, FREAD, context);
++		error = error ? error : close_error;
++		if (error || present) {
++			printf("COACHZ setup: %s %s: %d\n", name, present ? "already has its keys" : "not read", error);
++			return error;
++		}
++	} else if (error != ENOENT) {
++		printf("COACHZ setup: %s open: %d\n", name, error);
++		return error;
++	}
++	error = vnode_open(path, O_CREAT | O_TRUNC | O_NOFOLLOW | FWRITE, 0600, 0, &target, context);
++	if (error) {
++		printf("COACHZ setup: %s create: %d\n", name, error);
++		return error;
++	}
++	error = vn_rdwr(UIO_WRITE, target, plist, length, 0, UIO_SYSSPACE, IO_UNIT | IO_SYNC,
++	    vfs_context_ucred(context), NULL, vfs_context_proc(context));
++	if (!error) {
++		VATTR_INIT(&attributes);
++		VATTR_SET(&attributes, va_uid, 501);
++		VATTR_SET(&attributes, va_gid, 501);
++		VATTR_SET(&attributes, va_mode, 0600);
++		/* vnode_open leaves O_TRUNC to its caller: set the length explicitly. */
++		VATTR_SET(&attributes, va_data_size, (uint64_t)length);
++		error = vnode_setattr(target, &attributes, context);
++	}
++	close_error = vnode_close(target, FWRITE, context);
++	error = error ? error : close_error;
++	printf("COACHZ setup: wrote %s (%d bytes): %d\n", name, length, error);
++	return error;
++}
++
++static void
++coachz_setup_prepare(void)
++{
++	int enabled = 0;
++
++	if (!PE_parse_boot_argn("coachz-skip-setup", &enabled, sizeof(enabled)) || enabled != 1) {
++		return;
++	}
++	(void)coachz_setup_pref("com.apple.springboard", "BKNoWatchdogs",
++	    "<key>BKNoWatchdogs</key><true/>"
++	    "<key>FBLaunchWatchdogExceptions</key><dict><key>com.apple.purplebuddy</key><real>100</real></dict>"
++	    "<key>MCForceShowCloudConfigurationUI</key><false/>"
++	    /* No input and no idle timer here: without these the display dims and the system sleeps about 30 s in. */
++	    "<key>SBDisableAutoDim</key><true/><key>SBDontDimOrLockOnAC</key><true/><key>SBDisableIdleSleep</key><true/>");
++	(void)coachz_setup_pref("com.apple.migration", "DMUserDataDisposition",
++	    "<key>LastSystemVersion</key><string>21H461</string>"
++	    "<key>DMUserDataDisposition</key><dict><key>SyntheticDidUpgrade</key><false/>"
++	    "<key>buildVersion</key><string>21H461</string></dict>");
++	(void)coachz_setup_pref("com.apple.purplebuddy", "SetupDone",
++	    "<key>SetupDone</key><true/><key>SetupFinishedAllSteps</key><true/>"
++	    "<key>SetupVersion</key><integer>11</integer><key>daemonizeNeedsToRun</key><false/>");
++	(void)coachz_setup_pref("com.apple.purplebuddy.notbackedup", "ShouldRunStandardMiniBuddy",
++	    "<key>ShouldRunDiagnosticsMiniBuddy</key><false/><key>ShouldRunHSA2MiniBuddy</key><false/>"
++	    "<key>ShouldRunKeychainSyncMiniBuddy</key><false/><key>ShouldRunMesaMiniBuddy</key><false/>"
++	    "<key>ShouldRunPaymentMiniBuddy</key><false/><key>ShouldRunStandardMiniBuddy</key><false/>"
++	    "<key>SilentICDPUpgrade</key><false/>");
++	(void)coachz_setup_pref("com.apple.managedconfiguration.notbackedup",
++	    "LockdownActivationIndicatesCloudConfigurationAvailable",
++	    "<key>LockdownActivationIndicatesCloudConfigurationAvailable</key><false/>");
++}
++
++static int
+ coachz_watchdog_policy_prepare(void)
+ {
+ 	const char policy[] = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+@@ -8658,6 +8791,7 @@
+ 			panic("Coachz temporary watchdog launch policy failed: %d", error);
+ 		}
+ 		coachz_mobilegestalt_cache_reset();
++		coachz_setup_prepare();
+ 	}
+ }
+ 

@@ -1142,3 +1142,37 @@ cpufreq-hw 两个 CPU 域偏移 0x704 的当前投票；窗口内的拷帧统计
 因此频率是真实的，A76 能被调度并在承担一部分工作，但此时系统基本空闲，瓶颈不在 CPU 算力或大小核分配。
 同样大小的一帧有时 16 ms、有时约 193 ms，原因未查。backboardd 线程一栏为空：它有 65 个线程，而记录表只有
 32 项，超出的线程算不出增量，这是测量代码的缺陷。
+
+
+### 帧拷贝、SpringBoard 被杀与锁屏（k37～k41）
+
+k37 起报告还包括：每个 USB 块 I/O 的次数、字节、持锁和等锁时间；按内核栈分组的 backboardd、SpringBoard、
+lsd 等待线程（栈帧从线程的 `machine.kstackptr` 读，无栈时显示 continuation）；拷帧前用 `AT S1E1R` 读出的
+源缓冲区内存属性，以及拷贝前内容扫描的耗时。照片（屏幕证据）：
+
+- k37：开机 101 秒的 10 秒窗口里，拷贝 15.5～170 ms，但拷贝前的两遍内容扫描用了 292 ms，源缓冲区属性
+  为 0x44（不可缓存）。扫描和拷贝都在 backboardd 提交帧的线程里进行，这 10 秒 backboardd 用了 3.2 s CPU。
+  USB 盘 10 秒内读 21.6 MB、写 4.6 MB，持锁 523 ms，不是瓶颈。
+- k38 在显示补丁里关掉内容扫描（`scanBudget=0`，结果只用于诊断输出）：拷贝稳定在 20～21 ms，
+  不再出现 170 ms。源属性读数变为 0x100（地址转换失败），因为不再先扫描时，源映射在拷贝开始前还没建好页。
+- 第一个 SpringBoard 仍在约 90 秒被 backboardd SIGKILL，所以与扫描无关。k35 的 SpringBoard 栈停在
+  `-[BKSSystemShellService _checkIn]`，即同步 XPC 向 backboardd 报到。
+- k39 在 kill() 里记录 backboardd 的现场：发出 kill 的是主线程主队列上的一个 block（`x16 = 37`）；同时一个
+  线程在做 LaunchServices 目录扫描并读文件，另一个在 `os_state` 处理里 `dispatch_sync` 等队列。
+- k39、k40 两次的返回地址相差同一个偏移，据此在 backboardd 二进制里定位：block 属于
+  `-[BKSystemShellSentinel _lock_handleRelaunchRequestFromSystemApp:withOptions:]`，日志依次是
+  `Handling exit request from %@ with options: %@`、`Blocking system apps.`、`Killing %@.`。也就是说，
+  backboardd 是按某个系统应用的重启 shell 请求杀掉 SpringBoard 的，不是看门狗超时。请求方还没看到。
+- 之后的 SpringBoard 画出 "Swipe up to upgrade" 页，底部有 Home 指示条。
+
+k40 在 launchd 之前向外接 Data 写入 UniXNU `scripts/seed-data-skip-setup.py`（来自 ios-sweet
+`tools/sweet-root-tweaks.py`）的偏好：springboard 的 `BKNoWatchdogs` 等、migration 的 `LastSystemVersion`
+与 `DMUserDataDisposition`、purplebuddy 的 `SetupDone` 等（已含标记键的文件不动，否则备份为 `.coachz-prev`
+后替换，mobile 0600）。kill 和页面都没变，这在意料之中，因为 kill 不是看门狗造成的。
+k41 按 ios-sweet NOTES.md 的结论给 `/chosen` 加上合成的 `unique-chip-id` 与 `chip-id`（0x8011）：
+XNU 只用它们生成 IOPlatformUUID，没有它，CurrentHost 偏好写不进去，迁移就记不住已完成。kill 和页面仍然一样。
+后两张照片的数字完全相同，应是同一次开机，所以重启后的情况还没验证。
+
+ios-sweet 的 README 记录的是：首次开机后出现锁屏，上滑解锁。UniXNU 的 `mobilegestalt.md` 说
+`home-button-type = 2` 时锁屏用上滑手势。据此推断这一页是升级后需要解锁的锁屏，而不是死路，但系统卷的
+字符串表里没有找到这句原文，也没有输入设备去上滑，所以这还没有在真机上验证。偏好和芯片 ID 的效果同样未验证。

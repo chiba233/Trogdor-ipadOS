@@ -38,7 +38,7 @@
 | iPadOS 主系统从外接盘启动 | 进行中（2026-10-31） | 系统卷按 UUID 挂成只读根，SystemOS 挂在 `/private/preboot`，共享缓存映射通过，原版 launchd 通过 mount 阶段；无角色的内存 APFS 种子经 IOKit 发布并成功读写挂载到 `/private/var`，启动越过 tzinit；确认 watchdogd 在缺少 IOWatchdog 的原生分支主动 BRK 后，临时 launchd 禁用策略已让真机继续运行，周期采样仍输出；补齐 keybags 空目录后，原版初始化越过 persona.kb 的 ENOENT，进入加载前台用户 501 的流程，照片观察区间内未再捕获 usermanagerd 异常；SpringBoard 的 SIGABRT 现已捕获：Objective-C runtime 无法在普通路径加载 SystemOS 中的 libobjc-trampolines.dylib；原生 union 根视图与独立 8 GiB 外接 Data 的强制启动准备路径已由实机后续执行验证，文件持久性尚待单独读回；原版 IOMobileFramebufferLegacy 发布固件帧缓冲后越过主 CADisplay 断言；重建 MobileGestalt 缓存后越过显示模式校验，原版白色苹果标志及随后 SpringBoard 的 `Press home to upgrade` 界面经 CPU 后端显示；首个 SpringBoard 曾因同步等待 lsd 被 SIGKILL，尚无可用界面，只有屏幕证据，见 [硬件记录](hardware-tests.md) |
 | USB 主机与大容量存储 | 探针只读实验真机通过；XNU 从外接盘只读挂根屏幕确认（2026-10-31） | 探针用 libpayload 枚举到硬盘并读到 `EFI PART`、`CHROMEOS`，严格字段通过，见 [USB 只读实验](usb-read.md)。XNU 内核里的同一套栈经 IOKit 块设备、GPT 分区和 APFS 把恢复卷挂成只读根，`restored_update` 从外接盘运行；未封存根卷是放行而不是验证，只有屏幕证据，见 [硬件记录](hardware-tests.md)。既定路线：根文件系统先从外接盘启动，之后才考虑 eMMC |
 | SMP | 进行中（2026-10-31） | 六颗 A55 和两颗 A76 经 PSCI 启动，型号与 E／P 簇识别正确，SGI 能送达；所有核共用一个 pset，空闲核优先选 A76，大核已承担负载，但不是大小核调度；三个频率域固定在最高的非 boost 档，绑核计时测得 A55 1804、A76 2400 MHz，未被压频；升级页显示时系统合计只用约 0.37 颗核，没有动态调频和温控，见 [硬件记录](hardware-tests.md) |
-| eMMC、触摸、GPU 与可用 iPadOS 界面 | 未实现／未验收 | 原版苹果标志和全面屏身份的“Swipe up to upgrade”升级页已经 CPU 后端显示，写合并映射下拷一帧约 16 ms；无 GPU、触摸或可用界面 |
+| eMMC、触摸、GPU 与可用 iPadOS 界面 | 未实现／未验收 | 原版苹果标志和全面屏身份的“Swipe up to upgrade”页已经 CPU 后端显示，去掉内容扫描后拷一帧约 20 ms；该页推断为升级后待解锁的锁屏，没有输入设备，未验证；无 GPU、触摸或可用界面 |
 
 ## 已执行的主机验证
 

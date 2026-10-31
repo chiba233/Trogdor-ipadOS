@@ -14,6 +14,7 @@
 #include <libkern/c++/OSString.h>
 #include <sys/param.h>
 #include <pexpert/pexpert.h>
+#include <kern/clock.h>
 #include "USBDataWindow.h"
 
 extern "C" {
@@ -34,6 +35,9 @@ volatile uint64_t native_ram_block_bytes = 0;
 volatile uint64_t native_ram_block_reads = 0;
 volatile uint64_t native_ram_block_writes = 0;
 volatile uint64_t native_ram_block_failures = 0;
+// For the periodic report: read ops, read bytes, write ops, write bytes, time holding the gate, time waiting for it
+// (mach units), the slowest operation since the report last cleared it.
+volatile uint64_t coachz_io_stats[8];
 volatile uint64_t native_ram_block_resident_bytes = 0;
 volatile uint32_t native_ram_block_sparse = 0;
 uint8_t native_ram_block_seed_sha256[32];
@@ -128,8 +132,10 @@ IOReturn NativeRamBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 blo
   bool write = buffer->getDirection() == kIODirectionOut;
   if (write && (!persistent_data || !data_window.contains(block, count))) return kIOReturnNotWritable;
   if (!gate) return kIOReturnNotReady;
+  const uint64_t asked = mach_absolute_time();
   IOLockLock(gate);
   if (!online) { IOLockUnlock(gate); return kIOReturnNotReady; }
+  const uint64_t started = mach_absolute_time();
   const uint32_t most = coachz_usb_max_blocks();
   uint64_t done = 0;
   IOReturn status = kIOReturnSuccess;
@@ -147,6 +153,12 @@ IOReturn NativeRamBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 blo
   }
   __atomic_fetch_add(write ? &native_ram_block_writes : &native_ram_block_reads, 1, __ATOMIC_RELAXED);
   if (status) __atomic_fetch_add(&native_ram_block_failures, 1, __ATOMIC_RELAXED);
+  const uint64_t ended = mach_absolute_time();
+  __atomic_fetch_add(&coachz_io_stats[write ? 2 : 0], 1, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&coachz_io_stats[write ? 3 : 1], done * 512, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&coachz_io_stats[4], ended - started, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&coachz_io_stats[5], started - asked, __ATOMIC_RELAXED);
+  if (ended - started > coachz_io_stats[6]) __atomic_store_n(&coachz_io_stats[6], ended - started, __ATOMIC_RELAXED);
   IOLockUnlock(gate);
   completion->action(completion->target, completion->parameter, status, done * 512);
   return kIOReturnSuccess;

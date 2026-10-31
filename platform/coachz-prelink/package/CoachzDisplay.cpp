@@ -64,8 +64,17 @@ static uint64_t counter_read() { uint64_t value;__asm__ volatile("isb\n\tmrs %0,
 static uint64_t counter_hz() { uint64_t value;__asm__ volatile("mrs %0, cntfrq_el0":"=r"(value));return value?value:1; }
 // Copy cost against the interval between copies: a slow copy and a slow producer look alike on the screen.
 // The periodic report reads frames copied, the last copy in us and the gap before it in ms; for its window, the slowest
-// and fastest copy, the longest gap and a mask of the cores that copied (it resets those and keeps [8], the count it last saw).
-extern "C" { volatile uint64_t coachz_frame_stats[9]; }
+// and fastest copy, the longest gap and a mask of the cores that copied (it resets those and keeps [8], the count it last saw);
+// then the last source's memory attribute, the last content-scan time in us, the source attribute and the core of the slowest copy.
+extern "C" { volatile uint64_t coachz_frame_stats[13]; }
+// The memory attribute the source of the coming copy is mapped with, as the MMU translates it: AT S1E1R leaves the MAIR value
+// in PAR_EL1[63:56] (0xff write-back, 0x44 non-cacheable, 0 device). 0x100 marks a failed translation.
+void native_legacy_copy_source_observed(const void *source,uint64_t scanTicks) {
+    uint64_t par;
+    __asm__ volatile("at s1e1r, %1\n\tisb\n\tmrs %0, par_el1":"=r"(par):"r"(source));
+    coachz_frame_stats[9]=(par&1)?0x100:par>>56;
+    coachz_frame_stats[10]=scanTicks*1000000/counter_hz();
+}
 void native_legacy_copy_timing_observed(uint64_t ticks,uint64_t bytes) {
     static uint64_t copies,previous;
     uint64_t now=counter_read(),hz=counter_hz();
@@ -76,7 +85,7 @@ void native_legacy_copy_timing_observed(uint64_t ticks,uint64_t bytes) {
     __asm__ volatile("mrs %0, mpidr_el1":"=r"(mpidr));
     const uint64_t core=(mpidr>>8)&0xff;   // SC7180 numbers its cores in Affinity1
     coachz_frame_stats[0]=copies;coachz_frame_stats[1]=us;coachz_frame_stats[2]=gap;coachz_frame_stats[6]=core;
-    if(us>coachz_frame_stats[3])coachz_frame_stats[3]=us;
+    if(us>coachz_frame_stats[3]){coachz_frame_stats[3]=us;coachz_frame_stats[11]=coachz_frame_stats[9];coachz_frame_stats[12]=core;}
     if(us<coachz_frame_stats[4])coachz_frame_stats[4]=us;
     if(gap>coachz_frame_stats[5])coachz_frame_stats[5]=gap;
     if(core<64)coachz_frame_stats[7]|=1ull<<core;

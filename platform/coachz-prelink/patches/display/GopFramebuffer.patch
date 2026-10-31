@@ -1,6 +1,43 @@
 --- a/NativeLegacyDisplay.cpp
 +++ b/NativeLegacyDisplay.cpp
-@@ -495,7 +495,8 @@
+@@ -32,6 +32,8 @@
+ extern "C" bool native_legacy_prepare_scanout(void);
+ extern "C" void native_legacy_transfer_observed(IOReturn,const void *,uint64_t);
+ extern "C" void native_legacy_copy_timing_observed(uint64_t ticks,uint64_t bytes);
++// Coachz: the source mapping of the coming copy and how long the content scans before it took.
++extern "C" void native_legacy_copy_source_observed(const void *source,uint64_t scanTicks);
+ extern "C" void native_legacy_retirement_observed(IOService *);
+ // GPU hand-off (boot-arg sheng-fb-gpu=1): the frame is offered to the privileged GPU client instead of being copied; the swap retires when the
+ // client reports the GPU copy done (native_legacy_gpu_complete). A refused offer or a failed copy uses the CPU copy below and is counted.
+@@ -57,7 +59,9 @@
+ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
+     OSDeclareDefaultStructors(NativeLegacyDisplay)
+     IOMemoryMap *bootMapping=nullptr;
+-    uint32_t scanBudget=32;
++    // Coachz: no content scans. The source is non-cacheable, so the two full reads took about 292 ms a frame on hardware
++    // (k37), more than the copy, and their results only fed diagnostic prints.
++    uint32_t scanBudget=0;
+     void *shadow=nullptr;uint64_t shadowBytes=0;bool shadowValid=false;
+     bool primary=false;
+     bool logicalPM=false;
+@@ -318,6 +322,7 @@
+             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
+         }
+         // The two content scans read every pixel again; they only describe the first frames (the probe keeps 32).
++        uint64_t scanStart;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(scanStart));
+         if(scanBudget) {
+             --scanBudget;
+             uint64_t scan[5];
+@@ -327,6 +332,8 @@
+             if(native_legacy_frame_colors(reinterpret_cast<const void *>(source->getVirtualAddress()),source->getLength(),sourceStride,width,height,colors,counts,&other))
+                 native_legacy_frame_colors_observed(colors,counts,other);
+         }
++        {uint64_t scanEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(scanEnd));
++         native_legacy_copy_source_observed(reinterpret_cast<const void *>(source->getVirtualAddress()),scanEnd-scanStart);}
+         if(!native_legacy_prepare_scanout()) {
+             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
+         }
+@@ -495,7 +502,8 @@
             !video.v_width || !video.v_height || video.v_depth!=32 || video.v_rotate ||
             video.v_width>16384 || video.v_height>16384 || video.v_rowBytes<video.v_width*4 ||
             video.v_rowBytes>UINT64_MAX/video.v_height)return false;

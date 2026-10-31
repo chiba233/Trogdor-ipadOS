@@ -45,16 +45,135 @@
  #endif
 --- a/osfmk/arm64/coachz_thread.c
 +++ b/osfmk/arm64/coachz_thread.c
-@@ -474,7 +474,7 @@
+@@ -341,6 +341,7 @@
+ /* lsd seen while the first SpringBoard waits on it: two snapshots, 45 s and 80 s after that start. */
+ static int coachz_lsd_pid;
+ static int coachz_bbd_pid;
++static int coachz_sb_pid;
+ static uint32_t coachz_sb_started;
+ static char coachz_lsd_snapshots[2][1024];
+ static uint32_t coachz_lsd_snapshot_count;
+@@ -356,10 +357,100 @@
+ 	return (uint32_t)seconds;
+ }
+ 
++/*
++ * k39: backboardd's side of the first SpringBoard kill, taken once in the kill() call itself. The killing thread's user
++ * frames say why it kills; the other backboardd threads that are not waiting for a message or parked (a user lock, a
++ * condition variable...) show what could keep SpringBoard's check-in from being answered. For each: hint, pc, lr, x16
++ * (syscall), x1/x2 (a ulock_wait's address and expected value) with the word now at x1, then the user frame chain.
++ */
++static char coachz_kill_capture[2048];
++static uint32_t coachz_kill_captured;
++
++static size_t
++coachz_user_frames(char *out, size_t size, vm_map_t map, uint64_t fp, uint64_t sp, unsigned limit)
++{
++	size_t used = 0;
++	for (unsigned index = 0; index < limit && used < size; index++) {
++		uint64_t frame[2];
++		if ((fp & 15) || fp < sp || fp - sp > 1024 * 1024 ||
++		    vm_map_read_user(map, (vm_map_offset_t)fp, frame, sizeof(frame)) != KERN_SUCCESS) {
++			break;
++		}
++		used += snprintf(out + used, size - used, " %llx", (unsigned long long)frame[1]);
++		if (frame[0] <= fp) {
++			break;
++		}
++		fp = frame[0];
++	}
++	return used;
++}
++
++static void
++coachz_capture_kill(uint32_t seconds)
++{
++	struct {
++		uint64_t pc, lr, fp, sp, x16, x1, x2;
++		unsigned hint;
++	} seen[4] = { 0 };
++	unsigned count = 0, threads;
++	thread_t self = current_thread(), thread;
++	task_t task = current_task();
++	vm_map_t map = current_map();
++	char *out = coachz_kill_capture;
++	const size_t size = sizeof(coachz_kill_capture);
++	size_t used;
++
++	task_lock(task);
++	threads = task->thread_count;
++	queue_iterate(&task->threads, thread, thread_t, task_threads) {
++		unsigned hint = (unsigned)thread->block_hint;
++		arm_saved_state_t *saved = find_user_regs(thread);
++		/* Slot 0 is the killer; then threads that wait on something other than a message or the workqueue. */
++		unsigned slot = thread == self ? 0 : count + 1;
++		if (!saved || (thread != self && (count == 3 || hint == 2 || hint == 3 || hint == 15))) {
++			continue;
++		}
++		seen[slot].hint = hint;
++		seen[slot].pc = get_saved_state_pc(saved);
++		seen[slot].lr = get_saved_state_lr(saved);
++		seen[slot].fp = get_saved_state_fp(saved);
++		seen[slot].sp = get_saved_state_sp(saved);
++		seen[slot].x16 = get_saved_state_reg(saved, 16);
++		seen[slot].x1 = get_saved_state_reg(saved, 1);
++		seen[slot].x2 = get_saved_state_reg(saved, 2);
++		if (thread != self) {
++			count++;
++		}
++	}
++	task_unlock(task);
++	used = snprintf(out, size, "K39 kill at %u s: backboardd %u threads, slide 0x%x, %u others\n", seconds, threads,
++	    task->task_shared_region_slide, count);
++	for (unsigned slot = 0; slot <= count && used < size; slot++) {
++		uint32_t word = 0;
++		if (seen[slot].x1 && copyin((user_addr_t)seen[slot].x1, &word, sizeof(word))) {
++			word = 0xdeadbeef;
++		}
++		used += snprintf(out + used, size - used, " %s h%u pc %llx lr %llx x16 %lld x1 %llx x2 %llx [x1] %x:",
++		    slot ? "T" : "KILLER", seen[slot].hint, seen[slot].pc, seen[slot].lr, (long long)seen[slot].x16,
++		    seen[slot].x1, seen[slot].x2, word);
++		if (used < size) {
++			used += coachz_user_frames(out + used, size - used, map, seen[slot].fp, seen[slot].sp, slot ? 10 : 14);
++		}
++		if (used < size) {
++			used += snprintf(out + used, size - used, "\n");
++		}
++	}
++	os_atomic_store(&coachz_kill_captured, 1, release);
++}
++
+ void
+ coachz_launch_signal(int sender, const char *sender_name, int target, const char *target_name, int signum)
+ {
+ 	uint32_t index;
++	if (signum == 9 && !strcmp(sender_name, "backboardd") && !strcmp(target_name, "SpringBoard") &&
++	    os_atomic_cmpxchg(&coachz_kill_captured, 0, 2, relaxed)) {
++		coachz_capture_kill(coachz_launch_seconds());
++	}
+ 	if (signum != 9 || (index = os_atomic_inc_orig(&coachz_kill_count, relaxed)) >= 6) {
+ 		return;
+ 	}
+@@ -374,6 +465,9 @@
+ coachz_launch_process(int pid, const char *name, int exited, int status)
+ {
+ 	uint32_t index;
++	if (!exited && !strcmp(name, "SpringBoard")) {
++		os_atomic_store(&coachz_sb_pid, pid, relaxed);
++	}
+ 	if (!exited && !strcmp(name, "backboardd")) {
+ 		os_atomic_store(&coachz_bbd_pid, pid, relaxed);
+ 		return;
+@@ -474,7 +568,7 @@
  extern volatile uint32_t armcpu_smp_requested, armcpu_smp_running, armcpu_boot_mpidr;
  extern volatile uint32_t armcpu_smp_step[8], armcpu_smp_fail[8], armcpu_core_timer[8], armcpu_core_sgi[8];
  extern volatile uint32_t armcpu_smp_sys[8][5], armcpu_boot_sys[5], armcpu_freq[3][6];
 -extern volatile uint64_t coachz_frame_stats[3];
-+extern volatile uint64_t coachz_frame_stats[9];
++extern volatile uint64_t coachz_frame_stats[13];
  extern volatile int32_t armcpu_smp_psci_rc[8];
  extern void armcpu_group1_sgi_probe(uint64_t *);
  static char coachz_sgi_probe[256];
-@@ -625,11 +625,255 @@
+@@ -625,11 +719,374 @@
  	}
  }
  
@@ -81,7 +200,8 @@
 +	uint64_t total, delta;
 +	char name[20];
 +};
-+static struct coachz_usage coachz_tasks_seen[160], coachz_bbd_seen[32];
++/* backboardd alone has 65 threads: a table smaller than that left the thread column empty in k36. */
++static struct coachz_usage coachz_tasks_seen[512], coachz_bbd_seen[128];
 +static unsigned coachz_tasks_count, coachz_bbd_count;
 +
 +/* Remember a total under a key and return what it grew by since the last window. */
@@ -150,6 +270,104 @@
 +	return 32 * 200000 * hz / (chain * 1000000);
 +}
 +
++/*
++ * k37: where a process's waiting threads sit. Threads are grouped by their first four kernel return addresses (unslid,
++ * low 36 bits; a thread blocked with a continuation has no stack and shows that continuation, marked c). Each group
++ * shows its size, five frames, the user pc of one member, its wait event and state. Symbolicate offline with the kernel.
++ */
++struct coachz_wait_group {
++	uint64_t lr[5], upc, event;
++	unsigned count, state, hint, cont;
++};
++
++static void
++coachz_wait_report(int pid, const char *label)
++{
++	struct coachz_wait_group groups[3] = { 0 };
++	unsigned used = 0, threads = 0, running = 0, other = 0;
++	struct proc *p = pid > 0 ? proc_find(pid) : NULL;
++	thread_t thread;
++
++	if (!p) {
++		printf("K37 W %s: not running\n", label);
++		return;
++	}
++	task_t task = proc_task(p);
++	task_lock(task);
++	queue_iterate(&task->threads, thread, thread_t, task_threads) {
++		struct coachz_wait_group seen = { .count = 1 };
++		threads++;
++		if (!(thread->state & TH_WAIT) || (thread->state & TH_RUN)) {
++			running++;
++			continue;
++		}
++		seen.state = (unsigned)thread->state;
++		seen.hint = (unsigned)thread->block_hint;
++		seen.event = (uint64_t)VM_KERNEL_UNSLIDE_OR_PERM(thread->wait_event);
++		if (!thread->kernel_stack || !thread->machine.kstackptr) {
++			seen.cont = 1;
++			seen.lr[0] = (uint64_t)VM_KERNEL_UNSLIDE(thread->continuation);
++		} else {
++			const vm_offset_t low = thread->kernel_stack, high = low + kernel_stack_size;
++			/* kstackptr is the kernel context saved at the top of the stack when the thread blocked (as kdp reads it). */
++			const arm_kernel_saved_state_t *state = (const arm_kernel_saved_state_t *)thread->machine.kstackptr;
++			uint64_t fp = state->fp;
++			seen.lr[0] = (uint64_t)VM_KERNEL_UNSLIDE(state->lr);
++			for (unsigned frame = 1; frame < 5; frame++) {
++				if (!fp || (fp & 15) || fp < low || fp + 16 > high) {
++					break;
++				}
++				seen.lr[frame] = (uint64_t)VM_KERNEL_UNSLIDE(((const uint64_t *)fp)[1]);
++				fp = ((const uint64_t *)fp)[0];
++			}
++		}
++		arm_saved_state_t *user = find_user_regs(thread);
++		seen.upc = user ? (uint64_t)get_saved_state_pc(user) : 0;
++		unsigned index = 0;
++		while (index < used && memcmp(groups[index].lr, seen.lr, 4 * sizeof(seen.lr[0]))) {
++			index++;
++		}
++		if (index < used) {
++			groups[index].count++;
++		} else if (used < 3) {
++			groups[used++] = seen;
++		} else {
++			other++;
++		}
++	}
++	task_unlock(task);
++	proc_rele(p);
++	printf("K37 W %s(%d) %u threads, %u running, %u in other groups\n", label, pid, threads, running, other);
++	for (unsigned index = 0; index < used; index++) {
++		struct coachz_wait_group *g = &groups[index];
++		printf(" %ux%s s%x h%u:", g->count, g->cont ? " c" : "", g->state, g->hint);
++		for (unsigned frame = 0; frame < 5 && g->lr[frame]; frame++) {
++			printf(" %llx", g->lr[frame] & 0xfffffffffull);
++		}
++		printf(" e%llx u%llx\n", g->event & 0xfffffffffull, g->upc);
++	}
++}
++
++extern volatile uint64_t coachz_io_stats[8];
++
++/* Block I/O through the USB driver in the window: operations, KiB, time holding the device gate, time waiting for it, slowest operation. */
++static void
++coachz_io_report(void)
++{
++	static uint64_t last[8];
++	uint64_t now[8];
++	for (unsigned index = 0; index < 8; index++) {
++		now[index] = coachz_io_stats[index];
++	}
++	printf("K37 io: read %llu ops %llu KiB, write %llu ops %llu KiB, busy %llu ms, gate wait %llu ms, slowest %llu ms\n",
++	    now[0] - last[0], (now[1] - last[1]) / 1024, now[2] - last[2], (now[3] - last[3]) / 1024,
++	    coachz_ms(now[4] - last[4]), coachz_ms(now[5] - last[5]), coachz_ms(now[6]));
++	coachz_io_stats[6] = 0;
++	for (unsigned index = 0; index < 8; index++) {
++		last[index] = now[index];
++	}
++}
++
 +static void
 +coachz_measure_report(void)
 +{
@@ -196,7 +414,9 @@
 +	}
 +	printf("\n");
 +
-+	for (unsigned index = 0; index < cpus; index++) {
++	static unsigned reports;
++	const bool clocks = reports++ % 6 == 0;
++	for (unsigned index = 0; index < cpus && clocks; index++) {
 +		where[index] = -1;
 +		if (!processor_array[index]) {
 +			continue;
@@ -208,32 +428,37 @@
 +			mhz[index] = coachz_core_mhz(&loop2[index]);
 +		}
 +	}
-+	thread_bind(PROCESSOR_NULL);
-+	thread_block(THREAD_CONTINUE_NULL);
-+	printf("K36 MHz add-chain/loop2:");
-+	for (unsigned index = 0; index < cpus; index++) {
-+		if (where[index] == (int)index) {
-+			printf(" %u:%llu/%llu", index, mhz[index], loop2[index]);
-+		} else {
-+			printf(" %u:on%d", index, where[index]);
++	if (clocks) {
++		thread_bind(PROCESSOR_NULL);
++		thread_block(THREAD_CONTINUE_NULL);
++		printf("K36 MHz add-chain/loop2:");
++		for (unsigned index = 0; index < cpus; index++) {
++			if (where[index] == (int)index) {
++				printf(" %u:%llu/%llu", index, mhz[index], loop2[index]);
++			} else {
++				printf(" %u:on%d", index, where[index]);
++			}
 +		}
++		if (!freq_regs) {
++			/* Both CPU domains: 0x18323000 and 0x18325800, each read up to its state register at +0x920. */
++			freq_regs = ml_io_map(0x18323000, 0x4000);
++		}
++		if (freq_regs) {
++			uint32_t a55 = *(volatile uint32_t *)(freq_regs + 0x704), a76 = *(volatile uint32_t *)(freq_regs + 0x2800 + 0x704);
++			uint32_t s55 = *(volatile uint32_t *)(freq_regs + 0x920), s76 = *(volatile uint32_t *)(freq_regs + 0x2800 + 0x920);
++			printf(" | vote A55 0x%x=%u MHz state %u, A76 0x%x=%u MHz state %u", a55, (a55 & 0x3ff) * 192 / 10, s55,
++			    a76, (a76 & 0x3ff) * 192 / 10, s76);
++		}
++		printf("\n");
 +	}
-+	if (!freq_regs) {
-+		/* Both CPU domains: 0x18323000 and 0x18325800, each read up to its state register at +0x920. */
-+		freq_regs = ml_io_map(0x18323000, 0x4000);
-+	}
-+	if (freq_regs) {
-+		uint32_t a55 = *(volatile uint32_t *)(freq_regs + 0x704), a76 = *(volatile uint32_t *)(freq_regs + 0x2800 + 0x704);
-+		uint32_t s55 = *(volatile uint32_t *)(freq_regs + 0x920), s76 = *(volatile uint32_t *)(freq_regs + 0x2800 + 0x920);
-+		printf(" | vote A55 0x%x=%u MHz state %u, A76 0x%x=%u MHz state %u", a55, (a55 & 0x3ff) * 192 / 10, s55,
-+		    a76, (a76 & 0x3ff) * 192 / 10, s76);
-+	}
-+	printf("\n");
 +
 +	printf("K36 frames %llu (+%llu), copy us min %llu max %llu last %llu, gap ms max %llu last %llu, cores 0x%llx last %llu\n",
 +	    coachz_frame_stats[0], coachz_frame_stats[0] - coachz_frame_stats[8],
 +	    coachz_frame_stats[0] != coachz_frame_stats[8] ? coachz_frame_stats[4] : 0, coachz_frame_stats[3],
 +	    coachz_frame_stats[1], coachz_frame_stats[5], coachz_frame_stats[2], coachz_frame_stats[7], coachz_frame_stats[6]);
++	/* Memory attribute (MAIR value from AT S1E1R: 0xff write-back, 0x44 non-cacheable, 0 device) of the last copy's source and of the slowest in the window, and the last content-scan time. */
++	printf("K37 source attr last 0x%llx slowest 0x%llx on core %llu, scan us last %llu\n", coachz_frame_stats[9],
++	    coachz_frame_stats[11], coachz_frame_stats[12], coachz_frame_stats[10]);
 +	coachz_frame_stats[8] = coachz_frame_stats[0];
 +	coachz_frame_stats[3] = 0;
 +	coachz_frame_stats[4] = ~0ull;
@@ -285,6 +510,19 @@
 +			printf(" %s %llu", top[index].name, coachz_ms(top[index].delta));
 +		}
 +		printf("\n");
++	}
++	coachz_io_report();
++	{
++		static unsigned turn;
++		static const char *const labels[3] = { "backboardd", "SpringBoard", "lsd" };
++		int pids[3] = { os_atomic_load(&coachz_bbd_pid, relaxed), os_atomic_load(&coachz_sb_pid, relaxed),
++			        os_atomic_load(&coachz_lsd_pid, relaxed) };
++		unsigned which = turn++ % 3;
++		if (os_atomic_load(&coachz_kill_captured, acquire) == 1) {
++			printf("%s", coachz_kill_capture);
++		} else {
++			coachz_wait_report(pids[which], labels[which]);
++		}
 +	}
 +	uint32_t kills = os_atomic_load(&coachz_kill_count, relaxed);
 +	printf("K36 SB capture %u, %u SIGKILL", os_atomic_load(&coachz_sb_captured, acquire), kills);

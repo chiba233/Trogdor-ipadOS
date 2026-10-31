@@ -116,6 +116,10 @@ FULL_SCREEN_IDENTITY = {
 }
 
 
+# Must stay the same across boots: ByHost preference files are named after the UUID derived from it.
+COACHZ_UNIQUE_CHIP_ID = b'COACHZ\0\1'
+
+
 def apply_identity(node, table):
     """Apply a typed [adt] table of the OS profile: what the original components read."""
     for kind, values in table.items():
@@ -192,6 +196,11 @@ def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=T
         # not a measurement: nothing here is verified.
         root.child('chosen').set('boot-manifest-hash', hashlib.sha384(
             b'Coachz unsealed USB boot set\0' + root_uuid.encode() + b'\0' + SYSTEMOS_UUID.encode()).digest())
+        # XNU derives IOPlatformUUID only from these two (IOPlatformExpertDevice::generatePlatformUUID). Without it every
+        # CurrentHost preference write fails, so data migration never records that it finished and runs again on every
+        # boot, holding SpringBoard's check-in (ios-sweet NOTES.md). A fixed synthetic chip ID, not a real one; 0x8011 is A10X.
+        root.child('chosen').set('unique-chip-id', COACHZ_UNIQUE_CHIP_ID)
+        root.child('chosen').set('chip-id', struct.pack('<I', 0x8011))
     memory_map = root.child('chosen').child('memory-map')
     # Without a RAMDisk entry IOFindBSDRoot makes no md0, and rd= names a disk partition.
     if ram_root:
@@ -230,8 +239,8 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         command_line += ' coachz-display=1 offline-legacy-register=1 offline-legacy-gop=1 offline-legacy-phase=4'
         command_line += ' offline-legacy-pm=1 offline-legacy-validate=1 offline-legacy-transfer=1 offline-legacy-cpu-present=1'
         command_line += ' sheng-vsync=60 sheng-early-retire=0 coachz-reset-mgcache=1'
-        # Once the first frame is copied, the screen console keeps to the top 14 rows (coachz-prelink-measure.patch).
-        command_line += ' coachz-console-band=14'
+        # Once the first frame is copied, the screen console keeps to the top 18 rows (coachz-prelink-measure.patch).
+        command_line += ' coachz-console-band=18'
     if cpus != 1:
         # coachz-prelink-smp.patch raises BCM2837's board configuration to eight CPUs in two clusters.
         if not root_uuid or not prelinked or not 2 <= cpus <= 8:
@@ -246,6 +255,9 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         if not root_uuid or data_seed is not None or not re.fullmatch(r'[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}', data_uuid):
             raise ValueError('an external Data UUID needs the main OS root and no memory Data seed')
         command_line += ' coachz-data-uuid=' + data_uuid
+        if display:
+            # Persistent Data shown on screen: skip Setup and migration, no BackBoard watchdogs (coachz-prelink-skip-setup.patch).
+            command_line += ' coachz-skip-setup=1'
     if data_seed is not None and not root_uuid:
         raise ValueError('a Data seed goes with the main OS root')
     if data_seed or data_uuid:
