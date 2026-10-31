@@ -63,12 +63,15 @@ void native_legacy_surface_rejected(uint64_t width,uint64_t height,uint32_t form
 static uint64_t counter_read() { uint64_t value;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(value));return value; }
 static uint64_t counter_hz() { uint64_t value;__asm__ volatile("mrs %0, cntfrq_el0":"=r"(value));return value?value:1; }
 // Copy cost against the interval between copies: a slow copy and a slow producer look alike on the screen.
+// The periodic report reads frames copied, the last copy in us and the gap before it in ms.
+extern "C" { volatile uint64_t coachz_frame_stats[3]; }
 void native_legacy_copy_timing_observed(uint64_t ticks,uint64_t bytes) {
     static uint64_t copies,previous;
     uint64_t now=counter_read(),hz=counter_hz();
     copies++;
     if(copies<=8 || !(copies%32)) kprintf("COACHZ display: copy %llu took %llu us for %llu bytes, %llu ms since previous\n",
         copies,ticks*1000000/hz,bytes,previous?(now-previous)*1000/hz:0);
+    coachz_frame_stats[0]=copies;coachz_frame_stats[1]=ticks*1000000/hz;coachz_frame_stats[2]=previous?(now-previous)*1000/hz:0;
     previous=now;
 }
 void native_legacy_transfer_observed(IOReturn status,const void *,uint64_t bytes) {

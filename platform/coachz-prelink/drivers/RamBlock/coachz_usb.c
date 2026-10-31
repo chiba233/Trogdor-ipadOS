@@ -54,7 +54,17 @@ void *coachz_usb_calloc(size_t count, size_t size) {
 }
 void coachz_usb_free(void *p) { (void)p; }
 int dma_coherent(const void *p) { return (unsigned long)p - pool_va < POOL_BYTES; }
-void udelay(unsigned us) { IODelay(us); }
+/*
+ * The CPU nubs report no idle latency, so ml_delay_should_spin() is false and a short IODelay blocks the thread: every xHCI
+ * poll cost a timer interrupt and a wake from idle. Spin on the counter; transfers are short and other cores keep running.
+ */
+void udelay(unsigned us) {
+    unsigned long long start = mach_absolute_time(), ns;
+    do {
+        __asm__ volatile("yield");
+        absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
+    } while (ns < us * 1000ull);
+}
 void mdelay(unsigned ms) { while (ms--) IODelay(1000); }
 static uint64_t now_us(void) {
     unsigned long long ns;

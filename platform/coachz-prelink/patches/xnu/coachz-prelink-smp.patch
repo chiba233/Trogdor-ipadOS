@@ -44,3 +44,44 @@
  	kprintf("[%d]%s>pset_find(cluster_id=%d) returned pset %d\n", current_processor()->cpu_id, __FUNCTION__, in_processor_info->cluster_id, pset ? pset->pset_id : -1);
  	if (pset == NULL) {
  #if __AMP__
+@@ -1510,6 +1516,13 @@
+ #endif /* __AMP__ */
+ 	}
+ 	kprintf("[%d]%s>cpu_id %p cluster_id %d cpu_number %d is type %d\n", current_processor()->cpu_id, __FUNCTION__, in_processor_info->cpu_id, in_processor_info->cluster_id, this_cpu_datap->cpu_number, in_processor_info->cluster_type);
++	/*
++	 * Coachz: with one pset nothing else tells the scheduler that the A76 cores are faster, so threads
++	 * look for them first. This is a preference, not the Edge scheduler: nothing migrates a running thread.
++	 */
++	if (this_cpu_datap->cpu_cluster_type == CLUSTER_TYPE_P) {
++		bit_set(pset->perfcontrol_cpu_preferred_bitmask, this_cpu_datap->cpu_number);
++	}
+ 	lck_mtx_unlock(&pset_create_lock);
+ 
+ 	processor_t processor = PERCPU_GET_RELATIVE(processor, cpu_data, this_cpu_datap);
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -5175,7 +5175,10 @@
+ 					 * If the rotation bitmask to force a migration is set for this core and there's an idle core that
+ 					 * that needn't be avoided, don't continue running on the same core.
+ 					 */
+-					if (!(bit_test(processor->processor_set->perfcontrol_cpu_migration_bitmask, processor->cpu_id) && non_avoided_idle_primary_map != 0)) {
++					/* Coachz: a little core is no hint while a big core sits idle. */
++					bool better_idle = (idle_primary_map & pset->perfcontrol_cpu_preferred_bitmask) != 0 &&
++					    !bit_test(pset->perfcontrol_cpu_preferred_bitmask, processor->cpu_id);
++					if (!better_idle && !(bit_test(processor->processor_set->perfcontrol_cpu_migration_bitmask, processor->cpu_id) && non_avoided_idle_primary_map != 0)) {
+ 						return processor;
+ 					}
+ 				}
+@@ -8575,7 +8578,11 @@
+ 		primary_map = bit_ror64(primary_map, 1);
+ 	}
+ 
+-	int rotid = lsb_first(primary_map);
++	/* Coachz: realtime threads, the render server's among them, take a big core first. */
++	int rotid = lsb_first(primary_map & pset->perfcontrol_cpu_preferred_bitmask);
++	if (rotid < 0) {
++		rotid = lsb_first(primary_map);
++	}
+ 	if (rotid >= 0) {
+ 		int cpuid = avoid_cpu0 ? ((rotid + 1) & 63) : rotid;
+ 

@@ -60,7 +60,14 @@ def extract(tree, writable_storage=False):
             text += '''\n/* Coachz: complete APFS flushes with the original bulk-only SCSI transport. */\nint coachz_usbmsc_sync(usbdev_t *dev) {\n    const u8 command[10] = {0x35}; /* SYNCHRONIZE CACHE(10), whole LUN */\n    return execute_command(dev, cbw_direction_data_out, command, 10, NULL, 0, 0);\n}\n'''
         (tree / name).write_text(text)
     for name in HEADERS:
-        (tree / 'include/usb' / name).write_text(source('include/usb/' + name))
+        text = source('include/usb/' + name)
+        if writable_storage and name == 'usb.h':
+            # The kernel's udelay really takes a microsecond, so this limit is real time, and an APFS flush can outlast 5 s.
+            old = '#define USB_MAX_PROCESSING_TIME_US (5 * 1000 * 1000)'
+            if text.count(old) != 1:
+                raise ValueError('libpayload changed around USB_MAX_PROCESSING_TIME_US')
+            text = text.replace(old, '#define USB_MAX_PROCESSING_TIME_US (60 * 1000 * 1000)')
+        (tree / 'include/usb' / name).write_text(text)
 
 
 def build(zig, cpu, env, out):

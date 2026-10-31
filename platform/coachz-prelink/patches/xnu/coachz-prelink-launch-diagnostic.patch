@@ -1,6 +1,6 @@
 --- a/osfmk/arm64/coachz_thread.c
 +++ b/osfmk/arm64/coachz_thread.c
-@@ -8,6 +8,11 @@
+@@ -8,6 +8,13 @@
  #include <mach/arm/thread_status.h>
  #include <libkern/copyio.h>
  #include <os/atomic_private.h>
@@ -9,10 +9,12 @@
 +#include <kern/cpu_number.h>
 +#include <arm/cpu_data_internal.h>
 +#include <machine/machine_routines.h>
++#include <kern/kalloc.h>
++#include <kern/processor.h>
  
  void coachz_sample_task(const char *name, int pid, task_t task);
  void coachz_critical_user_state(const char *name, int pid);
-@@ -314,12 +319,245 @@
+@@ -314,12 +321,315 @@
  done:
  	os_atomic_store(&coachz_sb_captured, 2, release);
  	printf("%s", coachz_sb_failure);
@@ -35,6 +37,7 @@
 +static uint32_t coachz_launch_count;
 +/* lsd seen while the first SpringBoard waits on it: two snapshots, 45 s and 80 s after that start. */
 +static int coachz_lsd_pid;
++static int coachz_bbd_pid;
 +static uint32_t coachz_sb_started;
 +static char coachz_lsd_snapshots[2][1024];
 +static uint32_t coachz_lsd_snapshot_count;
@@ -68,6 +71,10 @@
 +coachz_launch_process(int pid, const char *name, int exited, int status)
 +{
 +	uint32_t index;
++	if (!exited && !strcmp(name, "backboardd")) {
++		os_atomic_store(&coachz_bbd_pid, pid, relaxed);
++		return;
++	}
 +	if ((strcmp(name, "lsd") && strcmp(name, "SpringBoard")) ||
 +	    (index = os_atomic_inc_orig(&coachz_launch_count, relaxed)) >= 10) {
 +		return;
@@ -163,10 +170,10 @@
 + */
 +extern volatile uint32_t armcpu_smp_requested, armcpu_smp_running, armcpu_boot_mpidr;
 +extern volatile uint32_t armcpu_smp_step[8], armcpu_smp_fail[8], armcpu_core_timer[8], armcpu_core_sgi[8];
-+extern volatile uint32_t armcpu_smp_sys[8][5], armcpu_boot_sys[5], armcpu_gic_boot[8];
++extern volatile uint32_t armcpu_smp_sys[8][5], armcpu_boot_sys[5], armcpu_freq[3][6];
++extern volatile uint64_t coachz_frame_stats[3];
 +extern volatile int32_t armcpu_smp_psci_rc[8];
 +extern void armcpu_group1_sgi_probe(uint64_t *);
-+extern void armcpu_gic_diag(uint64_t aff, uint32_t *out);
 +static char coachz_sgi_probe[256];
 +
 +static void
@@ -206,25 +213,90 @@
 +		    out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7]);
 +	}
 +	printf("%s", coachz_sgi_probe);
-+	printf("COACHZ GIC boot: IGROUPR0 %x ISENABLER0 %x GICD_CTLR %x TYPER %x IGRPMODR0 %x PMR %x IGRPEN1 %x SRE %x\n",
-+	    armcpu_gic_boot[0], armcpu_gic_boot[1], armcpu_gic_boot[2], armcpu_gic_boot[3], armcpu_gic_boot[4],
-+	    armcpu_gic_boot[5], armcpu_gic_boot[6], armcpu_gic_boot[7]);
-+	for (unsigned half = 0; half < 2; half++) {
-+		printf("COACHZ GICR:");
-+		for (unsigned index = half * 4; index < half * 4 + 4; index++) {
-+			uint32_t out[8];
-+			armcpu_gic_diag((uint64_t)index << 8, out);
-+			printf(" [%u grp %x en %x pend %x mod %x wake %x pri %x %s]", index, out[0], out[1], out[2], out[3], out[4], out[6],
-+			    out[7] == 1 ? "ok" : "missing");
++	{
++		static uint64_t reported_frames;
++		static uint32_t reported_seconds;
++		static uint64_t memcpy_mbs;
++		static const char names[3][4] = { "A55", "A76", "L3" };
++		uint64_t frames = coachz_frame_stats[0];
++		uint32_t now = coachz_launch_seconds();
++		printf("COACHZ frames: %llu (+%llu in %u s), last copy %llu us, gap %llu ms\n", frames, frames - reported_frames,
++		    now - reported_seconds, coachz_frame_stats[1], coachz_frame_stats[2]);
++		reported_frames = frames;
++		reported_seconds = now;
++		printf("COACHZ freq:");
++		for (unsigned domain = 0; domain < 3; domain++) {
++			printf(" [%s en%u state %u->%u/%u %u->%u MHz]", names[domain], armcpu_freq[domain][0], armcpu_freq[domain][1],
++			    armcpu_freq[domain][2], armcpu_freq[domain][3], armcpu_freq[domain][4], armcpu_freq[domain][5]);
 +		}
 +		printf("\n");
++		if (!memcpy_mbs) {
++			/* Larger than the L3: this is DRAM, which no CPU loop shows. */
++			const size_t size = 4 * 1024 * 1024;
++			void *from = kalloc_data(size, Z_WAITOK | Z_ZERO), *to = kalloc_data(size, Z_WAITOK | Z_ZERO);
++			if (from && to) {
++				uint64_t start = mach_absolute_time(), ns;
++				for (unsigned pass = 0; pass < 8; pass++) {
++					memcpy(to, from, size);
++					__asm__ volatile ("" : : "r" (to) : "memory");
++				}
++				absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
++				memcpy_mbs = 8 * size * 1000 / (ns ? ns : 1);
++			}
++			kfree_data(from, size);
++			kfree_data(to, size);
++		}
++		printf("COACHZ mem: memcpy %llu MB/s\n", memcpy_mbs);
 +	}
++}
++
++/* Each backboardd thread: state, block hint, priority, last CPU and the trap it sits in. */
++static void
++coachz_bbd_report(void)
++{
++	struct proc *p = proc_find(os_atomic_load(&coachz_bbd_pid, relaxed));
++	struct {
++		unsigned state, hint;
++		int pri, cpu;
++		long long trap;
++	} seen[12];
++	unsigned count = 0, threads;
++	task_t task;
++	thread_t thread;
++
++	if (!p) {
++		return;
++	}
++	task = proc_task(p);
++	task_lock(task);
++	threads = task->thread_count;
++	queue_iterate(&task->threads, thread, thread_t, task_threads) {
++		arm_saved_state_t *saved = find_user_regs(thread);
++		if (count == 12) {
++			break;
++		}
++		seen[count].state = (unsigned)thread->state;
++		seen[count].hint = (unsigned)thread->block_hint;
++		seen[count].pri = thread->sched_pri;
++		seen[count].cpu = thread->last_processor ? thread->last_processor->cpu_id : -1;
++		seen[count].trap = saved ? (long long)get_saved_state_reg(saved, 16) : 0;
++		count++;
++	}
++	task_unlock(task);
++	proc_rele(p);
++	printf("COACHZ BBD %u threads:", threads);
++	for (unsigned index = 0; index < count; index++) {
++		printf(" [s%x h%u p%d c%d x%lld]", seen[index].state, seen[index].hint, seen[index].pri, seen[index].cpu,
++		    seen[index].trap);
++	}
++	printf("\n");
 +}
 +
 +static void
 +coachz_launch_report(void)
 +{
 +	coachz_smp_report();
++	coachz_bbd_report();
 +	uint32_t kills = os_atomic_load(&coachz_kill_count, relaxed);
 +	uint32_t launches = os_atomic_load(&coachz_launch_count, relaxed);
 +	printf("COACHZ LS v1: %u SIGKILL, %u lsd/SpringBoard events, now %u s\n", kills, launches,

@@ -103,6 +103,19 @@ def read_tree(adt):
     return visit()
 
 
+# The Coachz has no Home button, so the display route presents a full-screen 11-inch iPad Pro (UniXNU guide/mobilegestalt).
+# Root compatible stays J120AP: original platform code and this IPSW's per-model resources key on it.
+FULL_SCREEN_IDENTITY = {
+    'root': {'string': {'model': 'iPad8,1', 'target-type': 'J317'}},
+    'product': {'string': {'product-name': 'iPad Pro (11-inch)', 'product-description': 'iPad Pro (11-inch)',
+                           'compatible-device-fallback': 'iPad7,3'},
+                'u32': {'artwork-device-subtype': 2388, 'thin-bezel': 1}},
+    'buttons': {'string': {'compatible': 'buttons', 'device_type': 'buttons'},
+                'bytes': {'button-names': b'hold\0voldown\0volup\0'.hex()},
+                'u32': {'home-button-type': 2}},
+}
+
+
 def apply_identity(node, table):
     """Apply a typed [adt] table of the OS profile: what the original components read."""
     for kind, values in table.items():
@@ -158,7 +171,8 @@ def smp_tree(root, count):
     psci.set('method', b'smc\0')
 
 
-def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=True, root_uuid=None, cpus=1):
+def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=True, root_uuid=None, cpus=1,
+                 full_screen=False):
     root = read_tree(adt)
     if cpus > 1:
         smp_tree(root, cpus)
@@ -166,6 +180,10 @@ def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=T
     apply_identity(root, table['root'])
     for name in ('chosen', 'product', 'defaults'):
         apply_identity(root.child(name), table[name])
+    if full_screen:
+        apply_identity(root, FULL_SCREEN_IDENTITY['root'])
+        for name in ('product', 'buttons'):
+            apply_identity(root.child(name), FULL_SCREEN_IDENTITY[name])
     if environment:
         root.child('chosen').set('osenvironment', environment.encode() + b'\0')
     if root_uuid:
@@ -220,7 +238,8 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
             raise ValueError('the command line must limit XNU to the boot CPU before SMP widens it')
         # cpus=N is the topology XNU parses; a CPU beyond it gets no logical number and ArmCpu skips it.
         command_line = command_line.replace(' cpus=1 ', ' cpus=%d ' % cpus)
-        command_line += ' sheng-smp=1 armcpu-self-ipi=1 armcpu-el2-entry=1'
+        # coachz-max-freq=1: ArmCpu raises the A55, A76 and L3 domains to their top non-boost states.
+        command_line += ' sheng-smp=1 armcpu-self-ipi=1 armcpu-el2-entry=1 coachz-max-freq=1'
     if data_uuid:
         if not root_uuid or data_seed is not None or not re.fullmatch(r'[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}', data_uuid):
             raise ValueError('an external Data UUID needs the main OS root and no memory Data seed')
@@ -244,7 +263,7 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         # The restore volume, from memory or from disk, runs as the restore OS environment; the main OS does not.
         environment = 'restore' if root_cache and not root_uuid else None
         adt = prelink_tree(adt, window, tree, ramdisk, cache, environment, ram_root=not disk_root or bool(data_seed),
-                           root_uuid=root_uuid, cpus=cpus)
+                           root_uuid=root_uuid, cpus=cpus, full_screen=display)
         ramdisk = ramdisk + cache + bytes(-len(cache) % 4096)
     else:
         adt = add_ramdisk_property(adt, window + up(tree + len(adt) + 52), len(ramdisk))

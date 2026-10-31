@@ -7,7 +7,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 from xnu_checkpoint import adt_fields
-from xnu_screen import Node, read_tree, smp_tree
+from xnu_screen import FULL_SCREEN_IDENTITY, Node, apply_identity, read_tree, smp_tree
 
 
 def boot_tree():
@@ -80,6 +80,41 @@ class SmpTreeTests(unittest.TestCase):
             for line in upstream.read_text().splitlines():
                 if any(';' in text for text in strings.findall(line)):
                     self.assertIn(line, removed)
+
+    def test_threads_look_for_big_cores_first(self):
+        patch = (Path(__file__).resolve().parents[1] / 'platform/coachz-prelink/patches/xnu/coachz-prelink-smp.patch').read_text()
+        self.assertIn('+		bit_set(pset->perfcontrol_cpu_preferred_bitmask, this_cpu_datap->cpu_number);', patch)
+        self.assertIn('+	int rotid = lsb_first(primary_map & pset->perfcontrol_cpu_preferred_bitmask);', patch)
+        self.assertIn('+					if (!better_idle && ', patch)
+
+    def test_usb_polling_does_not_block(self):
+        # A short IODelay blocks here: every xHCI poll would cost a timer interrupt and a wake from idle.
+        source = (Path(__file__).resolve().parents[1] / 'platform/coachz-prelink/drivers/RamBlock/coachz_usb.c').read_text()
+        body = source.split('void udelay(unsigned us) {', 1)[1].split('\n}', 1)[0]
+        self.assertNotIn('IODelay', body)
+        self.assertIn('mach_absolute_time', body)
+
+    def test_frequency_domains_come_from_the_device_tree(self):
+        patch = (Path(__file__).resolve().parents[1] / 'platform/coachz-screen/patches/drivers/ArmCpu.patch').read_text()
+        self.assertIn('kFreqWindow = 0x18320000', patch)
+        self.assertIn('kFreqOffset[3] = {0x3000, 0x5800, 0x1000}', patch)
+        self.assertIn('write32 (base, 0x920, best);', patch)
+
+    def test_full_screen_identity_has_no_home_button(self):
+        root = Node()
+        root.set('compatible', b'J120AP\0')
+        apply_identity(root, FULL_SCREEN_IDENTITY['root'])
+        for name in ('product', 'buttons'):
+            apply_identity(root.child(name), FULL_SCREEN_IDENTITY[name])
+        props = {key: value for key, _, value in root.props}
+        self.assertEqual(props['model'], b'iPad8,1\0')
+        self.assertEqual(props['target-type'], b'J317\0')
+        self.assertEqual(props['compatible'], b'J120AP\0')
+        buttons = {key: value for key, _, value in root.child('buttons').props}
+        self.assertEqual(buttons['home-button-type'], struct.pack('<I', 2))
+        self.assertEqual(buttons['button-names'], b'hold\0voldown\0volup\0')
+        product = {key: value for key, _, value in root.child('product').props}
+        self.assertEqual(product['artwork-device-subtype'], struct.pack('<I', 2388))
 
     def test_diagnostics_never_use_group_0_gic_registers(self):
         # UniXNU's armcpu_sgi_selfprobe uses them, and on this firmware the machine resets.

@@ -43,5 +43,5 @@ coachz-prelink-mgcache-reset.patch
 # Who sends SIGKILL through kill(), and when lsd and SpringBoard start and exit.
 coachz-prelink-launch-diagnostic.patch
 
-# SC7180: cores numbered in MPIDR Affinity1 (match both levels at the reset vector), eight CPUs in two clusters.
+# SC7180: threads look for the A76 cores first; cores numbered in MPIDR Affinity1 (match both levels at the reset vector), eight CPUs in two clusters.
 coachz-prelink-smp.patch
