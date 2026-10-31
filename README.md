@@ -2,13 +2,29 @@
 
 HP Chromebook x2 11（Google Coachz / SC7180）的 **原生 iPadOS 移植实验**。
 
-当前实现是第一阶段引导探针，已在真机取回寄存器日志，确认原厂 EL2 入口、EL1 诊断与 stage=3，并经 EL2 交接原生 Linux；源码 XNU 的 pre-MMU 入口检查点也已通过真机验证，确认在 EL1 读取 boot_args 后返回 Linux。目标用户态是已有社区原生实现可参考的 iPadOS 17；后续独立 MMU 检查点也已通过；高虚拟地址取指和 C 入口栈读取检查点也已通过；早期 C 正文的完整栈保存、参数复制与缓存清理返回也已真机验收，启动 CPU 数据的原始标量／FP/NEON 初始化也已通过；原始平台状态、ADT 绑定与首次原生 arm-io 查找已取回有效硬件日志；后续平台初始化、驱动与用户态接入仍待完成。
+目前已经能在真机上启动 XNU，并把输出直接画到屏幕上：内核带着 iPadOS 17.7.11 的 31 个 Apple 原始组件完成初始化，从内存盘启动一个自写的测试程序作为 PID 1。**还不能启动 iPadOS**，也没有运行 launchd 或任何 iPadOS 用户态。
 
 ```text
 原厂 Coreboot → TF-A BL31 → Depthcharge（NS EL2）
-  → 开发者模式签名 FIT → ARM64 探针 → EL1 诊断
-  → 后续：XNU Mach-O / Apple Device Tree / iPadOS
+  → 开发者模式签名 FIT → ARM64 探针 → EL1，恢复屏幕和背光
+  → XNU（prelink 31 个 Apple 组件）→ 内存盘上的自写 init（PID 1）
+  → 后续：launchd、存储驱动、iPadOS 用户态
 ```
+
+## 当前进度
+
+| 阶段 | 状态 | 证据 |
+| --- | --- | --- |
+| 原厂启动链、EL2→EL1、日志回传 Linux | 通过 | 真机日志，逐字段校验 |
+| XNU 早期检查点（入口、MMU、高地址、C 入口、CPU 数据、PE、拓扑） | 通过 | 真机日志，逐字段校验 |
+| 恢复屏幕和背光 | 通过 | 真机日志，加肉眼可见的棋盘格 |
+| XNU 屏幕控制台，内核初始化走完 | 通过 | 屏幕照片 |
+| 第一个用户态程序（PID 1）和定时器中断 | 通过 | 屏幕照片 |
+| prelink 31 个 Apple 组件，真实 AMFI 放行 init | 通过 | 屏幕照片，运行到至少 12 个 tick（约 1 分钟） |
+| launchd、dyld、iPadOS 用户态 | 未开始验证 | |
+| SMP、存储、触摸、GPU、音频 | 未实现 | 设备树里没有这些硬件节点，Apple 组件大多只是加载 |
+
+屏幕照片阶段没有逐字段核对，也没有验证长时间稳定性。早期有一个原因不明的随机 zone panic，最近几轮没有再出现，但没有解决。详情见 [状态](docs/status.md) 和 [硬件记录](docs/hardware-tests.md)。
 
 ## 已有内容
 
@@ -16,6 +32,7 @@ HP Chromebook x2 11（Google Coachz / SC7180）的 **原生 iPadOS 移植实验*
 - [设计与阶段边界](docs/design.md)：比较直接 FIT shim、U-Boot EFI 与替换固件，明确首阶段的接口。
 - `boot/`：带 Linux ARM64 Image 头的独立探针、EL2→EL1 入口、内存日志、受限 GENI UART 输出、只读 FDT 解析。
 - `tools/`：交叉编译、FIT 封装、vboot 容器签名、上游版本核对；所有产物都是普通文件。
+- `platform/`：`coachz` 是已验收检查点用的内核；`coachz-screen` 是不带 prelink 的屏幕内核；`coachz-prelink` 是带 Apple 组件的屏幕内核。
 - [状态与真机验收](docs/status.md)：区分源码证据、主机检查、已通过的探针硬件验收与后续阶段。
 
 ## 构建
@@ -105,4 +122,13 @@ python3 tools/sign.py build/uart/probe.itb \
 [WFE 与单 CPU 拓扑检查点](docs/xnu-topology-checkpoint.md) 已实现 version11，126 项主机测试、七次系统模型回归和原生产物独立审查通过；检查三个系统寄存器的运行值和完整恢复，严格读取要求 40 字段。2026-10-31 真机完整 40 字段已通过，原始 WFE 配置／单 CPU 拓扑、完整状态核对与寄存器恢复后正常交接 Linux；不包含线程／VM 初始化。
 
 
-[独立显示发现探针](docs/display-discovery.md) 已实现：校验 Coreboot framebuffer／GPIO 元数据，只读快照 13 个显示／GPIO／EC 协议寄存器，计算原 scanout 与整页分配范围的冲突，再 HVC 返回 Linux。137 项主机测试、11 次读异常 CPU 模型、旧 version11 回归及原生产物审查通过；2026-10-31 真机完整 42 字段通过，13 次读取无故障并正常交接 Linux。实际几何／格式匹配，候选为假的两个原因已经只读查明：当时的 1 MiB 基址门误读了分配器，复用的 XNU 放置范围门对动态 framebuffer 不可能为真，见 [核实记录](docs/display-discovery.md#2026-10-31真实分配与保留归属核实)。修正后的 schema 2 已通过真机 45 字段，候选为真。随后独立的画面实验恢复了 Depthcharge 停掉的 scanout：手电下可见全屏棋盘格，帧计数正好 60 Hz，并正常交接 Linux。随后的背光实验通过 EC 打开背光，不用手电即可看到棋盘格。字符输出和 XNU 显示接入尚未实现。该镜像不执行 XNU，不写 framebuffer、显示控制或 EC；候选标志不表示屏幕已点亮。
+[独立显示发现探针](docs/display-discovery.md) 已实现：校验 Coreboot framebuffer／GPIO 元数据，只读快照 13 个显示／GPIO／EC 协议寄存器，计算原 scanout 与整页分配范围的冲突，再 HVC 返回 Linux。137 项主机测试、11 次读异常 CPU 模型、旧 version11 回归及原生产物审查通过；2026-10-31 真机完整 42 字段通过，13 次读取无故障并正常交接 Linux。实际几何／格式匹配，候选为假的两个原因已经只读查明：当时的 1 MiB 基址门误读了分配器，复用的 XNU 放置范围门对动态 framebuffer 不可能为真，见 [核实记录](docs/display-discovery.md#2026-10-31真实分配与保留归属核实)。修正后的 schema 2 已通过真机 45 字段，候选为真。随后独立的画面实验恢复了 Depthcharge 停掉的 scanout：手电下可见全屏棋盘格，帧计数正好 60 Hz，并正常交接 Linux。随后的背光实验通过 EC 打开背光，不用手电即可看到棋盘格。发现探针本身不执行 XNU，不写 framebuffer、显示控制或 EC；候选标志不表示屏幕已点亮。
+
+## XNU 屏幕输出与用户态
+
+这部分镜像不再返回 Linux，结果都看屏幕。构建和配置见 [XNU 屏幕输出](docs/display-discovery.md#xnu-屏幕输出payload-version-12) 和 [prelink 屏幕镜像](docs/display-discovery.md#prelink-屏幕镜像)。
+
+- 屏幕控制台改编自 ios-sweet，kprintf 和 panic 调用栈都画到屏幕上。
+- 内存盘内容是 `tools/coachz_init.S` 打包成的静态程序，由 mockfs 当作 `/sbin/launchd` 启动，每 5 秒打印一次 tick。
+- SC7180 的虚拟定时器是 INTID 19，不是 ArmCpu 写死的 27，修正后定时器中断才开始工作。
+- prelink 需要用户自己提供 IPSW。IPSW、kernelcache 和合并后的内核都留在被忽略的目录里，不进仓库。
