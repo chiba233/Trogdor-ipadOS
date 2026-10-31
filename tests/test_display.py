@@ -294,7 +294,7 @@ class DisplayTests(unittest.TestCase):
         from xnu_screen import COMMAND_LINE,add_ramdisk_property
         self.assertIn('rd=md0',COMMAND_LINE)
         self.assertIn('copy(window+disk,p+ramdisk,',(ROOT/'boot/xnu_screen.c').read_text())
-        self.assertIn('tries=15 if a.screen else 1',(ROOT/'tools/linux_log.py').read_text())
+        self.assertIn('tries=15 if a.screen or a.usb_read else 1',(ROOT/'tools/linux_log.py').read_text())
         patch=(ROOT/'platform/coachz-screen/patches/xnu/coachz-screen-ramdisk-root.patch').read_text()
         for fixed in ('amfi_interface_register(&coachz_amfi);','bsd/kern/coachz_amfi.c\t\tstandard','if (!iomediaClass) {','if (!ioblockstoragedriverClass) {'):
             self.assertIn(fixed,patch)

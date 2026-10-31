@@ -164,10 +164,15 @@ def main():
     parser.add_argument('--display-pattern', action='store_true', help='first scanout restart, no EC or backlight')
     parser.add_argument('--display-backlight', action='store_true', help='scanout restart with EC backlight')
     parser.add_argument('--xnu-topology', action='store_true')
+    parser.add_argument('--usb-read', action='store_true', help='read-only USB experiment')
     parser.add_argument('--xnu-platform', action='store_true')
     args = parser.parse_args()
     with args.input.open('rb') as source:
         data = source.read(8193)
+    if args.usb_read:
+        from read_usb import read_usb_record
+        print(read_usb_record(data)[0], end='')
+        return
     if args.display_pattern or args.display_backlight:
         if any((args.display_pattern and args.display_backlight,args.display_discovery,args.display_discovery_schema1,args.xnu_checkpoint,args.xnu_mmu,args.xnu_highva,args.xnu_cinit,args.xnu_cpu,args.xnu_platform,args.xnu_pe,args.xnu_soc,args.xnu_topology,args.xnu_diagnostic)):
             parser.error("display pattern requires its own strict mode")

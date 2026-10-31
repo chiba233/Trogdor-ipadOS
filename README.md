@@ -8,7 +8,7 @@ HP Chromebook x2 11（Google Coachz / SC7180）的 **原生 iPadOS 移植实验*
 原厂 Coreboot → TF-A BL31 → Depthcharge（NS EL2）
   → 开发者模式签名 FIT → ARM64 探针 → EL1，恢复屏幕和背光
   → XNU（prelink Apple 组件）→ 内存里的恢复盘：launchd、dyld、restored_update
-  → 后续：USB 存储驱动、从 U 盘启动主系统、显示驱动
+  → 后续：XNU 里的 USB 存储驱动、从外接盘启动主系统、显示驱动
 ```
 
 ## 当前进度
@@ -22,7 +22,8 @@ HP Chromebook x2 11（Google Coachz / SC7180）的 **原生 iPadOS 移植实验*
 | 第一个用户态程序（PID 1）和定时器中断 | 通过 | 屏幕照片 |
 | prelink 31 个 Apple 组件（其中 1 个无代码，之后另加 tmpfs），真实 AMFI 放行 init | 通过 | 屏幕照片，运行到至少 12 个 tick（约 1 分钟） |
 | Apple launchd、dyld、恢复服务（恢复盘作根） | 运行，恢复服务按自身逻辑退出 | 屏幕照片，内核在 177 秒时仍存活 |
-| USB 存储、从 U 盘启动主系统 | 下一步，未开始 | 既定路线：先 U 盘，之后才考虑 eMMC |
+| 探针经 USB 读外接盘（只读实验） | 通过 | 真机日志，逐字段校验，见 [USB 只读实验](docs/usb-read.md) |
+| XNU 里的 USB 存储驱动、从外接盘启动主系统 | 下一步，未开始 | 既定路线：先外接盘，之后才考虑 eMMC |
 | 主系统、SMP、触摸、GPU、音频、界面 | 未实现 | 设备树里没有这些硬件节点，Apple 组件大多只是加载 |
 
 屏幕照片阶段没有逐字段核对，也没有验证长时间稳定性。早期有一个原因不明的随机 zone panic，最近几轮没有再出现，但没有解决。详情见 [状态](docs/status.md) 和 [硬件记录](docs/hardware-tests.md)。

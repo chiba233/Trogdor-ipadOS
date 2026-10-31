@@ -14,6 +14,7 @@ import zlib
 from artifacts import extract_image, inspect_image, inspect_scalar_code
 from build import CPU, elf_symbols
 from disk import create_image
+import usb_stack
 from relocation_audit import audit_sources
 from fdt import Node, decode, properties, string
 
@@ -97,7 +98,7 @@ def add_log(dtb):
     return result
 
 
-def compile_wrapper(out, kernel, memory, checkpoint=None, discovery=False, pattern=False, backlight=False, screen=False):
+def compile_wrapper(out, kernel, memory, checkpoint=None, discovery=False, pattern=False, backlight=False, screen=False, usb_read=False):
     if discovery and checkpoint is not None and not screen: raise ValueError("display discovery and XNU are separate images")
     zig = Path(os.environ.get("ZIG", ROOT / ".tools/ziglang/ziglang/zig")).resolve()
     env = dict(os.environ, ZIG_GLOBAL_CACHE_DIR=str(ROOT / ".tools/zig-cache"),
@@ -119,6 +120,7 @@ def compile_wrapper(out, kernel, memory, checkpoint=None, discovery=False, patte
         with assembly.open('a') as stream:
             stream.write('// payload sha256 ' + sha(checkpoint) + ' (the compiler cache does not track .incbin)\n.section .xnu_payload, "a"\n.balign 16\n.global _xnu_payload_start, _xnu_payload_end\n_xnu_payload_start:\n.incbin "' + quoted_xnu + '"\n_xnu_payload_end:\n')
     elf = out / "probe.elf"
+    usb_objects, usb_relocations = usb_stack.build(zig, CPU, env, out) if usb_read else ((), {})
     command = [str(zig), "cc", "-target", "aarch64-freestanding-none", "-mcpu=" + CPU,
                "-mgeneral-regs-only", "-ffreestanding", "-fno-builtin", "-fno-pic", "-fno-pie",
                "-fno-stack-protector", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables",
@@ -129,6 +131,7 @@ def compile_wrapper(out, kernel, memory, checkpoint=None, discovery=False, patte
                "-DPROBE_DISPLAY_PATTERN=" + str(int(pattern)),
                "-DPROBE_DISPLAY_BACKLIGHT=" + str(int(backlight)),
                "-DPROBE_XNU_SCREEN=" + str(int(screen)),
+               "-DPROBE_USB_READ=" + str(int(usb_read)),
                "-Wl,--build-id=none", "-Wl,--no-undefined", "-Wl,-z,max-page-size=4096",
                "-Wl,-T," + str(ROOT / ("boot/xnu-chain.ld" if checkpoint is not None else "boot/chain.ld")),
                *[str(ROOT / "boot" / name) for name in ("entry.S", "probe.c", "fdt.c", "checkpoint.c")],
@@ -137,10 +140,12 @@ def compile_wrapper(out, kernel, memory, checkpoint=None, discovery=False, patte
                *([str(ROOT / "boot" / name) for name in ("coreboot.c","display_state.c","display.c",*(() if screen else ("xnu_memory.c",)))] if discovery else []),
                *([str(ROOT / "boot/xnu_screen.c")] if screen else []),
                *([str(ROOT / "boot/display_ec.c")] if backlight else []),
+               *([str(ROOT / "boot/xnu_memory.c")] if usb_read else []),
+               *[str(obj) for obj in usb_objects],
                str(assembly), "-o", str(elf)]
     relocations=audit_sources(zig,CPU,[Path(arg) for arg in command if arg.endswith('.c')],env,
         out/'relocation-audit',('PROBE_UART=0','PROBE_RESET_EL=0','PROBE_LINUX_CHAIN=1',
-        'PROBE_XNU_CHECKPOINT='+str(int(checkpoint is not None)), 'PROBE_DISPLAY_DISCOVERY='+str(int(discovery)),'PROBE_DISPLAY_PATTERN='+str(int(pattern)),'PROBE_DISPLAY_BACKLIGHT='+str(int(backlight)),'PROBE_XNU_SCREEN='+str(int(screen))))
+        'PROBE_XNU_CHECKPOINT='+str(int(checkpoint is not None)), 'PROBE_USB_READ='+str(int(usb_read)),'PROBE_DISPLAY_DISCOVERY='+str(int(discovery)),'PROBE_DISPLAY_PATTERN='+str(int(pattern)),'PROBE_DISPLAY_BACKLIGHT='+str(int(backlight)),'PROBE_XNU_SCREEN='+str(int(screen))))
     subprocess.run(command, env=env, check=True)
     linked = elf.read_bytes()
     image = extract_image(linked)
@@ -162,7 +167,7 @@ def compile_wrapper(out, kernel, memory, checkpoint=None, discovery=False, patte
             image[start:start + len(kernel)] != kernel or len(image) != start + len(kernel)):
         raise ValueError("Linux wrapper memory/payload layout mismatch")
     (out / "Image").write_bytes(image)
-    return image, {"header": header, "scalar_code": scalar, "c_relocations": relocations, "linux_offset": start, **({"display_discovery_schema":4 if backlight else 3 if pattern else 2} if discovery else {}), **extra}
+    return image, {"header": header, "scalar_code": scalar, "c_relocations": {**relocations, **usb_relocations}, "linux_offset": start, **({"display_discovery_schema":4 if backlight else 3 if pattern else 2} if discovery else {}), **extra}
 
 
 def main():
@@ -175,10 +180,12 @@ def main():
     p.add_argument("--display-pattern", action="store_true", help="discovery plus the first scanout restart; writes display registers and the framebuffer, no EC or backlight")
     p.add_argument("--display-backlight", action="store_true", help="display pattern plus EC backlight; sends runtime EC commands, never writes EC firmware")
     p.add_argument("--xnu-screen", type=Path, help="screen-output XNU payload: keeps the display on and never returns to Linux")
+    p.add_argument("--usb-read", action="store_true", help="read three known sectors of the USB medium through the libpayload stack, then Linux; issues no writes")
     p.add_argument("--output", type=Path, default=ROOT / "build/linux-log")
     a = p.parse_args()
     if sum(map(bool, (a.display_discovery, a.display_pattern, a.display_backlight))) > 1: p.error("choose one display mode")
     if a.xnu_screen and (a.display_discovery or a.display_pattern or a.display_backlight or a.xnu_checkpoint): p.error("xnu screen is its own image")
+    if a.usb_read and (a.display_discovery or a.display_pattern or a.display_backlight or a.xnu_checkpoint or a.xnu_screen): p.error("USB read is its own image")
     a.screen = bool(a.xnu_screen)
     a.display_backlight = a.display_backlight or a.screen
     a.pattern = a.display_pattern or a.display_backlight
@@ -211,7 +218,7 @@ def main():
     kernel_node = child(images, kernels.pop())
     kernel, memory = linux_image(kernel_node.props["data"], cstring(kernel_node.props["compression"]))
     wrapper, layout = compile_wrapper(out, kernel, memory,
-        a.xnu_checkpoint.read_bytes() if a.xnu_checkpoint else None, discovery=a.display_discovery, pattern=a.pattern, backlight=a.display_backlight, screen=a.screen)
+        a.xnu_checkpoint.read_bytes() if a.xnu_checkpoint else None, discovery=a.display_discovery, pattern=a.pattern, backlight=a.display_backlight, screen=a.screen, usb_read=a.usb_read)
     kernel_node.props["data"], kernel_node.props["compression"] = wrapper, string("none")
     hashes(kernel_node, True)
     count = 0
@@ -250,7 +257,7 @@ def main():
     # The screen image never returns to Linux, and an unexplained panic can need a plain retry.
     # A prelinked kernel or a RAM disk root does not fit the usual 96 MiB partition; smaller images keep their exact layout.
     disk_mib, kernel_mib = next(sizes for sizes in ((128, 96), (256, 224), (512, 480)) if kpart.stat().st_size <= sizes[1] << 20)
-    create_image(kpart, image, "EL1 probe Linux log", disk_mib=disk_mib, kernel_mib=kernel_mib, tries=15 if a.screen else 1)
+    create_image(kpart, image, "EL1 probe Linux log", disk_mib=disk_mib, kernel_mib=kernel_mib, tries=15 if a.screen or a.usb_read else 1)
     code_files = ("boot/entry.S", "boot/probe.c", "boot/fdt.c", "boot/checkpoint.c", "boot/chain.ld",
                   "tools/linux_log.py", "tools/fdt.py", "tools/build.py", "tools/artifacts.py",
                   "tools/sign.py", "tools/disk.py", "tools/read_probe.py", "tools/relocation_audit.py")
@@ -263,6 +270,8 @@ def main():
         code_files += ("boot/display_ec.c",)
     if a.screen:
         code_files += ("boot/xnu_screen.c", "tools/xnu_screen.py", "tools/xnu_init.py", "tools/coachz_init.S")
+    if a.usb_read:
+        code_files += ("boot/usb_read.c", "tools/usb_stack.py", "boot/usb_compat/libpayload.h")
     report = {"schema": 1, "display_discovery": a.display_discovery, "display_pattern": a.pattern, "display_backlight": a.display_backlight, "xnu_screen": a.screen, "xnu_checkpoint": bool(a.xnu_checkpoint), "hardware_boot_tested": False,
               "toolchain": {"zig": "0.15.2", "cpu": CPU},
               "code_sha256": {name: sha((ROOT / name).read_bytes()) for name in code_files},

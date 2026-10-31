@@ -93,6 +93,12 @@ void probe_exception(uint64_t esr, uint64_t elr, uint64_t far, uint64_t vector) 
     __asm__ volatile("dsb sy" ::: "memory");
     for (;;) __asm__ volatile("wfe");
 }
+#ifndef PROBE_USB_READ
+#define PROBE_USB_READ 0
+#endif
+#if PROBE_USB_READ
+void usb_read_run(const void *);
+#endif
 void probe_main(const void *dt, uint64_t incoming_el, uint64_t sctlr, uint64_t hcr) {
     uint64_t current, freq, midr, mpidr;
     __asm__ volatile("mrs %0, CurrentEL" : "=r"(current));
@@ -125,6 +131,9 @@ void probe_main(const void *dt, uint64_t incoming_el, uint64_t sctlr, uint64_t h
     probe_log.stage = 3;
 #if PROBE_DISPLAY_DISCOVERY
     display_discover(dt,(uintptr_t)_start,(uint64_t)(_image_end-_start));
+#endif
+#if PROBE_USB_READ
+    usb_read_run(dt);
 #endif
     /* All state is already in RAM if UART probing itself faults. */
     uart_enabled = uart_available();
@@ -162,6 +171,6 @@ int probe_export_linux_log(void *dt) {
 }
 #endif
 
-#if PROBE_XNU_CHECKPOINT || PROBE_DISPLAY_DISCOVERY
+#if PROBE_XNU_CHECKPOINT || PROBE_DISPLAY_DISCOVERY || PROBE_USB_READ
 void probe_value(const char *name, uint64_t value) { item(name, value); }
 #endif

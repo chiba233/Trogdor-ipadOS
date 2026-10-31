@@ -679,3 +679,18 @@ panic 的调用栈为 `PE_init_iokit → InitIOKit → OSlibkernInit → OSRunti
 这不是主系统：没有主系统卷、共享缓存、界面或显示驱动。`restored_update` 没有走到等待电脑连接那一步，这一轮不打算补 IOWatchdog 和 NVRAM，因为恢复环境不是目标。`kpersona_find_by_type() failed` 的影响没有确认。
 
 未解决：随机 zone panic 原因未查明。根文件系统的既定路线是先做 USB 主机和大容量存储，从 U 盘启动。
+
+
+## 2026-10-31：探针通过 USB 读到外接盘
+
+运行时与配置见随本节提交，镜像 SHA-256 `982054a6745c32f3926202f764158bf57517a323229ecd7302ee8238b8394b86`。合约见 [USB 只读实验](usb-read.md)。不启动 XNU，只发读命令，读完回到 Linux。
+
+第一轮（U 盘）：MMIO 正常，SMMU 旁路且 `sGFSR=0`，但 `disk=0`，等待 67.8 秒，`USBSTS` 变成 `0x1015`（HSE、HCE）。
+
+第二轮（换成 128 GB 外接盘，加了诊断）：`DCBAAP` 读回的地址和内存池不符，初始化刚结束就有 HSE。反汇编确认 `DCBAAP` 被写成了单字节存储，原因是 `strict_align` 和 `__packed` 的组合，不是硬件、SMMU 或内存位置的问题。
+
+第三轮：去掉寄存器结构体的 `__packed`。真机日志严格字段全部通过：`DCBAAP` 正确，`USBSTS` 没有错误位，742 ms 内枚举到硬盘，SuperSpeed，容量 250069680 个 512 字节扇区，读到 `55AA`、`EFI PART`、`CHROMEOS`，`SMMU sGFSR` 全程为 0，随后正常进入 Linux。
+
+这是探针环境，MMU 和缓存都关着，也没有用中断，不代表 XNU 里已经能用 USB。
+
+未解决：这块外接盘在此前一次 Debian 启动的第 67.5 秒自己断开，重新出现时变成 `JMICRON JMS580`、容量 0，重新插拔后恢复。当时没有读写它，原因未查明。它要作为根盘，稳定性还需要观察。第二轮的备用内存地址没有通过 `fdt_range_clear`，备用尝试实际没有运行，这段代码目前没有被验证过。
