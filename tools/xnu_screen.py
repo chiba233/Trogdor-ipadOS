@@ -8,7 +8,9 @@ from xnu_checkpoint import HEADER, MAGIC, adt_fields
 from xnu_macho import macho
 
 VERSION = 12
-COMMAND_LINE = '-v debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam'
+# Without prelinked components the type distribution is skewed: the default budget of
+# 260 gives one size class more than the 32 zones kalloc allows.
+COMMAND_LINE = '-v debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam kt_fixed_zones=120'
 
 
 def pack(data, adt, window, memory, command_line=COMMAND_LINE):

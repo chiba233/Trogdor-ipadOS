@@ -589,3 +589,14 @@ EC 协议 3 在第一次运行就工作：`EC_CMD_HELLO` 回复校验通过，`E
 随后内核 panic 并完整显示现场：`Kernel data abort`，PC `0xfffffff007949f74`（`PE_create_console+0x48`，即内联的 `check_for_panic_log`），ESR `0x96000010`（同步外部中止）。当时 `x1` 为 `0x3c0fc000`，是 BCM2837 机器配置固定的 `PLATFORM_PANIC_LOG_PADDR`，在 SC7180 上不是可访问的内存。与 `boot_args.Video` 无关。
 
 修正：在 `platform/coachz-screen` 启用 UniXNU 现成的 `CONFIG_XNU_DT_PANIC_REGION`，改从设备树读取 panic 区域。完整系统启动仍未验收，组件 prelink 仍未接入。
+
+
+## 2026-10-31：XNU 屏幕输出越过 panic 区域问题
+
+运行时 `c807a9a`，镜像 SHA-256 `3cec4347877c4a94e718c79c3432d1c3a889c77b0ee97338f2f278864b528006`。启用设备树 panic 区域后，上一处外部中止消失。屏幕照片显示 `zone_init` 完成全部映射，并打印 `VM bootstrap done`，这是 XNU 第一次在真机上完成 VM 引导。
+
+随后内核 panic：`kalloc.c:1779 Assertion failed: n_zones_sig + n_zones_type + 1 <= 32`。这是 DEVELOPMENT 构建的断言。该函数按内核内类型统计把区域预算分给各大小类，默认预算 260；未接入组件 prelink 时类型分布偏向少数大小类，某一类超过 32。
+
+修正：在 `tools/xnu_screen.py` 的命令行加入现成的 `kt_fixed_zones=120`，无需改内核。接入 prelink 后应重新评估这个值。这些都只有屏幕证据，完整系统启动仍未验收。
+
+构建时发现另一处问题：编译缓存不跟踪 `.incbin`，同一输出路径可能复用旧负载。`linux_log.py` 现在把负载摘要写入汇编文件，并核对镜像确实包含该负载。
