@@ -100,6 +100,16 @@ class SmpTreeTests(unittest.TestCase):
             self.assertIn('first = (medium - 33 - LOG_BLOCKS) & ~2047', reader)
             self.assertNotIn('O_RDWR', reader)
 
+    def test_touch_keeps_the_kernel_event_driver(self):
+        # Without this personality the AppleUserHIDDrivers dext takes the digitizer and backboardd never gets a client.
+        hid = (Path(__file__).resolve().parents[1] / 'platform/coachz-prelink/package/CoachzHid.cpp').read_text()
+        self.assertLess(hid.index('addTouchPersonality();'), hid.index('native_hid_touch_allocate();'))
+
+    def test_migration_is_decided_by_last_system_version(self):
+        patch = (Path(__file__).resolve().parents[1] / 'platform/coachz-prelink/patches/xnu/coachz-prelink-skip-setup.patch').read_text()
+        self.assertIn('coachz_setup_pref("com.apple.migration", "LastSystemVersion",', patch)
+        self.assertIn('/private/var/datamigrator/migrate', patch)
+
     def test_all_cores_share_one_pset(self):
         # The single-cluster Clutch scheduler panics in thread_select() with a second pset.
         patch = (Path(__file__).resolve().parents[1] / 'platform/coachz-prelink/patches/xnu/coachz-prelink-smp.patch').read_text()

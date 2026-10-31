@@ -1,6 +1,6 @@
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -8513,7 +8513,140 @@
+@@ -8513,7 +8513,146 @@
  	printf("COACHZ MobileGestalt cache removed: %d\n", error);
  }
  
@@ -120,7 +120,11 @@
 +	    "<key>MCForceShowCloudConfigurationUI</key><false/>"
 +	    /* No input and no idle timer here: without these the display dims and the system sleeps about 30 s in. */
 +	    "<key>SBDisableAutoDim</key><true/><key>SBDontDimOrLockOnAC</key><true/><key>SBDisableIdleSleep</key><true/>");
-+	(void)coachz_setup_pref("com.apple.migration", "DMUserDataDisposition",
++	/*
++	 * datamigrator migrates when LastSystemVersion differs from the running build or while its sentinel exists. DataMigration
++	 * writes DMUserDataDisposition by itself, so only LastSystemVersion shows that this file already says no migration is due.
++	 */
++	(void)coachz_setup_pref("com.apple.migration", "LastSystemVersion",
 +	    "<key>LastSystemVersion</key><string>21H461</string>"
 +	    "<key>DMUserDataDisposition</key><dict><key>SyntheticDidUpgrade</key><false/>"
 +	    "<key>buildVersion</key><string>21H461</string></dict>");
@@ -135,13 +139,15 @@
 +	(void)coachz_setup_pref("com.apple.managedconfiguration.notbackedup",
 +	    "LockdownActivationIndicatesCloudConfigurationAvailable",
 +	    "<key>LockdownActivationIndicatesCloudConfigurationAvailable</key><false/>");
++	printf("COACHZ setup: migration sentinel removal: %d\n", unlink1(vfs_context_kernel(), NULLVP,
++	    CAST_USER_ADDR_T("/private/var/datamigrator/migrate"), UIO_SYSSPACE, 0));
 +}
 +
 +static int
  coachz_watchdog_policy_prepare(void)
  {
  	const char policy[] = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-@@ -8658,6 +8791,7 @@
+@@ -8658,6 +8797,7 @@
  			panic("Coachz temporary watchdog launch policy failed: %d", error);
  		}
  		coachz_mobilegestalt_cache_reset();

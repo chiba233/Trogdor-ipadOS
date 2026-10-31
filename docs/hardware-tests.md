@@ -1198,3 +1198,17 @@ XNU 只用它们生成 IOPlatformUUID，没有它，CurrentHost 偏好写不进�
   PreBoard，请求方仍没有直接证据。
 - 同一份日志里 `keybagd` 报 `FATAL KEYBAG ERROR: failed to load system bag`：内核里没有 AppleKeyStore。
 - 拷一帧的时间按核分成两档（真机）：A76（CPU6、7）约 20 ms，A55（CPU0～5）约 209 ms，刷新慢和它有关，原因还没查。
+
+## 主屏幕（k47、k48）
+
+- k47 接入 UniXNU 的 `AppleKeyStoreState`（`coachz-aks=1`，启动代码改编自 UniXNU-sheng 的 `KeyStoreProbe.cpp`）：一个回答
+  “没有 keybag、没有密码、没有锁定”的 AppleKeyStore，不提供任何密钥和保护。真机日志：`keybagd` 不再报
+  `FATAL KEYBAG ERROR`，PreBoard 不再启动，第一个 SpringBoard 不再被杀。这说明之前的 SIGKILL 很可能和 PreBoard 有关。
+- 随后屏幕出现苹果 logo 和进度条，由 `com.apple.datamigrator` 和 `com.apple.migrationpluginwrapper` 驱动。约 56 分钟里
+  连续出帧（每 10 秒约 380 帧，拷贝基本落在 A76 上，约 21 ms 一帧），3372 秒后停止出帧；第二个插件进程到日志结束
+  都没有退出，SpringBoard 也一直没画界面。
+- `datamigrator` 的字符串显示触发条件只有两个：哨兵 `/private/var/datamigrator/migrate` 存在，或
+  `LastSystemVersion` 与当前版本不同。之前用 `DMUserDataDisposition` 判断偏好已写入，而这个键 DataMigration 自己也会写，
+  所以 `LastSystemVersion` 很可能一直没写进去。
+- k48 改用 `LastSystemVersion` 判断，并在 launchd 之前删除哨兵。**机主照片：iPadOS 主屏幕、Dock 和状态栏都画出来了，
+  没有再跑进度条。** 第一页和第二页的图标带云朵徽标，机主报告打不开其他 App，原因还在查。

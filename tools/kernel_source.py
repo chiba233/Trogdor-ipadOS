@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
 import usb_stack
 
-COMPONENTS = ('drivers/ArmCpu', 'drivers/ArmDTPlatform', 'drivers/RamBlock', 'drivers/SoftwareAES', 'kits/XnuPrelink')
+COMPONENTS = ('drivers/AppleKeyStoreState', 'drivers/ArmCpu', 'drivers/ArmDTPlatform', 'drivers/RamBlock', 'drivers/SoftwareAES', 'kits/XnuPrelink')
 REFERENCES = {'xnu', 'libplatform', 'libdispatch', 'AvailabilityVersions', 'libpthread',
               'corecrypto-2023', 'IOStorageFamily'}
 

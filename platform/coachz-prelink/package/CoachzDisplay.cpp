@@ -129,10 +129,12 @@ static void cpu_probe() {
     kprintf("COACHZ cpu: midr 0x%llx mpidr 0x%llx counter %llu Hz, 20M-iteration loop %llu us (%llu per us)\n",
         midr,mpidr,counter_hz(),us,us?20000000/us:0);
 }
+extern "C" void coachz_keystore_start(void);
 int coachz_display_start(void) {
     int enabled=0;
     if(!PE_parse_boot_argn("coachz-display",&enabled,sizeof(enabled)) || enabled!=1)return 0;
     cpu_probe();
+    coachz_keystore_start();
     if(stage)return stage==10?0:EIO;
     stage=1;
     kern_return_t surface=OSKextLoadKextWithIdentifier("com.apple.iokit.IOSurface");

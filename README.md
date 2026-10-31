@@ -24,8 +24,9 @@ HP Chromebook x2 11（Google Coachz / SC7180）的 **原生 iPadOS 移植实验*
 | Apple launchd、dyld、恢复服务（恢复盘作根） | 运行，恢复服务按自身逻辑退出 | 屏幕照片，内核在 177 秒时仍存活 |
 | 探针经 USB 读外接盘（只读实验） | 通过 | 真机日志，逐字段校验，见 [USB 只读实验](docs/usb-read.md) |
 | XNU 里的 USB 存储驱动 | 只读挂根屏幕确认 | 内核经 GPT 和 APFS 从外接盘挂载恢复卷作只读根，`restored_update` 运行；未封存根卷是放行，不是验证，见 [硬件记录](docs/hardware-tests.md) |
-| 从外接盘启动主系统 | 屏幕确认到升级界面 | iPadOS 系统卷只读作根，外接 Data 卷可写；原版系统经 CPU 绘制出白色苹果 logo 和 PreBoard 的升级界面，见 [硬件记录](docs/hardware-tests.md) |
-| 触摸 | 真机通过 | 上滑进入 PreBoard 的密码页，键盘已画出；密码页还过不去 |
+| 从外接盘启动主系统 | 屏幕确认到升级界面 | iPadOS 系统卷只读作根，外接 Data 卷可写；原版系统经 CPU 绘制到 iPadOS 主屏幕，见 [硬件记录](docs/hardware-tests.md) |
+| 触摸 | 真机通过 | 经 GENI I2C 和内核 `IOHIDEventDriver` 接到 backboardd |
+| App | 进行中 | 主屏幕能显示，App 还打不开 |
 | SMP | 进行中 | 八个核上线，A55／A76 识别正确，IPI 能送达，空闲核优先选 A76；实测 A55 1804、A76 2400 MHz，界面静止时系统基本空闲；频率固定在最高档且没有温控，也不是真正的大小核调度 |
 | GPU、音频、可用界面 | 未实现 | 设备树里没有这些硬件节点，Apple 组件大多只是加载 |
 

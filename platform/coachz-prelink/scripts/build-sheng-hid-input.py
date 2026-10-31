@@ -108,25 +108,34 @@ def code(data,info):
     sec=next(s for g in info['segments'] for s in g['sections'] if s['name']=='__text');return data[sec['fileoff']:sec['fileoff']+sec['size']]
 require(code(raw,om)==code(late.read_bytes(),macho(late.read_bytes())),'Owned code unchanged by deferred metaclass registration')
 
-# The Coachz start-up (kits/coachz/CoachzHid.cpp), compiled like the display glue with the platform expert's flags.
+# The Coachz start-ups (kits/coachz), compiled like the display glue with the platform expert's flags.
 record=json.loads((ROOT/'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/IOPlatformExpert.cpo.json').read_text().strip().rstrip(','))
-source=ROOT/'kits/coachz/CoachzHid.cpp'
-args=record['arguments'];cmd=[];i=0
-while i<len(args):
-    value=args[i]
-    if value==record['file']:cmd.append(str(source))
-    elif value in ('-o','-MF','-MT','-MJ'):
-        if value=='-o':cmd+=['-o',str(OUT/'CoachzHid.o')]
+def compile_glue(source,output):
+    args=record['arguments'];cmd=[];i=0
+    while i<len(args):
+        value=args[i]
+        if value==record['file']:cmd.append(str(source))
+        elif value in ('-o','-MF','-MT','-MJ'):
+            if value=='-o':cmd+=['-o',str(output)]
+            i+=1
+        elif value=='-Xclang' and args[i+1].startswith('-W'):i+=1
+        elif not value.startswith('-W'):cmd.append(value)
         i+=1
-    elif value=='-Xclang' and args[i+1].startswith('-W'):i+=1
-    elif not value.startswith('-W'):cmd.append(value)
-    i+=1
-cmd+=['-Wall','-Wextra','-Werror','-Wno-unused-parameter','-Wno-unnecessary-virtual-specifier','-Wno-c99-designator','-Wno-reorder-init-list','-Wno-deprecated-enum-enum-conversion']
-run(cmd,cwd=record['directory'])
+    cmd+=['-Wall','-Wextra','-Werror','-Wno-unused-parameter','-Wno-unnecessary-virtual-specifier','-Wno-c99-designator','-Wno-reorder-init-list','-Wno-deprecated-enum-enum-conversion']
+    run(cmd,cwd=record['directory'])
+source=ROOT/'kits/coachz/CoachzHid.cpp'
+compile_glue(source,OUT/'CoachzHid.o')
+# UniXNU's AppleKeyStoreState service (component:AppleKeyStoreState runs first) with its class registered at start-up, as in UniXNU-sheng.
+keystore=ROOT/'kits/coachz/CoachzKeyStore.cpp'
+compile_glue(keystore,OUT/'CoachzKeyStore.o')
+keyevents=(ROOT/'build/apple-key-store-state/NativeKeyStoreEvents.o').read_bytes()
+keyevents_late=OUT/'NativeKeyStoreEvents.late.o'
+keyevents_late.write_bytes(stage_initializer(keyevents,'__GLOBAL__sub_I_NativeKeyStoreEvents.cpp'))
+require(code(keyevents,macho(keyevents))==code(keyevents_late.read_bytes(),macho(keyevents_late.read_bytes())),'Owned keystore code unchanged by deferred metaclass registration')
 archive=OUT/'libCoachzHid.a';archive.unlink(missing_ok=True)
-run(['xcrun','ar','rcs',archive,late,OUT/'hid-original-bindings.o',OUT/'CoachzHid.o'])
+run(['xcrun','ar','rcs',archive,late,OUT/'hid-original-bindings.o',OUT/'CoachzHid.o',keyevents_late,OUT/'CoachzKeyStore.o'])
 report={'archive_sha256':sha(archive),'reference_sha256':sha(candidate),'original_text_sha256':HID_TEXT_SHA,'original_slots':207,
         'owned_slots':owned,'bindings':{n:hex(v) for n,v in bindings.items()},'source_sha256':{str(p.relative_to(ROOT)):sha(p) for p in
-        [ROOT/'drivers/ShengHidInput/NativeHidInput.cpp',source]},'hardware_accepted':False}
+        [ROOT/'drivers/ShengHidInput/NativeHidInput.cpp',source,ROOT/'drivers/AppleKeyStoreState/NativeKeyStoreEvents.cpp',keystore]},'hardware_accepted':False}
 (OUT/'coachz-report.json').write_text(json.dumps(report,indent=2)+'\n')
 print('Coachz: original IOHIDDevice ABI bound and touch digitizer built; hardware not accepted')
