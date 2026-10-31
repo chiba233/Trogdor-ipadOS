@@ -258,7 +258,7 @@ def main():
     if a.display_backlight:
         code_files += ("boot/display_ec.c",)
     if a.screen:
-        code_files += ("boot/xnu_screen.c", "tools/xnu_screen.py")
+        code_files += ("boot/xnu_screen.c", "tools/xnu_screen.py", "tools/xnu_init.py", "tools/coachz_init.S")
     report = {"schema": 1, "display_discovery": a.display_discovery, "display_pattern": a.pattern, "display_backlight": a.display_backlight, "xnu_screen": a.screen, "xnu_checkpoint": bool(a.xnu_checkpoint), "hardware_boot_tested": False,
               "toolchain": {"zig": "0.15.2", "cpu": CPU},
               "code_sha256": {name: sha((ROOT / name).read_bytes()) for name in code_files},

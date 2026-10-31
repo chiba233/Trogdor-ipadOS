@@ -9,3 +9,4 @@ __pycache__/
 
 /platform/coachz/.cache/
 /platform/coachz/unixnu.lock
+*.ipsw

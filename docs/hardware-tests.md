@@ -620,3 +620,14 @@ panic 的调用栈为 `PE_init_iokit → InitIOKit → OSlibkernInit → OSRunti
 这只有屏幕证据。没有根文件系统、存储驱动、用户态、完整组件 prelink 或 iPadOS 启动。尚未确认计时器中断是否工作：XNU 约 60 秒后应打印 `Still waiting for root device`，这一轮未记录是否出现。
 
 未解决：早期轮次在 `preModLoad` 的首次 `kalloc` 处随机出现 `not in the expected zone ... found in [0]`，后续轮次未复现，原因未查明。`coachz-screen-console.patch` 暂时保留 `COACHZ META` 诊断输出，以便再次出现时取证。
+
+
+## 2026-10-31：第一个用户态程序在 Coachz 上运行
+
+运行时与配置见随本节提交，镜像 SHA-256 `526147c61b275f6324f05582e9e2c2646a3fb2b02ab5d782c5bce5b409dd7e84`。这一轮在屏幕镜像上增加了内存盘和 `rd=md0`，`IOService.cpp` 跳过了依赖 IOStorageFamily 的两处断言，并注册了内置 AMFI 接口。
+
+屏幕照片依次显示：`Added memory device md0/rmd0`、`BSD root: md0, major 1, minor 0`、`load_init_program: attempting to load /sbin/launchd`，然后是 `*** COACHZ userspace: init running as PID 1 ***`。这是第一次在 Coachz 真机上离开内核进入 EL0。这行文字由程序自己通过 `open("/dev/console")`、`getpid` 和 `write` 打印，因此这几个系统调用、devfs、mockfs、Mach-O 加载和内存盘读取都走通了。
+
+这只有屏幕证据，没有逐字段核对。运行的是自写的静态测试程序，不是 launchd，也没有 dyld、共享缓存或任何 iPadOS 用户态。`Failed to open swap file` 符合预期，内存盘根上没有可写文件系统。
+
+未确认：计时器中断。程序每 5 秒用 `select` 睡眠后应打印 `COACHZ init: timer tick N`，这张照片里 PID 那行之后还没有 tick，但拍摄时刻距启动多久未知，不能据此判断。`zone` 随机 panic 这一轮未出现，原因仍未查明。

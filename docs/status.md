@@ -32,6 +32,7 @@
 | 同步异常／返回失败诊断 | version10 主动异常传输已真机验收（2026-10-30） | 8192 字节日志通过 46 项必需字段读取，精确 BRK／向量／页表池／缓存传输门匹配并返回 Linux；version10 的 checkpoint=0 符合故障设计，后续 version9 正常 SoC 返回已验收，见 docs/xnu-diagnostics.md |
 | XNU WFE／单 CPU 拓扑 | version11 真机 40 字段通过（2026-10-31） | 原始 WFE 配置、完整单 CPU 拓扑与父帧／PE／表池／AT／缓存门通过；三个系统寄存器按入口值恢复，随后交接 Linux，见 [契约](xnu-topology-checkpoint.md) |
 | XNU 内核初始化 | 屏幕输出镜像已到达等待根设备 | 屏幕照片显示 VM、IOKit、BSD、网络栈初始化完成并打印 `Waiting on ... IOMedia`；无逐字段核对。计时器中断和 SMP 未确认，有一个未查明的随机 zone panic，见 [硬件记录](hardware-tests.md) |
+| 第一个用户态程序 | 屏幕输出镜像已从内存盘运行 PID 1（2026-10-31） | 屏幕照片显示 `/sbin/launchd` 加载和 `init running as PID 1`，即 EL0 执行及 `open`、`getpid`、`write` 系统调用可用；程序是自写的静态测试程序，不是 launchd。计时器中断仍未确认，见 [硬件记录](hardware-tests.md) |
 | eMMC、触摸、GPU 与完整 iPadOS 用户态 | 未实现 | 没有原生桌面或应用运行记录 |
 
 ## 已执行的主机验证

@@ -289,6 +289,20 @@ class DisplayTests(unittest.TestCase):
         self.assertIn('kt_fixed_zones=120',(ROOT/'tools/xnu_screen.py').read_text())
         self.assertNotIn('coachz-screen-console.patch',(ROOT/'platform/coachz/patches/xnu/series').read_text())
 
+    def test_hardware_verified_ramdisk_userspace_route_is_unchanged(self):
+        from xnu_screen import COMMAND_LINE,add_ramdisk_property
+        self.assertIn('rd=md0',COMMAND_LINE)
+        self.assertIn('copy(window+disk,p+ramdisk,',(ROOT/'boot/xnu_screen.c').read_text())
+        patch=(ROOT/'platform/coachz-screen/patches/xnu/coachz-screen-console.patch').read_text()
+        for fixed in ('amfi_interface_register(&coachz_amfi);','bsd/kern/coachz_amfi.c\t\tstandard','if (!iomediaClass) {','if (!ioblockstoragedriverClass) {'):
+            self.assertIn(fixed,patch)
+        self.assertIn('COACHZ userspace: init running as PID',(ROOT/'tools/coachz_init.S').read_text())
+        prop=lambda key,value:key.ljust(32,b'\0')+struct.pack('<I',len(value))+value+bytes(-len(value)%4)
+        tree=struct.pack('<II',1,1)+prop(b'name',b'chosen\0')+struct.pack('<II',1,0)+prop(b'name',b'memory-map\0')
+        out=bytes(add_ramdisk_property(tree,0x1000,0x5000))
+        self.assertTrue(out.endswith(b'RAMDisk'.ljust(32,b'\0')+struct.pack('<IQQ',16,0x1000,0x5000)))
+        self.assertEqual(struct.unpack_from('<I',out,8+len(prop(b'name',b'chosen\0')))[0],2)
+
     def test_hardware_verified_scanout_restart_order_is_unchanged(self):
         source=(ROOT/'boot/display.c').read_text()
         self.assertEqual(re.findall(r'pattern_write\(DISPLAY_(\w+),',source),['COUNT_EN','DSI','SCANOUT','TE','TE','DSI','COUNT_EN'])

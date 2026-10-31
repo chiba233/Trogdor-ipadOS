@@ -6,7 +6,7 @@ by this project. Their tracked revisions and origins are in upstream.lock.json.
 - ChromiumOS Coreboot, Depthcharge, vboot and Velvet tools: firmware and packaging
   interface references; retain their respective GPL and per-file notices.
 - UniXNU DarwinBoot: BSD-2-Clause-Patent; reference for the future XNU handoff.
-- ios-sweet (MIT, Copyright (c) 2026 dipa-studio): `platform/coachz-screen/patches/xnu/coachz-screen-console.patch` adapts its early framebuffer console. Also a reference for direct native ARM64 shim loading; consult upstream
+- ios-sweet (MIT, Copyright (c) 2026 dipa-studio): `platform/coachz-screen/patches/xnu/coachz-screen-console.patch` adapts its early framebuffer console, RAM disk root changes and built-in AMFI interface; `tools/coachz_init.S` and `tools/xnu_init.py` adapt its minimal init and static Mach-O packer. Also a reference for direct native ARM64 shim loading; consult upstream
   per-file licensing before importing any implementation.
 - Zig 0.15.2: MIT toolchain distributed by ziglang on PyPI, installed separately
   in the ignored .tools directory.

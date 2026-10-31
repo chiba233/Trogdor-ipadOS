@@ -125,6 +125,8 @@ INTF 帧／行计数的偏移来自 Linux DPU 驱动，锁定固件源码没有�
 
 `linux_log.py --xnu-screen` 生成独立镜像：探针按已验证的顺序恢复 scanout 和背光，不再停止，随后把源码 XNU 装入 RAM 中的高地址窗口并跳转，不再返回 Linux，所有结果都看屏幕。窗口基址由私有设备树选定，运行时仍由 `xnu_range_allowed()` 重新核对，并与 framebuffer 比对。装载失败时才走原有的 HVC 路径回到 Linux 读日志。
 
-内核用 `tools/kernel_source.py --platform coachz-screen` 单独构建，`platform/coachz-screen` 比 `platform/coachz` 只多一个控制台补丁，已验收检查点使用的内核和配置不变。控制台改编自 ios-sweet（MIT）的早期 framebuffer 调试补丁，按 4K 页和 `boot_args.Video` 重新参数化：`arm_init` 中用一个 1 GiB 的 Normal-NC L1 块把 framebuffer 映射到 bootstrap TTBR0，`arm_vm_init` 在移除 TTBR0 前切到低全局区与内核之间的别名；启动阶段标记、kprintf 和 panic 字符串都画到屏幕上。
+内核用 `tools/kernel_source.py --platform coachz-screen` 单独构建，`platform/coachz-screen` 比 `platform/coachz` 只多一个屏幕内核补丁，已验收检查点使用的内核和配置不变。控制台改编自 ios-sweet（MIT）的早期 framebuffer 调试补丁，按 4K 页和 `boot_args.Video` 重新参数化：`arm_init` 中用一个 1 GiB 的 Normal-NC L1 块把 framebuffer 映射到 bootstrap TTBR0，`arm_vm_init` 在移除 TTBR0 前切到低全局区与内核之间的别名；启动阶段标记、kprintf 和 panic 字符串都画到屏幕上。
 
-屏幕右上角的绿色方块表示探针已完成。这张镜像不验收任何 XNU 阶段的状态，只显示实际跑到哪里；组件 prelink 仍未接入，不预期能进入用户态。
+屏幕右上角的绿色方块表示探针已完成。这张镜像不验收任何 XNU 阶段的状态，只显示实际跑到哪里。
+
+负载末尾带一个内存盘，装载器把它放在设备树之后，并计入 `topOfKernelData`；打包时向 `/chosen/memory-map` 写入 `RAMDisk` 属性，启动参数带 `rd=md0`。内存盘内容就是 `tools/coachz_init.S` 打包成的静态 Mach-O，mockfs 把整个设备当作 `/sbin/launchd`。程序打开 `/dev/console`，打印 PID，然后每 5 秒用 `select` 睡眠并打印一次 tick。补丁另外包含两处改编自 ios-sweet 的修改：没有 IOStorageFamily 时跳过 `IOService.cpp` 的两处断言，以及内置 AMFI 接口 `bsd/kern/coachz_amfi.c`，它不授予任何 entitlement，代码签名和页哈希校验仍由内核完成。组件 prelink 仍未接入；接入时必须删除这个内置接口，否则 AMFI kext 重复注册会 panic。
