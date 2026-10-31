@@ -54,3 +54,15 @@ coachz-prelink-skip-setup.patch
 
 # The GT7375P touchscreen: GENI I2C on SE4, HID over I2C, fingers to ShengHidInput's digitizer.
 coachz-prelink-touch.patch
+
+# coachz-oslog=1: selected processes mirror os_log to stderr, copied to the disk log.
+coachz-prelink-oslog.patch
+
+# Crash and main-thread samples and the panic text for the disk log; WebKit's extension processes past launch constraints.
+coachz-prelink-crash.patch
+
+# No GPU: uncached DRAM as Normal non-cacheable for QuartzCore's bzero, and CoreImage's empty OpenGL table in iconservicesagent.
+coachz-prelink-software-render.patch
+
+# A dc zva that faults in user space zeroes its block by ordinary stores (QuartzCore's software renderer).
+coachz-prelink-dc-zva.patch

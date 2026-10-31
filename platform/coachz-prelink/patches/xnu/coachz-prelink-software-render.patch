@@ -1,0 +1,102 @@
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -5835,13 +5835,10 @@
+ 
+ 	switch (wimg & (VM_WIMG_MASK)) {
+ 	case VM_WIMG_IO:
+-		// Map DRAM addresses with VM_WIMG_IO as Device-GRE instead of
+-		// Device-nGnRnE. On H14+, accesses to them can be reordered by
+-		// AP, while preserving the security benefits of using device
+-		// mapping against side-channel attacks. On pre-H14 platforms,
+-		// the accesses will still be strongly ordered.
++		// Coachz: uncached DRAM is Normal non-cacheable here, not Device-GRE. There is no GPU, so QuartzCore's software
++		// renderer clears IOSurfaces with bzero, whose dc zva takes an alignment fault on any Device memory.
+ 		if (is_dram_addr(pa)) {
+-			pte = ARM_PTE_ATTRINDX(CACHE_ATTRINDX_POSTED_COMBINED_REORDERED);
++			pte = ARM_PTE_ATTRINDX(CACHE_ATTRINDX_WRITECOMB);
+ 		} else {
+ 			pte = ARM_PTE_ATTRINDX(CACHE_ATTRINDX_DISABLE);
+ 		}
+@@ -5853,7 +5850,7 @@
+ 		break;
+ 	case VM_WIMG_POSTED:
+ 		if (is_dram_addr(pa)) {
+-			pte = ARM_PTE_ATTRINDX(CACHE_ATTRINDX_POSTED_COMBINED_REORDERED);
++			pte = ARM_PTE_ATTRINDX(CACHE_ATTRINDX_WRITECOMB);
+ 		} else {
+ 			pte = ARM_PTE_ATTRINDX(CACHE_ATTRINDX_POSTED);
+ 		}
+@@ -5861,14 +5858,14 @@
+ 		break;
+ 	case VM_WIMG_POSTED_REORDERED:
+ 		if (is_dram_addr(pa)) {
+-			pte = ARM_PTE_ATTRINDX(CACHE_ATTRINDX_POSTED_COMBINED_REORDERED);
++			pte = ARM_PTE_ATTRINDX(CACHE_ATTRINDX_WRITECOMB);
+ 		} else {
+ 			pte = ARM_PTE_ATTRINDX(CACHE_ATTRINDX_POSTED_REORDERED);
+ 		}
+ 		pte |= ARM_PTE_NX | ARM_PTE_PNX;
+ 		break;
+ 	case VM_WIMG_POSTED_COMBINED_REORDERED:
+-		pte = ARM_PTE_ATTRINDX(CACHE_ATTRINDX_POSTED_COMBINED_REORDERED);
++		pte = ARM_PTE_ATTRINDX(is_dram_addr(pa) ? CACHE_ATTRINDX_WRITECOMB : CACHE_ATTRINDX_POSTED_COMBINED_REORDERED);
+ #if HAS_FEAT_XS
+ 		if (!is_dram_addr(pa)) {
+ 			pte = ARM_PTE_ATTRINDX(CACHE_ATTRINDX_POSTED_COMBINED_REORDERED_XS);
+--- a/osfmk/arm64/coachz_thread.c	2026-11-01 01:47:45
++++ b/osfmk/arm64/coachz_thread.c	2026-11-01 01:47:46
+@@ -1313,3 +1313,39 @@
+ 	coachz_sample_main_thread(coachz_preferences_pid, "Preferences");
+ 	coachz_sample_main_thread(os_atomic_load(&coachz_sb_pid, relaxed), "SpringBoard");
+ }
++
++/*
++ * coachz-null-call=1: iconservicesagent keeps running when it calls address 0. Without a GPU CoreImage still takes its OpenGL path
++ * (CIGLIsUsable always returns 1) and calls through an empty function table in CI::GLContext::init; UniXNU-sheng records the same
++ * crash. Every such call returns 0 to its caller. Settings waits on this agent for its icons, so its crash loop keeps Settings closed.
++ */
++int coachz_null_call_resume(arm_saved_state_t *state);
++
++int
++coachz_null_call_resume(arm_saved_state_t *state)
++{
++	static int enabled = -1;
++	static uint32_t logged;
++	void *bsd = get_bsdtask_info(current_task());
++	const uint64_t lr = get_saved_state_lr(state);
++
++	if (enabled < 0) {
++		unsigned value = 0;
++		enabled = PE_parse_boot_argn("coachz-null-call", &value, sizeof(value)) && value == 1;
++	}
++	/* The process's short name, cut to MAXCOMLEN characters. */
++	if (enabled != 1 || !bsd || !lr || strncmp(proc_name_address(bsd), "iconservicesagent", 16)) {
++		return 0;
++	}
++	if (logged < 32) {
++		char line[128];
++		const int used = snprintf(line, sizeof(line), "@nullcall iconservicesagent lr %llx slide 0x%x x1 %llx\n",
++		    (unsigned long long)lr, current_task()->task_shared_region_slide,
++		    (unsigned long long)get_saved_state_reg(state, 1));
++		logged++;
++		coachz_log_append(line, (size_t)used);
++	}
++	set_saved_state_reg(state, 0, 0);
++	set_saved_state_pc(state, lr);
++	return 1;
++}
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -794,6 +794,12 @@
+ 
+ 
+ 	case ESR_EC_IABORT_EL0:
++		{
++			extern int coachz_null_call_resume(arm_saved_state_t *);
++			if (far == 0 && get_saved_state_pc(state) == 0 && coachz_null_call_resume(state)) {
++				break;
++			}
++		}
+ 		handle_abort(state, esr, far, inspect_instruction_abort, handle_user_abort, expected_fault_handler);
+ 		break;
+ 

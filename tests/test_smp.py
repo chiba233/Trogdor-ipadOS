@@ -105,6 +105,12 @@ class SmpTreeTests(unittest.TestCase):
         hid = (Path(__file__).resolve().parents[1] / 'platform/coachz-prelink/package/CoachzHid.cpp').read_text()
         self.assertLess(hid.index('addTouchPersonality();'), hid.index('native_hid_touch_allocate();'))
 
+    def test_settings_is_not_blocked_by_the_icon_agent(self):
+        # Without a GPU CoreImage calls an empty OpenGL table; the agent's crash loop kept Settings waiting for its icons.
+        root = Path(__file__).resolve().parents[1]
+        self.assertIn("coachz-null-call=1", (root / 'tools/xnu_screen.py').read_text())
+        self.assertIn('coachz_null_call_resume', (root / 'platform/coachz-prelink/patches/xnu/coachz-prelink-software-render.patch').read_text())
+
     def test_migration_is_decided_by_last_system_version(self):
         patch = (Path(__file__).resolve().parents[1] / 'platform/coachz-prelink/patches/xnu/coachz-prelink-skip-setup.patch').read_text()
         self.assertIn('coachz_setup_pref("com.apple.migration", "LastSystemVersion",', patch)

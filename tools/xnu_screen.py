@@ -245,6 +245,12 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         command_line += ' coachz-touch=1'
         # UniXNU's AppleKeyStoreState: no keybag, no passcode, nothing locked (package/CoachzKeyStore.cpp).
         command_line += ' coachz-aks=1'
+        # os_log of SpringBoard, runningboardd and the first apps goes to the disk log (coachz-prelink-oslog.patch).
+        command_line += ' coachz-oslog=1'
+        # WebKit's extension processes fail AMFI's launch constraints here (coachz-prelink-crash.patch).
+        command_line += ' coachz-no-launch-constraints=1'
+        # CoreImage calls an empty OpenGL table in iconservicesagent, which Settings waits on (coachz-prelink-software-render.patch).
+        command_line += ' coachz-null-call=1'
     if cpus != 1:
         # coachz-prelink-smp.patch raises BCM2837's board configuration to eight CPUs in two clusters.
         if not root_uuid or not prelinked or not 2 <= cpus <= 8:

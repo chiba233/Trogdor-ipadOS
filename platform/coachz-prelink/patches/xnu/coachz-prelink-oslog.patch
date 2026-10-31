@@ -1,0 +1,151 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -6001,6 +6001,27 @@
+ 		imgp->ip_envc++;
+ 	}
+ 
++	/* coachz-oslog: the selected processes mirror their os_log to stderr (osfmk/arm64/coachz_thread.c). */
++	{
++		extern int coachz_oslog_match(const char *);
++		static const char mirror[] = "OS_ACTIVITY_DT_MODE=YES";
++		const char *name = imgp->ip_strings + strlen(EXECUTABLE_KEY);
++
++		for (const char *scan = name; *scan; scan++) {
++			if (*scan == '/') {
++				name = scan + 1;
++			}
++		}
++		if (coachz_oslog_match(name) && imgp->ip_argspace >= new_ptr_size) {
++			error = exec_add_user_string(imgp, CAST_USER_ADDR_T(mirror), UIO_SYSSPACE, TRUE);
++			if (error) {
++				goto bad;
++			}
++			imgp->ip_argspace -= new_ptr_size;
++			imgp->ip_envc++;
++		}
++	}
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;
+--- a/bsd/kern/sys_generic.c
++++ b/bsd/kern/sys_generic.c
+@@ -685,6 +685,13 @@
+ 		extern void coachz_springboard_write(int, uint64_t, uint64_t);
+ 		coachz_springboard_write(fd, buf, nbyte);
+ 	}
++	if (fd == 1 || fd == 2) {
++		extern int coachz_oslog_match(const char *);
++		extern void coachz_oslog_write(const char *, int, uint64_t, uint64_t);
++		if (coachz_oslog_match(p->p_name)) {
++			coachz_oslog_write(p->p_name, proc_getpid(p), buf, nbyte);
++		}
++	}
+ 	if ((fd == 1 || fd == 2) &&
+ 	    (!strcmp(p->p_name, "usermanagerd") || !strcmp(p->p_comm, "usermanagerd"))) {
+ 		extern void coachz_usermanager_write(int, int, uint64_t, uint64_t);
+@@ -792,6 +799,16 @@
+ 
+ 	if (error) {
+ 		goto out;
++	}
++
++	if (fd == 1 || fd == 2) {
++		extern int coachz_oslog_match(const char *);
++		extern void coachz_oslog_write(const char *, int, uint64_t, uint64_t);
++		if (coachz_oslog_match(p->p_name)) {
++			for (int index = 0; index < iovcnt; index++) {
++				coachz_oslog_write(p->p_name, proc_getpid(p), iovp[index].iov_base, iovp[index].iov_len);
++			}
++		}
+ 	}
+ 
+ 	error = writev_internal(p, fd, uio, flags, puguard, retval);
+--- a/osfmk/arm64/coachz_early.c
++++ b/osfmk/arm64/coachz_early.c
+@@ -48,17 +48,27 @@
+ 
+ /*
+  * Everything this console prints, kept for the kernel log on the external disk (NativeRamBlock.cpp flushes it once a second).
+- * A plain index, no atomics: this runs before the allocator and in panic; a rare torn character between CPUs is acceptable.
++ * Writers reserve their bytes with an atomic add; the flusher can overtake one that is still copying, which at worst tears a line.
+  */
+ char coachz_log_capture[1u << 20];
+ volatile uint64_t coachz_log_head;
+ 
++/* User-space output for the disk log only: it never reaches the screen. */
+ void
++coachz_log_append(const char *bytes, size_t count)
++{
++	uint64_t at = __atomic_fetch_add(&coachz_log_head, count, __ATOMIC_RELAXED);
++
++	for (size_t i = 0; i < count; i++) {
++		coachz_log_capture[(at + i) & ((1u << 20) - 1)] = bytes[i];
++	}
++}
++
++void
+ coachz_early_putc(char c)
+ {
+-	uint64_t at = coachz_log_head;
++	uint64_t at = __atomic_fetch_add(&coachz_log_head, 1, __ATOMIC_RELAXED);
+ 	coachz_log_capture[at & ((1u << 20) - 1)] = c;
+-	coachz_log_head = at + 1;
+ 	if (early_fb == NULL) {
+ 		return;
+ 	}
+--- a/osfmk/arm64/coachz_thread.c	2026-11-01 01:14:54
++++ b/osfmk/arm64/coachz_thread.c	2026-11-01 01:14:54
+@@ -1135,3 +1135,52 @@
+ 	printf("COACHZ SB stdout/stderr tail:\n%s\n%s", coachz_sb_output + start, coachz_sb_failure);
+ 	return 1;
+ }
++
++/*
++ * coachz-oslog=1: the os_log of these processes reaches the disk log, not the screen. exec_extract_strings gives them
++ * OS_ACTIVITY_DT_MODE, which makes libtrace mirror os_log to stderr, and write and writev copy fds 1 and 2 here.
++ */
++extern void coachz_log_append(const char *bytes, size_t count);
++int coachz_oslog_match(const char *name);
++void coachz_oslog_write(const char *name, int pid, uint64_t address, uint64_t size);
++
++int
++coachz_oslog_match(const char *name)
++{
++	static const char *const names[] = {
++		"SpringBoard", "backboardd", "runningboardd", "lsd", "installd", "iconservicesagent", "splashboardd",
++		"Preferences", "MobileSMS", "MobileSafari", "MobileNotes", "MobileMail", "MobileSlideShow", "MobileCal",
++	};
++	static int enabled = -1;
++
++	if (enabled < 0) {
++		unsigned value = 0;
++		enabled = PE_parse_boot_argn("coachz-oslog", &value, sizeof(value)) && value == 1;
++	}
++	if (enabled != 1) {
++		return 0;
++	}
++	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
++		if (!strcmp(name, names[i])) {
++			return 1;
++		}
++	}
++	return 0;
++}
++
++void
++coachz_oslog_write(const char *name, int pid, uint64_t address, uint64_t size)
++{
++	char line[768];
++	const int prefix = snprintf(line, sizeof(line), "@%s[%d] ", name, pid);
++	const uint64_t room = sizeof(line) - (uint64_t)prefix - 1;
++	uint32_t length = size > room ? (uint32_t)room : (uint32_t)size;
++
++	if (!length || copyin(address, line + prefix, length) || (length == 1 && line[prefix] == '\n')) {
++		return;
++	}
++	if (line[prefix + length - 1] != '\n') {
++		line[prefix + length++] = '\n';
++	}
++	coachz_log_append(line, (size_t)prefix + length);
++}

@@ -1211,4 +1211,23 @@ XNU 只用它们生成 IOPlatformUUID，没有它，CurrentHost 偏好写不进�
   `LastSystemVersion` 与当前版本不同。之前用 `DMUserDataDisposition` 判断偏好已写入，而这个键 DataMigration 自己也会写，
   所以 `LastSystemVersion` 很可能一直没写进去。
 - k48 改用 `LastSystemVersion` 判断，并在 launchd 之前删除哨兵。**机主照片：iPadOS 主屏幕、Dock 和状态栏都画出来了，
-  没有再跑进度条。** 第一页和第二页的图标带云朵徽标，机主报告打不开其他 App，原因还在查。
+  没有再跑进度条。** 日志确认 `com.apple.migration` 被改写（原文件确实没有 `LastSystemVersion`），哨兵文件本来就不存在。
+
+## App（k49～k52）
+
+- 带云朵的图标是占位符：OS 卷的 `/private/var/staged_system_apps`（231 MB、29 个 App）被 Data 种子脚本排除了，当时种子只有
+  64 MiB。Data 现在有 8 GiB，但这些 App 正常靠跳过的迁移安装，还没做。
+- k49 的 `OS_ACTIVITY_DT_MODE` 没有把 `os_log` 镜像到 stderr，只录到 objc 警告和 CoreImage 的少量输出。系统日志还拿不到。
+- k50 把崩溃现场和主线程调用栈写进日志区（`@crash`、`@sample`），符号化后：
+  - `iconservicesagent` 崩在 `CI::GLContext::init` 调用地址 0。没有 GPU 时 CoreImage 仍走 OpenGL（`CIGLIsUsable` 恒返回 1），
+    函数表是空的。UniXNU-sheng 的代码注释记录了同样的崩溃。
+  - Settings 主线程在 `-[PKIconImageCache imageForKey:]` 的 `dispatch_sync` 里等，进程在，界面出不来。
+  - backboardd 的 SIGBUS 是 `dc zva` 对齐错误（`esr 0x92000061`），位置在 `CA::OGL::SWContext::set_surface` 的 `bzero`。
+  - Safari 的 WebKit 进程被 AMFI 启动约束拦下（`c[1]p[1]m[1]e[4]`），`coachz-no-launch-constraints=1` 放行后不再因此退出。
+- k51（`coachz-null-call=1`）让 `iconservicesagent` 调到地址 0 时按返回 0 继续：29 次空调用都接住了，不再崩溃，并打印
+  `Failed to render 3364 pixels because a CIKernel's ROI function did not allow tiling`。**Settings 的主线程随后越过图标，走到
+  `-[PSGAboutController viewDidLoad]`**，停在 `_macAddress` 的 `dispatch_once` 上。所以 Settings 这条因果链成立，“关于本机”页还会卡住。
+- k51 把不缓存的 DRAM 从 Device-GRE 改成 Normal 非缓存，backboardd 仍在同一条 `dc zva` 上 SIGBUS，所以这一改动没有解决它。
+  k52 在内核里接住这个错误、用普通写入清零并记录 MMU 属性（`@dczva`），还没有真机结果。
+- 机主报告 backboardd 崩溃重启后触摸没有反应。日志里报告仍在进 HID（`to HID 911`），`user clients 1`，SpringBoard 主线程空闲在 runloop，
+  所以断点在 backboardd 重启之后的上层，原因没查。k49 那次机主还看到过一次 panic，内容没有落盘；k50 起 panic 文字也写进日志区，这段写入还没有真机触发过。

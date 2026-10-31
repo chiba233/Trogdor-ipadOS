@@ -1,0 +1,62 @@
+--- a/osfmk/arm64/coachz_thread.c	2026-11-01 02:01:53
++++ b/osfmk/arm64/coachz_thread.c	2026-11-01 02:01:53
+@@ -1349,3 +1349,44 @@
+ 	set_saved_state_pc(state, lr);
+ 	return 1;
+ }
++
++/*
++ * A dc zva that takes an alignment fault in user space zeroes its block by ordinary stores instead. QuartzCore's software
++ * renderer (CA::OGL::SWContext::set_surface) clears surfaces with bzero; on hardware this killed backboardd with SIGBUS even
++ * after uncached DRAM became Normal non-cacheable. The log keeps the memory attribute the MMU reports for the first few.
++ */
++int coachz_dc_zva_resume(arm_saved_state_t *state, uint32_t esr, vm_offset_t far);
++
++int
++coachz_dc_zva_resume(arm_saved_state_t *state, uint32_t esr, vm_offset_t far)
++{
++	static const uint64_t zeros[32] = { 0 };
++	static uint32_t logged;
++	const uint64_t pc = get_saved_state_pc(state);
++	uint64_t dczid, par;
++	uint32_t instruction, size;
++	boolean_t interrupts;
++
++	if ((ESR_ISS(esr) & 0x3f) != 0x21 || copyin(pc, &instruction, sizeof(instruction)) ||
++	    (instruction & 0xffffffe0) != 0xd50b7420) {
++		return 0;
++	}
++	__asm__ volatile ("mrs %0, dczid_el0" : "=r"(dczid));
++	size = 4u << (dczid & 0xf);
++	if (size > sizeof(zeros) || copyout(zeros, (user_addr_t)far & ~((uint64_t)size - 1), size)) {
++		return 0;
++	}
++	if (logged < 16) {
++		char line[128];
++		int used;
++		interrupts = ml_set_interrupts_enabled(FALSE);
++		__asm__ volatile ("at s1e0w, %1\n\tisb\n\tmrs %0, par_el1" : "=r"(par) : "r"(far));
++		(void)ml_set_interrupts_enabled(interrupts);
++		used = snprintf(line, sizeof(line), "@dczva pc %llx far %llx size %u par %llx attr 0x%llx\n",
++		    (unsigned long long)pc, (unsigned long long)far, size, (unsigned long long)par, (unsigned long long)(par >> 56));
++		logged++;
++		coachz_log_append(line, (size_t)used);
++	}
++	set_saved_state_pc(state, pc + 4);
++	return 1;
++}
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -767,6 +767,12 @@
+ 		break;
+ 
+ 	case ESR_EC_DABORT_EL0:
++		{
++			extern int coachz_dc_zva_resume(arm_saved_state_t *, uint32_t, vm_offset_t);
++			if (coachz_dc_zva_resume(state, esr, far)) {
++				break;
++			}
++		}
+ 		handle_abort(state, esr, far, inspect_data_abort, handle_user_abort, expected_fault_handler);
+ 		break;
+ 

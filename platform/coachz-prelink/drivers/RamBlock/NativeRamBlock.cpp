@@ -85,8 +85,8 @@ static bool log_write_header(void) {
   return coachz_usb_write(log_window.first, 1, log_buffer);
 }
 
-static void log_flush(thread_call_param_t, thread_call_param_t) {
-  IOLockLock(log_gate);
+// The caller holds log_gate.
+static void log_store(void) {
   uint64_t head = coachz_log_head;
   if (head - log_taken > kCaptureBytes) {
     log_dropped += head - log_taken - kCaptureBytes;
@@ -118,10 +118,33 @@ static void log_flush(thread_call_param_t, thread_call_param_t) {
   }
   log_flushes++;
   if (ok) ok = log_write_header() && coachz_usb_sync();
+}
+
+static void log_flush(thread_call_param_t, thread_call_param_t) {
+  IOLockLock(log_gate);
+  log_store();
   IOLockUnlock(log_gate);
   uint64_t deadline;
   clock_interval_to_deadline(1, NSEC_PER_SEC, &deadline);
   thread_call_enter_delayed(log_call, deadline);
+}
+
+// A panic stops the flusher, so the panic path stores what it printed. The gate is never released: nothing else may use the
+// drive from here on, and an unlock could wake waiters on CPUs that are already stopped. If a transfer holds the gate for
+// half a second, its controller state is unknown and the log stays as it is.
+extern "C" void coachz_log_panic_flush(void) {
+  static volatile uint32_t running;
+  static bool held;
+  if (!log_gate || !log_buffer || !__sync_bool_compare_and_swap(&running, 0, 1)) return;
+  if (!held) {
+    uint64_t start = mach_absolute_time(), ns = 0;
+    do {
+      held = IOLockTryLock(log_gate);
+      absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
+    } while (!held && ns < 500000000ull);
+  }
+  if (held) log_store();
+  running = 0;
 }
 
 static void log_start(IOLock *gate, uint64_t capacity) {

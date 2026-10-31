@@ -1,0 +1,210 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -9360,8 +9360,16 @@
+ 	/* call the launch constraints hook */
+ 	os_reason_t launch_constraint_reason;
+ 	if ((error = mac_proc_check_launch_constraints(p, imgp, &launch_constraint_reason)) != 0) {
+-		signature_failure_reason = launch_constraint_reason;
+-		goto done;
++		/* coachz-no-launch-constraints=1: WebKit's extension processes fail these here; AMFI still prints each violation. */
++		unsigned coachz_no_constraints = 0;
++		if (PE_parse_boot_argn("coachz-no-launch-constraints", &coachz_no_constraints, sizeof(coachz_no_constraints)) &&
++		    coachz_no_constraints == 1) {
++			os_reason_free(launch_constraint_reason);
++			error = 0;
++		} else {
++			signature_failure_reason = launch_constraint_reason;
++			goto done;
++		}
+ 	}
+ 
+ #if XNU_TARGET_OS_OSX
+--- a/bsd/kern/kern_exit.c	2026-11-01 01:28:25
++++ b/bsd/kern/kern_exit.c	2026-11-01 01:28:25
+@@ -1909,6 +1909,11 @@
+ 	}
+ 
+ 
++	if (p == current_proc() && rv) {
++		extern void coachz_crash_capture(const char *, int, int);
++		coachz_crash_capture(p->p_name, proc_getpid(p), rv);
++	}
++
+ 	if (!strcmp(p->p_name, "SpringBoard") || !strcmp(p->p_comm, "SpringBoard")) {
+ 		extern void coachz_springboard_exit(int, int, unsigned, uint64_t, const char *, task_t, int, int);
+ 		os_reason_t reason = p->p_exit_reason;
+--- a/osfmk/arm64/coachz_thread.c	2026-11-01 01:28:25
++++ b/osfmk/arm64/coachz_thread.c	2026-11-01 01:28:25
+@@ -480,6 +480,12 @@
+ void
+ coachz_launch_process(int pid, const char *name, int exited, int status)
+ {
++	{
++		extern int coachz_preferences_pid;
++		if (!strcmp(name, "Preferences")) {
++			coachz_preferences_pid = exited ? 0 : pid;
++		}
++	}
+ 	uint32_t index;
+ 	if (!exited && !strcmp(name, "SpringBoard")) {
+ 		os_atomic_store(&coachz_sb_pid, pid, relaxed);
+@@ -950,6 +956,11 @@
+ 		coachz_compact = 1;
+ 	}
+ 
++	{
++		extern void coachz_sample_main_threads(void);
++		coachz_sample_main_threads();
++	}
++
+ 	printf("K36 busy%% %llus:", coachz_ms(wall) / 1000);
+ 	for (unsigned index = 0; index < cpus; index++) {
+ 		processor_t processor = processor_array[index];
+@@ -1183,4 +1194,122 @@
+ 		line[prefix + length++] = '\n';
+ 	}
+ 	coachz_log_append(line, (size_t)prefix + length);
++}
++
++/*
++ * What a crash leaves in the disk log: where the exiting thread faulted, in the addresses of its shared cache slide. The first
++ * few per process name; only signals that mean a fault or an abort, and only on the exiting process's own thread.
++ */
++void coachz_crash_capture(const char *name, int pid, int status);
++
++void
++coachz_crash_capture(const char *name, int pid, int status)
++{
++	static struct {
++		char name[20];
++		unsigned count;
++	} seen[24];
++	static unsigned total;
++	const int signal = status & 0x7f;
++	char line[640];
++	arm_saved_state_t *state;
++	size_t used;
++	unsigned slot;
++
++	if (signal != 4 && signal != 5 && signal != 6 && signal != 8 && signal != 10 && signal != 11 && signal != 12) {
++		return;
++	}
++	for (slot = 0; slot < 24; slot++) {
++		if (!seen[slot].name[0]) {
++			strlcpy(seen[slot].name, name, sizeof(seen[slot].name));
++			break;
++		}
++		if (!strncmp(seen[slot].name, name, sizeof(seen[slot].name) - 1)) {
++			break;
++		}
++	}
++	if (slot == 24 || seen[slot].count++ >= 3 || total++ >= 48 || !(state = find_user_regs(current_thread()))) {
++		return;
++	}
++	used = (size_t)snprintf(line, sizeof(line),
++	    "@crash %s[%d] signal %d slide 0x%x pc %llx lr %llx sp %llx far %llx esr %x x0 %llx x1 %llx x2 %llx x16 %llx:",
++	    name, pid, signal, current_task()->task_shared_region_slide, (unsigned long long)get_saved_state_pc(state),
++	    (unsigned long long)get_saved_state_lr(state), (unsigned long long)get_saved_state_sp(state),
++	    (unsigned long long)state->ss_64.far, (unsigned)state->ss_64.esr,
++	    (unsigned long long)get_saved_state_reg(state, 0), (unsigned long long)get_saved_state_reg(state, 1),
++	    (unsigned long long)get_saved_state_reg(state, 2), (unsigned long long)get_saved_state_reg(state, 16));
++	if (used < sizeof(line) - 1) {
++		used += coachz_user_frames(line + used, sizeof(line) - 1 - used, current_map(), get_saved_state_fp(state),
++		    get_saved_state_sp(state), 24);
++	}
++	if (used > sizeof(line) - 2) {
++		used = sizeof(line) - 2;
++	}
++	line[used++] = '\n';
++	coachz_log_append(line, used);
++}
++
++/* Each report, where the main threads of the tapped app and of SpringBoard are, for the disk log. */
++int coachz_preferences_pid;
++void coachz_sample_main_threads(void);
++
++static void
++coachz_sample_main_thread(int pid, const char *label)
++{
++	struct proc *p = pid > 0 ? proc_find(pid) : NULL;
++	char line[640];
++	uint64_t pc = 0, lr = 0, fp = 0, sp = 0, x16 = 0;
++	unsigned hint = 0, thread_state = 0;
++	size_t used;
++	bool found = false;
++
++	if (!p) {
++		return;
++	}
++	task_t task = proc_task(p);
++	task_lock(task);
++	if (!queue_empty(&task->threads)) {
++		thread_t thread = (thread_t)queue_first(&task->threads);
++		arm_saved_state_t *saved = find_user_regs(thread);
++		if (saved) {
++			pc = get_saved_state_pc(saved);
++			lr = get_saved_state_lr(saved);
++			fp = get_saved_state_fp(saved);
++			sp = get_saved_state_sp(saved);
++			x16 = get_saved_state_reg(saved, 16);
++			hint = (unsigned)thread->block_hint;
++			thread_state = (unsigned)thread->state;
++			found = true;
++		}
++	}
++	const unsigned slide = task->task_shared_region_slide;
++	task_unlock(task);
++	if (found) {
++		extern vm_map_t get_task_map_reference(task_t);
++		vm_map_t map = get_task_map_reference(task);
++		used = (size_t)snprintf(line, sizeof(line), "@sample %s[%d] t%u slide 0x%x state 0x%x hint %u pc %llx lr %llx x16 %lld:",
++		    label, pid, coachz_launch_seconds(), slide, thread_state, hint, pc, lr, (long long)x16);
++		if (map != VM_MAP_NULL) {
++			if (used < sizeof(line) - 1) {
++				used += coachz_user_frames(line + used, sizeof(line) - 1 - used, map, fp, sp, 24);
++			}
++			vm_map_deallocate(map);
++		}
++		if (used > sizeof(line) - 2) {
++			used = sizeof(line) - 2;
++		}
++		line[used++] = '\n';
++		coachz_log_append(line, used);
++	}
++	proc_rele(p);
++}
++
++void
++coachz_sample_main_threads(void)
++{
++	if (!coachz_oslog_match("SpringBoard")) {
++		return;
++	}
++	coachz_sample_main_thread(coachz_preferences_pid, "Preferences");
++	coachz_sample_main_thread(os_atomic_load(&coachz_sb_pid, relaxed), "SpringBoard");
+ }
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1139,6 +1139,10 @@
+ #if defined(__arm64__)
+ 	/* No CPU, thread or debugger state is required for this first panic copy. */
+ 	coachz_early_panic(panic_format_str, panic_args);
++	{
++		extern void coachz_log_panic_flush(void);
++		coachz_log_panic_flush();
++	}
+ #endif
+ 
+ #if defined(__x86_64__) && (DEVELOPMENT || DEBUG)
+@@ -1259,6 +1263,11 @@
+ static void
+ kdp_machine_reboot_type(unsigned int type, uint64_t debugger_flags)
+ {
++#if defined(__arm64__)
++	/* Again with everything the panic printed since the first copy; the other CPUs are stopped by now. */
++	extern void coachz_log_panic_flush(void);
++	coachz_log_panic_flush();
++#endif
+ 	if ((type == kPEPanicRestartCPU) && (debugger_flags & DEBUGGER_OPTION_SKIP_PANICEND_CALLOUTS)) {
+ 		PEHaltRestart(kPEPanicRestartCPUNoCallouts);
+ 	} else {
