@@ -48,9 +48,7 @@ def source(path):
                                     spec['commit'] + ':payloads/libpayload/' + path], text=True)
 
 
-def build(zig, cpu, env, out):
-    """Returns the objects to link and their relocation reports."""
-    tree = out / 'libpayload-usb'
+def extract(tree):
     (tree / 'include/usb').mkdir(parents=True)
     for name in DRIVERS + LOCAL_HEADERS:
         text = source('drivers/usb/' + name)
@@ -61,6 +59,12 @@ def build(zig, cpu, env, out):
         (tree / name).write_text(text)
     for name in HEADERS:
         (tree / 'include/usb' / name).write_text(source('include/usb/' + name))
+
+
+def build(zig, cpu, env, out):
+    """Returns the objects to link and their relocation reports."""
+    tree = out / 'libpayload-usb'
+    extract(tree)
     flags = ['-target', 'aarch64-freestanding-none', '-mcpu=' + cpu, '-mgeneral-regs-only', '-ffreestanding',
              '-fno-builtin', '-fno-pic', '-fno-pie', '-fno-stack-protector', '-fno-unwind-tables',
              '-fno-asynchronous-unwind-tables', '-Os', '-g', '-I' + str(ROOT / 'boot/usb_compat'),

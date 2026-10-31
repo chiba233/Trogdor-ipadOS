@@ -30,6 +30,16 @@ typedef int64_t s64;
 #define __unused __attribute__((unused))
 #define __weak __attribute__((weak))
 #define printf(...) ((void)0)
+#if COACHZ_USB_KERNEL
+#define usb_read_fatal coachz_usb_fatal
+#define malloc coachz_usb_malloc
+#define calloc coachz_usb_calloc
+#define memalign coachz_usb_memalign
+#define free coachz_usb_free
+#define gettimeofday coachz_usb_gettimeofday
+#define dma_malloc coachz_usb_malloc
+#define dma_memalign coachz_usb_memalign
+#endif
 #define fatal(...) usb_read_fatal()
 #define assert(x) do { if (!(x)) usb_read_fatal(); } while (0)
 void usb_read_fatal(void);

@@ -34,7 +34,7 @@ diff --git a/bsd/dev/coachz_sample.c b/bsd/dev/coachz_sample.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/coachz_sample.c
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,62 @@
 +/*
 + * Bring-up diagnostics, adapted from the process sampler of ios-sweet (MIT, Copyright
 + * (c) 2026 dipa-studio). The screen is the only output: a kernel thread prints a line
@@ -54,6 +54,7 @@ new file mode 100644
 +extern int hz;
 +extern void coachz_sample_task(const char *, int, task_t);
 +extern void coachz_root_prepare(void);
++extern void coachz_usb_report(void);
 +
 +static int
 +coachz_sample_proc(proc_t p, __unused void *arg)
@@ -81,6 +82,7 @@ new file mode 100644
 +		clock_get_system_microtime(&sec, &usec);
 +		printf("COACHZ alive: %lu s\n", (unsigned long)sec);
 +		proc_iterate(PROC_ALLPROCLIST, coachz_sample_proc, NULL, NULL, NULL);
++		coachz_usb_report();
 +	}
 +}
 +

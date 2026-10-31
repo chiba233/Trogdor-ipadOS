@@ -10,7 +10,10 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-COMPONENTS = ('drivers/ArmCpu', 'drivers/ArmDTPlatform', 'drivers/SoftwareAES', 'kits/XnuPrelink')
+sys.path.insert(0, str(ROOT / 'tools'))
+import usb_stack
+
+COMPONENTS = ('drivers/ArmCpu', 'drivers/ArmDTPlatform', 'drivers/RamBlock', 'drivers/SoftwareAES', 'kits/XnuPrelink')
 REFERENCES = {'xnu', 'libplatform', 'libdispatch', 'AvailabilityVersions', 'libpthread',
               'corecrypto-2023', 'IOStorageFamily'}
 
@@ -45,12 +48,23 @@ def materialize_xnu(source, destination):
 def patched_drivers(base, platform, out):
     """Copy the pinned drivers a platform patches, leaving upstream clean; returns --local-module options."""
     options = []
-    for patch in sorted((ROOT / 'platform' / platform / 'patches/drivers').glob('*.patch')):
-        copy = out / 'reference' / patch.stem
+    def fresh_copy(name):
+        copy = out / 'reference' / name
         shutil.rmtree(copy, ignore_errors=True)
-        shutil.copytree(base / 'drivers' / patch.stem, copy, ignore=shutil.ignore_patterns('.git'))
+        shutil.copytree(base / 'drivers' / name, copy, ignore=shutil.ignore_patterns('.git'))
+        return copy
+    for patch in sorted((ROOT / 'platform' / platform / 'patches/drivers').glob('*.patch')):
+        copy = fresh_copy(patch.stem)
         subprocess.run(['patch', '--batch', '--silent', '-p1', '-d', str(copy), '-i', str(patch)], check=True)
         options += ['--local-module', 'driver:' + patch.stem + '=' + str(copy)]
+    # Files that replace or join a driver's sources; RamBlock also carries the USB stack.
+    for overlay in sorted(path for path in (ROOT / 'platform' / platform / 'drivers').glob('*') if path.is_dir()):
+        copy = fresh_copy(overlay.name)
+        shutil.copytree(overlay, copy, dirs_exist_ok=True)
+        options += ['--local-module', 'driver:' + overlay.name + '=' + str(copy)]
+        if (overlay / 'coachz_usb.c').is_file():
+            usb_stack.extract(copy / 'usb')
+            shutil.copytree(ROOT / 'boot/usb_compat', copy / 'usb/compat')
     return options
 
 
@@ -103,6 +117,8 @@ def main():
         local_tools = ROOT / '.tools/xnu-host-deps'
         bins = [local_tools / 'cmake/data/bin', local_tools / 'bin']
         os.environ['PATH'] = os.pathsep.join([*(str(b) for b in bins if b.is_dir()), os.environ.get('PATH', '')])
+        if (ROOT / 'platform' / a.platform / 'drivers/RamBlock/coachz_usb.c').is_file():
+            os.environ['XNU_EXTRA_LD_ARCHIVES'] = '-Wl,-force_load,' + str(ctx.tree / 'build/coachz-usb/libCoachzUsb.a')
         kernel.build(ctx, modules)
         candidate = ctx.tree / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf'
         if not candidate.is_file():

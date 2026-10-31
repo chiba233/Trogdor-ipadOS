@@ -19,3 +19,5 @@ USB 栈是 Depthcharge 启动 U 盘时用的同一套 libpayload 代码（BSD）
 Coachz 上的事实：控制器在 `0x0a600000`，中断是 GIC INTID 165（SPI 133），SMMU stream 是 `0x540`。固件交接后 SMMU 处于旁路状态。启动介质走 USB3，挂在板载 Realtek 集线器上，键盘 Hammer 挂在同一个集线器的 USB2 一侧。这些都是探针或 Debian 在真机上读到的。
 
 这个实验没有用到中断，也没有开 MMU 和缓存。XNU 里的驱动要自己解决 Device 映射、非缓存 DMA 内存和块设备接口。
+
+XNU 里的驱动在 `platform/coachz-prelink/drivers/RamBlock`。控制器用 `ml_io_map` 映射成 Device 内存，DMA 池是 XNU 物理窗口外的一段固定物理内存，用 `ml_io_map_wcomb` 映射成非缓存内存。两者都从 ARM 固定 8 MiB 的 `io_submap` 分配，所以 DMA 池只有 1 MiB；16 MiB 的第一版在映射时就 panic 了。2026-10-31 真机屏幕确认内核读到了同样三个扇区。

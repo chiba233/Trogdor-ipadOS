@@ -694,3 +694,18 @@ panic 的调用栈为 `PE_init_iokit → InitIOKit → OSlibkernInit → OSRunti
 这是探针环境，MMU 和缓存都关着，也没有用中断，不代表 XNU 里已经能用 USB。
 
 未解决：这块外接盘在此前一次 Debian 启动的第 67.5 秒自己断开，重新出现时变成 `JMICRON JMS580`、容量 0，重新插拔后恢复。当时没有读写它，原因未查明。它要作为根盘，稳定性还需要观察。第二轮的备用内存地址没有通过 `fdt_range_clear`，备用尝试实际没有运行，这段代码目前没有被验证过。
+
+
+## 2026-10-31：XNU 内核通过 USB 读到外接盘
+
+运行时与配置见随本节提交，镜像 SHA-256 `aef9eacee6e7ef02f84711bd861c399b68a7a8988d8b6cae0cdde8bf8700052c`。prelink 内核里加入了 `platform/coachz-prelink/drivers/RamBlock`：块设备类沿用 UniXNU RamBlock，后面接探针验证过的同一套 libpayload xHCI 和大容量存储栈，轮询、只发读命令，向系统报告写保护。
+
+第一轮：屏幕显示 `kmem_alloc(..., 16777216, 0x100021): failed with 3 @vm_kern.c:180`。调用栈是 `NativeRamBlock::start → coachz_usb_open → ml_io_map_wcomb → io_map → kmem_alloc`，USB 控制器还没有初始化。ARM 的 `io_map` 从固定 8 MiB 的 `io_submap` 分配（`osfmk/arm/io_map.c` 的 `IO_MAP_SIZE`），16 MiB 的 DMA 池放不下，`KMA_NOFAIL` 让失败直接 panic。
+
+修正：DMA 池缩到 1 MiB。探针真机成功那一轮堆最多用了 176 KiB，内核再加 64 KiB 传输缓冲区。池子的物理地址核对过真机设备树：在普通 RAM 段内，不与任何保留区重叠，也不在 XNU 的物理窗口内。
+
+第二轮：屏幕照片依次显示 `COACHZ USB: mapped 1 1`、`controller 1`、`disk 1 after 787 ms`，`USBSTS 0x18`（没有 HSE、HCE），`fatal 0`，池子用了 240168 字节。随后是 `blocks 250069680 size 512 speed 3`，三个扇区 `lba 0`、`lba 1`、`lba 2048` 都是 `ok 1`，分别读到 `55AA`、`EFI PART`、`CHROMEOS`。这是 XNU 第一次在真机上自己枚举 USB 设备并读到外接盘的真实内容。之后 APFS 加载、内存盘作根、launchd 照常运行。
+
+只有屏幕证据。照片里没有出现每分钟一次的 `COACHZ media:` 行，IOKit 块设备、GPT 分区和 IOMedia 是否发布还没有确认。没有写外接盘、固件或内置盘。
+
+未解决：根文件系统仍是内存盘。随机 zone panic 原因未查明。外接盘此前那次自行断开的原因也未查明。
