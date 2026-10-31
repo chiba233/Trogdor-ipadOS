@@ -110,3 +110,12 @@ schema 1 把多个条件合成 `scanout consistent` 和 `FDT range allowed` 两�
 INTF 帧／行计数的偏移来自 Linux DPU 驱动，锁定固件源码没有定义，只用作时序是否运行的日志证据。`read_probe.py --display-pattern` 校验 58 个字段，只判断实验完整执行并干净停止；计数是否前进和肉眼现象分开记录。没有背光时只能用手电观察，没看到不能据此判断是哪一层失败，画面可见性须由观察单独记录。
 
 编译开关关闭时，发现镜像与已验收的 schema 2 镜像逐字节相同。2026-10-31 该实验已在真机通过，手电下全屏棋盘格可见，帧计数 60.00 Hz，见 [硬件记录](hardware-tests.md)。
+
+
+## 背光实验（schema 4）
+
+`linux_log.py --display-backlight` 在上述画面实验上增加背光，其余步骤和写入顺序不变。TE 启动 1 秒后，通过固件已配置的 QUP1 SE0 SPI 用 EC 协议 3 发送只读的 `EC_CMD_HELLO` 并核对回复；成功才发送 `EC_CMD_PWM_SET_DUTY`（屏幕背光，80%，即 Depthcharge 默认的 52428），再打开表中 backlight 项对应的 GPIO。保持结束后先关 GPIO、把 PWM 设回 0，再停 TE 和 DSI，然后交接 Linux。
+
+这些只是 EC 运行状态命令，不写 EC 固件或闪存。每个等待都有上限，所有路径都释放片选；EC 失败只丢失背光，错误码写入日志，棋盘格和 Linux 交接照常完成。EC 客户端依公开协议另写，未复制 GPL 的 Depthcharge 代码。`read_probe.py --display-backlight` 校验 64 个字段，接受 EC 失败的完整记录。
+
+三个编译开关相互独立，已验证的发现镜像和画面实验镜像逐字节不变。

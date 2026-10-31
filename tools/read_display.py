@@ -17,6 +17,7 @@ SCHEMA1_FIXED=dict(FIXED,schema=1)
 PATTERN=('pattern attempted','pattern mismatches','pattern hold seconds','pattern MMIO fault','pattern count enable saved',
          'pattern TE running','pattern DSI running','pattern frame start','pattern frame end','pattern line start','pattern line end',
          'pattern TE stopped','pattern DSI stopped')
+BACKLIGHT=('backlight hello','backlight EC on','backlight EC off','backlight error','backlight GPIO on','backlight GPIO off')
 DEPTHCHARGE_BASE=0xf1000000
 
 def parse(data,fixed,flags,extra=()):
@@ -69,17 +70,31 @@ def read_display_record(data):
     check_gates(v)
     return text,fields
 
-def read_display_pattern_record(data):
+def parse_pattern(data,schema,extra=()):
     """Accepts any completed attempt; whether the timing engine ran is read from the counters."""
-    fixed={k:b for k,b in FIXED.items() if k!='hardware writes'};fixed['schema']=3
-    text,fields,v=parse(data,fixed,FLAGS,PATTERN+('hardware writes',))
+    fixed={k:b for k,b in FIXED.items() if k!='hardware writes'};fixed['schema']=schema
+    text,fields,v=parse(data,fixed,FLAGS,PATTERN+tuple(extra)+('hardware writes',))
     check_gates(v)
     if v['pattern attempted']!=v['candidate writable']:raise ValueError('pattern must follow the candidate')
     if v['hardware writes']==0:
         if any(v[k] for k in PATTERN if k not in ('pattern attempted','pattern mismatches','pattern count enable saved','pattern MMIO fault')):
             raise ValueError('pattern reported without hardware writes')
-    elif (v['hardware writes'],v['pattern hold seconds'],v['pattern TE stopped'],v['pattern DSI stopped'])!=(7,20,0,0):
+    elif (v['pattern hold seconds'],v['pattern TE stopped'],v['pattern DSI stopped'])!=(20,0,0):
         raise ValueError('pattern did not stop cleanly')
+    return text,fields,v
+
+def read_display_pattern_record(data):
+    text,fields,v=parse_pattern(data,3)
+    if v['hardware writes'] not in (0,7):raise ValueError('unexpected pattern hardware writes')
+    return text,fields
+
+def read_display_backlight_record(data):
+    """An EC failure is a valid record: the scanout still ran and the error code says why."""
+    text,fields,v=parse_pattern(data,4,BACKLIGHT)
+    hello,on,off=(v['backlight '+k] for k in ('hello','EC on','EC off'))
+    if any(x not in (0,1) for x in (hello,on,off)) or (on and not hello) or (off and not on):
+        raise ValueError('contradictory backlight sequence')
+    if v['hardware writes']!=(9 if on else 7 if v['pattern hold seconds'] else 0):raise ValueError('unexpected backlight hardware writes')
     return text,fields
 
 def read_display_record_schema1(data):

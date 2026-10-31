@@ -7,4 +7,6 @@ struct display_state { uint64_t span,allocation;uint32_t consistent,allocated,wi
 int display_analyze(const struct cb_display *,const uint32_t *,uint64_t,uint64_t,struct display_state *);
 int display_read32(uint64_t,uint32_t *);
 void display_discover(const void *,uint64_t,uint64_t);
+int display_ec_hello(uint64_t,uint32_t *);
+int display_ec_backlight(uint64_t,uint16_t,uint32_t *);
 #endif

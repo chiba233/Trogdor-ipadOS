@@ -4,6 +4,9 @@
 #ifndef PROBE_DISPLAY_PATTERN
 #define PROBE_DISPLAY_PATTERN 0
 #endif
+#ifndef PROBE_DISPLAY_BACKLIGHT
+#define PROBE_DISPLAY_BACKLIGHT 0
+#endif
 void probe_value(const char *,uint64_t);
 int fdt_range_clear(const void *,uint64_t,uint64_t);
 static uint64_t be64(const uint8_t *p) { return (uint64_t)fdt_be32(p)<<32|fdt_be32(p+4); }
@@ -67,7 +70,13 @@ static const struct { char name[40];uint32_t address; } registers[DISPLAY_READS]
 #define DISPLAY_SCANOUT 0xae05014u
 #define DISPLAY_DSI_VIDEO 0x1f3u /* Coreboot mdss_dsi_video_mode_config, four lanes. */
 #define DISPLAY_HOLD_SECONDS 20u
-struct display_pattern_result { uint32_t attempted,mismatches,writes,fault,saved,te,dsi,frame0,frame1,line0,line1,te_after,dsi_after; };
+#define DISPLAY_BACKLIGHT_DUTY 52428u /* 80%, the Depthcharge default. */
+struct display_pattern_result {
+    uint32_t attempted,mismatches,writes,fault,saved,te,dsi,frame0,frame1,line0,line1,te_after,dsi_after;
+#if PROBE_DISPLAY_BACKLIGHT
+    uint32_t hello,ec_on,ec_off,gpio_on,gpio_off,ec_error;
+#endif
+};
 static uint32_t pattern_read(uint32_t address,uint32_t *fault) {
     uint32_t value=0;if(!display_read32(address,&value))*fault=1;return value;
 }
@@ -104,13 +113,29 @@ static void display_pattern(const struct cb_display *b,uint32_t pa,struct displa
     o->te=pattern_read(DISPLAY_TE,&o->fault);o->dsi=pattern_read(DISPLAY_DSI,&o->fault);
     pattern_wait(freq);
     o->frame0=pattern_read(DISPLAY_FRAME,&o->fault);o->line0=pattern_read(DISPLAY_LINE,&o->fault);
+#if PROBE_DISPLAY_BACKLIGHT
+    /* A failed EC exchange only loses the backlight; the scanout hold still completes. */
+    o->hello=(uint32_t)display_ec_hello(freq,&o->ec_error);
+    if(o->hello)o->ec_on=(uint32_t)display_ec_backlight(freq,DISPLAY_BACKLIGHT_DUTY,&o->ec_error);
+    if(o->ec_on) {
+        pattern_write(COACHZ_BACKLIGHT_PORT+4,b->bl_polarity?2u:0u,&o->writes);
+        o->gpio_on=pattern_read(COACHZ_BACKLIGHT_PORT+4,&o->fault);
+    }
+#endif
     pattern_wait(freq*(DISPLAY_HOLD_SECONDS-1));
     o->frame1=pattern_read(DISPLAY_FRAME,&o->fault);o->line1=pattern_read(DISPLAY_LINE,&o->fault);
+#if PROBE_DISPLAY_BACKLIGHT
+    if(o->ec_on) {
+        pattern_write(COACHZ_BACKLIGHT_PORT+4,b->bl_polarity?0u:2u,&o->writes);
+        o->gpio_off=pattern_read(COACHZ_BACKLIGHT_PORT+4,&o->fault);
+        o->ec_off=(uint32_t)display_ec_backlight(freq,0,&o->ec_error);
+    }
+#endif
     pattern_write(DISPLAY_TE,0,&o->writes);pattern_wait(freq/50);pattern_write(DISPLAY_DSI,0,&o->writes);
     pattern_write(DISPLAY_COUNT_EN,o->saved,&o->writes);
     o->te_after=pattern_read(DISPLAY_TE,&o->fault);o->dsi_after=pattern_read(DISPLAY_DSI,&o->fault);
 }
-#define DISPLAY_SCHEMA 3
+#define DISPLAY_SCHEMA (PROBE_DISPLAY_BACKLIGHT?4:3)
 #define DISPLAY_WRITES pattern.writes
 #else
 #define DISPLAY_SCHEMA 2
@@ -166,5 +191,10 @@ done:
     probe_value("Display pattern frame start=",pattern.frame0);probe_value("Display pattern frame end=",pattern.frame1);
     probe_value("Display pattern line start=",pattern.line0);probe_value("Display pattern line end=",pattern.line1);
     probe_value("Display pattern TE stopped=",pattern.te_after);probe_value("Display pattern DSI stopped=",pattern.dsi_after);
+#endif
+#if PROBE_DISPLAY_BACKLIGHT
+    probe_value("Display backlight hello=",pattern.hello);probe_value("Display backlight EC on=",pattern.ec_on);
+    probe_value("Display backlight EC off=",pattern.ec_off);probe_value("Display backlight error=",pattern.ec_error);
+    probe_value("Display backlight GPIO on=",pattern.gpio_on);probe_value("Display backlight GPIO off=",pattern.gpio_off);
 #endif
 }

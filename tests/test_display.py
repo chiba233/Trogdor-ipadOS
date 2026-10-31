@@ -10,7 +10,7 @@ import unittest
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'tools'))
 from linux_log import compile_wrapper
-from read_display import FIXED,METADATA,REGISTERS,FLAGS,PATTERN,SCHEMA1_FIXED,SCHEMA1_FLAGS,read_display_pattern_record,read_display_record,read_display_record_schema1
+from read_display import BACKLIGHT,FIXED,METADATA,REGISTERS,FLAGS,PATTERN,SCHEMA1_FIXED,SCHEMA1_FLAGS,read_display_backlight_record,read_display_pattern_record,read_display_record,read_display_record_schema1
 from read_probe import read_record
 from fdt import Node,encode,string,u32
 
@@ -260,6 +260,19 @@ class DisplayTests(unittest.TestCase):
             drawn,report=compile_wrapper(b,image,4096,discovery=True,pattern=True)
             self.assertEqual(report['display_discovery_schema'],3)
             self.assertNotIn(b'pattern attempted',plain);self.assertIn(b'pattern attempted',drawn)
+
+    def test_backlight_mode_is_separate_and_accepts_an_ec_failure(self):
+        d=values();d['schema']=4;d['hardware writes']=9;d.update(dict.fromkeys(PATTERN+BACKLIGHT,0))
+        d.update({'pattern attempted':1,'pattern hold seconds':20,'pattern TE running':1,'pattern DSI running':0x1f3,'backlight hello':1,'backlight EC on':1,'backlight EC off':1,'backlight GPIO on':2})
+        self.assertEqual(len(read_display_backlight_record(log(d))[1]),64)
+        failed=dict(d,**{'hardware writes':7,'backlight hello':0,'backlight EC on':0,'backlight EC off':0,'backlight GPIO on':0,'backlight error':6});read_display_backlight_record(log(failed))
+        for bad in ({'hardware writes':7},{'backlight hello':0},{'pattern DSI stopped':1},{'schema':3}):
+            with self.subTest(bad=bad),self.assertRaises(ValueError):read_display_backlight_record(log(dict(d,**bad)))
+        with self.assertRaises(ValueError):read_display_pattern_record(log(d))
+        image=struct.pack('<II6QII',0x91005a4d,0x14000001,0,4096,0xa,0,0,0,0x644d5241,0)+bytes(64)
+        with tempfile.TemporaryDirectory() as tmp:
+            data,report=compile_wrapper(Path(tmp),image,4096,discovery=True,pattern=True,backlight=True)
+            self.assertEqual((report['display_discovery_schema'],len(report['c_relocations'])),(4,8));self.assertIn(b'backlight hello',data)
 
     def test_hardware_verified_scanout_restart_order_is_unchanged(self):
         source=(ROOT/'boot/display.c').read_text()
