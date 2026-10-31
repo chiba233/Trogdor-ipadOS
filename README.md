@@ -1,15 +1,110 @@
 # Trogdor-ipadOS
 
-HP Chromebook x2 11（Google Coachz / SC7180）的 **原生 iPadOS 移植实验**。
+HP Chromebook x2 11（Google Coachz / SC7180，骁龙 7c）的 **原生 iPadOS 移植实验**。不是虚拟机：原厂固件链启动，XNU 直接跑在这颗芯片上。
 
-目前已经能在真机上启动 XNU，并把输出直接画到屏幕上：内核合并 iPadOS 17.7.11 的 Apple 原始组件后完成初始化，从内存里的恢复盘启动 Apple 原版 launchd 和恢复服务。**还不能启动 iPadOS**：跑的是恢复环境，不是主系统，没有界面，也没有存储驱动。
+**现在能做到的（都在真机上确认过）：** 从外接 USB 盘启动 iPadOS 17.7.11，进入主屏幕和 Dock，触摸和键盘可用，Safari 和设置能启动，系统声音从扬声器播放，状态栏显示电量，亮度滑块能调背光。八个 CPU 核都在工作。
 
-```text
-原厂 Coreboot → TF-A BL31 → Depthcharge（NS EL2）
-  → 开发者模式签名 FIT → ARM64 探针 → EL1，恢复屏幕和背光
-  → XNU（prelink Apple 组件）→ 内存里的恢复盘：launchd、dyld、restored_update
-  → 后续：XNU 里的 USB 存储驱动、从外接盘启动主系统、显示驱动
+**还不行的：** 界面全靠 CPU 绘制。GPU 已经能在真机上执行命令，但还没有接到系统上，所以没有 Metal，也没有 GPU 合成。没有网络（Wi-Fi 和蜂窝都没有），也没有验证过长时间稳定性。这是一个实验项目，离日常使用还很远。
+
+## 架构
+
+### 启动链
+
+原厂固件一个字节都不改，靠开发者模式的签名 FIT 进入自己的代码。
+
+```mermaid
+flowchart TD
+    A["原厂 Coreboot、TF-A BL31"] --> B["Depthcharge（NS EL2）"]
+    B --> C["开发者模式签名 FIT<br/>来自外接 USB 盘"]
+    C --> D["ARM64 探针：切到 EL1，恢复屏幕和背光<br/>装载内核时依次显示 R、G、B 启动图"]
+    D --> E["XNU + iPadOS 的 Apple 原始组件<br/>prelink 成一个内核"]
+    E --> F["外接盘：OS 卷和 SystemOS 只读<br/>Data 卷可写，APFS"]
+    F --> G["Apple 原版 launchd"]
+    G --> H["backboardd、SpringBoard、App"]
 ```
+
+### 系统分层
+
+上面是 Apple 的原版程序和组件，下面的驱动把它们接到这台机器的硬件上。硬件知识来自主线 Linux，iPadOS 适配的做法来自 UniXNU。
+
+```mermaid
+flowchart TB
+    subgraph APPLE["Apple 原版（IPSW 提供，不进仓库）"]
+        direction LR
+        A1["launchd、backboardd<br/>SpringBoard、App"]
+        A2["CoreAudio、QuartzCore<br/>Metal 框架"]
+        A3["内核组件：APFS、AMFI<br/>IOHIDFamily、IOGPUFamily 等"]
+    end
+    subgraph OURS["这个项目和 UniXNU 的驱动"]
+        direction LR
+        D1["显示<br/>GopFramebuffer"]
+        D2["输入<br/>触摸、USB 键盘、音量键"]
+        D3["存储<br/>USB xHCI、大容量存储"]
+        D4["音频<br/>LPASS、HAL 插件"]
+        D5["电源<br/>Chrome EC：电池、背光"]
+        D6["GPU<br/>见下图"]
+    end
+    KERNEL["XNU（Darwin 23 源码，修补后编译）<br/>8 核 SMP，GICv3，定时器"]
+    subgraph HW["SC7180 硬件"]
+        direction LR
+        H1["MDSS 面板"]
+        H2["GENI I2C、GT7375P"]
+        H3["DWC3 USB"]
+        H4["LPASS MI2S"]
+        H5["Chrome EC"]
+        H6["Adreno 618"]
+    end
+    APPLE --> OURS --> KERNEL --> HW
+```
+
+### GPU
+
+这是目前的重点。路线很明确：**硬件这边照主线 Linux，iPadOS 这边用 UniXNU 现成的 Metal 翻译层**，中间的 A618 内核后端要自己写。Turnip 只依赖一组固定的内核接口，所以上层可以基本不动。
+
+绿色是真机验证过的，黄色是编译过但没上过机的，灰色是还没接上的。
+
+```mermaid
+flowchart TB
+    APP["App、QuartzCore（CARenderServer）"]:::todo
+    subgraph US["系统进程里"]
+        META["AdrenoMetal 插件<br/>发布 Metal 设备"]:::built
+        M2V["metal2vulkan<br/>AIR → SPIR-V"]:::built
+        TU["Turnip（Mesa）<br/>SPIR-V → NIR → IR3"]:::built
+    end
+    subgraph KS["内核里"]
+        KMD["A618 内核驱动<br/>内存、地址空间、提交、fence"]:::todo
+        GMU["GMU：固件、HFI、电源"]:::ok
+        SMMU["GPU SMMU：页表"]:::ok
+        CP["CP：SQE、ring、IB、fence"]:::ok
+    end
+    GPU["Adreno 618"]:::ok
+    SCAN["合成结果送到 scanout"]:::todo
+    SCREEN["屏幕"]
+    APP --> META --> M2V --> TU --> KMD
+    KMD --> GMU --> GPU
+    KMD --> SMMU --> GPU
+    KMD --> CP --> GPU
+    GPU --> SCAN --> SCREEN
+    classDef ok fill:#2e7d32,color:#ffffff,stroke:#1b5e20
+    classDef built fill:#f9a825,color:#000000,stroke:#f57f17
+    classDef todo fill:#9e9e9e,color:#000000,stroke:#616161
+```
+
+GPU 的启动顺序。下面每一步都在真机上跑通了，寄存器和顺序都按主线 Linux：
+
+```mermaid
+flowchart LR
+    S1["CX 上电<br/>GMU 时钟"] --> S2["GMU 固件<br/>写入 TCM"]
+    S2 --> S3["SMMU 页表<br/>11 个地址核对"]
+    S3 --> S4["RSC、PDC<br/>放开 CM3"]
+    S4 --> S5["固件签名<br/>0xbabeface"]
+    S5 --> S6["CMD DB 投票<br/>GX 上电"]
+    S6 --> S7["HFI 5 条消息<br/>GPU_SET"]
+    S7 --> S8["hw_init<br/>SQE 启动"]
+    S8 --> S9["ME_INIT<br/>CP 写内存和 fence"]
+```
+
+到这一步，GPU 已经真正执行了命令，但还没有运行过着色器，也没有画过东西，而且验证跑完就全部关掉。详情见 [GPU 计划](docs/plans/gpu.md) 和 [硬件记录](docs/hardware-tests.md)。
 
 ## 当前进度
 
@@ -18,20 +113,29 @@ HP Chromebook x2 11（Google Coachz / SC7180）的 **原生 iPadOS 移植实验*
 | 原厂启动链、EL2→EL1、日志回传 Linux | 通过 | 真机日志，逐字段校验 |
 | XNU 早期检查点（入口、MMU、高地址、C 入口、CPU 数据、PE、拓扑） | 通过 | 真机日志，逐字段校验 |
 | 恢复屏幕和背光 | 通过 | 真机日志，加肉眼可见的棋盘格 |
-| XNU 屏幕控制台，内核初始化走完 | 通过 | 屏幕照片 |
-| 第一个用户态程序（PID 1）和定时器中断 | 通过 | 屏幕照片 |
-| prelink 31 个 Apple 组件（其中 1 个无代码，之后另加 tmpfs），真实 AMFI 放行 init | 通过 | 屏幕照片，运行到至少 12 个 tick（约 1 分钟） |
-| Apple launchd、dyld、恢复服务（恢复盘作根） | 运行，恢复服务按自身逻辑退出 | 屏幕照片，内核在 177 秒时仍存活 |
-| 探针经 USB 读外接盘（只读实验） | 通过 | 真机日志，逐字段校验，见 [USB 只读实验](docs/usb-read.md) |
-| XNU 里的 USB 存储驱动 | 只读挂根屏幕确认 | 内核经 GPT 和 APFS 从外接盘挂载恢复卷作只读根，`restored_update` 运行；未封存根卷是放行，不是验证，见 [硬件记录](docs/hardware-tests.md) |
-| 从外接盘启动主系统 | 屏幕确认到升级界面 | iPadOS 系统卷只读作根，外接 Data 卷可写；原版系统经 CPU 绘制到 iPadOS 主屏幕，见 [硬件记录](docs/hardware-tests.md) |
-| 触摸 | 真机通过 | 经 GENI I2C 和内核 `IOHIDEventDriver` 接到 backboardd |
-| App | 进行中 | Safari 和设置能启动；带云朵的 App 还是占位符 |
-| 电池、背光、键盘、扬声器测试音、音量键 | 真机通过 | 状态栏显示电量，亮度滑块和键盘可用，开机测试音能听到；系统音频、音量条和触控板还没有 |
-| SMP | 进行中 | 八个核上线，A55／A76 识别正确，IPI 能送达，空闲核优先选 A76；实测 A55 1804、A76 2400 MHz，界面静止时系统基本空闲；频率固定在最高档且没有温控，也不是真正的大小核调度 |
-| GPU、系统音频、可用界面 | 未实现 | 设备树里没有这些硬件节点，Apple 组件大多只是加载 |
+| XNU 内核初始化走完，第一个程序和定时器中断 | 通过 | 屏幕照片 |
+| prelink 31 个 Apple 组件（其中 1 个无代码，另加 tmpfs），原版 AMFI 放行 | 通过 | 屏幕照片 |
+| XNU 里的 USB 存储驱动，经 GPT 和 APFS 挂载根卷 | 通过 | 屏幕和日志；未封存的根卷是放行，不是验证 |
+| 从外接盘启动主系统，进入主屏幕和 Dock | 通过 | 屏幕照片 |
+| 外接 Data 卷可写 | 通过 | 日志；跨重启的持久性有实际使用，没有单独验收 |
+| 触摸 | 通过 | 经 GENI I2C 和内核 `IOHIDEventDriver` 接到 backboardd |
+| App | 部分 | Safari 和设置能启动；带云朵的 App 是占位符；“设置 → 关于本机”打不开 |
+| 电池、背光、Zed 键盘 | 通过 | 状态栏电量和 Debian 一致，亮度滑块和键盘可用 |
+| 音量键 | 部分 | 按键能到 HID；音量条还没确认 |
+| 系统音频 | 通过（听感） | 经原版音频服务播放，机主听到正常，日志无校正、无崩溃；路由显示为 iPad，图标是音响；麦克风没接 |
+| SMP | 部分 | 八个核上线，IPI 正常，空闲核优先选 A76；频率固定在最高档，没有温控，不是真正的大小核调度 |
+| 温度、加速度计、合盖 | 只读 | 能读到值；没有接温控和 CoreMotion，屏幕不会自动旋转 |
+| GPU 启动和命令执行 | 通过 | CP 经 SMMU 从 ring 和 IB 写内存，fence 到达，所有故障寄存器为 0；跑完全部关掉 |
+| GPU 常驻驱动、Metal、GPU 合成 | 进行中 | Turnip 和 Metal 插件已编译通过，没上过机 |
+| Wi-Fi、蜂窝网络 | 未实现 | 只读过 SMEM，基带还没启动；下一步是 MPSS 冷启动 |
 
-屏幕照片阶段没有逐字段核对，也没有验证长时间稳定性。早期有一个原因不明的随机 zone panic，最近几轮没有再出现，但没有解决。详情见 [状态](docs/status.md) 和 [硬件记录](docs/hardware-tests.md)。
+屏幕照片阶段没有逐字段核对。早期有一个原因不明的随机 zone panic，最近几轮没有再出现，但没有解决。系统从未整机卡死，屏幕和诊断输出一直在跑。详情见 [状态](docs/status.md) 和 [硬件记录](docs/hardware-tests.md)。
+
+## 站在谁的肩膀上
+
+- **主线 Linux**：Coachz 是主线正式支持的整机，设备树和驱动给出了硬件的答案。Linux 是 GPL，这里只取事实和顺序，代码自己写。
+- **[UniXNU](https://github.com/UniXNU)、UniXNU-sheng**：非 Apple 硬件跑 iPadOS 的框架，prelink、显示、触摸、音频和 GPU 的路线都来自这里。改编的文件保留了出处和协议。
+- **ios-sweet**：屏幕控制台，以及系统启动问题的排错记录。
 
 ## 已有内容
 
@@ -39,7 +143,8 @@ HP Chromebook x2 11（Google Coachz / SC7180）的 **原生 iPadOS 移植实验*
 - [设计与阶段边界](docs/design.md)：比较直接 FIT shim、U-Boot EFI 与替换固件，明确首阶段的接口。
 - `boot/`：带 Linux ARM64 Image 头的独立探针、EL2→EL1 入口、内存日志、受限 GENI UART 输出、只读 FDT 解析。
 - `tools/`：交叉编译、FIT 封装、vboot 容器签名、上游版本核对；所有产物都是普通文件。
-- `platform/`：`coachz` 是已验收检查点用的内核；`coachz-screen` 是不带 prelink 的屏幕内核；`coachz-prelink` 是带 Apple 组件的屏幕内核。
+- `platform/`：`coachz` 是已验收检查点用的内核；`coachz-screen` 是不带 prelink 的屏幕内核；`coachz-prelink` 是主系统路线用的内核，所有驱动都在这里。
+- [计划](docs/plans/)：GPU、Wi-Fi、音频等每个驱动的路线和真机上要看什么。
 - [状态与真机验收](docs/status.md)：区分源码证据、主机检查、已通过的探针硬件验收与后续阶段。
 
 ## 构建
@@ -139,4 +244,4 @@ python3 tools/sign.py build/uart/probe.itb \
 - 第一个用户程序是 `tools/coachz_init.S` 打包成的静态程序，由 mockfs 当作 `/sbin/launchd` 启动，每 5 秒打印一次 tick。
 - 之后改用 IPSW 的 Update 恢复内存盘作为 APFS 根，运行 Apple 原版 launchd。内核每 60 秒打印一次存活信息和线程状态。
 - SC7180 的虚拟定时器是 INTID 19，不是 ArmCpu 写死的 27，修正后定时器中断才开始工作。
-- prelink 需要用户自己提供 IPSW。IPSW、kernelcache 和合并后的内核都留在被忽略的目录里，不进仓库。
+- prelink 需要自己提供 IPSW。IPSW、kernelcache、合并后的内核和 GPU 固件都留在被忽略的目录里，不进仓库。
