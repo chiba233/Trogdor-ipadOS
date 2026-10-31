@@ -10,12 +10,12 @@
  bsd/dev/unix_startup.c			standard
 --- a/bsd/dev/coachz_gpu.c
 +++ b/bsd/dev/coachz_gpu.c
-@@ -0,0 +1,180 @@
+@@ -0,0 +1,190 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/*
 + * Adreno 618 first stages on Coachz (coachz-gpu=1 inventory, =2 bounded CX + GMU clock window, =3 also the GMU firmware into
 + * TCM, =4 the window plus a read-only GPU SMMU inventory, =5 the GMU's SMMU bank checked by translation, =6 also the firmware started
-+ * up to its init result): maps GCC, GPUCC, the GMU register block and the GPU SMMU, runs
++ * up to its init result, =7 also GX, SPTPRAC, HFI and GPU_SET): maps GCC, GPUCC, the GMU register block and the GPU SMMU, runs
 + * coachz_gpu_run() (coachz_gpu_seq.h) once from the sampler thread and prints what it found and restored. The firmware is /chosen/memory-map CoachzGmuFirmware, placed by tools/xnu_screen.py
 + * --gmu-firmware in the loader's kernel data after the trust cache.
 + */
@@ -75,8 +75,9 @@
 +static void
 +gpu_note(__unused void *cookie, const struct coachz_gpu_report *r)
 +{
-+	printf("COACHZ gpu: step %u next, %u of %u translations right, rsc stop polls %u\n", r->gmu_step, r->ats_right, r->ats_total,
-+	    r->rsc_stop_polls);
++	printf("COACHZ gpu: step %u next, %u of %u translations right, rsc stop polls %u, init 0x%x, boot oob polls %u, sptprac polls %u, hfi start polls %u, %u messages (last %u, version 0x%x), gpu oob polls %u\n",
++	    r->gmu_step, r->ats_right, r->ats_total, r->rsc_stop_polls, r->fw_init, r->oob_boot_polls, r->sptprac_polls, r->hfi_start_polls, r->hfi_done,
++	    r->hfi_id, r->hfi_version, r->oob_gpu_polls);
 +	delay(1500000);
 +}
 +
@@ -117,16 +118,16 @@
 +{
 +	static int started;
 +	unsigned mode = 0;
-+	if (started || !PE_parse_boot_argn("coachz-gpu", &mode, sizeof(mode)) || (mode < 1 || mode > 6)) {
++	if (started || !PE_parse_boot_argn("coachz-gpu", &mode, sizeof(mode)) || (mode < 1 || mode > 7)) {
 +		return;
 +	}
 +	started = 1;
 +	static const struct { vm_offset_t base; vm_size_t size; } blocks[GPU_BLOCKS] = {
 +		[GPU_GCC] = {GPU_GCC_BASE, GPU_GCC_SIZE}, [GPU_CC] = {GPU_CC_BASE, GPU_CC_SIZE}, [GPU_GMU] = {GPU_GMU_BASE, GPU_GMU_SIZE},
 +		[GPU_SMMU] = {GPU_SMMU_BASE, GPU_SMMU_SIZE}, [GPU_PDC] = {GPU_PDC_BASE, GPU_PDC_SIZE},
-+		[GPU_PDC_SEQ] = {GPU_PDC_SEQ_BASE, GPU_PDC_SEQ_SIZE}};
++		[GPU_PDC_SEQ] = {GPU_PDC_SEQ_BASE, GPU_PDC_SEQ_SIZE}, [GPU_CMD_DB] = {GPU_CMD_DB_BASE, GPU_CMD_DB_SIZE}};
 +	for (unsigned i = 0; i < GPU_BLOCKS; i++) {
-+		if (mode < 6 && (i == GPU_PDC || i == GPU_PDC_SEQ)) {
++		if ((mode < 6 && (i == GPU_PDC || i == GPU_PDC_SEQ)) || (mode < 7 && i == GPU_CMD_DB)) {
 +			continue;
 +		}
 +		gpu_window[i] = (uintptr_t)ml_io_map(blocks[i].base, blocks[i].size);
@@ -139,7 +140,7 @@
 +	const struct coachz_gpu_io io = {NULL, gpu_read, gpu_write, gpu_delay, gpu_read64, gpu_write64, pool, gpu_note};
 +	static struct coachz_gpu_report r;
 +	uint32_t image_bytes = 0;
-+	const uint32_t *image = mode == 3 || mode == 6 ? gpu_firmware(&image_bytes) : NULL;
++	const uint32_t *image = mode == 3 || mode >= 6 ? gpu_firmware(&image_bytes) : NULL;
 +	coachz_gpu_run(&io, mode, image, image_bytes, &r);
 +	printf("COACHZ gpu: mode %u stage %u restored %u: %s\n", r.mode, r.stage, r.restored, r.error ? r.error : "ok");
 +	/* GCC: gpll0-mode gpll0-vote branch-vote cfg-ahb memnoc ddrss-axi snoc-dvm */
@@ -171,7 +172,7 @@
 +		    r.gmu_step, r.ats_right, r.ats_total, r.ats_wrong_va, (unsigned long long)r.ats_wrong_par, r.scr0_on, r.scr0_after, r.smmu_gfsr,
 +		    r.smmu_fsr, r.unmap_clean);
 +	}
-+	if (mode == 6 && r.own_rsc) {
++	if (mode >= 6 && r.own_rsc) {
 +		printf("COACHZ gpu: rsc stop polls %u, wake polls %u, stop again polls %u; firmware version 0x%x, init result 0x%x after %u polls of 100 us\n",
 +		    r.rsc_stop_polls, r.rsc_start_polls, r.rsc_stop_polls_end, r.fw_version, r.fw_init, r.fw_init_polls);
 +		/* fw-busy rpmh-power-state ao-host-irq gmu2host-irq */
@@ -180,7 +181,16 @@
 +		    r.smmu_fsynr0, (unsigned long long)r.smmu_far, (unsigned long long)r.fw_log, (unsigned long long)r.fw_hfi,
 +		    (unsigned long long)r.fw_dummy);
 +	}
-+	if ((mode == 3 || mode == 6) && r.tcm_words) {
++	if (mode == 7 && r.fw_init_polls) {
++		printf("COACHZ gpu: cmd db levels gfx %u mx %u cx %u, top vote 0x%x; boot oob polls %u, sptprac polls %u, hfi start polls %u, gpu oob polls %u\n",
++		    r.db_counts[0], r.db_counts[1], r.db_counts[2], r.gx_vote_top, r.oob_boot_polls, r.sptprac_polls, r.hfi_start_polls, r.oob_gpu_polls);
++		printf("COACHZ gpu: hfi %u messages done, last id %u status 0x%x, firmware version 0x%x, firmware error 0x%x\n", r.hfi_done, r.hfi_id, r.hfi_status,
++		    r.hfi_version, r.hfi_fw_error);
++		/* boot: intr-info gx-gdscr rpmh-power-state sptprac; gpu set: intr-info gx-gdscr sptprac rpmh-power-state */
++		gpu_print("gx state", r.gx_state, 8);
++		printf("COACHZ gpu: shutdown sptprac off polls %u, tcs idle %u of 4, gx at the end 0x%x\n", r.sptprac_off_polls, r.tcs_idle, r.gx_end);
++	}
++	if ((mode == 3 || mode >= 6) && r.tcm_words) {
 +		printf("COACHZ gpu: firmware %u bytes fnv 0x%08x, TCM %u words read back fnv 0x%08x, %u mismatches (first %u), cm3 reset after 0x%x\n",
 +		    image_bytes, r.fw_hash, r.tcm_words, r.tcm_hash, r.tcm_mismatches, r.tcm_first_mismatch, r.sysreset_after);
 +	}
@@ -193,7 +203,7 @@
 +}
 --- a/bsd/dev/coachz_gpu_seq.h
 +++ b/bsd/dev/coachz_gpu_seq.h
-@@ -0,0 +1,394 @@
+@@ -0,0 +1,400 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/*
 + * Adreno 618 (SC7180) first bring-up stages: the GPU clock/power inventory, a bounded CX + GMU clock window with full rollback, and
@@ -216,7 +226,7 @@
 +#define COACHZ_GPU_SEQ_H
 +#include <stdint.h>
 +
-+enum { GPU_GCC, GPU_CC, GPU_GMU, GPU_SMMU, GPU_PDC, GPU_PDC_SEQ, GPU_BLOCKS };
++enum { GPU_GCC, GPU_CC, GPU_GMU, GPU_SMMU, GPU_PDC, GPU_PDC_SEQ, GPU_CMD_DB, GPU_BLOCKS };
 +#define GPU_GCC_BASE 0x00100000u
 +#define GPU_GCC_SIZE 0x00080000u
 +#define GPU_CC_BASE 0x05090000u
@@ -229,6 +239,8 @@
 +#define GPU_PDC_SIZE 0x00010000u
 +#define GPU_PDC_SEQ_BASE 0x0b490000u
 +#define GPU_PDC_SEQ_SIZE 0x00010000u
++#define GPU_CMD_DB_BASE 0x80820000u
++#define GPU_CMD_DB_SIZE 0x00020000u
 +
 +/* GCC */
 +#define GCC_GPLL0_MODE 0x00000u          /* bit 31: lock detect */
@@ -338,6 +350,10 @@
 +	uint32_t rsc_stop_polls, rsc_start_polls, rsc_stop_polls_end, votes_before, general7_before;
 +	uint32_t fw_version, fw_init, fw_init_polls, after_start[4], sysreset_stopped;
 +	uint64_t fw_log, fw_hfi, fw_dummy;
++	/* Mode 7: the level table sizes, the top vote, each handshake's polls, HFI's progress, and the machine after each OOB. */
++	unsigned own_gx;
++	uint32_t db_counts[3], gx_vote_top, oob_boot_polls, sptprac_polls, hfi_start_polls, oob_gpu_polls, sptprac_off_polls, tcs_idle, gx_end;
++	uint32_t hfi_seq, hfi_id, hfi_done, hfi_status, hfi_payload, hfi_version, hfi_fw_error, gx_state[8];
 +};
 +
 +static inline uint32_t gpu_fnv(uint32_t hash, uint32_t word) {
@@ -472,7 +488,7 @@
 +    struct coachz_gpu_report *r) {
 +	*r = (struct coachz_gpu_report){0};
 +	r->mode = mode;
-+	if ((mode == 3 || mode == 6) && (!image || image_bytes < 4 || image_bytes > GMU_TCM_BYTES || image_bytes % 4)) {
++	if ((mode == 3 || mode == 6 || mode == 7) && (!image || image_bytes < 4 || image_bytes > GMU_TCM_BYTES || image_bytes % 4)) {
 +		r->error = "no usable GMU firmware: nothing read or changed";
 +		return;
 +	}
@@ -481,7 +497,7 @@
 +	/* GPUCC sits behind the GPU AHB branch: with it stopped, any GPUCC access stalls the bus. */
 +	gpu_snapshot(io, r->gcc_before, r->cc_before, ahb_running);
 +	r->stage = 1;
-+	if (mode < 2 || mode > 6) {
++	if (mode < 2 || mode > 7) {
 +		if (!ahb_running) r->error = "GPU AHB branch off: GPUCC not read";
 +		return;
 +	}
@@ -572,7 +588,7 @@
 +	}
 +	if (mode >= 5) {
 +		gpu_read_smmu(io, r);
-+		if (gmu_map(io, r) && mode == 6) {
++		if (gmu_map(io, r) && mode >= 6) {
 +			gmu_start(io, image, image_bytes, r);
 +		}
 +	}
@@ -590,7 +606,7 @@
 +#endif
 --- a/bsd/dev/coachz_gpu_gmu.h
 +++ b/bsd/dev/coachz_gpu_gmu.h
-@@ -0,0 +1,383 @@
+@@ -0,0 +1,705 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/*
 + * Adreno 618 GMU memory and firmware start (coachz-gpu=5 and 6), inside the CX + GMU clock window of coachz_gpu_seq.h.
@@ -600,6 +616,8 @@
 + * Mode 6, only after every translation came out right: the RSC and PDC sequences, the firmware into TCM and CM3 out of reset until its
 + * init result; CM3 then goes back into reset. No GX, no HFI message, no vote of ours. Everything is undone before CX collapses, except
 + * the PDC's sequence and TCS commands: Linux leaves those programmed too, and nothing starts them while the GPU is off.
++ * Mode 7, only after that init result: the firmware powers GX (the boot OOB with the rail votes from CMD DB), SPTPRAC, the legacy HFI
++ * start with Linux's message order, and the GPU_SET OOB, then Linux's forced shutdown. The GPU core itself is still not touched.
 + *
 + * Values and order follow Linux a6xx_gmu.c, a6xx_gmu.xml, a6xx.xml, arm-smmu.c and io-pgtable-arm.c (reference only, rewritten here).
 + * The SMMU's table walk is not coherent; the pool is mapped uncached, so what is written is what it reads.
@@ -687,6 +705,25 @@
 +#define GMU_FENCE_RANGE ((1u << 31) | (0xau << 18) | 0xa0u)
 +#define GMU_CHIP_ID 0x06018000u          /* chip 0x06010800 in the GMU's layout */
 +#define GMU_INIT_POLLS 1000u             /* of 100 us; Linux waits 10 ms */
++#define GMU_GX_SPTPRAC_POWER_CONTROL 0x204u
++#define GMU_BOOT_SLUMBER_OPTION 0x8fe0u
++#define GMU_GX_VOTE_IDX 0x8fe4u
++#define GMU_MX_VOTE_IDX 0x8fe8u
++#define GMU_PWR_COL_KEEPALIVE 0x1430cu
++#define GMU_HFI_CTRL_STATUS 0x14600u
++#define GMU_HFI_CTRL_INIT 0x14618u
++#define GMU_GMU2HOST_INTR_CLR 0x14644u
++#define GMU_HOST2GMU_INTR_SET 0x14650u
++#define GMU_AO_AHB_FENCE_CTRL 0x24c40u
++#define GMU_AHB_FENCE_STATUS_CLR 0x24c50u
++#define GMU_INTR_MSGQ 1u
++#define GMU_OOB_BOOT_SET 22u
++#define GMU_OOB_BOOT_ACK 30u
++#define GMU_OOB_GPU_SET 16u
++#define GMU_OOB_GPU_ACK 24u
++#define GMU_BOOT_COLD 1u
++#define GMU_IOVA_DEBUG 0x60001000u
++#define GMU_DEBUG_BYTES 0x4000u
 +
 +/* The RSC, in the always-on part of the GMU's block: a6xx_gmu.xml dword offset * 4 + 0x23000. */
 +#define RSCC(reg) (0x23000u + (reg) * 4u)
@@ -716,6 +753,40 @@
 +#define PDC_TCS3_CMD0 0x5764u
 +#define PDC_MSGID 0x10108u
 +#define PDC_ADDR_GFX 0x30090u            /* a618's level resource */
++
++/* HFI: the table, two queue headers, then a 4 KiB queue each (a6xx_hfi.c, legacy). Offsets from the pool. */
++#define HFI_CMD_HEADER (GMU_POOL_HFI + 24u)
++#define HFI_RSP_HEADER (HFI_CMD_HEADER + 48u)
++#define HFI_CMD_DATA (GMU_POOL_HFI + 0x1000u)
++#define HFI_RSP_DATA (GMU_POOL_HFI + 0x2000u)
++#define HFI_QUEUE_WORDS 1024u
++#define HFI_READ_INDEX 40u
++#define HFI_WRITE_INDEX 44u
++#define HFI_RESPONSE_WORDS 19u
++#define HFI_MSG_INIT 0u
++#define HFI_MSG_FW_VERSION 1u
++#define HFI_MSG_BW_TABLE 3u
++#define HFI_MSG_PERF_TABLE 4u
++#define HFI_MSG_TEST 5u
++#define HFI_MSG_ERROR 100u
++#define HFI_BW_DWORDS 160u
++#define HFI_PERF_DWORDS 43u
++
++/* CMD DB, the always-on processor's table of RPMh resources (sc7180.dtsi aop_cmd_db_mem; layout from Linux cmd-db.c). */
++#define CMD_DB_MAGIC 0x0c0330dbu
++#define CMD_DB_DATA 0x90u
++#define CMD_DB_RSCS 8u
++#define CMD_DB_ENTRY 24u
++/* Resource names as two little-endian words. */
++#define CMD_DB_GFX_LVL 0x2e786667u, 0x006c766cu
++#define CMD_DB_MX_LVL 0x6c2e786du, 0x00006c76u
++#define CMD_DB_CX_LVL 0x6c2e7863u, 0x00006c76u
++#define GMU_LEVELS_GX 8u
++#define GMU_LEVELS_CX 2u
++/* This board's OPP tables as Debian reads them (opp-825000000 needs a higher speed bin), with the "off" level Linux adds first. */
++static const struct { uint32_t khz, level; } gmu_gx_levels[GMU_LEVELS_GX] = {{0, 0}, {180000, 48}, {267000, 64}, {355000, 128}, {430000, 192},
++    {565000, 256}, {650000, 320}, {800000, 384}};
++static const struct { uint32_t khz, level; } gmu_cx_levels[GMU_LEVELS_CX] = {{0, 0}, {200000, 48}};
 +
 +static inline uint64_t gmu_bank(const struct coachz_gpu_report *r) {
 +	return (uint64_t)r->smmu_bank_base + GMU_BANK * (uint64_t)r->smmu_page;
@@ -900,6 +971,260 @@
 +	return idle != 0;
 +}
 +
++static inline uint32_t gmu_poll_long(const struct coachz_gpu_io *io, uint32_t offset, uint32_t mask, uint32_t want) {
++	for (uint32_t i = 1; i <= GMU_INIT_POLLS; i++) {
++		if ((gpu_r(io, GPU_GMU, offset) & mask) == want) return i;
++		io->delay_us(io->cookie, 100);
++	}
++	return 0;
++}
++
++static inline uint32_t gmu_mem_r(const struct coachz_gpu_io *io, uint32_t at) {
++	return ((volatile uint32_t *)io->pool)[at / 4u];
++}
++static inline void gmu_mem_w(const struct coachz_gpu_io *io, uint32_t at, uint32_t value) {
++	((volatile uint32_t *)io->pool)[at / 4u] = value;
++}
++
++static inline uint32_t gmu_db_u16(const struct coachz_gpu_io *io, uint32_t at) {
++	return (gpu_r(io, GPU_CMD_DB, at & ~3u) >> ((at & 2u) * 8u)) & 0xffffu;
++}
++
++/* A resource's table of 16-bit levels: its offset and count, or 0 when it is absent or out of bounds. */
++static inline uint32_t gmu_db_find(const struct coachz_gpu_io *io, uint32_t name0, uint32_t name1, uint32_t *count) {
++	for (uint32_t i = 0; i < CMD_DB_RSCS; i++) {
++		const uint32_t rsc = 8u + 16u * i;
++		if (!gmu_db_u16(io, rsc)) break;
++		const uint32_t headers = CMD_DB_DATA + gmu_db_u16(io, rsc + 2u), data = CMD_DB_DATA + gmu_db_u16(io, rsc + 4u);
++		const uint32_t entries = gmu_db_u16(io, rsc + 6u);
++		for (uint32_t j = 0; j < entries; j++) {
++			const uint32_t entry = headers + j * CMD_DB_ENTRY;
++			if (entry + CMD_DB_ENTRY > GPU_CMD_DB_SIZE) return 0;
++			if (gpu_r(io, GPU_CMD_DB, entry) != name0 || gpu_r(io, GPU_CMD_DB, entry + 4u) != name1) continue;
++			const uint32_t bytes = gmu_db_u16(io, entry + 20u), at = data + gmu_db_u16(io, entry + 22u);
++			if (!bytes || (at & 1u) || at + bytes > GPU_CMD_DB_SIZE) return 0;
++			*count = bytes / 2u;
++			return at;
++		}
++	}
++	return 0;
++}
++
++/* One level's vote: the level's value, the secondary rail's index and the primary rail's index (a6xx_gmu_rpmh_arc_votes_init). */
++static inline int gmu_arc_vote(const struct coachz_gpu_io *io, uint32_t pri, uint32_t pri_count, uint32_t sec, uint32_t sec_count,
++    uint32_t level, uint32_t *vote) {
++	uint32_t pindex = pri_count, sindex = 0;
++	for (uint32_t j = 0; j < pri_count; j++) {
++		if (gmu_db_u16(io, pri + 2u * j) >= level) {
++			pindex = j;
++			break;
++		}
++	}
++	if (pindex == pri_count) return 0;
++	for (uint32_t j = 0; j < sec_count; j++) {
++		const uint32_t value = gmu_db_u16(io, sec + 2u * j);
++		if (value >= level) {
++			sindex = j;
++			break;
++		}
++		if (value) sindex = j;
++	}
++	*vote = gmu_db_u16(io, pri + 2u * pindex) << 16 | sindex << 8 | pindex;
++	return 1;
++}
++
++/* The rail votes for every level; 1 on done. */
++static inline int gmu_build_votes(const struct coachz_gpu_io *io, struct coachz_gpu_report *r, uint32_t *gx, uint32_t *cx) {
++	uint32_t gfx_count = 0, mx_count = 0, cx_count = 0;
++	if (gpu_r(io, GPU_CMD_DB, 4u) != CMD_DB_MAGIC) {
++		r->error = "CMD DB magic differs";
++		return 0;
++	}
++	const uint32_t gfx_at = gmu_db_find(io, CMD_DB_GFX_LVL, &gfx_count), mx_at = gmu_db_find(io, CMD_DB_MX_LVL, &mx_count);
++	const uint32_t cx_at = gmu_db_find(io, CMD_DB_CX_LVL, &cx_count);
++	r->db_counts[0] = gfx_count;
++	r->db_counts[1] = mx_count;
++	r->db_counts[2] = cx_count;
++	if (!gfx_at || !mx_at || !cx_at) {
++		r->error = "CMD DB lacks a rail level table";
++		return 0;
++	}
++	for (unsigned i = 0; i < GMU_LEVELS_GX; i++) {
++		if (!gmu_arc_vote(io, gfx_at, gfx_count, mx_at, mx_count, gmu_gx_levels[i].level, &gx[i])) {
++			r->error = "a GX level is not in CMD DB";
++			return 0;
++		}
++	}
++	for (unsigned i = 0; i < GMU_LEVELS_CX; i++) {
++		if (!gmu_arc_vote(io, cx_at, cx_count, mx_at, mx_count, gmu_cx_levels[i].level, &cx[i])) {
++			r->error = "a CX level is not in CMD DB";
++			return 0;
++		}
++	}
++	return 1;
++}
++
++static inline void gmu_hfi_queue(const struct coachz_gpu_io *io, uint32_t header, uint32_t iova, uint32_t id) {
++	gmu_mem_w(io, header, 1u);                  /* status */
++	gmu_mem_w(io, header + 4u, iova);
++	gmu_mem_w(io, header + 8u, 10u << 8 | id);  /* type */
++	gmu_mem_w(io, header + 12u, HFI_QUEUE_WORDS);
++	gmu_mem_w(io, header + 24u, 1u);            /* rx watermark */
++	gmu_mem_w(io, header + 28u, 1u);            /* tx watermark */
++	gmu_mem_w(io, header + 32u, 1u);            /* rx request */
++}
++
++/* The queue table the firmware finds at HFI_QTBL_ADDR; the pool is already zero. */
++static inline void gmu_hfi_table(const struct coachz_gpu_io *io) {
++	gmu_mem_w(io, GMU_POOL_HFI + 4u, 24u + 2u * 48u);   /* size, as Linux writes it */
++	gmu_mem_w(io, GMU_POOL_HFI + 8u, 24u >> 2);         /* first queue header */
++	gmu_mem_w(io, GMU_POOL_HFI + 12u, 48u >> 2);        /* queue header size */
++	gmu_mem_w(io, GMU_POOL_HFI + 16u, 2u);              /* queues */
++	gmu_mem_w(io, GMU_POOL_HFI + 20u, 2u);              /* active queues */
++	gmu_hfi_queue(io, HFI_CMD_HEADER, GMU_IOVA_HFI + 0x1000u, 0);
++	gmu_hfi_queue(io, HFI_RSP_HEADER, GMU_IOVA_HFI + 0x2000u, 4u);
++}
++
++/* One command and its acknowledgement; msg[0] is filled in. 1 on done. */
++static inline int gmu_hfi_send(const struct coachz_gpu_io *io, struct coachz_gpu_report *r, uint32_t id, uint32_t *msg, uint32_t dwords) {
++	const uint32_t seq = ++r->hfi_seq;
++	r->hfi_id = id;
++	msg[0] = seq << 20 | dwords << 8 | id;
++	uint32_t at = gmu_mem_r(io, HFI_CMD_HEADER + HFI_WRITE_INDEX);
++	for (uint32_t i = 0; i < dwords; i++) {
++		gmu_mem_w(io, HFI_CMD_DATA + at * 4u, msg[i]);
++		at = (at + 1u) % HFI_QUEUE_WORDS;
++	}
++	gmu_mem_w(io, HFI_CMD_HEADER + HFI_WRITE_INDEX, at);
++	gpu_w(io, GPU_GMU, GMU_HOST2GMU_INTR_SET, 1u);
++	if (!gmu_poll_long(io, GMU_GMU2HOST_INTR_INFO, GMU_INTR_MSGQ, GMU_INTR_MSGQ)) {
++		r->error = "an HFI message got no response";
++		return 0;
++	}
++	gpu_w(io, GPU_GMU, GMU_GMU2HOST_INTR_CLR, GMU_INTR_MSGQ);
++	for (unsigned tries = 0; tries < 8u; tries++) {
++		uint32_t read = gmu_mem_r(io, HFI_RSP_HEADER + HFI_READ_INDEX), response[HFI_RESPONSE_WORDS] = {0};
++		if (read == gmu_mem_r(io, HFI_RSP_HEADER + HFI_WRITE_INDEX) || read >= HFI_QUEUE_WORDS) break;
++		const uint32_t size = (gmu_mem_r(io, HFI_RSP_DATA + read * 4u) >> 8) & 0xffu;
++		if (!size || size > HFI_RESPONSE_WORDS) {
++			r->error = "an HFI response has an impossible size";
++			return 0;
++		}
++		for (uint32_t i = 0; i < size; i++) {
++			response[i] = gmu_mem_r(io, HFI_RSP_DATA + read * 4u);
++			read = (read + 1u) % HFI_QUEUE_WORDS;
++		}
++		gmu_mem_w(io, HFI_RSP_HEADER + HFI_READ_INDEX, read);
++		if ((response[0] & 0xffu) == HFI_MSG_ERROR) {
++			r->hfi_fw_error = response[1];
++			continue;
++		}
++		if (((response[1] >> 20) & 0xfffu) != seq) continue;
++		r->hfi_status = response[2];
++		if (response[2]) {
++			r->error = "the firmware refused an HFI message";
++			return 0;
++		}
++		r->hfi_payload = response[3];
++		r->hfi_done++;
++		return 1;
++	}
++	r->error = "the HFI response queue held no answer";
++	return 0;
++}
++
++/* a6xx_hfi_start_v1's messages. a618's GMU does no bus scaling: one "off" DDR level and the fixed CNOC votes. */
++static inline int gmu_hfi_messages(const struct coachz_gpu_io *io, struct coachz_gpu_report *r, const uint32_t *gx, const uint32_t *cx) {
++	uint32_t init[5] = {0, 0, GMU_IOVA_DEBUG, GMU_DEBUG_BYTES, GMU_BOOT_COLD};
++	if (!gmu_hfi_send(io, r, HFI_MSG_INIT, init, 5u)) return 0;
++	uint32_t version[2] = {0, 1u << 28 | 1u << 19 | 1u << 17};
++	if (!gmu_hfi_send(io, r, HFI_MSG_FW_VERSION, version, 2u)) return 0;
++	r->hfi_version = r->hfi_payload;
++	uint32_t perf[HFI_PERF_DWORDS] = {0, GMU_LEVELS_GX, GMU_LEVELS_CX};
++	for (unsigned i = 0; i < GMU_LEVELS_GX; i++) {
++		perf[3u + 2u * i] = gx[i];
++		perf[4u + 2u * i] = gmu_gx_levels[i].khz;
++	}
++	for (unsigned i = 0; i < GMU_LEVELS_CX; i++) {
++		perf[35u + 2u * i] = cx[i];
++		perf[36u + 2u * i] = gmu_cx_levels[i].khz;
++	}
++	if (!gmu_hfi_send(io, r, HFI_MSG_PERF_TABLE, perf, HFI_PERF_DWORDS)) return 0;
++	/* header, level count, CNOC and DDR command counts and wait masks, then the CNOC addresses [6] and data [2][6], the DDR addresses [8] and data [16][8]. */
++	uint32_t bw[HFI_BW_DWORDS] = {0, 1u, 1u, 3u, 1u, 1u};
++	bw[6] = 0x5007cu;
++	bw[12] = 0x40000000u;
++	bw[18] = 0x60000001u;
++	bw[24] = 0x50000u;
++	bw[25] = 0x5003cu;
++	bw[26] = 0x5000cu;
++	bw[32] = bw[33] = bw[34] = 0x40000000u;
++	if (!gmu_hfi_send(io, r, HFI_MSG_BW_TABLE, bw, HFI_BW_DWORDS)) return 0;
++	uint32_t test[1] = {0};
++	return gmu_hfi_send(io, r, HFI_MSG_TEST, test, 1u);
++}
++
++/* Mode 7, the firmware's init result in hand: GX, SPTPRAC, HFI and GPU_SET, in a6xx_gmu_resume's order. */
++static inline void gmu_bring_up_gx(const struct coachz_gpu_io *io, struct coachz_gpu_report *r) {
++	uint32_t gx[GMU_LEVELS_GX], cx[GMU_LEVELS_CX];
++	if (!gmu_build_votes(io, r, gx, cx)) return;
++	r->gx_vote_top = gx[GMU_LEVELS_GX - 1u];
++	gmu_note(io, r, 5);
++	/* Linux's "default" level: the highest this board has. */
++	gpu_w(io, GPU_GMU, GMU_BOOT_SLUMBER_OPTION, 0);
++	gpu_w(io, GPU_GMU, GMU_GX_VOTE_IDX, r->gx_vote_top & 0xffu);
++	gpu_w(io, GPU_GMU, GMU_MX_VOTE_IDX, (r->gx_vote_top >> 8) & 0xffu);
++	r->own_gx = 1;
++	gpu_w(io, GPU_GMU, GMU_HOST2GMU_INTR_SET, 1u << GMU_OOB_BOOT_SET);
++	r->oob_boot_polls = gmu_poll_long(io, GMU_GMU2HOST_INTR_INFO, 1u << GMU_OOB_BOOT_ACK, 1u << GMU_OOB_BOOT_ACK);
++	r->gx_state[0] = gpu_r(io, GPU_GMU, GMU_GMU2HOST_INTR_INFO);
++	gpu_w(io, GPU_GMU, GMU_GMU2HOST_INTR_CLR, 1u << GMU_OOB_BOOT_ACK);
++	r->gx_state[1] = gpu_r(io, GPU_CC, GPUCC_GX_GDSCR);
++	r->gx_state[2] = gpu_r(io, GPU_GMU, GMU_RPMH_POWER_STATE);
++	if (!r->oob_boot_polls) {
++		r->error = "the firmware did not acknowledge the boot OOB";
++		return;
++	}
++	gpu_w(io, GPU_GMU, GMU_GX_SPTPRAC_POWER_CONTROL, 0x778000u);
++	r->sptprac_polls = gpu_poll(io, GPU_GMU, GMU_SPTPRAC_PWR_CLK_STATUS, 0x38u, 0x28u);
++	r->gx_state[3] = gpu_r(io, GPU_GMU, GMU_SPTPRAC_PWR_CLK_STATUS);
++	gpu_w(io, GPU_GMU, GMU_HFI_CTRL_INIT, 1u);
++	r->hfi_start_polls = gmu_poll_long(io, GMU_HFI_CTRL_STATUS, 1u, 1u);
++	if (!r->hfi_start_polls) {
++		r->error = "the HFI queues did not start";
++		return;
++	}
++	gmu_note(io, r, 6);
++	if (!gmu_hfi_messages(io, r, gx, cx)) return;
++	gmu_note(io, r, 7);
++	gpu_w(io, GPU_GMU, GMU_HOST2GMU_INTR_SET, 1u << GMU_OOB_GPU_SET);
++	r->oob_gpu_polls = gmu_poll_long(io, GMU_GMU2HOST_INTR_INFO, 1u << GMU_OOB_GPU_ACK, 1u << GMU_OOB_GPU_ACK);
++	r->gx_state[4] = gpu_r(io, GPU_GMU, GMU_GMU2HOST_INTR_INFO);
++	gpu_w(io, GPU_GMU, GMU_GMU2HOST_INTR_CLR, 1u << GMU_OOB_GPU_ACK);
++	r->gx_state[5] = gpu_r(io, GPU_CC, GPUCC_GX_GDSCR);
++	r->gx_state[6] = gpu_r(io, GPU_GMU, GMU_SPTPRAC_PWR_CLK_STATUS);
++	r->gx_state[7] = gpu_r(io, GPU_GMU, GMU_RPMH_POWER_STATE);
++	if (!r->oob_gpu_polls) {
++		r->error = "the firmware did not acknowledge GPU_SET";
++		return;
++	}
++	gpu_w(io, GPU_GMU, GMU_HOST2GMU_INTR_SET, 1u << GMU_OOB_GPU_ACK);   /* the OOB cleared again: nothing uses the GPU */
++}
++
++/* Linux's a6xx_gmu_force_off without the GPU core's own registers, which nothing has touched. */
++static inline void gmu_gx_shutdown(const struct coachz_gpu_io *io, struct coachz_gpu_report *r) {
++	static const uint32_t tcs[4] = {RSCC(0x346u), RSCC(0x3eeu), RSCC(0x496u), RSCC(0x53eu)};
++	gpu_w(io, GPU_GMU, GMU_PWR_COL_KEEPALIVE, 0);
++	gpu_w(io, GPU_CC, GPUCC_GX_GDSCR, gpu_r(io, GPU_CC, GPUCC_GX_GDSCR) | (1u << 11));   /* retention, then SPTP off */
++	gpu_w(io, GPU_GMU, GMU_GX_SPTPRAC_POWER_CONTROL, 0x778001u);
++	r->sptprac_off_polls = gmu_poll_long(io, GMU_SPTPRAC_PWR_CLK_STATUS, 4u, 4u);
++	for (unsigned i = 0; i < 4u; i++) {
++		if (gmu_poll_long(io, tcs[i], 1u, 1u)) r->tcs_idle++;
++	}
++	gpu_w(io, GPU_GMU, GMU_AHB_FENCE_STATUS_CLR, 7u);
++	gpu_w(io, GPU_GMU, GMU_AO_AHB_FENCE_CTRL, 0);
++}
++
 +/* Mode 6, the bank live: everything up to the firmware's init result, then CM3 back in reset. */
 +static inline void gmu_start(const struct coachz_gpu_io *io, const uint32_t *image, uint32_t image_bytes, struct coachz_gpu_report *r) {
 +	if (!(r->gmu[0] & 1u)) {
@@ -931,6 +1256,7 @@
 +	gpu_w(io, GPU_GMU, GMU_RPMH_CTRL, r->votes_before | GMU_RPMH_CTRL_VOTES);
 +	r->fw_version = gpu_r(io, GPU_GMU, GMU_FW_VERSION_AT);
 +	const uint32_t mask = r->fw_version <= 0x20010004u ? ~0u : 0x1ffu, want = r->fw_version <= 0x20010004u ? 0xbabefaceu : 0x100u;
++	if (r->mode >= 7) gmu_hfi_table(io);
 +	gmu_note(io, r, 4);
 +	gpu_w(io, GPU_GMU, GMU_CM3_SYSRESET, 1u);
 +	gpu_w(io, GPU_GMU, GMU_PWR_COL_CP_RESP, 0);
@@ -945,6 +1271,7 @@
 +		io->delay_us(io->cookie, 100);
 +	}
 +	if (!r->fw_init_polls) r->error = "GMU firmware init result never came";
++	if (r->mode >= 7 && r->fw_init_polls) gmu_bring_up_gx(io, r);
 +	/* What the firmware did to the rest of the machine in that time. */
 +	const uint32_t bank = (uint32_t)gmu_bank(r);
 +	r->after_start[0] = gpu_r(io, GPU_GMU, GMU_CM3_FW_BUSY);
@@ -960,8 +1287,12 @@
 +	r->fw_dummy = io->pool[GMU_POOL_DUMMY / 8u];
 +}
 +
-+/* Undoes what modes 5 and 6 did, inside the window: CM3 first, because it is the one using everything else. */
++/* Undoes what modes 5 to 7 did, inside the window: CM3 first, because it is the one using everything else. */
 +static inline void gmu_undo(const struct coachz_gpu_io *io, struct coachz_gpu_report *r) {
++	if (r->own_gx) {
++		gmu_note(io, r, 8);
++		gmu_gx_shutdown(io, r);
++	}
 +	if (r->own_cm3) {
 +		gpu_w(io, GPU_GMU, GMU_CM3_SYSRESET, 1u);
 +		r->sysreset_stopped = gpu_r(io, GPU_GMU, GMU_CM3_SYSRESET);
@@ -970,6 +1301,13 @@
 +		r->rsc_stop_polls_end = gmu_rsc_stop(io);
 +		gpu_w(io, GPU_GMU, GMU_RPMH_CTRL, r->votes_before);
 +		gpu_w(io, GPU_GMU, GMU_GENERAL_7, r->general7_before);
++	}
++	if (r->own_gx) {
++		/* The GX domain off before CX, as Linux drops its GX reference; the retention bit back as it was. */
++		r->gx_end = gpu_r(io, GPU_CC, GPUCC_GX_GDSCR);
++		gpu_w(io, GPU_CC, GPUCC_GX_GDSCR, r->gx_end | GDSC_SW_COLLAPSE);
++		io->delay_us(io->cookie, 500);
++		gpu_w(io, GPU_CC, GPUCC_GX_GDSCR, r->cc_before[2]);
 +	}
 +	if (r->own_smmu) gmu_unmap(io, r);
 +}

@@ -1303,3 +1303,18 @@ k54 起第一帧之后屏幕不再显示诊断文字（`coachz-console-band=0`�
 - 收尾：CM3 回到复位，`mode 6 stage 7 restored 1: ok`。GCC 和 GPUCC 回到启动前的值，RCG 配置和 cx-gmu 的 wake/sleep 字段除外。系统照常运行到日志结束（144 秒），没有 `@crash`。
 
 没有点亮 GX，没有发送任何 HFI 消息，GPU 核心没有执行任何东西，渲染仍然在 CPU 上。
+
+## GX 上电和 HFI（k66）
+
+`coachz-gpu=7`，说明在 `docs/plans/gpu.md`。
+
+- CMD DB：`gfx`、`mx`、`cx` 各 16 档。800 MHz 对应等级 384，投票 `0x1800307`，即 GX 索引 7、MX 索引 3。
+- `BOOT_SLUMBER` OOB：第 8 次轮询（约 800 µs）确认。INTR_INFO `0x40000000`，GX GDSCR `0xf8222000`（已上电），RPMH 电源状态 `0xf`，SPTPRAC 状态 `0x28`。
+- SPTPRAC：第 1 次轮询就绪。HFI 队列：第 2 次轮询启动。
+- HFI：`GMU_INIT`、`FW_VERSION`、`PERF_TABLE`、`BW_TABLE`、`TEST` 5 条全部成功，状态 0，固件版本 `0x10060000`，没有固件错误。固件能读到命令队列并写回响应，所以这一次证明了它经 SMMU 访问内存的路径。全程 gfsr 0，fsr `0x400`（只有 FORMAT 字段），FAR 和 FSYNR0 都是 0。
+- `GPU_SET` OOB：第 2 次轮询确认。INTR_INFO `0x01000000`，RPMH 电源状态变为 0。
+- 收尾：SPTPRAC 关闭用 2 次轮询，4 个 TCS 全部空闲，CM3 回到复位，`mode 7 stage 7 restored 1: ok`。GCC 和 GPUCC 回到启动前的值，RCG 配置和 cx-gmu 的 wake/sleep 字段除外，GX GDSCR 回到 `0x00222001`。系统照常运行到日志结束（127 秒），触摸有报告，没有 `@crash`。
+
+没有碰 GPU 核心寄存器，没有写 SQE 固件，CP 没有启动，GPU 没有执行任何命令，渲染仍然在 CPU 上。GPU 频率也没有设置，投票值只是电压档。
+
+同一次在 Debian 上只读确认：这台的设备树写着 `qcom/sc7180-trogdor/modem/{mba,qdsp6sw}.mbn` 和 `qcom,gsi-loader = "modem"`，文件都在，MPSS 运行中，`wlan0` 已启动。这是后面 Wi-Fi 的对照基准。

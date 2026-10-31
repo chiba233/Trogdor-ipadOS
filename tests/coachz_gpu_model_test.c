@@ -14,6 +14,9 @@ static uint32_t smmu_idr1, smmu_reads;
 static uint32_t smmu[GPU_SMMU_SIZE / 4], gmu_regs[GPU_GMU_SIZE / 4], pdc[GPU_PDC_SIZE / 4], pdc_seq[GPU_PDC_SEQ_SIZE / 4];
 static uint64_t pool[GMU_POOL_BYTES / 8];
 static int gmu_live, fw_silent, wrong_walk, released_early, notes;
+/* Mode 7: CMD DB, and the firmware: it reads the queue table and answers every message after checking it. */
+static uint32_t cmd_db[GPU_CMD_DB_SIZE / 4], hfi_ids[8], hfi_count, hfi_seq_seen, gx_allowed, no_boot_ack, refuse_message, table_good;
+static uint32_t perf_top_vote, perf_top_khz, perf_counts, perf_cx_khz, bw_first_ddr, bw_cnoc_second, init_debug, init_boot, gpu_set_seen;
 #define MODEL_BANK (0x8000u + GMU_BANK * 0x1000u)
 
 static uint32_t *slot(unsigned block, uint32_t offset) {
@@ -34,6 +37,10 @@ static void tick(void) {
 static uint32_t model_read(void *cookie, unsigned block, uint32_t offset) {
 	(void)cookie;
 	if (block == GPU_CC && !ahb_on()) { faults++; return 0xffffffffu; }
+	if (block == GPU_CMD_DB) {
+		if (offset >= GPU_CMD_DB_SIZE || offset % 4 || !gx_allowed) { faults++; return 0; }
+		return cmd_db[offset / 4];
+	}
 	if (block == GPU_SMMU) {
 		/* CX is its power domain; memnoc (bus) and cfg-ahb (iface) its clocks. */
 		if (!ahb_on() || !cx_on() || !(gcc[GCC_GPU_MEMNOC_GFX / 4] & CBCR_ENABLE) || offset >= GPU_SMMU_SIZE || offset % 4) {
@@ -98,6 +105,70 @@ static void model_write64(void *cookie, unsigned block, uint32_t offset, uint64_
 
 static void model_note(void *cookie, const struct coachz_gpu_report *r) { (void)cookie; (void)r; notes++; }
 
+static uint32_t mem32(uint32_t at) { return ((uint32_t *)pool)[at / 4]; }
+static void mem32_set(uint32_t at, uint32_t value) { ((uint32_t *)pool)[at / 4] = value; }
+
+/* The firmware's view of the table: everything Linux writes, at the addresses the bank translates. */
+static void firmware_reads_table(void) {
+	const uint32_t q0 = GMU_POOL_HFI + 24u, q1 = q0 + 48u;
+	table_good = gmu_regs[GMU_HFI_QTBL_ADDR / 4] == GMU_IOVA_HFI && !mem32(GMU_POOL_HFI) && mem32(GMU_POOL_HFI + 4) == 120 && mem32(GMU_POOL_HFI + 8) == 6 &&
+	    mem32(GMU_POOL_HFI + 12) == 12 && mem32(GMU_POOL_HFI + 16) == 2 && mem32(GMU_POOL_HFI + 20) == 2 && mem32(q0) == 1 && mem32(q0 + 4) == GMU_IOVA_HFI + 0x1000u &&
+	    mem32(q0 + 8) == 0xa00u && mem32(q0 + 12) == 1024 && mem32(q0 + 32) == 1 && mem32(q1 + 4) == GMU_IOVA_HFI + 0x2000u && mem32(q1 + 8) == 0xa04u && mem32(q1 + 12) == 1024;
+	if (!table_good) faults++;
+}
+
+/* One command out of the queue, checked; its acknowledgement into the response queue, with a firmware error message first once. */
+static void firmware_takes_message(void) {
+	const uint32_t q0 = GMU_POOL_HFI + 24u, q1 = q0 + 48u, data = GMU_POOL_HFI + 0x1000u, rsp = GMU_POOL_HFI + 0x2000u;
+	uint32_t read = mem32(q0 + 40), out = mem32(q1 + 44);
+	if (read == mem32(q0 + 44)) { faults++; return; }
+	const uint32_t header = mem32(data + read * 4), id = header & 0xffu, dwords = header >> 8 & 0xffu;
+	const uint32_t expected = id == HFI_MSG_INIT ? 5u : id == HFI_MSG_FW_VERSION ? 2u : id == HFI_MSG_PERF_TABLE ? HFI_PERF_DWORDS : id == HFI_MSG_BW_TABLE ? HFI_BW_DWORDS : 1u;
+	if (dwords != expected || header >> 16 & 0xfu || (header >> 20) != hfi_seq_seen + 1) faults++;
+	hfi_seq_seen = header >> 20;
+	if (hfi_count < 8) hfi_ids[hfi_count++] = id;
+	if (id == HFI_MSG_INIT) { init_debug = mem32(data + (read + 2) * 4); init_boot = mem32(data + (read + 4) * 4); }
+	if (id == HFI_MSG_PERF_TABLE) {
+		perf_counts = mem32(data + (read + 1) * 4) << 8 | mem32(data + (read + 2) * 4);
+		perf_top_vote = mem32(data + (read + 3 + 2 * 7) * 4);
+		perf_top_khz = mem32(data + (read + 4 + 2 * 7) * 4);
+		perf_cx_khz = mem32(data + (read + 36 + 2) * 4);
+	}
+	if (id == HFI_MSG_BW_TABLE) { bw_first_ddr = mem32(data + (read + 24) * 4); bw_cnoc_second = mem32(data + (read + 18) * 4); }
+	mem32_set(q0 + 40, (read + dwords) % 1024);
+	const uint32_t words[4] = {126u | 4u << 8 | (hfi_count << 20), header, id == refuse_message ? 7u : 0u, id == HFI_MSG_FW_VERSION ? 0x10a20000u : 0u};
+	if (id == HFI_MSG_INIT) {   /* an unrelated firmware error comes first and must be skipped */
+		const uint32_t error[2] = {HFI_MSG_ERROR | 2u << 8, 0x55u};
+		for (unsigned i = 0; i < 2; i++) { mem32_set(rsp + out * 4, error[i]); out = (out + 1) % 1024; }
+	}
+	for (unsigned i = 0; i < 4; i++) { mem32_set(rsp + out * 4, words[i]); out = (out + 1) % 1024; }
+	mem32_set(q1 + 44, out);
+	gmu_regs[GMU_GMU2HOST_INTR_INFO / 4] |= GMU_INTR_MSGQ;
+}
+
+static void db_put16(uint32_t at, uint32_t value) {
+	cmd_db[at / 4] = (cmd_db[at / 4] & ~(0xffffu << ((at & 2u) * 8u))) | value << ((at & 2u) * 8u);
+}
+
+/* One slave with three rail tables, in Linux cmd-db.c's layout. */
+static void db_build(void) {
+	static const uint16_t gfx[] = {0, 16, 48, 64, 128, 192, 256, 320, 384, 416}, mx[] = {16, 48, 128, 192, 256, 320, 384, 416}, cx[] = {0, 16, 48, 64, 128, 192, 256, 320, 384};
+	static const struct { uint32_t name0, name1; const uint16_t *levels; uint32_t count; } tables[3] = {{CMD_DB_GFX_LVL, gfx, 10}, {CMD_DB_MX_LVL, mx, 8}, {CMD_DB_CX_LVL, cx, 9}};
+	const uint32_t rsc = 8u, headers = CMD_DB_DATA + 0x10u, data = CMD_DB_DATA + 0x100u;
+	cmd_db[1] = CMD_DB_MAGIC;
+	db_put16(rsc, 3); db_put16(rsc + 2, 0x10); db_put16(rsc + 4, 0x100); db_put16(rsc + 6, 3);
+	uint32_t used = 0;
+	for (unsigned i = 0; i < 3; i++) {
+		const uint32_t entry = headers + i * CMD_DB_ENTRY;
+		cmd_db[entry / 4] = tables[i].name0;
+		cmd_db[entry / 4 + 1] = tables[i].name1;
+		db_put16(entry + 20, tables[i].count * 2);
+		db_put16(entry + 22, used);
+		for (uint32_t j = 0; j < tables[i].count; j++) db_put16(data + used + j * 2, tables[i].levels[j]);
+		used += tables[i].count * 2;
+	}
+}
+
 static void branch(uint32_t *reg, uint32_t value, int voted) {
 	*reg = value;
 	if (voted) return;
@@ -116,9 +187,29 @@ static void model_write(void *cookie, unsigned block, uint32_t offset, uint32_t 
 		if (!gmu_live) faults++; else if (block == GPU_PDC) pdc[offset / 4] = value; else pdc_seq[offset / 4] = value;
 		return;
 	}
-	if (block == GPU_GMU && gmu_live && (offset < GMU_CM3_ITCM || offset >= GMU_CM3_ITCM + GMU_TCM_BYTES)) {
+	if (block == GPU_CMD_DB) { faults++; return; }   /* read only */
+	if (block == GPU_GMU && gmu_live && (offset < GMU_CM3_ITCM || offset >= GMU_CM3_ITCM + GMU_TCM_BYTES || (gx_allowed && !(sysreset & 1u) && offset >= GMU_BOOT_SLUMBER_OPTION && offset <= GMU_MX_VOTE_IDX))) {
 		if (!cx_on() || (cc[GPUCC_CX_GMU / 4] & CBCR_CLK_OFF)) faults++;
 		gmu_regs[offset / 4] = value;
+		if (offset == GMU_HOST2GMU_INTR_SET) {
+			if (sysreset & 1u) faults++;   /* a stopped firmware cannot answer */
+			if (value == 1u << GMU_OOB_BOOT_SET) {
+				if (!no_boot_ack) {
+					gmu_regs[GMU_GMU2HOST_INTR_INFO / 4] |= 1u << GMU_OOB_BOOT_ACK;
+					cc[GPUCC_GX_GDSCR / 4] &= ~GDSC_SW_COLLAPSE;
+				}
+			} else if (value == 1u << GMU_OOB_GPU_SET) {
+				gmu_regs[GMU_GMU2HOST_INTR_INFO / 4] |= 1u << GMU_OOB_GPU_ACK;
+				gpu_set_seen = 1;
+			} else if (value == 1u) {
+				firmware_takes_message();
+			} else if (value != 1u << GMU_OOB_GPU_ACK) {
+				faults++;
+			}
+		}
+		if (offset == GMU_GMU2HOST_INTR_CLR) gmu_regs[GMU_GMU2HOST_INTR_INFO / 4] &= ~value;
+		if (offset == GMU_HFI_CTRL_INIT) { firmware_reads_table(); gmu_regs[GMU_HFI_CTRL_STATUS / 4] |= 1u; }
+		if (offset == GMU_GX_SPTPRAC_POWER_CONTROL) gmu_regs[GMU_SPTPRAC_PWR_CLK_STATUS / 4] = value == 0x778000u ? 0x28u : 0x04u;
 		if (offset == GMU_RSCC_CONTROL_REQ) {
 			if (value & 2u) gmu_regs[GMU_RSCC_CONTROL_ACK / 4] |= 2u;
 			if (value & 1u) gmu_regs[RSCC_RSC_STATUS0_DRV0 / 4] |= RSC_STATUS0_POWERED_OFF;
@@ -140,7 +231,11 @@ static void model_write(void *cookie, unsigned block, uint32_t offset, uint32_t 
 		if ((offset - GMU_CM3_ITCM) / 4 != stuck_word) tcm[(offset - GMU_CM3_ITCM) / 4] = value;
 		return;
 	}
-	if (block == GPU_CC && offset == GPUCC_GX_GDSCR) { faults++; return; }
+	if (block == GPU_CC && offset == GPUCC_GX_GDSCR) {
+		/* Only mode 7's shutdown, and only collapse and retention. */
+		if (!gx_allowed || (value ^ cc[GPUCC_GX_GDSCR / 4]) & ~(GDSC_SW_COLLAPSE | 1u << 11)) faults++; else cc[GPUCC_GX_GDSCR / 4] = value;
+		return;
+	}
 	if (block == GPU_CC && !ahb_on()) { faults++; return; }
 	uint32_t *reg = slot(block, offset);
 	if (block == GPU_GCC && offset == GCC_BRANCH_VOTE && ((value ^ *reg) & ~GPU_GPLL0_DIV_GATE)) faults++;
@@ -177,6 +272,13 @@ static void reset(void) {
 	memset(pdc, 0, sizeof(pdc));
 	memset(pdc_seq, 0, sizeof(pdc_seq));
 	memset(pool, 0xa5, sizeof(pool));
+	memset(cmd_db, 0, sizeof(cmd_db));
+	memset(hfi_ids, 0, sizeof(hfi_ids));
+	hfi_count = hfi_seq_seen = gx_allowed = no_boot_ack = refuse_message = table_good = 0;
+	perf_top_vote = perf_top_khz = perf_counts = perf_cx_khz = bw_first_ddr = bw_cnoc_second = init_debug = init_boot = gpu_set_seen = 0;
+	refuse_message = ~0u;
+	db_build();
+	gmu_regs[RSCC(0x346u) / 4] = gmu_regs[RSCC(0x3eeu) / 4] = gmu_regs[RSCC(0x496u) / 4] = gmu_regs[RSCC(0x53eu) / 4] = 1;
 	/* What the hardware reported (docs/hardware-tests.md): bypass, six groups, eight banks, every bank's CBAR at its reset value. */
 	smmu[SMMU_SCR0 / 4] = 1;
 	smmu[SMMU_IDR0 / 4] = 0x78016606u;
@@ -352,6 +454,39 @@ int main(void) {
 	reset();
 	coachz_gpu_run(&io, 6, NULL, 0, &r);
 	CHECK("mode 6 needs the firmware", r.error && r.stage == 0 && writes == 0 && faults == 0);
+
+	reset();
+	gmu_live = 1;
+	gx_allowed = 1;
+	memcpy(g0, gcc, sizeof(g0)); memcpy(c0, cc, sizeof(c0));
+	coachz_gpu_run(&io, 7, image, sizeof(image), &r);
+	CHECK("GX, HFI and GPU_SET complete", r.stage == 7 && r.restored && !r.error && faults == 0 && r.oob_boot_polls && r.sptprac_polls && r.hfi_start_polls && r.oob_gpu_polls && gpu_set_seen);
+	CHECK("the top votes from CMD DB", gmu_regs[GMU_GX_VOTE_IDX / 4] == 8 && gmu_regs[GMU_MX_VOTE_IDX / 4] == 6 && r.gx_vote_top == (384u << 16 | 6u << 8 | 8u) && r.db_counts[0] == 10 && r.db_counts[1] == 8 && r.db_counts[2] == 9);
+	CHECK("Linux's message order", hfi_count == 5 && hfi_ids[0] == HFI_MSG_INIT && hfi_ids[1] == HFI_MSG_FW_VERSION && hfi_ids[2] == HFI_MSG_PERF_TABLE && hfi_ids[3] == HFI_MSG_BW_TABLE && hfi_ids[4] == HFI_MSG_TEST && r.hfi_done == 5);
+	CHECK("the messages' contents", table_good && init_debug == GMU_IOVA_DEBUG && init_boot == GMU_BOOT_COLD && perf_counts == (8u << 8 | 2u) && perf_top_vote == r.gx_vote_top && perf_top_khz == 800000 && perf_cx_khz == 200000 &&
+	    bw_first_ddr == 0x50000u && bw_cnoc_second == 0x60000001u && r.hfi_version == 0x10a20000u && r.hfi_fw_error == 0x55u);
+	CHECK("all off again", sysreset == 1 && r.tcs_idle == 4 && r.sptprac_off_polls && cc[GPUCC_GX_GDSCR / 4] == c0[GPUCC_GX_GDSCR / 4] && same_except_rcg(g0, c0) && !cx_on() && smmu[SMMU_SCR0 / 4] == 1);
+
+	reset();
+	gmu_live = 1;
+	gx_allowed = 1;
+	no_boot_ack = 1;
+	coachz_gpu_run(&io, 7, image, sizeof(image), &r);
+	CHECK("no boot OOB ack stops HFI and still shuts down", r.error && r.stage == 6 && r.restored && faults == 0 && !r.oob_boot_polls && !hfi_count && sysreset == 1 && !cx_on());
+
+	reset();
+	gmu_live = 1;
+	gx_allowed = 1;
+	refuse_message = HFI_MSG_PERF_TABLE;
+	coachz_gpu_run(&io, 7, image, sizeof(image), &r);
+	CHECK("a refused message stops there", r.error && r.restored && faults == 0 && r.hfi_done == 2 && r.hfi_status == 7 && hfi_count == 3 && !gpu_set_seen && sysreset == 1);
+
+	reset();
+	gmu_live = 1;
+	gx_allowed = 1;
+	cmd_db[1] = 0;
+	coachz_gpu_run(&io, 7, image, sizeof(image), &r);
+	CHECK("a bad CMD DB votes nothing", r.error && r.restored && faults == 0 && !r.own_gx && !gmu_regs[GMU_GX_VOTE_IDX / 4] && sysreset == 1);
 
 	if (!failed) printf("PASS\n");
 	return failed;

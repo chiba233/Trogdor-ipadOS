@@ -4,7 +4,7 @@
 
 ## 路线
 
-整体路线按 `Trogdor-GPU-Research` 的结论走：苹果侧复用 UniXNU 的 AdrenoMetal、metal2vulkan 和 Turnip，内核侧给 SC7180 写 A618 后端。真机顺序参考 ios-extra 在 A618（SM7150）上逐步测过的 0083–0100，寄存器值逐个按 SC7180 重新核对。每一阶段都必须能独立回滚，再进下一阶段。
+整体路线按 `Trogdor-GPU-Research` 的结论走：苹果侧复用 UniXNU 的 AdrenoMetal、metal2vulkan 和 Turnip，内核侧给 SC7180 写 A618 后端。Coachz 是主线 Linux 正式支持的整机（`sc7180-trogdor-coachz-*`），所以顺序和寄存器值以主线的设备树和 `drm/msm` 为准，再用同一台机器上 Debian 读到的值核对。ios-extra 是 SM7150 手机上的记录，权限和这台不同，只作线索，它的进展和卡点都不算这里的预期。Linux 是 GPL，这里只取事实和顺序，代码自己写。每一阶段都必须能独立回滚，再进下一阶段。
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
@@ -13,7 +13,7 @@
 | 3a | GPU SMMU（0x05040000）只读清点：全局配置、ID、故障、stream match group、各 context bank | 真机通过（mode 4） |
 | 3b | GMU stream 5 的 context bank、页表、HFI 队列和日志缓冲区映射，用 SMMU 的地址转换操作核对 | 真机通过（mode 5 的内容，由 mode 6 那次运行验证） |
 | 4a | RSCC/PDC 序列（0x0b290000 / 0x0b490000）、释放 CM3、等 `FW_INIT_RESULT` 签名，再把 CM3 放回复位 | 真机通过（mode 6），签名 `0xbabeface` |
-| 4b | GX OOB、SPTPRAC，之后用 legacy HFI 启动（sweet 的两队列传输） | 待写。ios-extra 拿到签名后卡在 GX OOB ACK（据文档转述） |
+| 4b | GX OOB、SPTPRAC，之后用 legacy HFI 启动（sweet 的两队列传输） | 真机通过（mode 7），固件版本 `0x10060000`，5 条消息全部成功 |
 | 5 | GX 上电、SQE 固件、A6xx CP 初始化、ring 写内存和 fence | 待写。CP 初始化格式和 A740 不同 |
 | 6 | Turnip Darwin KMD、Metal 发布、接系统合成器 | 待写 |
 
@@ -94,6 +94,13 @@ SC7180 与 SM7150 不同的地方都已按 Linux 源码改过，例如 GPU 的 G
 
 `coachz-gpu=6`：只有 11 个转换全部正确才继续。写 RSC 和 PDC 的序列与 TCS 命令，唤醒 RSC，写入固件，配置 HFI 地址、日志地址、芯片 ID 和投票使能，放开 CM3，等 `FW_INIT_RESULT`。结果读完后把 CM3 放回复位，停 RSC，恢复 SMMU，关 CX。PDC 的内容留着，Linux 也不清，GPU 关着时没有东西启动它。
 
+`coachz-gpu=7`：拿到签名之后继续，顺序照 `a6xx_gmu_resume`：
+- 从 CMD DB（`0x80820000`，只读）取 `gfx.lvl`、`mx.lvl`、`cx.lvl` 三张等级表，算出每一档的投票。GPU 的档位是这块板子的 OPP 表：180 到 800 MHz，再加 Linux 补的 “off” 一档；825 MHz 要更高的 speed bin。GMU 的档位是 200 MHz。
+- 投最高档，发 `BOOT_SLUMBER` OOB，固件给 GX 上电并确认。
+- 打开 SPTPRAC，写 `HFI_CTRL_INIT`，发 `GMU_INIT`、`FW_VERSION`、`PERF_TABLE`、`BW_TABLE`、`TEST`。A618 的 GMU 不做总线调频，`BW_TABLE` 是一档 “off” 加固定的 CNOC 投票。
+- 发 `GPU_SET` OOB 并确认，再清掉。GPU 核心寄存器一个都不碰。
+- 结束时走 `a6xx_gmu_force_off` 去掉 GPU 核心部分的流程：SPTPRAC 关，等 4 个 TCS 空闲，清 fence，CM3 复位，RSC 停，GX 折叠。
+
 每个可能卡住机器的步骤之前都打印一行 `step N next` 并等 1.5 秒，让日志环落盘。
 
 ## 主机验证
@@ -146,10 +153,14 @@ SC7180 与 SM7150 不同的地方都已按 Linux 源码改过，例如 GPU 的 G
   - `smmu map step 4: 11 of 11 translations right`，`sCR0 on 0x1812 after 0x1`，`fsr 0x400`。这个 fsr 只是 FORMAT 字段（AArch64），没有故障位。
   - `init result 0xbabeface after N polls`。
   - `cm3 reset after 0x1`。
+- `=7`：`mode 7 stage 7 restored 1: ok`，另有以下几行：
+  - `boot oob polls N`、`gpu oob polls N` 都不为 0，`hfi 5 messages done ... status 0x0`。
+  - `gx state`：`BOOT_SLUMBER` 之后 INTR_INFO 的 bit30 为 1，GX GDSCR 的 bit31 为 1（已上电），SPTPRAC 状态 `0x28`；`GPU_SET` 之后 INTR_INFO 的 bit24 为 1。
+  - `shutdown sptprac off polls N, tcs idle 4 of 4`。`gpucc after` 里 GX GDSCR 回到启动前的值。
 - 卡死或异常重启时，说明某个前提不成立，先退回上一个阶段看结果。
 
 ## 还没做的
 
-见上表第 4b–6 阶段。另外：
+见上表第 5–6 阶段。另外：
 - GPU 中断（SPI 300/304/305）还没接。
-- 带宽投票（interconnect / BCM）和 GX 的 ARC 投票还没有 RPMh 客户端，这是第 4/5 阶段的前置。
+- 带宽投票（interconnect / BCM）还没有 RPMh 客户端。GX 的 ARC 投票不需要：表从 CMD DB 读，由 GMU 固件代投。

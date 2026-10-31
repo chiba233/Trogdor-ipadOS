@@ -88,15 +88,27 @@ class GmuStartTests(unittest.TestCase):
 
     def test_the_firmware_needs_the_checked_bank(self):
         run = new_file(PATCH, 'bsd/dev/coachz_gpu_seq.h')
-        self.assertIn('if (gmu_map(io, r) && mode == 6) {', run)
+        self.assertIn('if (gmu_map(io, r) && mode >= 6) {', run)
         source = new_file(PATCH, 'bsd/dev/coachz_gpu_gmu.h')
         start = source[source.index('static inline void gmu_start('):source.index('static inline void gmu_undo(')]
         for later in ['gmu_rsc_program(io, r);', 'gmu_rsc_start(io, r)', 'gpu_load_tcm(io, image, image_bytes, r);', 'gpu_w(io, GPU_GMU, GMU_CM3_SYSRESET, 0);']:
             self.assertIn(later, start)
         self.assertLess(start.index('gpu_load_tcm(io'), start.index('gpu_w(io, GPU_GMU, GMU_CM3_SYSRESET, 0);'))
-        # No GX and no HFI message at this stage.
-        for absent in ['GPUCC_GX_GDSCR', 'GMU_GX_VOTE', 'HOST2GMU']:
-            self.assertNotIn(absent, source)
+        # GX and HFI only from mode 7, after the init result, and never the GPU core's own registers.
+        self.assertIn('if (r->mode >= 7 && r->fw_init_polls) gmu_bring_up_gx(io, r);', start)
+        self.assertEqual(start.count('gmu_bring_up_gx(io, r)'), 1)
+        self.assertNotIn('0x05000000u', source)
+
+    def test_gx_and_hfi_facts(self):
+        source = new_file(PATCH, 'bsd/dev/coachz_gpu_gmu.h')
+        # a6xx_gmu.xml dword offsets * 4, the legacy OOB bits, and a6xx_hfi.h's message sizes.
+        for dword, name in [(0x5194, 'GMU_HOST2GMU_INTR_SET'), (0x5191, 'GMU_GMU2HOST_INTR_CLR'), (0x81, 'GMU_GX_SPTPRAC_POWER_CONTROL'),
+                            (0x23f8, 'GMU_BOOT_SLUMBER_OPTION'), (0x23f9, 'GMU_GX_VOTE_IDX'), (0x23fa, 'GMU_MX_VOTE_IDX')]:
+            self.assertIn('%s 0x%xu' % (name, dword * 4), source)
+        for fact in ['GMU_OOB_BOOT_SET 22u', 'GMU_OOB_BOOT_ACK 30u', 'GMU_OOB_GPU_SET 16u', 'GMU_OOB_GPU_ACK 24u', 'HFI_PERF_DWORDS 43u', 'HFI_BW_DWORDS 160u']:
+            self.assertIn(fact, source)
+        self.assertEqual(1 + 2 + 2 * 16 + 2 * 4, 43)
+        self.assertEqual(6 + 6 + 2 * 6 + 8 + 16 * 8, 160)
 
 
 class LoaderTests(unittest.TestCase):

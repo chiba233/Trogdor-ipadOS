@@ -221,7 +221,7 @@ def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=T
         memory_map.set('RAMDisk', struct.pack('<QQ', disk, len(ramdisk)))
     memory_map.set('TrustCache', struct.pack('<QQ', disk + len(ramdisk), len(cache)))
     if gmu_firmware_size:
-        # The A618 GMU firmware right after the trust cache, inside the loader's kernel data (coachz-prelink-gpu.patch, coachz-gpu=3 or 6).
+        # The A618 GMU firmware right after the trust cache, inside the loader's kernel data (coachz-prelink-gpu.patch, coachz-gpu=3, 6 or 7).
         memory_map.set('CoachzGmuFirmware', struct.pack('<QQ', disk + len(ramdisk) + len(cache) + (-len(cache) % 4096),
                                                         gmu_firmware_size))
     return root.write()
@@ -275,7 +275,7 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
     if gpu:
         # Adreno 618 bring-up stages (docs/plans/gpu.md): 1 inventory, 2 CX + GMU clock window, 3 also the GMU firmware into TCM,
         # 4 the window with a read-only GPU SMMU inventory.
-        if not prelinked or gpu not in (1, 2, 3, 4, 5, 6) or (gpu in (3, 6)) != (gmu_firmware is not None):
+        if not prelinked or gpu not in (1, 2, 3, 4, 5, 6, 7) or (gpu in (3, 6, 7)) != (gmu_firmware is not None):
             raise ValueError('GPU stage 1 to 4 on the prelinked kernel; stage 3, and only it, takes the GMU firmware')
         if gmu_firmware is not None and not (4 <= len(gmu_firmware) <= 0x8000 and len(gmu_firmware) % 4 == 0):
             raise ValueError('the legacy GMU firmware fills at most the 32 KiB of ITCM and DTCM, in whole words')
@@ -358,8 +358,8 @@ def main():
     p.add_argument('--root-uuid', help='with --prelinked: the main OS, rooted on the APFS volume of this UUID')
     p.add_argument('--display', action='store_true', help='main OS: publish the firmware framebuffer through original MobileFramebuffer Legacy')
     p.add_argument('--smp', type=int, default=1, help='main OS: start CPU0..N-1 (up to 8) through PSCI')
-    p.add_argument('--gpu', type=int, default=0, help='prelinked: Adreno 618 bring-up stage 1 to 6 (docs/plans/gpu.md)')
-    p.add_argument('--gmu-firmware', type=Path, help='with --gpu 3 or 6: the legacy A618 GMU firmware, linux-firmware qcom/a630_gmu.bin')
+    p.add_argument('--gpu', type=int, default=0, help='prelinked: Adreno 618 bring-up stage 1 to 7 (docs/plans/gpu.md)')
+    p.add_argument('--gmu-firmware', type=Path, help='with --gpu 3, 6 or 7: the legacy A618 GMU firmware, linux-firmware qcom/a630_gmu.bin')
     p.add_argument('--data-uuid', help='with --root-uuid: selected external Data APFS volume UUID')
     p.add_argument('--data-image', type=Path, help='with --root-uuid: APFS Data seed, the RAM disk the kernel mounts on /private/var')
     a = p.parse_args()
