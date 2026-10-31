@@ -600,3 +600,12 @@ EC 协议 3 在第一次运行就工作：`EC_CMD_HELLO` 回复校验通过，`E
 修正：在 `tools/xnu_screen.py` 的命令行加入现成的 `kt_fixed_zones=120`，无需改内核。接入 prelink 后应重新评估这个值。这些都只有屏幕证据，完整系统启动仍未验收。
 
 构建时发现另一处问题：编译缓存不跟踪 `.incbin`，同一输出路径可能复用旧负载。`linux_log.py` 现在把负载摘要写入汇编文件，并核对镜像确实包含该负载。
+
+
+## 2026-10-31：XNU 屏幕输出进入 IOKit
+
+运行时 `099c601`，镜像 SHA-256 `15012d323cdaf4c5227c875177b832bdac1f9376408abcb5e736b99b06423732`。`kt_fixed_zones=120` 后 kalloc 断言消失。屏幕照片显示调度器、firehose、遥测、BANK 与串行 KDP 初始化，随后进入 `PE_init_iokit`。
+
+panic 的调用栈为 `PE_init_iokit → InitIOKit → OSlibkernInit → OSRuntimeInitializeCPP → OSMetaClass::postModLoad`：`Kernel data abort`，ESR `0x96000006`（转换错误），PC `0xfffffff007834534`，正在沿父类链读取，地址在内核范围之外。静态扫描全部 C++ 静态构造后，只有 `__GLOBAL__sub_I_NativeAES.cpp` 的父类指针超出内核范围，且与现场寄存器值相同。SoftwareAES 的父类 `IOAESAccelerator` 属于只有 prelink 才能提供的组件。此前一轮同一阶段的 `not in the expected zone` panic 尚未单独解释，可能同源。
+
+修正：`platform/coachz-screen` 关闭 `CONFIG_XNU_NATIVE_AES`，接入 prelink 时再恢复。这些都只有屏幕证据，完整系统启动仍未验收。

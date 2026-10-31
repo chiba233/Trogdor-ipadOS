@@ -6,3 +6,5 @@
 # CONFIG_XNU_BOOT_PROGRESS is not set
 # The BCM2837 fixed panic region address is not memory on SC7180; ask the device tree instead.
 CONFIG_XNU_DT_PANIC_REGION=y
+# SoftwareAES subclasses IOAESAccelerator from a kext that only prelink provides.
+# CONFIG_XNU_NATIVE_AES is not set
