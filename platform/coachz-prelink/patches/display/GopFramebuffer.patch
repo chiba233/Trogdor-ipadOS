@@ -1,0 +1,12 @@
+--- a/NativeLegacyDisplay.cpp
++++ b/NativeLegacyDisplay.cpp
+@@ -495,7 +495,8 @@
+            !video.v_width || !video.v_height || video.v_depth!=32 || video.v_rotate ||
+            video.v_width>16384 || video.v_height>16384 || video.v_rowBytes<video.v_width*4 ||
+            video.v_rowBytes>UINT64_MAX/video.v_height)return false;
+-        IOMemoryMap *mapping=provider->mapDeviceMemoryWithIndex(0,kIOMapInhibitCache);
++        // Coachz: write-combined, so the CPU copy's stores merge; the copy ends with dsb sy before scanout uses it.
++        IOMemoryMap *mapping=provider->mapDeviceMemoryWithIndex(0,kIOMapWriteCombineCache);
+         if(!mapping)return false;
+         bool valid=mapping->getVirtualAddress() && mapping->getPhysicalAddress()==video.v_baseAddr &&
+                    mapping->getLength()==video.v_rowBytes*video.v_height;

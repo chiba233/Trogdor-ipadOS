@@ -1,16 +1,18 @@
 --- a/osfmk/arm64/coachz_thread.c
 +++ b/osfmk/arm64/coachz_thread.c
-@@ -8,6 +8,9 @@
+@@ -8,6 +8,11 @@
  #include <mach/arm/thread_status.h>
  #include <libkern/copyio.h>
  #include <os/atomic_private.h>
 +#include <kern/clock.h>
 +#include <vm/vm_map.h>
 +#include <kern/cpu_number.h>
++#include <arm/cpu_data_internal.h>
++#include <machine/machine_routines.h>
  
  void coachz_sample_task(const char *name, int pid, task_t task);
  void coachz_critical_user_state(const char *name, int pid);
-@@ -314,12 +317,207 @@
+@@ -314,12 +319,245 @@
  done:
  	os_atomic_store(&coachz_sb_captured, 2, release);
  	printf("%s", coachz_sb_failure);
@@ -156,14 +158,21 @@
 +	proc_rele(p);
  }
  
-+/* ArmCpu's secondary-CPU evidence (steps: 1 nub, 2 registered, 3 start thread, 4 CPU_ON, 5 initCPU, 6 GIC, 7 running). */
-+extern volatile uint32_t armcpu_smp_requested, armcpu_smp_running;
++/* ArmCpu's secondary-CPU evidence (steps: 1 nub, 2 registered, 3 start thread, 4 CPU_ON, 5 initCPU, 6 GIC, 7 running),
++ * each core's CurrentEL and MIDR (part 0x805 A55, 0x804 A76), and the cluster type XNU registered it with.
++ */
++extern volatile uint32_t armcpu_smp_requested, armcpu_smp_running, armcpu_boot_mpidr;
 +extern volatile uint32_t armcpu_smp_step[8], armcpu_smp_fail[8], armcpu_core_timer[8], armcpu_core_sgi[8];
++extern volatile uint32_t armcpu_smp_sys[8][5], armcpu_boot_sys[5], armcpu_gic_boot[8];
 +extern volatile int32_t armcpu_smp_psci_rc[8];
++extern void armcpu_group1_sgi_probe(uint64_t *);
++extern void armcpu_gic_diag(uint64_t aff, uint32_t *out);
++static char coachz_sgi_probe[256];
 +
 +static void
 +coachz_smp_report(void)
 +{
++	const ml_topology_info_t *topology = ml_get_topology_info();
 +	uint64_t count = 2000000, start, end, hz;
 +
 +	__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(hz));
@@ -171,14 +180,45 @@
 +	__asm__ volatile ("1: subs %0, %0, #1\n\tb.ne 1b" : "+r"(count) :: "cc");
 +	__asm__ volatile ("isb\n\tmrs %0, cntpct_el0" : "=r"(end));
 +	uint64_t us = hz ? (end - start) * 1000000 / hz : 0;
-+	printf("COACHZ SMP v1: requested %u, %u secondary running; loop on cpu %d: %llu per us\n",
-+	    armcpu_smp_requested, armcpu_smp_running, cpu_number(), us ? 2000000 / us : 0);
-+	printf("COACHZ SMP cores:");
-+	for (unsigned index = 0; index < 4; index++) {
-+		printf(" [%u step %u rc %d fail %u timer %u sgi %u]", index, armcpu_smp_step[index],
-+		    armcpu_smp_psci_rc[index], armcpu_smp_fail[index], armcpu_core_timer[index], armcpu_core_sgi[index]);
++	printf("COACHZ SMP v2: requested %u, %u secondary running, %u CPUs in %u clusters; loop on cpu %d: %llu per us\n",
++	    armcpu_smp_requested, armcpu_smp_running, topology ? topology->num_cpus : 0, topology ? topology->num_clusters : 0,
++	    cpu_number(), us ? 2000000 / us : 0);
++	for (unsigned half = 0; half < 2; half++) {
++		printf("COACHZ SMP %u-%u:", half * 4, half * 4 + 3);
++		for (unsigned index = half * 4; index < half * 4 + 4; index++) {
++			uint32_t el = index ? armcpu_smp_sys[index][0] : armcpu_boot_sys[0];
++			uint32_t midr = index ? armcpu_smp_sys[index][4] : armcpu_boot_sys[4];
++			/* The cluster type XNU registered the core with; a core not yet registered has no cpu_data. */
++			cpu_data_t *data = index < (unsigned)ml_get_cpu_count() ? cpu_datap(index) : NULL;
++			int type = data ? (int)data->cpu_cluster_type : -1;
++			printf(" [%u s%u rc%d f%u t%u g%u el%u p%03x %c]", index, index ? armcpu_smp_step[index] : 7,
++			    armcpu_smp_psci_rc[index], armcpu_smp_fail[index], armcpu_core_timer[index], armcpu_core_sgi[index],
++			    (el >> 2) & 3, (midr >> 4) & 0xfff, type == CLUSTER_TYPE_E ? 'E' : type == CLUSTER_TYPE_P ? 'P' : '-');
++		}
++		printf("\n");
 +	}
-+	printf("\n");
++	/* Once: which non-secure SGIs to this core become pending as Group 1, and how is the CPU interface set? */
++	if (!coachz_sgi_probe[0]) {
++		uint64_t out[10];
++		armcpu_group1_sgi_probe(out);
++		snprintf(coachz_sgi_probe, sizeof(coachz_sgi_probe),
++		    "COACHZ SGI probe mpidr 0x%llx: grp1 0x%llx pmr 0x%llx igrpen1 0x%llx sre 0x%llx ctlr 0x%llx rpr 0x%llx hppir 0x%llx\n",
++		    out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7]);
++	}
++	printf("%s", coachz_sgi_probe);
++	printf("COACHZ GIC boot: IGROUPR0 %x ISENABLER0 %x GICD_CTLR %x TYPER %x IGRPMODR0 %x PMR %x IGRPEN1 %x SRE %x\n",
++	    armcpu_gic_boot[0], armcpu_gic_boot[1], armcpu_gic_boot[2], armcpu_gic_boot[3], armcpu_gic_boot[4],
++	    armcpu_gic_boot[5], armcpu_gic_boot[6], armcpu_gic_boot[7]);
++	for (unsigned half = 0; half < 2; half++) {
++		printf("COACHZ GICR:");
++		for (unsigned index = half * 4; index < half * 4 + 4; index++) {
++			uint32_t out[8];
++			armcpu_gic_diag((uint64_t)index << 8, out);
++			printf(" [%u grp %x en %x pend %x mod %x wake %x pri %x %s]", index, out[0], out[1], out[2], out[3], out[4], out[6],
++			    out[7] == 1 ? "ok" : "missing");
++		}
++		printf("\n");
++	}
 +}
 +
 +static void

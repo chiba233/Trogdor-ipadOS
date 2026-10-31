@@ -432,7 +432,7 @@ new file mode 100644
 +	*slot = (pa & ~(uint64_t)(ARM_TT_L1_SIZE - 1)) | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
 +	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
 +	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
-+	__asm__ volatile ("dsb ish; isb" ::: "memory");
++	__asm__ volatile ("dsb ish\nisb" ::: "memory");
 +
 +	early_pa = pa;
 +	early_bytes = (uint64_t)row_bytes * height;

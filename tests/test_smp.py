@@ -1,5 +1,6 @@
 """The ADT the SMP route gives XNU: SC7180 cores in MPIDR Affinity1, PSCI by SMC."""
 from pathlib import Path
+import re
 import struct
 import sys
 import unittest
@@ -27,13 +28,15 @@ def props(node):
 class SmpTreeTests(unittest.TestCase):
     def test_secondary_cpus_and_psci(self):
         root = boot_tree()
-        smp_tree(root, 4)
+        smp_tree(root, 8)
         root = read_tree(root.write())
         cpus = root.child('cpus').children
-        self.assertEqual([c.name() for c in cpus], ['cpu0', 'cpu1', 'cpu2', 'cpu3'])
+        self.assertEqual([c.name() for c in cpus], ['cpu%d' % index for index in range(8)])
         for index, cpu in enumerate(cpus):
             p = props(cpu)
             self.assertEqual(p['reg'], struct.pack('<I', index << 8))
+            # XNU reads cluster-type as an integer and compares it with 'E' and 'P'.
+            self.assertEqual(p['cluster-type'], struct.pack('<I', ord('P' if index >= 6 else 'E')))
             self.assertEqual(p['state'], b'running\0' if index == 0 else b'waiting\0')
             self.assertEqual(p['device_type'], b'cpu\0')
             self.assertEqual(p['compatible'], b'qcom,kryo468\0')
@@ -53,6 +56,42 @@ class SmpTreeTests(unittest.TestCase):
             cpu.set('state', b'running\0')
         with self.assertRaises(ValueError):
             adt_fields(root.write())
+
+    def test_all_cores_share_one_pset(self):
+        # The single-cluster Clutch scheduler panics in thread_select() with a second pset.
+        patch = (Path(__file__).resolve().parents[1] / 'platform/coachz-prelink/patches/xnu/coachz-prelink-smp.patch').read_text()
+        self.assertIn('+\tpset = pset_find(0, NULL);', patch)
+
+    def test_kernel_inline_assembly_has_no_semicolons(self):
+        # On Mach-O AArch64 ";" starts a comment, so the rest of the string silently disappears. That is
+        # how signalCPU lost its ICC_SGI1R write: "dsb ishst; msr icc_sgi1r_el1, %0; isb" built as one dsb.
+        root = Path(__file__).resolve().parents[1]
+        strings = re.compile(r'(?:__asm__|\basm\b)[^"]*\("([^"]*)"')
+        patch = (root / 'platform/coachz-screen/patches/drivers/ArmCpu.patch').read_text()
+        console = (root / 'platform/coachz-screen/patches/xnu/coachz-screen-console.patch').read_text()
+        for line in (patch + console).splitlines():
+            if line.startswith('+'):
+                for text in strings.findall(line):
+                    self.assertNotIn(';', text, line)
+        self.assertIn(r'"dsb ishst\nmsr icc_sgi1r_el1, %0\nisb"', patch)
+        upstream = root / 'upstream/unixnu/drivers/ArmCpu/ArmCpu.cpp'
+        if upstream.is_file():
+            removed = {line[1:] for line in patch.splitlines() if line.startswith('-')}
+            for line in upstream.read_text().splitlines():
+                if any(';' in text for text in strings.findall(line)):
+                    self.assertIn(line, removed)
+
+    def test_diagnostics_never_use_group_0_gic_registers(self):
+        # UniXNU's armcpu_sgi_selfprobe uses them, and on this firmware the machine resets.
+        root = Path(__file__).resolve().parents[1] / 'platform'
+        report = (root / 'coachz-prelink/patches/xnu/coachz-prelink-launch-diagnostic.patch').read_text()
+        self.assertNotIn('armcpu_sgi_selfprobe(', report)
+        self.assertIn('armcpu_group1_sgi_probe(out);', report)
+        probe = (root / 'coachz-screen/patches/drivers/ArmCpu.patch').read_text()
+        start = probe.index('+extern "C" void armcpu_group1_sgi_probe')
+        body = probe[start:probe.index('+extern "C" void armcpu_sgi_selfprobe', start) if '+extern "C" void armcpu_sgi_selfprobe' in probe[start:] else None]
+        for register in ('icc_sgi0r', 'icc_hppir0', 'icc_iar0', 'icc_eoir0', 'icc_igrpen0'):
+            self.assertNotIn(register, body.split('void armcpu_group1_sgi_probe', 1)[1].split('msr daif, %0', 1)[0])
 
     def test_single_cpu_tree_is_unchanged(self):
         root = boot_tree()

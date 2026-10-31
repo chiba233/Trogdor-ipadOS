@@ -138,11 +138,13 @@ def root_matching(uuid):
 
 
 def smp_tree(root, count):
-    """CPU0..count-1, the A55 cluster: SC7180 numbers its cores in MPIDR Affinity1. PSCI is called by SMC."""
+    """CPU0..count-1: SC7180 numbers its cores in MPIDR Affinity1; CPU0-5 are A55 (E), CPU6-7 A76 (P).
+    PSCI is called by SMC."""
     if count <= 1:
         return
     cpus = root.child('cpus')
     boot = cpus.child('cpu0')
+    boot.set('cluster-type', struct.pack('<I', ord('E')))
     for index in range(1, count):
         cpu = cpus.child('cpu%d' % index)
         for key, _, value in boot.props:
@@ -150,6 +152,7 @@ def smp_tree(root, count):
                 cpu.set(key, value)
         cpu.set('reg', struct.pack('<I', index << 8))
         cpu.set('state', b'waiting\0')
+        cpu.set('cluster-type', struct.pack('<I', ord('P' if index >= 6 else 'E')))
     psci = root.child('psci')
     psci.set('compatible', b'arm,psci-1.0\0')
     psci.set('method', b'smc\0')
@@ -210,9 +213,9 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         command_line += ' offline-legacy-pm=1 offline-legacy-validate=1 offline-legacy-transfer=1 offline-legacy-cpu-present=1'
         command_line += ' sheng-vsync=60 sheng-early-retire=0 coachz-reset-mgcache=1'
     if cpus != 1:
-        # BCM2837's board configuration allows four CPUs in one cluster: CPU0..3, all A55.
-        if not root_uuid or not prelinked or not 2 <= cpus <= 4:
-            raise ValueError('secondary CPUs need the prelinked main OS and 2 to 4 CPUs')
+        # coachz-prelink-smp.patch raises BCM2837's board configuration to eight CPUs in two clusters.
+        if not root_uuid or not prelinked or not 2 <= cpus <= 8:
+            raise ValueError('secondary CPUs need the prelinked main OS and 2 to 8 CPUs')
         if command_line.count(' cpus=1 ') != 1:
             raise ValueError('the command line must limit XNU to the boot CPU before SMP widens it')
         # cpus=N is the topology XNU parses; a CPU beyond it gets no logical number and ArmCpu skips it.
@@ -279,7 +282,7 @@ def main():
     p.add_argument('--root-device', help='with --prelinked: root on this BSD disk instead of a RAM disk, such as disk1s1')
     p.add_argument('--root-uuid', help='with --prelinked: the main OS, rooted on the APFS volume of this UUID')
     p.add_argument('--display', action='store_true', help='main OS: publish the firmware framebuffer through original MobileFramebuffer Legacy')
-    p.add_argument('--smp', type=int, default=1, help='main OS: start CPU0..N-1 (up to 4) through PSCI')
+    p.add_argument('--smp', type=int, default=1, help='main OS: start CPU0..N-1 (up to 8) through PSCI')
     p.add_argument('--data-uuid', help='with --root-uuid: selected external Data APFS volume UUID')
     p.add_argument('--data-image', type=Path, help='with --root-uuid: APFS Data seed, the RAM disk the kernel mounts on /private/var')
     a = p.parse_args()

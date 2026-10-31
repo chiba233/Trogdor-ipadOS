@@ -13,3 +13,34 @@
  	ldr		x1, [x19, CPU_DATA_ENTRIES]			// Load start of data entries
  	add		x3, x1, MAX_CPUS * 16				// end addr of data entries = start + (16 * MAX_CPUS)
  Lcheck_cpu_data_entry:
+--- a/pexpert/pexpert/arm64/board_config.h
++++ b/pexpert/pexpert/arm64/board_config.h
+@@ -134,8 +134,9 @@
+ #include <pexpert/arm64/BCM2837.h>
+ 
+ #define MAX_L2_CLINE                   6
+-#define MAX_CPUS                       4
+-#define MAX_CPU_CLUSTERS               1
++/* Coachz: SC7180 has eight cores in two clusters, six A55 (E) and two A76 (P). */
++#define MAX_CPUS                       8
++#define MAX_CPU_CLUSTERS               2
+ 
+ #define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
+ #endif  /* ARM64_BOARD_CONFIG_BCM2837 */
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -1495,7 +1495,13 @@
+ 	this_cpu_datap->cluster_master = is_boot_cpu;
+ #endif /* HAS_CLUSTER */
+ 	lck_mtx_lock(&pset_create_lock);
+-	pset = pset_find(in_processor_info->cluster_id, NULL);
++	/*
++	 * Coachz has no __AMP__, so its scheduler is the single-cluster Clutch, which assumes one pset:
++	 * a second pset enables stealing, and sched_clutch_steal_thread() returns with the pset lock
++	 * still held, so thread_select() takes it again and panics. All cores share pset 0; the E and
++	 * P clusters stay in the topology.
++	 */
++	pset = pset_find(0, NULL);
+ 	kprintf("[%d]%s>pset_find(cluster_id=%d) returned pset %d\n", current_processor()->cpu_id, __FUNCTION__, in_processor_info->cluster_id, pset ? pset->pset_id : -1);
+ 	if (pset == NULL) {
+ #if __AMP__

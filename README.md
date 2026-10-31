@@ -24,8 +24,9 @@ HP Chromebook x2 11（Google Coachz / SC7180）的 **原生 iPadOS 移植实验*
 | Apple launchd、dyld、恢复服务（恢复盘作根） | 运行，恢复服务按自身逻辑退出 | 屏幕照片，内核在 177 秒时仍存活 |
 | 探针经 USB 读外接盘（只读实验） | 通过 | 真机日志，逐字段校验，见 [USB 只读实验](docs/usb-read.md) |
 | XNU 里的 USB 存储驱动 | 只读挂根屏幕确认 | 内核经 GPT 和 APFS 从外接盘挂载恢复卷作只读根，`restored_update` 运行；未封存根卷是放行，不是验证，见 [硬件记录](docs/hardware-tests.md) |
-| 从外接盘启动主系统 | 进行中 | iPadOS 系统卷挂成只读根，SystemOS cryptex 与共享缓存就位，原版 launchd 通过 mount 阶段，运行到 `tzinit`；内存 Data 卷尚未挂上，见 [硬件记录](docs/hardware-tests.md) |
-| 主系统、SMP、触摸、GPU、音频、界面 | 未实现 | 设备树里没有这些硬件节点，Apple 组件大多只是加载 |
+| 从外接盘启动主系统 | 屏幕确认到升级界面 | iPadOS 系统卷只读作根，外接 Data 卷可写；原版 SpringBoard 经 CPU 绘制出白色苹果 logo 和升级界面，刷新极慢，也没有输入，见 [硬件记录](docs/hardware-tests.md) |
+| SMP | 进行中 | 八个核上线，A55／A76 识别正确，IPI 能送达；调度不区分大小核，大核基本没有分到负载，调频未做 |
+| 触摸、GPU、音频、可用界面 | 未实现 | 设备树里没有这些硬件节点，Apple 组件大多只是加载 |
 
 屏幕照片阶段没有逐字段核对，也没有验证长时间稳定性。早期有一个原因不明的随机 zone panic，最近几轮没有再出现，但没有解决。详情见 [状态](docs/status.md) 和 [硬件记录](docs/hardware-tests.md)。
 

@@ -1058,3 +1058,32 @@ k29 照片中的周期报告：`3 secondary running`，CPU1～3 均为步骤 7�
 相符；这是计数循环估算，不是调频寄存器读数。四颗核的 SGI 计数均为 0：自 IPI 与跨核 IPI
 都未被接收，跨核唤醒目前只能依靠各核自身的定时器。尚未验证 A76 大核、调频、IPI 与长期
 稳定性。
+
+### 八核与 IPI（k30～k34）
+
+k30 让 ADT 列出八个核后，CPU6、7 的 A76 上线，随后 cpu 2 在 `thread_select` 的 ticket lock 上
+panic：BCM2837 没有 `__AMP__`，调度器是单簇 Clutch，第二个 pset 打开了偷取，而
+`sched_clutch_steal_thread` 返回时仍持有 pset 锁。现在所有核共用 pset 0，E／P 簇仍保留在拓扑里。
+代价是调度器不区分大小核。
+
+k31 带上游诊断 `armcpu_sgi_selfprobe`，每次都在 launchd 的 `check_np` 之后整机复位，Coreboot
+日志有 `PM: WRM_reset by PS_HOLD`（正常重启也会这样）。k33 只把它换成只碰 Group 1、只发
+SGI 0～7 的 `armcpu_group1_sgi_probe`，同一位置不再复位。诱因应是这个函数，具体机制未确认；
+反汇编显示它实际会写 `ICC_SGI1R_EL1`、不屏蔽 IRQ，并从 EL1 读 `ICC_HPPIR0_EL1`。
+
+k33 的探测仍是 `grp1 0x0`。host 上的反汇编给出了原因：Mach-O 的 AArch64 汇编器把 `;` 当注释，
+`"dsb ishst; msr icc_sgi1r_el1, %0; isb"` 只生成一条 `dsb`，所以 `signalCPU` 从未发出 SGI。
+内联汇编改用 `\n` 分隔后，k34 的 `signalCPU` 等四个函数都有这条写入。
+
+k34 的照片（开机 31 秒和 41 秒两次周期报告）：
+
+- `7 secondary running, 8 CPUs in 2 clusters`，八个核都是步骤 7、PSCI 返回 0、无失败码。
+- CPU0～5 显示 `p805 E`，CPU6、7 显示 `p804 P`。
+- 探测在 CPU0 上得到 `grp1 0xff`，SGI 0～7 都能到达。
+- 41 秒时各核 SGI 计数依次为 234、186、118、23、5、5、9、1；CPU0～2 在这 10 秒内继续增长。
+- CPU0～2 在这 10 秒内定时器中断约增加 40320、52262、7316 次；CPU3～7 几乎不变，CPU6、7
+  只有 2 和 0 次。
+
+因此 IPI 已在真机上工作，但大核基本没有分到负载。计数循环在 CPU0 上约为每微秒 757 次，同样
+只是估算，不是调频寄存器读数。机主观察到 SpringBoard 的刷新仍然极慢、帧间隔很长，写合并映射
+的效果还没有测到。

@@ -108,6 +108,15 @@ def main():
             raise ValueError('unexpected generic framebuffer source revision')
         if subprocess.check_output(['git', '-C', str(display_source), 'status', '--porcelain'], text=True):
             raise ValueError('generic framebuffer source reference must remain clean')
+        # Platform patches go to a copy, so the qualified reference itself stays clean.
+        display_patches = sorted((ROOT / 'platform' / a.platform / 'patches/display').glob('*.patch'))
+        if display_patches:
+            patched = out / 'reference/GopFramebuffer-patched'
+            shutil.rmtree(patched, ignore_errors=True)
+            shutil.copytree(display_source, patched, ignore=shutil.ignore_patterns('.git'))
+            for patch in display_patches:
+                subprocess.run(['patch', '--batch', '--silent', '-p1', '-d', str(patched), '-i', str(patch)], check=True)
+            display_source = patched
         display_options = ['--local-module', 'driver:GopFramebuffer=' + str(display_source)]
     # Use only the selected source components. The normal CLI also initializes all
     # unrelated module submodules and prelinks/downloads IPSW input after a build.
