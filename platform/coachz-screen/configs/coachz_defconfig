@@ -8,3 +8,7 @@
 CONFIG_XNU_DT_PANIC_REGION=y
 # SoftwareAES subclasses IOAESAccelerator from a kext that only prelink provides.
 # CONFIG_XNU_NATIVE_AES is not set
+# No prelink yet: register the built-in source corecrypto provider.
+CONFIG_XNU_CRYPTO_BOOTSTRAP="source"
+# The trust cache runtime needs AppleImage4, which only prelink provides.
+# CONFIG_XNU_TRUST_CACHE_RUNTIME is not set

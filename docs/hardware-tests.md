@@ -609,3 +609,14 @@ EC 协议 3 在第一次运行就工作：`EC_CMD_HELLO` 回复校验通过，`E
 panic 的调用栈为 `PE_init_iokit → InitIOKit → OSlibkernInit → OSRuntimeInitializeCPP → OSMetaClass::postModLoad`：`Kernel data abort`，ESR `0x96000006`（转换错误），PC `0xfffffff007834534`，正在沿父类链读取，地址在内核范围之外。静态扫描全部 C++ 静态构造后，只有 `__GLOBAL__sub_I_NativeAES.cpp` 的父类指针超出内核范围，且与现场寄存器值相同。SoftwareAES 的父类 `IOAESAccelerator` 属于只有 prelink 才能提供的组件。此前一轮同一阶段的 `not in the expected zone` panic 尚未单独解释，可能同源。
 
 修正：`platform/coachz-screen` 关闭 `CONFIG_XNU_NATIVE_AES`，接入 prelink 时再恢复。这些都只有屏幕证据，完整系统启动仍未验收。
+
+
+## 2026-10-31：XNU 屏幕输出到达等待根设备
+
+运行时与配置见随本节提交，镜像 SHA-256 `2a41ced24e468ca9b4a31ab79b2ab886a9c0c6025ca48f48e5a0941955dfa7aa`。这一轮之前依次处理了三处依赖 prelink 的问题：关闭 `CONFIG_XNU_NATIVE_AES`；`CONFIG_XNU_CRYPTO_BOOTSTRAP` 改为 `source`，由内置 corecrypto 提供 `g_crypto_funcs`（否则 `kmem_crypto_init` 空指针）；关闭 `CONFIG_XNU_TRUST_CACHE_RUNTIME`（否则 panic `image4 interface not available`）。
+
+屏幕照片显示 corecrypto FIPS 自检 `all tests PASSED`，IOKit 与 NVRAM 初始化，BSD 版权行，MAC Framework、mbuf、DLIL 和 Skywalk 自检通过，`bsd_autoconf` 调用 `kmInit`，最后打印 `Waiting on <dict>...IOMedia...Apple_HFS...</dict>`，没有 panic。这是 XNU 第一次在 Coachz 真机上完成内核初始化并开始等待根设备。
+
+这只有屏幕证据。没有根文件系统、存储驱动、用户态、完整组件 prelink 或 iPadOS 启动。尚未确认计时器中断是否工作：XNU 约 60 秒后应打印 `Still waiting for root device`，这一轮未记录是否出现。
+
+未解决：早期轮次在 `preModLoad` 的首次 `kalloc` 处随机出现 `not in the expected zone ... found in [0]`，后续轮次未复现，原因未查明。`coachz-screen-console.patch` 暂时保留 `COACHZ META` 诊断输出，以便再次出现时取证。

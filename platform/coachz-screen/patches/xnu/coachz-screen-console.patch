@@ -258,6 +258,26 @@
  } serial_device_t;
  
  kern_return_t serial_irq_enable(serial_device_t device);
+--- a/osfmk/kern/zalloc.c
++++ b/osfmk/kern/zalloc.c
+@@ -771,6 +771,17 @@
+ 	}
+ 
+ 	zidx = meta->zm_index;
++	/* Coachz bring-up: show the metadata state behind this panic. */
++	printf("COACHZ META addr %p meta %p meta_pa 0x%llx addr_pa 0x%llx\n", (void *)addr, meta,
++	    (unsigned long long)ptoa(pmap_find_phys(kernel_pmap, (vm_offset_t)meta)),
++	    (unsigned long long)ptoa(pmap_find_phys(kernel_pmap, addr)));
++	printf("COACHZ META raw %016llx %016llx prev %016llx next %016llx\n",
++	    ((unsigned long long *)meta)[0], ((unsigned long long *)meta)[1],
++	    ((unsigned long long *)(meta - 1))[0], ((unsigned long long *)(meta + 1))[0]);
++	printf("COACHZ META map %p-%p base %p range %p-%p chunk %u va_cur %u wired %u\n",
++	    (void *)zone_info.zi_map_range.min_address, (void *)zone_info.zi_map_range.max_address,
++	    zone_info.zi_meta_base, (void *)zone_info.zi_meta_range.min_address,
++	    (void *)zone_info.zi_meta_range.max_address, zone->z_chunk_pages, zone->z_va_cur, zone->z_wired_cur);
+ 	if (zidx >= os_atomic_load(&num_zones, relaxed)) {
+ 		panic("%p expected in zone %s%s[%d], but metadata has invalid zidx: %d",
+ 		    (void *)addr, zone_heap_name(zone), zone->z_name, zone_index(zone),
 --- a/osfmk/conf/files.arm64
 +++ b/osfmk/conf/files.arm64
 @@ -53,6 +53,7 @@

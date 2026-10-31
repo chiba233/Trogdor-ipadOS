@@ -282,6 +282,13 @@ class DisplayTests(unittest.TestCase):
         order=[source.index(s) for s in ('display_ec_hello(freq','display_ec_backlight(freq,DISPLAY_BACKLIGHT_DUTY','b->bl_polarity?2u:0u','b->bl_polarity?0u:2u','display_ec_backlight(freq,0,','pattern_write(DISPLAY_TE,0,')]
         self.assertEqual(order,sorted(order))
 
+    def test_hardware_verified_screen_kernel_configuration_is_unchanged(self):
+        config=(ROOT/'platform/coachz-screen/configs/coachz_defconfig').read_text().splitlines()
+        for line in ('CONFIG_XNU_DT_PANIC_REGION=y','# CONFIG_XNU_NATIVE_AES is not set','CONFIG_XNU_CRYPTO_BOOTSTRAP="source"','# CONFIG_XNU_TRUST_CACHE_RUNTIME is not set'):
+            self.assertIn(line,config)
+        self.assertIn('kt_fixed_zones=120',(ROOT/'tools/xnu_screen.py').read_text())
+        self.assertNotIn('coachz-screen-console.patch',(ROOT/'platform/coachz/patches/xnu/series').read_text())
+
     def test_hardware_verified_scanout_restart_order_is_unchanged(self):
         source=(ROOT/'boot/display.c').read_text()
         self.assertEqual(re.findall(r'pattern_write\(DISPLAY_(\w+),',source),['COUNT_EN','DSI','SCANOUT','TE','TE','DSI','COUNT_EN'])
