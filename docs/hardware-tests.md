@@ -1275,4 +1275,4 @@ k54 起第一帧之后屏幕不再显示诊断文字（`coachz-console-band=0`�
   开机时约 37 °C，有负载时 bank 0 峰值到约 55 °C。Debian 同一时期 `cpu*-thermal` 约 44～49 °C，量级一致，但两边没有逐路对照。这还没有接入温控，频率仍然固定在最高档。
 - Wi-Fi：`SMEM v12 inventory status 0`，14 个分区项，global 和 apps-modem 分区都解析到了。SMP2P 项 428、GLINK 项 478～480 都不存在，因为基带没有启动。没有启动 WCN3990，也没有发布网卡。
 - 加速度计：EC 枚举出 3 个传感器。传感器 0 是 BMI 加速度计，12.5 Hz、±4 g，静止时读数合成约 1 g，错误数 0。陀螺仪 ODR 为 0（未启用），传感器 2 的类型 5 这个驱动不支持。没有接 CoreMotion，屏幕不会自动旋转。转动机身时重力依次落到 +Y、+Z、-X 轴，幅值一直约 1 g。
-- 合盖（k62，`coachz-switches=1`，说明在 `docs/plans/switches.md`）：`supported 0xf raw 0x5`，合盖时 `raw 0x4 changed 0x1`，打开回到 `0x5`，错误数 0。日志里没有底座位的变化，拆底座还没有验证。这只读取状态，不触发锁屏或睡眠。
+- 合盖（k62，`coachz-switches=1`，说明在 `docs/plans/switches.md`）：`supported 0xf raw 0x5`，bit 0（LID_OPEN）在 `0x5`、`0x4`、`0x5` 之间变化了一次，错误数 0。机主依次做了合盖和拆底座，而日志在开机 127 秒、这两次变化之后就停了，bit 2（BASE_ATTACHED）没有变化。所以不能认定 EC 漏报了底座；日志在拆底座前后为什么停止还没有查明。这只读取状态，不触发锁屏或睡眠。
