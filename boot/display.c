@@ -94,9 +94,10 @@ static void pattern_wait(uint64_t ticks) {
 }
 #if PROBE_XNU_SCREEN
 struct display_video display_video;
-/* Black, with a green corner meaning the probe finished and XNU comes next. */
+/* Black: the load draws its picture on this (xnu_screen.c). */
 static uint32_t pattern_pixel(uint32_t x,uint32_t y,const struct cb_display *b) {
-    return x+64>=b->width && y<32?0xff00ff00u:0xff000000u;
+    (void)x;(void)y;(void)b;
+    return 0xff000000u;
 }
 #else
 static uint32_t pattern_pixel(uint32_t x,uint32_t y,const struct cb_display *b) {
