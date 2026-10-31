@@ -2,20 +2,25 @@
 // Adapted from UniXNU drivers/RamBlock/NativeRamBlock.cpp, Copyright (c) 2026, UniXNU contributors.
 // The IOKit side of UniXNU's RamBlock (same class, personality and exported names), with the
 // USB mass storage device behind it instead of memory. Read-only: the kernel reports the medium
-// as write protected and refuses writes, whatever a filesystem asks.
+// as write protected unless the explicit, validated external Data partition is selected.
+// In that mode only sectors wholly inside that partition can be written.
 #include <IOKit/IOLib.h>
 #include <IOKit/IOBSD.h>
 #include <IOKit/storage/IOBlockStorageDevice.h>
+#include <IOKit/storage/IOMedia.h>
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSIterator.h>
 #include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSString.h>
 #include <sys/param.h>
 #include <pexpert/pexpert.h>
+#include "USBDataWindow.h"
 
 extern "C" {
 int coachz_usb_open(uint64_t *blocks);
 int coachz_usb_read(uint64_t block, uint32_t count, void **data);
+int coachz_usb_write(uint64_t block, uint32_t count, const void *data);
+int coachz_usb_sync(void);
 uint32_t coachz_usb_max_blocks(void);
 void coachz_usb_report(void);
 int coachz_usb_root_device(dev_t device);
@@ -37,9 +42,14 @@ int native_ram_block_gpu_addon(const uint8_t **, uint64_t *);
 int native_ram_block_volume_seed(const char *, dev_t *, char *, size_t, uint64_t *, uint64_t *, uint8_t *);
 }
 
+static CoachzUSBDataWindow data_window;
+static char data_uuid[40];
+static bool persistent_data;
+
 class NativeRamBlock : public IOBlockStorageDevice {
   OSDeclareDefaultStructors(NativeRamBlock)
   IOLock *gate = nullptr;
+  uint8_t *write_buffer = nullptr;
   uint64_t capacity = 0;
   bool online = false;
 public:
@@ -60,10 +70,10 @@ public:
     *present = online; if (changed) *changed = false; return kIOReturnSuccess;
   }
   IOReturn reportRemovability(bool *value) override { *value = false; return kIOReturnSuccess; }
-  IOReturn reportWriteProtection(bool *value) override { *value = true; return kIOReturnSuccess; }
-  IOReturn doSynchronizeCache() override { return online ? kIOReturnSuccess : kIOReturnNotReady; }
+  IOReturn reportWriteProtection(bool *value) override { *value = !persistent_data; return kIOReturnSuccess; }
+  IOReturn doSynchronizeCache() override;
   IOReturn doSynchronize(UInt64, UInt64, IOOptionBits) override { return doSynchronizeCache(); }
-  IOReturn getWriteCacheState(bool *value) override { *value = false; return kIOReturnSuccess; }
+  IOReturn getWriteCacheState(bool *value) override { *value = persistent_data; return kIOReturnSuccess; }
   IOReturn setWriteCacheState(bool) override { return kIOReturnUnsupported; }
   IOReturn doAsyncReadWrite(IOMemoryDescriptor *, UInt64, UInt64, IOStorageAttributes *, IOStorageCompletion *) override;
 };
@@ -76,6 +86,22 @@ bool NativeRamBlock::start(IOService *provider)
     kprintf("COACHZ USB: no storage, driver not started\n");
     return false;
   }
+  if (PE_parse_boot_argn("coachz-data-uuid", data_uuid, sizeof(data_uuid))) {
+    uint8_t *work = static_cast<uint8_t *>(IOMallocZero(33792));
+    auto read = [](uint64_t block, uint32_t count, uint8_t *out) {
+      void *source = nullptr;
+      if (!coachz_usb_read(block, count, &source)) return false;
+      memcpy(out, source, count * 512u);
+      return true;
+    };
+    bool valid = strlen(data_uuid) == 36 && work && coachz_data_window(capacity, read, data_window, work, 33792);
+    if (work) IOFree(work, 33792);
+    if (!valid) panic("Coachz external Data GPT validation failed");
+    write_buffer = static_cast<uint8_t *>(IOMalloc(128 * 512));
+    if (!write_buffer || !coachz_usb_sync()) panic("Coachz external Data cache synchronization unavailable");
+    persistent_data = true;
+    kprintf("COACHZ Data: external partition validated, %llu MiB, protected outside window\n", data_window.blocks / 2048);
+  }
   native_ram_block_bytes = capacity * 512;
   online = true;
   native_ram_block_ready = 1;
@@ -83,15 +109,24 @@ bool NativeRamBlock::start(IOService *provider)
   return true;
 }
 
+IOReturn NativeRamBlock::doSynchronizeCache()
+{
+  if (!gate) return kIOReturnNotReady;
+  IOLockLock(gate);
+  IOReturn status = !online ? kIOReturnNotReady :
+      persistent_data && !coachz_usb_sync() ? kIOReturnIOError : kIOReturnSuccess;
+  IOLockUnlock(gate);
+  return status;
+}
+
 IOReturn NativeRamBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block, UInt64 count,
     IOStorageAttributes *, IOStorageCompletion *completion)
 {
   if (!buffer || !completion || !completion->action || !count || block >= capacity ||
-      count > capacity - block || buffer->getLength() < count * 512) return kIOReturnBadArgument;
-  if (buffer->getDirection() != kIODirectionIn) {
-    __atomic_fetch_add(&native_ram_block_writes, 1, __ATOMIC_RELAXED);
-    return kIOReturnNotWritable;
-  }
+      count > capacity - block || buffer->getLength() < count * 512 ||
+      (buffer->getDirection() != kIODirectionIn && buffer->getDirection() != kIODirectionOut)) return kIOReturnBadArgument;
+  bool write = buffer->getDirection() == kIODirectionOut;
+  if (write && (!persistent_data || !data_window.contains(block, count))) return kIOReturnNotWritable;
   if (!gate) return kIOReturnNotReady;
   IOLockLock(gate);
   if (!online) { IOLockUnlock(gate); return kIOReturnNotReady; }
@@ -100,12 +135,17 @@ IOReturn NativeRamBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 blo
   IOReturn status = kIOReturnSuccess;
   while (done < count) {
     uint32_t n = count - done > most ? most : static_cast<uint32_t>(count - done);
-    void *data = nullptr;
-    if (!coachz_usb_read(block + done, n, &data)) { status = kIOReturnIOError; break; }
-    if (buffer->writeBytes(done * 512, data, n * 512ull) != n * 512ull) { status = kIOReturnIOError; break; }
+    if (write) {
+      if (buffer->readBytes(done * 512, write_buffer, n * 512ull) != n * 512ull ||
+          !coachz_usb_write(block + done, n, write_buffer)) { status = kIOReturnIOError; break; }
+    } else {
+      void *data = nullptr;
+      if (!coachz_usb_read(block + done, n, &data) ||
+          buffer->writeBytes(done * 512, data, n * 512ull) != n * 512ull) { status = kIOReturnIOError; break; }
+    }
     done += n;
   }
-  __atomic_fetch_add(&native_ram_block_reads, 1, __ATOMIC_RELAXED);
+  __atomic_fetch_add(write ? &native_ram_block_writes : &native_ram_block_reads, 1, __ATOMIC_RELAXED);
   if (status) __atomic_fetch_add(&native_ram_block_failures, 1, __ATOMIC_RELAXED);
   IOLockUnlock(gate);
   completion->action(completion->target, completion->parameter, status, done * 512);
@@ -120,6 +160,7 @@ void NativeRamBlock::stop(IOService *provider)
 
 void NativeRamBlock::free()
 {
+  if (write_buffer) { IOFree(write_buffer, 128 * 512); write_buffer = nullptr; }
   if (gate) { IOLockFree(gate); gate = nullptr; }
   IOBlockStorageDevice::free();
 }
@@ -167,6 +208,7 @@ OSDefineMetaClassAndStructors(CoachzDataBlock, IOBlockStorageDevice)
 
 extern "C" int coachz_data_publish(void)
 {
+  if (persistent_data) return 1;
   uint64_t base = 0, bytes = 0;
   if (mdevgetrange(0, &base, &bytes) || !base || !bytes || (bytes & 511)) return 0;
   IOService *resources = IOService::getResourceService();
@@ -183,6 +225,31 @@ extern "C" int coachz_data_volume_device(char *path, size_t size)
 {
   if (!path || size < 6) return 0;
   path[0] = 0;
+  if (persistent_data) {
+    if (!coachz_usb_volume_device(data_uuid, path, size)) return 0;
+    OSDictionary *matching = IOService::serviceMatching("IOMedia");
+    OSIterator *iterator = matching ? IOService::getMatchingServices(matching) : nullptr;
+    OSSafeReleaseNULL(matching);
+    bool found = false;
+    while (iterator) {
+      IOService *media = OSDynamicCast(IOService, iterator->getNextObject());
+      if (!media) break;
+      OSString *name = OSDynamicCast(OSString, media->getProperty(kIOBSDNameKey));
+      if (!name || strcmp(name->getCStringNoCopy(), path + 5)) continue;
+      bool partition = false;
+      for (unsigned depth = 0; media && depth < 64; media = media->getProvider(), depth++) {
+        // IOMedia belongs to the original prelinked storage kext, not the source kernel.
+        IOMedia *extent = static_cast<IOMedia *>(media->metaCast("IOMedia"));
+        if (extent && extent->getBase() == data_window.first * 512 &&
+            extent->getSize() == data_window.blocks * 512) partition = true;
+        if (OSDynamicCast(NativeRamBlock, media)) { found = partition; break; }
+      }
+      break;
+    }
+    OSSafeReleaseNULL(iterator);
+    if (!found) path[0] = 0;
+    return found;
+  }
   for (unsigned attempt = 0; attempt < 100 && !path[0]; attempt++) {
     OSDictionary *matching = IOService::serviceMatching("IOMedia");
     OSString *content = OSString::withCString("41504653-0000-11AA-AA11-00306543ECAC");

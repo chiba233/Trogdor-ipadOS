@@ -1,0 +1,111 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8178,6 +8178,12 @@
+  * (BSD-2-Clause-Patent, Copyright (c) 2026, UniXNU contributors), including its APFS mount
+  * payload. The outcome is kept for the exit of process 1.
+  */
++/* Native union root and lower-directory fixes follow pinned UniXNU's SystemOS composition
++ * (BSD-2-Clause-Patent). The ordinary path view includes non-cache dylibs and resources.
++ */
++#if !CONFIG_UNION_MOUNTS
++#error Coachz SystemOS composition requires native union mounts
++#endif
+ #define COACHZ_SYSTEMOS_UUID "8846FE78-2910-4297-AF97-D59BB6F8FC16"
+ extern int coachz_usb_root_device(dev_t);
+ extern int coachz_usb_volume_device(const char *, char *, size_t);
+@@ -8196,7 +8202,11 @@
+ static void
+ coachz_systemos_prepare(proc_t p, user_addr_t scratch, user_addr_t *envp)
+ {
+-	const char *mountpoint = "/private/preboot";
++	int use_union = 0;
++	(void)PE_parse_boot_argn("coachz-systemos-union", &use_union, sizeof(use_union));
++	use_union = use_union == 1;
++	const char *mountpoint = use_union ? "/" : "/private/preboot";
++	vnode_t original_os_root = rootvnode;
+ 	const char *environment = "DYLD_SHARED_CACHE_DIR=/private/preboot/System/Library/Caches/com.apple.dyld";
+ 	user64_addr_t environment_vector[2] = {scratch + 0x400, USER_ADDR_NULL};
+ 	mount_t root_mount = vnode_mount(rootvnode);
+@@ -8209,7 +8219,7 @@
+ 	uint16_t mount_mode = 1;
+ 	uint32_t anonymous_owner = 99;
+ 	struct mount_args request = {.type = scratch + 0x100, .path = scratch + 0x120,
+-	    .flags = MNT_RDONLY, .data = scratch + 0x200};
++	    .flags = MNT_RDONLY | (use_union ? MNT_UNION : 0), .data = scratch + 0x200};
+ 	int32_t result = 0;
+ 	int error;
+ 
+@@ -8221,12 +8231,18 @@
+ 		    "COACHZ SystemOS: skipped, root read-only %d on the USB disk %d\n",
+ 		    (vfs_flags(root_mount) & MNT_RDONLY) != 0, root_device != NODEV && coachz_usb_root_device(root_device));
+ 		printf("%s", coachz_systemos_note);
++		if (use_union) {
++			panic("Coachz SystemOS union requires the selected read-only USB volumes");
++		}
+ 		return;
+ 	}
+ 	if (!coachz_usb_volume_device(COACHZ_SYSTEMOS_UUID, device_path, sizeof(device_path))) {
+ 		snprintf(coachz_systemos_note, sizeof(coachz_systemos_note),
+ 		    "COACHZ SystemOS: no volume %s on the USB disk\n", COACHZ_SYSTEMOS_UUID);
+ 		printf("%s", coachz_systemos_note);
++		if (use_union) {
++			panic("Coachz SystemOS union requires the selected read-only USB volumes");
++		}
+ 		return;
+ 	}
+ 	memcpy(mount_data, &spec, sizeof(spec));
+@@ -8251,25 +8267,45 @@
+ 		vnode_t mounted = NULLVP;
+ 		error = vnode_lookup(mountpoint, 0, &mounted, vfs_context_current());
+ 		if (!error) {
+-			coachz_systemos_mount = vnode_mount(mounted);
++			mount_t mp = vnode_mount(mounted);
++			if (use_union && ((vfs_flags(mp) & (MNT_RDONLY | MNT_UNION)) != (MNT_RDONLY | MNT_UNION) ||
++			    rootvnode != mounted || vnode_mountedhere(original_os_root) != mp)) {
++				error = EINVAL;
++			} else {
++				coachz_systemos_mount = mp;
++			}
+ 			vnode_put(mounted);
+ 		}
+ 	}
++	if (!error && use_union) {
++		vnode_t library = NULLVP;
++		error = vnode_lookup("/usr/lib/libobjc-trampolines.dylib", 0, &library, vfs_context_current());
++		if (!error && (vnode_mount(library) != coachz_systemos_mount || vnode_vtype(library) != VREG)) {
++			error = EINVAL;
++		}
++		if (library) {
++			vnode_put(library);
++		}
++	}
++	if (!error && !use_union) {
++		error = copyout(environment, environment_vector[0], strlen(environment) + 1);
++	}
++	if (!error && !use_union) {
++		error = copyout(environment_vector, scratch + 0x500, sizeof(environment_vector));
++	}
+ 	if (!error) {
+-		error = copyout(environment, environment_vector[0], strlen(environment) + 1);
+-	}
+-	if (!error) {
+-		error = copyout(environment_vector, scratch + 0x500, sizeof(environment_vector));
+-	}
+-	if (!error) {
+-		*envp = scratch + 0x500;
++		*envp = use_union ? USER_ADDR_NULL : scratch + 0x500;
+ 		/* dyld flag bit 3: no ignition, the cryptex is in place already. */
+ 		dyld_flags |= UINT64_C(8);
+ 		commpage_update_dyld_flags(dyld_flags);
+ 	}
+ 	snprintf(coachz_systemos_note, sizeof(coachz_systemos_note),
+-	    "COACHZ SystemOS: mount %s at %s: %d, dyld_flags 0x%llx\n", device_path, mountpoint, error, dyld_flags);
++	    "COACHZ SystemOS: mount %s at %s: %d, union %d, dyld_flags 0x%llx\n",
++	    device_path, mountpoint, error, use_union, dyld_flags);
+ 	printf("%s", coachz_systemos_note);
++	if (error && use_union) {
++		panic("Coachz SystemOS union composition failed: %d", error);
++	}
+ }
+ 
+ /* Temporary bring-up policy, using launchd's original root-owned disabled.plist loader.

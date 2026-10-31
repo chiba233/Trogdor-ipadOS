@@ -385,6 +385,41 @@ class DisplayTests(unittest.TestCase):
             command = HEADER.unpack_from(payload)[-1].split(b'\0', 1)[0].split()
             self.assertEqual(b'coachz-disable-watchdogd=1' in command, seed is not None)
 
+    def test_systemos_union_selects_main_os_without_changing_restore_routes(self):
+        from test_xnu_checkpoint import fixture, adt
+        from xnu_checkpoint import HEADER
+        from xnu_screen import pack, PRELINK_COMMAND_LINE
+        cache = struct.pack('<I16sI', 2, bytes(16), 0)
+        self.assertNotIn('coachz-systemos-union', PRELINK_COMMAND_LINE)
+        for root in ({'root_uuid': '04769D26-2CA0-4825-B443-E2E5F88300F2'},
+                     {'root_device': 'disk1s1'}, {}):
+            payload = pack(bytes(fixture()), adt(), 0x40000000, 1 << 30,
+                           prelinked=True, root_cache=[cache], **root)
+            command = HEADER.unpack_from(payload)[-1].split(b'\0', 1)[0].split()
+            self.assertEqual(command.count(b'coachz-systemos-union=1'), int('root_uuid' in root))
+
+    def test_external_data_omits_ramdisk_and_preserves_main_os_policy(self):
+        from test_xnu_checkpoint import fixture, adt
+        from xnu_checkpoint import HEADER
+        from xnu_screen import pack, read_tree
+        cache = struct.pack('<I16sI', 2, bytes(16), 0)
+        uuid = '00000000-1111-2222-3333-444444444444'
+        options = dict(prelinked=True, root_cache=[cache], root_uuid='04769D26-2CA0-4825-B443-E2E5F88300F2')
+        payload = pack(bytes(fixture()), adt(), 0x40000000, 1 << 30, data_uuid=uuid, **options)
+        header = HEADER.unpack_from(payload)
+        command = header[-1].split(b'\0', 1)[0].split()
+        self.assertIn(('coachz-data-uuid=' + uuid).encode(), command)
+        self.assertIn(b'coachz-disable-watchdogd=1', command)
+        tree = read_tree(payload[header[9]:header[9] + header[10]])
+        props = dict((key, value) for key, _, value in tree.child('chosen').child('memory-map').props)
+        self.assertNotIn('RAMDisk', props)
+        self.assertIn('TrustCache', props)
+        for invalid in ('bad', uuid.lower().replace('1', 'a')):
+            with self.assertRaises(ValueError):
+                pack(bytes(fixture()), adt(), 0x40000000, 1 << 30, data_uuid=invalid, **options)
+        with self.assertRaises(ValueError):
+            pack(bytes(fixture()), adt(), 0x40000000, 1 << 30, data_uuid=uuid, data_seed=bytes(4096), **options)
+
     def test_hardware_verified_scanout_restart_order_is_unchanged(self):
         source=(ROOT/'boot/display.c').read_text()
         self.assertEqual(re.findall(r'pattern_write\(DISPLAY_(\w+),',source),['COUNT_EN','DSI','SCANOUT','TE','TE','DSI','COUNT_EN'])

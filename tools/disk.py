@@ -3,7 +3,6 @@
 import argparse
 import hashlib
 from pathlib import Path
-import shutil
 import struct
 import uuid
 import zlib
@@ -79,6 +78,15 @@ def fragments(payload, label="Coachz probe", disk_mib=64, kernel_mib=16, tries=1
             ((sectors - 1) * SECTOR, header(sectors - 1, 1, sectors - 33))]
 
 
+def copy_container(source, destination):
+    """Keep zero-filled APFS free space sparse in the ordinary output file."""
+    while chunk := source.read(8 << 20):
+        if chunk.count(0) == len(chunk):
+            destination.seek(len(chunk), 1)
+        else:
+            destination.write(chunk)
+
+
 def create_image(source, output, label="Coachz probe", disk_mib=64, kernel_mib=16, tries=1, roots=(),
                  kernel_only=False):
     """kernel_only: write only up to the end of the kernel partition, for a medium whose
@@ -105,7 +113,7 @@ def create_image(source, output, label="Coachz probe", disk_mib=64, kernel_mib=1
             dest.seek(offset)
             if isinstance(data, Path):
                 with data.open("rb") as container:
-                    shutil.copyfileobj(container, dest, 8 << 20)
+                    copy_container(container, dest)
             else:
                 dest.write(data)
     return output

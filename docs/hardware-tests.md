@@ -838,3 +838,69 @@ panic 的调用栈为 `PE_init_iokit → InitIOKit → OSlibkernInit → OSRunti
 同次启动的屏幕出现 SpringBoard 的退出记录，wait 状态为 `0x6`／SIGABRT，证明启动已推进到该进程的退出路径；尚没有可见界面，也没有其真实故障 PC／调用栈。locationd、sharingd、chronod 等也出现 SIGABRT，liveactivitiesd 则为 SIGTRAP；不据相同信号断定相同根因。
 
 `Too many corpses being created` 是 proc_prepareexit 在原有崩溃处理阶段调用 task_mark_corpse 失败后的诊断，不是本次进程为何 abort 的解释。下一步保留已通过的目录准备与 usermanagerd 诊断，单独记录 SpringBoard 的首个非零退出 reason、上下文、可执行文件头、共享缓存 slide 和可用用户栈，先定位实际依赖失败。
+
+
+## 2026-10-31：SpringBoard 首次异常现场诊断（本地修订）
+
+在已验收的 keybags 目录准备之上，新增独立 `coachz-prelink-springboard-diagnostic.patch`。它仅观察 SpringBoard：有界保存 stdout/stderr，在首次非零退出时记录原始 wait 状态、reason namespace／code／description、处理上下文、Mach header 与共享缓存 slide。自身退出时保存 PC／LR／x16，并通过 copyin 读取最多十二帧、限初始 SP 上方 64 KiB 的用户帧链；其他上下文仅记录目标线程的标注快照。
+
+记录完成后每十秒重显末尾输出及现场，并优先于全量进程／介质采样，避免循环屏幕覆盖。user-manager 诊断和通过验收的目录准备保持原样；原版进程、trust cache、信号与关键进程退出策略不变。同版原始共享缓存与本地符号 UUID 已核对匹配，为实际硬件帧定位准备输入。锁定 UniXNU 的 FrontBoard 显示断言分析仅作参考，不能替代本机故障位置。源码内核与 prelink 构建通过，27 项既有基础回归通过；最终机器码已核对退出、普通 write 路径与周期报告三个实际调用。镜像 SHA-256 为 `8b998ea52af6eb14ba1f3c30a2257841d57342bd3761246388ef8903bfa30dad`，实际内嵌内核及 SB 诊断字符串、已验收目录准备字符串、相同 GPT 与 Data 种子核对后，既有免密写盘器完成 225 MiB 前缀写入与全量回读并返回零，没有自动重启。普通 write 路径只保留片段，空白 stdio 不代表没有日志；可用帧链也不保证完整。新诊断仍未实机验收，保持未提交。
+
+## SpringBoard 首次异常：Objective-C trampoline 路径缺失
+
+独立的 SpringBoard 诊断已在真机照片中输出首个异常退出：`status 0x6`，
+`OS_REASON_OBJC`（namespace 8）、code 1。原始说明为无法 `dlopen`
+`/usr/lib/libobjc-trampolines.dylib`：普通路径不存在，亦不在 dyld cache 中。
+已取得可执行文件基址、cache slide、PC/LR 与 12 层用户栈；原始现场保留在私有记录中。
+这确认了装载命名空间故障，不表示已进入正常图形界面，也不能由此判断 GPU 是否可用。
+
+只读检查同一 IPSW 的原始 OS 与 SystemOS：该文件不在 OS，却在 SystemOS 的 `usr/lib`
+中。之前仅挂载 SystemOS 到 `/private/preboot` 并设置共享缓存搜索目录，未合成普通
+`/usr/lib` 路径。因此当前实验改用 XNU 原生只读 union root，沿用已选架构的 lower-directory
+及 getattrlistbulk 补丁，检查真实挂载关系及规范路径的原始 dylib，移除该模式下的缓存目录
+环境覆盖。保持旧恢复环境与显式内存 Data 路线。
+
+### 下一轮介质配置：尚未实机验收
+
+64 MiB 内存 Data 已不适合当前服务。下一轮选择独立 8 GiB、无角色 APFS Data，作为
+GPT 第四分区；按卷 UUID 挂到 `/private/var`。种子从原有普通镜像扩容，保留目录及真实
+所有者。OS 与 SystemOS 原始容器保持只读；只有经主备 GPT 校验的 Data 扇区窗口允许
+USB 写入，所有读写及真实 SCSI cache flush 共用一个锁。原厂 vboot 会在尝试启动时把
+备份 GPT 更新到物理盘尾，而主表 alternate LBA 可能仍指向镜像末尾；校验按该实现处理。
+
+分区布局改变后须在 Mac 本地写完整镜像并回读。后续内核前缀只能用于完全相同的 GPT
+布局，不能再使用先前的三分区脚本。具体设计见 [外接 Data](plans/usb-data.md)。
+构建、分区边界回归和介质回读均不代替这条新路线的真机验收；重启后数据保留也需单独验证。
+
+下一轮普通镜像已完成主机校验：实际嵌入当前 prelinked 内核，启动参数选择 native union
+和外接 Data UUID，不包含 `RAMDisk`／`PackedRAMDisk`，未添加全局 panic 或代码签名禁用。
+主备 GPT CRC 和容器逐字节校验通过，第四分区与 APFS superblock 均为 8 GiB。
+边界测试覆盖物理盘尾 vboot 修复、损坏主备表、读取失败、分区重叠、错误容量与跨界写入；
+原有恢复路线回归、五项镜像检查及四种基线探针构建通过。全套 162 项主机检查中 ABI 编译
+项被沙箱工具权限阻断，其所属 12 项模块在正常主机权限下重跑通过。以上仍非真机启动验收。
+
+## 2026-10-31：原生 union 与外接 Data 启动路径越过缺库，进入主显示器断言
+
+同一四分区整盘镜像的本地写入与完整回读由操作者完成，摘要匹配，随后手动启动。
+照片中的 SpringBoard 首次异常已由此前 namespace 8/code 1 的缺库 SIGABRT 变为
+`status 0x5`、`OS_REASON_SIGNAL`（namespace 2）、code 5，且为自身退出上下文。
+照片包含本轮共享缓存 slide 与可读帧链。
+
+使用本次 IPSW 原始缓存和 UUID 匹配的 local-symbol 文件独立符号化：PC 对应
+`-[FBSDisplayMonitor _initWithBookendObserver:transformer:] + 1148`，随后帧链经过
+FrontBoard 的 `+[FBDisplayManager sharedInstance]` block、libdispatch once 和
+`-[FBSystemShell _initWithOptions:]` block。原始缓存该 PC 的指令为 BRK；解析此
+故障块实际引用的 CFString 得到 `failed to find the main CADisplay`。此字符串是原始
+二进制的静态断言引用，并非照片捕获的运行时输出；原始地址和图像留在私有记录中。
+`Too many corpses being created` 仍只是后续崩溃处理失败，不能取代这个故障位置。
+
+本镜像在 launchd 前强制验证 union 根关系及规范路径的 trampoline 文件，并在外接
+Data 的 GPT、cache sync、卷选择、挂载或目录／策略准备失败时停止。因此 SpringBoard
+到达新位置说明这些启动前检查已经通过，且已越过此前原版 Objective-C 缺库退出；这是
+根据确切镜像与强制路径作出的判断，照片没有保留所有早期成功行。恢复到 Debian 后，
+只读分区检查确认第四分区为 8 GiB APFS。没有再次出现之前带 Data 角色的未加密卷拒绝。
+重启后的文件内容持久性尚未单独读回，不将分区存在等同于完整的持久性验收。
+
+下一步是向原版显示框架发布实际固件 framebuffer。现有内核文本控制台不等于存在
+IOMobileFramebuffer/CADisplay 服务；此轮没有可见用户界面，也没有 GPU 渲染或触摸支持
+的验收。保持原版系统文件、崩溃策略、四分区布局及外接 Data，不再重写整盘来做纯内核迭代。

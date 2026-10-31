@@ -164,7 +164,7 @@ def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=T
 
 
 def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=False, root_cache=None, root_device=None,
-         root_uuid=None, data_seed=None):
+         root_uuid=None, data_seed=None, data_uuid=None):
     if window & 0x1fffff or memory & 0x1fffff:
         raise ValueError('window base and size must be 2 MiB aligned')
     kernel = macho(data)
@@ -181,10 +181,16 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         if not re.fullmatch(r'[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}', root_uuid):
             raise ValueError('invalid root volume UUID')
         command_line = command_line.replace(' rd=md0', '')
+        # Compose all SystemOS files at their normal paths, not only the shared-cache directory.
+        command_line += ' coachz-systemos-union=1'
+    if data_uuid:
+        if not root_uuid or data_seed is not None or not re.fullmatch(r'[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}', data_uuid):
+            raise ValueError('an external Data UUID needs the main OS root and no memory Data seed')
+        command_line += ' coachz-data-uuid=' + data_uuid
     if data_seed is not None and not root_uuid:
         raise ValueError('a Data seed goes with the main OS root')
-    if data_seed:
-        # The real board has no IOWatchdog service yet; the override lives only in memory Data.
+    if data_seed or data_uuid:
+        # The real board has no IOWatchdog service yet; the override lives on the selected Data volume.
         command_line += ' coachz-disable-watchdogd=1'
     if disk_root:
         # The main OS can carry its Data seed as the RAM disk: md0, mounted on /private/var by the kernel.
@@ -237,6 +243,7 @@ def main():
                    help='an original trust cache module of the root; repeat for the main OS and its cryptexes')
     p.add_argument('--root-device', help='with --prelinked: root on this BSD disk instead of a RAM disk, such as disk1s1')
     p.add_argument('--root-uuid', help='with --prelinked: the main OS, rooted on the APFS volume of this UUID')
+    p.add_argument('--data-uuid', help='with --root-uuid: selected external Data APFS volume UUID')
     p.add_argument('--data-image', type=Path, help='with --root-uuid: APFS Data seed, the RAM disk the kernel mounts on /private/var')
     a = p.parse_args()
     if a.output.exists() or a.output.resolve().is_relative_to(Path('/dev')):
@@ -249,7 +256,7 @@ def main():
     payload = pack(a.kernel.read_bytes(), a.adt.read_bytes(), a.window, a.memory, prelinked=a.prelinked,
                    ramdisk=a.root_image.read_bytes() if a.root_image else None,
                    root_cache=[cache.read_bytes() for cache in a.root_trust_cache] or None, root_device=a.root_device,
-                   root_uuid=a.root_uuid, data_seed=a.data_image.read_bytes() if a.data_image else None)
+                   root_uuid=a.root_uuid, data_seed=a.data_image.read_bytes() if a.data_image else None, data_uuid=a.data_uuid)
     a.output.parent.mkdir(parents=True, exist_ok=True)
     a.output.write_bytes(payload)
     print('Built screen-output XNU payload', hashlib.sha256(payload).hexdigest())

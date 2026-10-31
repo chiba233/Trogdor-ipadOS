@@ -20,3 +20,10 @@ coachz-prelink-watchdog-policy.patch
 coachz-prelink-keybags-directory.patch
 # Keep normal init task counts and the first abnormal usermanagerd exit visible after respawns.
 coachz-prelink-usermanager-diagnostic.patch
+# First abnormal SpringBoard exit, retained separately from user initialization.
+coachz-prelink-springboard-diagnostic.patch
+# Whole read-only SystemOS/OS root view and directory fallback, adapted from UniXNU (BSD-2-Clause-Patent).
+coachz-prelink-systemos-union.patch
+
+# Selected external 8 GiB Data, with the previous RAM Data as an explicit fallback route.
+coachz-prelink-usb-data.patch

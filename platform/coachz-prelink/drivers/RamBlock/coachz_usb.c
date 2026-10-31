@@ -3,7 +3,7 @@
    probe. libpayload writes zero into every upper address word, and the kernel's memory is above
    4 GiB, so its memory is a fixed pool below 4 GiB that XNU does not manage, mapped uncached.
    The probe experiment showed DMA reaches this range and the SMMU is in bypass. It polls: no
-   interrupt is used. Only READ commands are issued. Calls are serialized by the driver. */
+   interrupt is used. The driver serializes all calls and bounds Data writes to its validated GPT window. */
 #include <libpayload.h>
 #include <usb/usb.h>
 #include <usb/usbmsc.h>
@@ -85,10 +85,23 @@ static uint64_t le64_at(const uint8_t *p) {
     return v;
 }
 
+extern int coachz_usbmsc_sync(usbdev_t *dev);
+
+int coachz_usb_sync(void) { return disk && coachz_usbmsc_sync(disk) == 0; }
+
+/* Caller holds the block-device gate and has checked the Data partition window. */
+int coachz_usb_write(uint64_t block, uint32_t count, const void *data) {
+    if (!disk || !data || !count || count > MAX_BLOCKS || block >= MSC_INST(disk)->numblocks ||
+        count > MSC_INST(disk)->numblocks - block || block + count > 0x7fffffffull) return 0;
+    memcpy(transfer, data, count * 512u);
+    return readwrite_blocks_512(disk, (int)block, (int)count, cbw_direction_data_out, transfer) == 0;
+}
+
 uint32_t coachz_usb_max_blocks(void) { return MAX_BLOCKS; }
 
 int coachz_usb_read(uint64_t block, uint32_t count, void **data) {
-    if (!disk || count > MAX_BLOCKS || block + count > 0x7fffffffull) return 0;
+    if (!disk || !data || !count || count > MAX_BLOCKS || block >= MSC_INST(disk)->numblocks ||
+        count > MSC_INST(disk)->numblocks - block || block + count > 0x7fffffffull) return 0;
     if (readwrite_blocks_512(disk, (int)block, (int)count, cbw_direction_data_in, transfer)) return 0;
     *data = transfer;
     return 1;

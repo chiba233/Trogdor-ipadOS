@@ -1,0 +1,170 @@
+--- a/osfmk/arm64/coachz_thread.c
++++ b/osfmk/arm64/coachz_thread.c
+@@ -199,3 +199,117 @@
+ 	    coachz_um_output + start, coachz_um_failure);
+ 	return 1;
+ }
++
++/* Keep SpringBoard's first abnormal exit separate from usermanagerd's accepted
++ * initialization observations. This is a passive screen diagnostic, not a driver.
++ */
++void coachz_springboard_write(int, uint64_t, uint64_t);
++void coachz_springboard_exit(int, int, unsigned, uint64_t, const char *, task_t, int, int);
++int coachz_springboard_report(void);
++static char coachz_sb_output[2048];
++static uint32_t coachz_sb_output_used;
++static char coachz_sb_failure[3072];
++static uint32_t coachz_sb_captured;
++
++void
++coachz_springboard_write(int fd, uint64_t address, uint64_t size)
++{
++	char bytes[256];
++	uint32_t length = size > sizeof(bytes) - 1 ? sizeof(bytes) - 1 : (uint32_t)size;
++	uint32_t at;
++
++	if (!length || os_atomic_load(&coachz_sb_captured, acquire) || copyin(address, bytes, length)) {
++		return;
++	}
++	at = os_atomic_add_orig(&coachz_sb_output_used, length + 1, relaxed);
++	if (at < sizeof(coachz_sb_output) - 1) {
++		uint32_t room = (uint32_t)sizeof(coachz_sb_output) - 1 - at;
++		uint32_t count = length < room ? length : room;
++		memcpy(coachz_sb_output + at, bytes, count);
++		if (count < room) {
++			coachz_sb_output[at + count] = '\n';
++		}
++	}
++	(void)fd;
++}
++
++void
++coachz_springboard_exit(int pid, int status, unsigned ns, uint64_t code,
++    const char *description, task_t task, int self, int caller)
++{
++	arm_saved_state_t *state;
++	uint64_t fp, sp;
++	size_t used;
++
++	if (!status || !os_atomic_cmpxchg(&coachz_sb_captured, 0, 1, acq_rel)) {
++		return;
++	}
++	used = snprintf(coachz_sb_failure, sizeof(coachz_sb_failure),
++	    "COACHZ SB v1 exit[%d]: status 0x%x self %d caller %d\n"
++	    "COACHZ SB reason: namespace %u code 0x%llx description %.200s\n",
++	    pid, status, self, caller, ns, (unsigned long long)code, description ? description : "none");
++	if (task == TASK_NULL) {
++		goto done;
++	}
++	used += snprintf(coachz_sb_failure + used, sizeof(coachz_sb_failure) - used,
++	    "COACHZ SB image: header 0x%llx cache-slide 0x%x\n",
++	    (unsigned long long)task->mach_header_vm_address, task->task_shared_region_slide);
++	if (!self) {
++		thread_t thread;
++		unsigned index = 0;
++		task_lock(task);
++		queue_iterate(&task->threads, thread, thread_t, task_threads) {
++			if (index == 3) {
++				break;
++			}
++			state = find_user_regs(thread);
++			used += snprintf(coachz_sb_failure + used, sizeof(coachz_sb_failure) - used,
++			    "COACHZ SB target t%u (sample): pc 0x%llx lr 0x%llx x16 0x%llx\n",
++			    index++, state ? (unsigned long long)get_saved_state_pc(state) : 0ULL,
++			    state ? (unsigned long long)get_saved_state_lr(state) : 0ULL,
++			    state ? (unsigned long long)get_saved_state_reg(state, 16) : 0ULL);
++		}
++		task_unlock(task);
++		goto done;
++	}
++	state = find_user_regs(current_thread());
++	if (!state) {
++		goto done;
++	}
++	used += snprintf(coachz_sb_failure + used, sizeof(coachz_sb_failure) - used,
++	    "COACHZ SB state: pc 0x%llx lr 0x%llx x16 0x%llx\n",
++	    (unsigned long long)get_saved_state_pc(state), (unsigned long long)get_saved_state_lr(state),
++	    (unsigned long long)get_saved_state_reg(state, 16));
++	sp = get_saved_state_sp(state);
++	fp = get_saved_state_fp(state);
++	for (unsigned index = 0; index < 12 && used < sizeof(coachz_sb_failure) - 100; index++) {
++		uint64_t frame[2];
++		if ((fp & 15) || fp < sp || fp - sp > 65536 || copyin(fp, frame, sizeof(frame))) {
++			break;
++		}
++		used += snprintf(coachz_sb_failure + used, sizeof(coachz_sb_failure) - used,
++		    "COACHZ SB frame %u: fp 0x%llx lr 0x%llx\n", index,
++		    (unsigned long long)fp, (unsigned long long)frame[1]);
++		if (frame[0] <= fp) {
++			break;
++		}
++		fp = frame[0];
++	}
++done:
++	os_atomic_store(&coachz_sb_captured, 2, release);
++	printf("%s", coachz_sb_failure);
++}
++
++int
++coachz_springboard_report(void)
++{
++	unsigned phase = os_atomic_load(&coachz_sb_captured, acquire);
++	if (phase != 2) {
++		printf("COACHZ SB v1: waiting for abnormal exit (capture %u)\n", phase);
++		return 0;
++	}
++	size_t length = strnlen(coachz_sb_output, sizeof(coachz_sb_output));
++	unsigned start = length > 512 ? (unsigned)(length - 512) : 0;
++	printf("COACHZ SB stdout/stderr tail:\n%s\n%s", coachz_sb_output + start, coachz_sb_failure);
++	return 1;
++}
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1909,6 +1909,14 @@
+ 	}
+ 
+ 
++	if (!strcmp(p->p_name, "SpringBoard") || !strcmp(p->p_comm, "SpringBoard")) {
++		extern void coachz_springboard_exit(int, int, unsigned, uint64_t, const char *, task_t, int, int);
++		os_reason_t reason = p->p_exit_reason;
++		coachz_springboard_exit(proc_getpid(p), rv, reason ? reason->osr_namespace : 0,
++		    reason ? reason->osr_code : 0, exit_reason_get_string_desc(reason), task,
++		    p == current_proc(), proc_getpid(current_proc()));
++	}
++
+ 	if (p->p_crash_behavior != 0 || p == initproc) {
+ 		proc_handle_critical_exit(p, rv);
+ 	}
+--- a/bsd/kern/sys_generic.c
++++ b/bsd/kern/sys_generic.c
+@@ -681,6 +681,11 @@
+ 	int spacetype = IS_64BIT_PROCESS(p) ? UIO_USERSPACE64 : UIO_USERSPACE32;
+ 
+ 	if ((fd == 1 || fd == 2) &&
++	    (!strcmp(p->p_name, "SpringBoard") || !strcmp(p->p_comm, "SpringBoard"))) {
++		extern void coachz_springboard_write(int, uint64_t, uint64_t);
++		coachz_springboard_write(fd, buf, nbyte);
++	}
++	if ((fd == 1 || fd == 2) &&
+ 	    (!strcmp(p->p_name, "usermanagerd") || !strcmp(p->p_comm, "usermanagerd"))) {
+ 		extern void coachz_usermanager_write(int, int, uint64_t, uint64_t);
+ 		coachz_usermanager_write(proc_getpid(p), fd, buf, nbyte);
+--- a/bsd/dev/coachz_sample.c
++++ b/bsd/dev/coachz_sample.c
+@@ -19,6 +19,7 @@
+ extern void coachz_root_prepare(void);
+ extern void coachz_usb_report(void);
+ extern int coachz_usermanager_report(void);
++extern int coachz_springboard_report(void);
+ 
+ static int
+ coachz_sample_proc(proc_t p, __unused void *arg)
+@@ -45,7 +46,7 @@
+ 
+ 		(void)tsleep(&chan, PZERO, "coachz", 10 * hz);
+ 		/* Keep the captured note readable on the wrapping screen console. */
+-		if (coachz_usermanager_report() || ++ticks < 6) {
++		if (coachz_springboard_report() || coachz_usermanager_report() || ++ticks < 6) {
+ 			continue;
+ 		}
+ 		ticks = 0;

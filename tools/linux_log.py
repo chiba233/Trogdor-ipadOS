@@ -28,6 +28,14 @@ def sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def file_sha(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(8 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def child(node, name):
     matches = [c for c in node.children if c.name == name]
     if len(matches) != 1:
@@ -290,7 +298,7 @@ def main():
               "source_sha256": sha(source.read_bytes()),
               "linux_sha256": sha(kernel), "cmdline_sha256": sha(cmdline), "dtb_count": count,
               "log_property": LOG_PROPERTY, "log_bytes": LOG_BYTES, "layout": layout,
-              "artifacts": {f.name: {"sha256": sha(f.read_bytes()), "bytes": f.stat().st_size}
+              "artifacts": {f.name: {"sha256": file_sha(f), "bytes": f.stat().st_size}
                             for f in (out / "probe.elf", out / "Image", fit_path, kpart, image)}}
     (out / "manifest.json").write_text(json.dumps(report, indent=2) + "\n")
     print("Built native probe/Linux log image; source command line, DTBs and initrd preserved.")

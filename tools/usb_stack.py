@@ -48,7 +48,7 @@ def source(path):
                                     spec['commit'] + ':payloads/libpayload/' + path], text=True)
 
 
-def extract(tree):
+def extract(tree, writable_storage=False):
     (tree / 'include/usb').mkdir(parents=True)
     for name in DRIVERS + LOCAL_HEADERS:
         text = source('drivers/usb/' + name)
@@ -56,6 +56,8 @@ def extract(tree):
             text = runtime_table(text, *TABLES[name])
         if name == 'xhci_private.h':
             text = unpacked_registers(text)
+        if writable_storage and name == 'usbmsc.c':
+            text += '''\n/* Coachz: complete APFS flushes with the original bulk-only SCSI transport. */\nint coachz_usbmsc_sync(usbdev_t *dev) {\n    const u8 command[10] = {0x35}; /* SYNCHRONIZE CACHE(10), whole LUN */\n    return execute_command(dev, cbw_direction_data_out, command, 10, NULL, 0, 0);\n}\n'''
         (tree / name).write_text(text)
     for name in HEADERS:
         (tree / 'include/usb' / name).write_text(source('include/usb/' + name))

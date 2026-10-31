@@ -63,7 +63,7 @@ def patched_drivers(base, platform, out):
         shutil.copytree(overlay, copy, dirs_exist_ok=True)
         options += ['--local-module', 'driver:' + overlay.name + '=' + str(copy)]
         if (overlay / 'coachz_usb.c').is_file():
-            usb_stack.extract(copy / 'usb')
+            usb_stack.extract(copy / 'usb', writable_storage=True)
             shutil.copytree(ROOT / 'boot/usb_compat', copy / 'usb/compat')
     return options
 
