@@ -1,0 +1,396 @@
+--- a/iokit/conf/files
++++ b/iokit/conf/files
+@@ -53,2 +53,3 @@
+ iokit/Kernel/IOPMPowerSource.cpp			optional iokitcpp
++iokit/Kernel/CoachzMotion.cpp			optional iokitcpp
+ iokit/Kernel/CoachzInput.cpp			optional iokitcpp
+--- a/bsd/dev/coachz_sample.c
++++ b/bsd/dev/coachz_sample.c
+@@ -53,2 +53,4 @@
+ 	coachz_battery_start();
++	extern void coachz_motion_start(void);
++	coachz_motion_start(); /* optional shared-EC sensor service (coachz-motion=1) */
+ 	/* A one-second tone on the speaker (iokit/Kernel/CoachzSpeaker.cpp, coachz-speaker=1), once. */
+--- /dev/null
++++ b/iokit/Kernel/CoachzMotion.cpp
+@@ -0,0 +1,214 @@
++// SPDX-License-Identifier: BSD-2-Clause
++// Chrome EC sensor service. Pending only: no active build integration.
++#include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOWorkLoop.h>
++#include <IOKit/IOTimerEventSource.h>
++#include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSString.h>
++#include <pexpert/pexpert.h>
++#include <kern/clock.h>
++#include "coachz_motion.h"
++
++extern "C" {
++int coachz_ec_command(uint16_t, uint8_t, const void *, uint32_t, void *, uint32_t, uint32_t *);
++void coachz_motion_start(void);
++}
++
++namespace {
++constexpr unsigned kPollMs = 200; // Host polling, not a promise of sensor ODR or fresh hardware samples.
++int command(void *, uint16_t cmd, uint8_t version, const void *args, uint32_t size,
++    void *reply, uint32_t room, uint32_t *length) {
++    return coachz_ec_command(cmd, version, args, size, reply, room, length);
++}
++const cm_bus bus = {nullptr, command};
++
++bool number(OSDictionary *dictionary, const char *key, uint64_t value) {
++    OSNumber *n = OSNumber::withNumber(value, 64);
++    bool ok = n && dictionary->setObject(key, n);
++    OSSafeReleaseNULL(n);
++    return ok;
++}
++bool text(OSDictionary *dictionary, const char *key, const char *value) {
++    OSString *s = OSString::withCString(value);
++    bool ok = s && dictionary->setObject(key, s);
++    OSSafeReleaseNULL(s);
++    return ok;
++}
++bool axes(OSDictionary *dictionary, const char *key, const int64_t *values) {
++    OSArray *array = OSArray::withCapacity(3);
++    bool ok = array != nullptr;
++    for (unsigned i = 0; i < 3 && ok; ++i) {
++        OSNumber *n = OSNumber::withNumber((uint64_t)values[i], 64);
++        ok = n && array->setObject(n);
++        OSSafeReleaseNULL(n);
++    }
++    ok = ok && dictionary->setObject(key, array);
++    OSSafeReleaseNULL(array);
++    return ok;
++}
++}
++
++class CoachzMotion : public IOService {
++    OSDeclareDefaultStructors(CoachzMotion)
++    IOWorkLoop *loop = nullptr;
++    IOTimerEventSource *timer = nullptr;
++    IOService *children[CM_MAX_SENSORS] = {};
++    bool childPublished[CM_MAX_SENSORS] = {};
++    cm_topology topology = {};
++    uint64_t sequence = 0;
++    unsigned attempts = 0;
++    bool discovered = false, stopping = false;
++
++    bool discover() {
++        int error = cm_discover(&bus, &topology);
++        if (error) {
++            setProperty("EnumerationStatus", "query-error");
++            setProperty("LastEnumerationError", (uint64_t)(int64_t)error, 64);
++            printf("COACHZ motion: enumeration error %d attempt %u\n", error, attempts);
++            return false;
++        }
++        // INFO can fail while the EC initializes sensors: retry before publishing children.
++        for (unsigned i = 0; i < topology.scanned; ++i) if (topology.sensors[i].info_error) {
++            setProperty("EnumerationStatus", "info-query-error");
++            setProperty("LastEnumerationError", (uint64_t)(int64_t)topology.sensors[i].info_error, 64);
++            printf("COACHZ motion: INFO sensor %u error %d attempt %u\n",
++                i, topology.sensors[i].info_error, attempts);
++            return false;
++        }
++        setProperty("CommandVersions", (uint64_t)topology.versions, 32);
++        setProperty("ReportedSensorCount", (uint64_t)topology.reported, 32);
++        setProperty("ScannedSensorCount", (uint64_t)topology.scanned, 32);
++        setProperty("EnumerationStatus", topology.reported > topology.scanned ? "scan-limited" : "complete");
++        for (unsigned i = 0; i < topology.scanned; ++i) {
++            const cm_sensor &sensor = topology.sensors[i];
++            IOService *child = new IOService;
++            if (!child || !child->init() || !child->attach(this)) {
++                OSSafeReleaseNULL(child);
++                continue;
++            }
++            children[i] = child; // Retain the allocation until stop(), in addition to attachment.
++            child->setName(sensor.type == CM_ACCEL ? "CoachzECAccelerometer" :
++                sensor.type == CM_GYRO ? "CoachzECGyroscope" : "CoachzECUnclaimedSensor");
++            child->setProperty("ECSensorID", (uint64_t)sensor.id, 32);
++            child->setProperty("ECSensorType", (uint64_t)sensor.type, 32);
++            child->setProperty("ECSensorLocation", (uint64_t)sensor.location, 32);
++            child->setProperty("ECSensorChip", (uint64_t)sensor.chip, 32);
++            child->setProperty("Coordinates", "EC-standard-frame-unmodified");
++            child->setProperty("TimestampMeaning", "host-command-completion-not-sensor-time");
++            child->setProperty("SupportedByThisDriver", cm_supported(&sensor) != 0);
++            printf("COACHZ motion: sensor %u type %u location %u chip %u supported %d\n",
++                sensor.id, sensor.type, sensor.location, sensor.chip, cm_supported(&sensor));
++        }
++        return true;
++    }
++
++    void refresh() {
++        ++sequence;
++        for (unsigned i = 0; i < topology.scanned; ++i) {
++            IOService *child = children[i];
++            if (!child) continue;
++            cm_sample sample;
++            cm_collect(&bus, &topology.sensors[i], &sample);
++            uint64_t ns = 0;
++            absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++            OSDictionary *snapshot = OSDictionary::withCapacity(9);
++            if (!snapshot) continue;
++            bool ok = text(snapshot, "Status", cm_status_name(sample.status)) &&
++                number(snapshot, "Error", (uint64_t)(int64_t)sample.error) &&
++                number(snapshot, "HostSequence", sequence) && number(snapshot, "HostCompletionNS", ns) &&
++                number(snapshot, "Range", (uint64_t)(int64_t)sample.range) &&
++                number(snapshot, "ODRMilliHz", (uint64_t)(int64_t)sample.odr_millihz);
++            if (sample.status == CM_AVAILABLE) {
++                int64_t raw[3] = {sample.raw[0], sample.raw[1], sample.raw[2]};
++                ok = ok && axes(snapshot, "RawXYZ", raw) && axes(snapshot, "ScaledXYZ", sample.scaled) &&
++                    text(snapshot, "Units", topology.sensors[i].type == CM_ACCEL ? "micro-g" : "micro-degrees-per-second");
++            }
++            // One immutable dictionary replaces the entire prior snapshot. Failed reads
++            // publish an error without old axes presented under a new timestamp.
++            bool replaced = ok && child->setProperty("LatestSample", snapshot);
++            snapshot->release();
++            if (replaced && !childPublished[i]) {
++                childPublished[i] = true;
++                child->registerService(); // Initial state is visible before matching.
++            }
++            if (sequence == 1 || sequence % 50 == 0)
++                printf("COACHZ motion: sensor %u %s error %d odr %d range %d raw %d/%d/%d host-seq %llu\n",
++                    i, cm_status_name(sample.status), sample.error, sample.odr_millihz, sample.range,
++                    sample.raw[0], sample.raw[1], sample.raw[2], (unsigned long long)sequence);
++        }
++    }
++
++    static void tick(OSObject *owner, IOTimerEventSource *sender) {
++        CoachzMotion *self = OSDynamicCast(CoachzMotion, owner);
++        if (!self || self->stopping) return;
++        if (!self->discovered) {
++            ++self->attempts;
++            self->discovered = self->discover();
++            if (!self->discovered) {
++                if (self->attempts < 5) sender->setTimeoutMS(2000);
++                return;
++            }
++        }
++        self->refresh();
++        sender->setTimeoutMS(kPollMs);
++    }
++
++    static IOReturn quiesce(OSObject *owner, void *, void *, void *, void *) {
++        CoachzMotion *self = OSDynamicCast(CoachzMotion, owner);
++        if (!self) return kIOReturnBadArgument;
++        self->stopping = true;
++        if (self->timer) { self->timer->cancelTimeout(); self->timer->disable(); }
++        return kIOReturnSuccess;
++    }
++
++public:
++    bool start(IOService *provider) override {
++        if (!IOService::start(provider)) return false;
++        loop = IOWorkLoop::workLoop();
++        timer = IOTimerEventSource::timerEventSource(this, &CoachzMotion::tick);
++        if (!loop || !timer || loop->addEventSource(timer) != kIOReturnSuccess) {
++            OSSafeReleaseNULL(timer);
++            OSSafeReleaseNULL(loop);
++            IOService::stop(provider);
++            return false;
++        }
++        setName("CoachzECMotion");
++        setProperty("EnumerationStatus", "pending");
++        setProperty("PollIntervalMS", (uint64_t)kPollMs, 32);
++        setProperty("CoreMotionABI", "not-connected");
++        timer->setTimeoutMS(1);
++        return true;
++    }
++
++    void stop(IOService *provider) override {
++        // runAction is public and waits for an active callback; closeGate is protected.
++        if (loop) loop->runAction(&CoachzMotion::quiesce, this);
++        if (loop && timer) loop->removeEventSource(timer);
++        OSSafeReleaseNULL(timer);
++        OSSafeReleaseNULL(loop);
++        for (unsigned i = 0; i < CM_MAX_SENSORS; ++i) if (children[i]) {
++            children[i]->terminate(kIOServiceRequired | kIOServiceSynchronous);
++            OSSafeReleaseNULL(children[i]);
++        }
++        IOService::stop(provider);
++    }
++};
++OSDefineMetaClassAndStructors(CoachzMotion, IOService)
++
++extern "C" void coachz_motion_start(void) {
++    static bool started;
++    unsigned mode = 0;
++    if (started || !PE_parse_boot_argn("coachz-motion", &mode, sizeof(mode)) || mode != 1) return;
++    started = true;
++    IOService *platform = IOService::getPlatform();
++    CoachzMotion *motion = OSTypeAlloc(CoachzMotion);
++    if (!platform || !motion || !motion->init()) { OSSafeReleaseNULL(motion); return; }
++    if (!motion->attach(platform)) { motion->release(); return; }
++    if (!motion->start(platform)) { motion->detach(platform); motion->release(); return; }
++    motion->registerService();
++    motion->release(); // The platform attachment keeps the running service.
++}
+--- /dev/null
++++ b/iokit/Kernel/coachz_motion.h
+@@ -0,0 +1,163 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++/* Chrome EC motion host-command client. Register/protocol evidence: SOURCES.md.
++ * No FIFO consumption, sensor configuration, calibration or direct I2C access.
++ */
++#ifndef COACHZ_MOTION_H
++#define COACHZ_MOTION_H
++#include <stdint.h>
++
++#define CM_COMMAND 0x002bu
++#define CM_MAX_SENSORS 8u
++#define CM_PARAMS 13u /* Packed ec_params_motion_sense at the pinned revision. */
++#define CM_REPLY 64u
++enum { CM_DUMP = 0, CM_INFO = 1, CM_ODR = 3, CM_RANGE = 4, CM_DATA = 6 };
++enum { CM_ACCEL = 0, CM_GYRO = 1, CM_LID = 1, CM_BMI160 = 2, CM_BMI260 = 24 };
++enum { CM_SHORT = -1, CM_VERSION = -2, CM_FRAME = -3, CM_CONFIG = -4 };
++enum cm_status { CM_UNAVAILABLE, CM_AVAILABLE, CM_INACTIVE, CM_ERROR, CM_UNSUPPORTED };
++
++struct cm_bus {
++    void *context;
++    int (*command)(void *, uint16_t, uint8_t, const void *, uint32_t, void *, uint32_t, uint32_t *);
++};
++struct cm_sensor { uint8_t id, type, location, chip; int info_error; };
++struct cm_topology {
++    uint32_t versions;
++    uint8_t module_flags, reported, scanned;
++    struct cm_sensor sensors[CM_MAX_SENSORS];
++};
++struct cm_sample {
++    enum cm_status status;
++    int error;
++    int32_t range, odr_millihz;
++    int16_t raw[3];
++    /* Accel: micro-g; gyro: micro-degrees/second, NOT radians/second. */
++    int64_t scaled[3];
++};
++
++static inline uint16_t cm_le16(const uint8_t *p) { return (uint16_t)(p[0] | (uint16_t)p[1] << 8); }
++static inline uint32_t cm_le32(const uint8_t *p) {
++    return p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++static inline int32_t cm_i32(const uint8_t *p) {
++    uint32_t n = cm_le32(p);
++    return n <= INT32_MAX ? (int32_t)n : -1 - (int32_t)(UINT32_MAX - n);
++}
++static inline void cm_clear(void *object, uint32_t size) {
++    uint8_t *bytes = (uint8_t *)object;
++    for (uint32_t i = 0; i < size; ++i) bytes[i] = 0;
++}
++
++static inline void
++cm_request(uint8_t *args, uint8_t command, uint8_t sensor)
++{
++    for (unsigned i = 0; i < CM_PARAMS; ++i) args[i] = 0;
++    args[0] = command;
++    args[1] = sensor;
++    if (command == CM_RANGE || command == CM_ODR)
++        for (unsigned i = 5; i < 9; ++i) args[i] = 0xff; /* data = NO_VALUE (-1), query only. */
++}
++
++static inline int
++cm_query(const struct cm_bus *bus, uint8_t command, uint8_t sensor, uint8_t *reply, uint32_t *length)
++{
++    uint8_t args[CM_PARAMS];
++    cm_request(args, command, sensor);
++    *length = 0;
++    return bus->command(bus->context, CM_COMMAND, 1, args, sizeof(args), reply, CM_REPLY, length);
++}
++
++static inline int
++cm_supported(const struct cm_sensor *sensor)
++{
++    return !sensor->info_error && sensor->location == CM_LID &&
++        (sensor->type == CM_ACCEL || sensor->type == CM_GYRO) &&
++        (sensor->chip == CM_BMI160 || sensor->chip == CM_BMI260);
++}
++
++/* Use version 1's small INFO response deliberately, not the newest unknown ABI. */
++static inline int
++cm_discover(const struct cm_bus *bus, struct cm_topology *topology)
++{
++    cm_clear(topology, sizeof(*topology));
++    uint8_t reply[CM_REPLY], command = CM_COMMAND;
++    uint32_t length = 0;
++    int error = bus->command(bus->context, 0x0008, 0, &command, 1, reply, sizeof(reply), &length);
++    if (error) return error;
++    if (length != 4) return CM_SHORT;
++    topology->versions = cm_le32(reply);
++    if (!(topology->versions & (1u << 1))) return CM_VERSION;
++    error = cm_query(bus, CM_DUMP, 0, reply, &length); /* max_sensor_count=0: count only. */
++    if (error) return error;
++    if (length != 2) return CM_SHORT;
++    topology->module_flags = reply[0];
++    topology->reported = reply[1];
++    topology->scanned = topology->reported < CM_MAX_SENSORS ? topology->reported : CM_MAX_SENSORS;
++    for (unsigned i = 0; i < topology->scanned; ++i) {
++        struct cm_sensor *sensor = &topology->sensors[i];
++        sensor->id = (uint8_t)i;
++        error = cm_query(bus, CM_INFO, sensor->id, reply, &length);
++        sensor->info_error = error ? error : (length != 3 ? CM_SHORT : 0);
++        if (sensor->info_error) continue;
++        sensor->type = reply[0]; sensor->location = reply[1]; sensor->chip = reply[2];
++    }
++    return 0;
++}
++
++static inline int
++cm_parameter(const struct cm_bus *bus, uint8_t command, uint8_t sensor, int32_t *value)
++{
++    uint8_t reply[CM_REPLY];
++    uint32_t length;
++    int error = cm_query(bus, command, sensor, reply, &length);
++    if (error) return error;
++    if (length != 4) return CM_SHORT;
++    *value = cm_i32(reply);
++    return 0;
++}
++
++static inline void
++cm_collect(const struct cm_bus *bus, const struct cm_sensor *sensor, struct cm_sample *sample)
++{
++    cm_clear(sample, sizeof(*sample));
++    if (!cm_supported(sensor)) {
++        sample->status = sensor->info_error ? CM_ERROR : CM_UNSUPPORTED;
++        sample->error = sensor->info_error;
++        return;
++    }
++    sample->status = CM_ERROR;
++    int error = cm_parameter(bus, CM_ODR, sensor->id, &sample->odr_millihz);
++    if (!error && sample->odr_millihz < 0) error = CM_CONFIG;
++    if (error) { sample->error = error; return; }
++    if (!sample->odr_millihz) { sample->status = CM_INACTIVE; return; }
++    error = cm_parameter(bus, CM_RANGE, sensor->id, &sample->range);
++    if (!error && (sample->range <= 0 || sample->range > 65535)) error = CM_CONFIG;
++    if (error) { sample->error = error; return; }
++    uint8_t reply[CM_REPLY];
++    uint32_t length;
++    error = cm_query(bus, CM_DATA, sensor->id, reply, &length);
++    if (!error && length != 8) error = CM_SHORT;
++    /* DATA flags are zero in the pinned EC implementation; DUMP's PRESENT
++     * bit is NOT a validity bit here. DATA's sensor_num byte isn't filled by
++     * that handler either. Associate the reply with the serialized request.
++     */
++    if (!error && reply[0]) error = CM_FRAME;
++    if (error) { sample->error = error; return; }
++    for (unsigned i = 0; i < 3; ++i) {
++        uint16_t n = cm_le16(reply + 2 + 2 * i);
++        sample->raw[i] = n <= INT16_MAX ? (int16_t)n : (int16_t)(-1 - (int32_t)(UINT16_MAX - n));
++        sample->scaled[i] = (int64_t)sample->raw[i] * sample->range * 1000000 / 32768;
++    }
++    sample->status = CM_AVAILABLE;
++}
++
++static inline const char *cm_status_name(enum cm_status status) {
++    switch (status) {
++    case CM_UNAVAILABLE: return "unavailable";
++    case CM_AVAILABLE: return "available-latest-ec-value";
++    case CM_INACTIVE: return "inactive-odr-zero";
++    case CM_ERROR: return "query-error";
++    case CM_UNSUPPORTED: return "unsupported-sensor";
++    }
++    return "unknown";
++}
++#endif

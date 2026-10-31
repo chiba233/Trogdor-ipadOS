@@ -81,3 +81,12 @@ coachz-prelink-input.patch
 
 # Adreno 618: clock and power inventory, a bounded CX + GMU clock window with rollback, GMU firmware into TCM, GPU SMMU inventory (coachz-gpu=1 to 4).
 coachz-prelink-gpu.patch
+
+# Read-only SoC temperature sampling through TSENS (coachz-thermal=1), docs/plans/thermal.md.
+coachz-prelink-thermal.patch
+
+# Read-only SMEM inventory for the WCN3990 route (coachz-wifi=1), docs/plans/wifi.md.
+coachz-prelink-wifi.patch
+
+# Latest EC accelerometer and gyroscope readings, query only (coachz-motion=1), docs/plans/motion.md.
+coachz-prelink-motion.patch

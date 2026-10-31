@@ -1266,3 +1266,12 @@ k54 起第一帧之后屏幕不再显示诊断文字（`coachz-console-band=0`�
 - `coachz-gpu=2`：`mode 2 stage 7 restored 1: ok`，轮询 CX 1 次、时钟 2 次。窗口内 CX 上电（`f8222000`），GMU 寄存器可读，CM3_SYSRESET 为 1。撤销后只有 RCG cfg 和 cx-gmu 的 wake/sleep 字段保持改动，符合计划。
 - `coachz-gpu=3`：32768 字节的 `a630_gmu.bin` 写入 TCM，8192 个字读回，0 处不一致，FNV-1a `0x51c28be8` 和按原文件算出的相同，CM3 始终在复位。固件取自 Debian，不进仓库，打包时用 `--gmu-firmware` 传入。
 - `coachz-gpu=4`：只读 GPU SMMU。sCR0 `00000001`（CLIENTPD=1，旁路），IDR0 `78016606`，IDR1 `20008008`，6 个 stream 组，8 个 context bank，页 4 KiB，bank 从 +0x8000 起。SMR 和 S2CR 全为 0，每个 bank 的 SCTLR、TCR、FSR 全为 0，CBAR 都是 `00010000`。固件没有留下任何配置。
+
+## 温度、Wi-Fi 第一步和加速度计（k60、k61）
+
+都是只读探测，说明在 `docs/plans/thermal.md`、`wifi.md`、`motion.md`。
+
+- 温度：k60 按 TRDY bit 0 门控，bank 0 一直是 `0x8`，读不出任何值，bank 1 也偶尔掉到 `0x8`。k61 改为只看每路的 VALID 位（和 Linux 一样），两组共 25 路全部有效：
+  开机时约 37 °C，有负载时 bank 0 峰值到约 55 °C。Debian 同一时期 `cpu*-thermal` 约 44～49 °C，量级一致，但两边没有逐路对照。这还没有接入温控，频率仍然固定在最高档。
+- Wi-Fi：`SMEM v12 inventory status 0`，14 个分区项，global 和 apps-modem 分区都解析到了。SMP2P 项 428、GLINK 项 478～480 都不存在，因为基带没有启动。没有启动 WCN3990，也没有发布网卡。
+- 加速度计：EC 枚举出 3 个传感器。传感器 0 是 BMI 加速度计，12.5 Hz、±4 g，静止时读数合成约 1 g，错误数 0。陀螺仪 ODR 为 0（未启用），传感器 2 的类型 5 这个驱动不支持。没有接 CoreMotion，屏幕不会自动旋转。

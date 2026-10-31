@@ -208,6 +208,14 @@ def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=T
     memory_map.set('TrustCache', bytes(16))
     if gmu_firmware_size:
         memory_map.set('CoachzGmuFirmware', bytes(16))
+    if full_screen:
+        # Physical u64 base/size pairs: TM0, SROT0, TM1, SROT1. Not arm-io offsets.
+        thermal = root.child('arm-io').child('coachz-thermal')
+        thermal.set('compatible', b'google,coachz-tsens-v2\0')
+        thermal.set('reg', struct.pack('<8Q', 0x0c263000, 0x200, 0x0c222000, 0x200, 0x0c265000, 0x200, 0x0c223000, 0x200))
+        wifi = root.child('arm-io').child('coachz-wifi')
+        wifi.set('compatible', b'google,coachz-wcn3990\0')
+        wifi.set('smem-region', struct.pack('<QQ', 0x80900000, 0x200000))
     disk = window + up(tree + len(root.write()))
     if ram_root:
         memory_map.set('RAMDisk', struct.pack('<QQ', disk, len(ramdisk)))
@@ -261,6 +269,8 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         command_line += ' coachz-battery=1 coachz-speaker=1 coachz-buttons=1'
         # The panel backlight behind the system's brightness control, and the Zed keyboard (docs/plans/backlight.md, input.md).
         command_line += ' coachz-backlight=1 coachz-usb-keyboard=1'
+        # Read-only probes: SoC temperatures and the SMEM inventory, with their nodes from prelink_tree (docs/plans/thermal.md, wifi.md).
+        command_line += ' coachz-thermal=1 coachz-wifi=1 coachz-motion=1'
     if gpu:
         # Adreno 618 bring-up stages (docs/plans/gpu.md): 1 inventory, 2 CX + GMU clock window, 3 also the GMU firmware into TCM,
         # 4 the window with a read-only GPU SMMU inventory.

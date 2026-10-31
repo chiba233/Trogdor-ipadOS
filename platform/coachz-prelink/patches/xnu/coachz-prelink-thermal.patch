@@ -1,0 +1,269 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,2 +110,3 @@
+ bsd/dev/coachz_touch.c		standard
++bsd/dev/coachz_thermal.c		standard
+ bsd/dev/coachz_ec.c		standard
+--- a/bsd/dev/coachz_sample.c
++++ b/bsd/dev/coachz_sample.c
+@@ -41,2 +41,5 @@
+ 	unsigned ticks = 0;
++	extern void coachz_thermal_start(void);
++	extern void coachz_thermal_poll(void);
++	coachz_thermal_start(); /* optional read-only TSENS (coachz-thermal=1) */
+ 	extern void coachz_battery_start(void);
+@@ -59,2 +62,3 @@
+ 		(void)tsleep(&chan, PZERO, "coachz", 10 * hz);
++		coachz_thermal_poll(); /* before diagnostic early-continue branches */
+ 		/* Keep the captured note readable on the wrapping screen console. */
+--- /dev/null
++++ b/bsd/dev/coachz_thermal.c
+@@ -0,0 +1,111 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++/* Copyright (c) 2026, UniXNU contributors. All rights reserved.
++ * Optional SC7180 TSENS sampler. Not enabled in the active kernel build.
++ * See LICENSE for NativeQcomTsens attribution and SOURCES.md for differences.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++#include "coachz_tsens.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void coachz_thermal_start(void);
++void coachz_thermal_poll(void);
++
++struct ct_mapping { uintptr_t srot, tm; };
++static struct ct_mapping mappings[CT_BANKS];
++static int active;
++
++static int
++thermal_read(void *context, enum ct_block block, uint32_t offset, uint32_t *value)
++{
++    const struct ct_mapping *map = context;
++    const uintptr_t base = block == CT_SROT ? map->srot : map->tm;
++    const uint32_t limit = block == CT_SROT ? 8 : CT_WINDOW;
++    if (!base || (offset & 3) || offset > limit - 4) return -1;
++    *value = *(volatile uint32_t *)(base + offset);
++    __asm__ volatile ("dmb oshld" ::: "memory");
++    return 0;
++}
++
++static void
++thermal_report(int detail)
++{
++    for (unsigned bank = 0; bank < CT_BANKS; ++bank) {
++        const struct ct_reader reader = {&mappings[bank], thermal_read};
++        struct ct_sample sample;
++        int32_t peak = 0;
++        ct_collect(mappings[bank].srot && mappings[bank].tm ? &reader : NULL,
++            ct_banks[bank].mask, &sample);
++        if (ct_peak(&sample, &peak)) {
++            printf("COACHZ thermal: bank %u version 0x%x control 0x%x ready 0x%x requested 0x%x enabled 0x%x valid 0x%x peak %d mC\n",
++                bank, sample.version, sample.control, sample.ready, (unsigned)sample.requested,
++                (unsigned)sample.enabled, (unsigned)sample.valid, peak);
++        } else {
++            printf("COACHZ thermal: bank %u version 0x%x control 0x%x ready 0x%x requested 0x%x enabled 0x%x no-valid-temperature\n",
++                bank, sample.version, sample.control, sample.ready,
++                (unsigned)sample.requested, (unsigned)sample.enabled);
++        }
++        /* The first report explains every channel; periodic reports stay short. */
++        if (detail) for (unsigned sensor = 0; sensor < CT_SENSORS; ++sensor) {
++            if (!(sample.requested & (1u << sensor))) continue;
++            if (sample.status[sensor] == CT_OK)
++                printf("COACHZ thermal: bank %u sensor %u raw 0x%x temperature %d mC\n",
++                    bank, sensor, sample.raw[sensor], sample.milli_c[sensor]);
++            else
++                printf("COACHZ thermal: bank %u sensor %u %s raw 0x%x\n",
++                    bank, sensor, ct_status_name(sample.status[sensor]), sample.raw[sensor]);
++        }
++    }
++}
++
++/* Both entry points run only on coachz_sample_thread, with no second thread. */
++void
++coachz_thermal_start(void)
++{
++    static int started;
++    unsigned mode = 0;
++    if (started || !PE_parse_boot_argn("coachz-thermal", &mode, sizeof(mode)) || mode != 1) return;
++    started = 1;
++    DTEntry node;
++    const void *property = NULL;
++    unsigned size = 0;
++    const char compatible[] = "google,coachz-tsens-v2";
++    if (SecureDTLookupEntry(NULL, "/arm-io/coachz-thermal", &node) != kSuccess ||
++        SecureDTGetProperty(node, "compatible", &property, &size) != kSuccess ||
++        size != sizeof(compatible) || memcmp(property, compatible, sizeof(compatible))) {
++        printf("COACHZ thermal: explicit Coachz ADT node missing, not mapped\n"); return;
++    }
++    /* Physical TM/SROT tuples, little-endian u64 pairs. Only these fixed banks
++     * are supported; an ADT cannot turn this sampler into arbitrary MMIO.
++     */
++    if (SecureDTGetProperty(node, "reg", &property, &size) != kSuccess || size != 64) {
++        printf("COACHZ thermal: reg must contain four base/size pairs\n"); return;
++    }
++    uint64_t ranges[8];
++    memcpy(ranges, property, sizeof(ranges));
++    for (unsigned bank = 0; bank < CT_BANKS; ++bank) {
++        if (ranges[4 * bank] != ct_banks[bank].tm || ranges[4 * bank + 1] != CT_WINDOW ||
++            ranges[4 * bank + 2] != ct_banks[bank].srot || ranges[4 * bank + 3] != CT_WINDOW) {
++            printf("COACHZ thermal: bank %u differs from SC7180 layout, not mapped\n", bank); return;
++        }
++    }
++    for (unsigned bank = 0; bank < CT_BANKS; ++bank) {
++        mappings[bank].srot = (uintptr_t)ml_io_map((vm_offset_t)ct_banks[bank].srot, 8);
++        mappings[bank].tm = (uintptr_t)ml_io_map((vm_offset_t)ct_banks[bank].tm, CT_WINDOW);
++    }
++    /* Small uncached mappings retained for the kernel lifetime. No register
++     * writes, controller reset, clock votes, calibration or interrupt changes.
++     */
++    active = 1;
++    thermal_report(1);
++}
++
++void
++coachz_thermal_poll(void)
++{
++    if (active) thermal_report(0);
++}
+--- /dev/null
++++ b/bsd/dev/coachz_tsens.h
+@@ -0,0 +1,134 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++/* Copyright (c) 2026, UniXNU contributors. All rights reserved.
++ * Read-only sampling adapted from NativeQcomTsens; see LICENSE and SOURCES.md.
++ * Register facts checked against Linux's SC7180 / generic TSENS v2 path.
++ */
++#ifndef COACHZ_TSENS_H
++#define COACHZ_TSENS_H
++#include <stdint.h>
++
++#define CT_BANKS 2u
++#define CT_SENSORS 16u
++#define CT_WINDOW 0x200u
++#define CT_READY 1u /* TM + 0xe4, TRDY bit 0. Logged only: on hardware bank 0 stayed 0x8 and bank 1 toggled, so each sensor's VALID bit decides, as in Linux. */
++#define CT_VALID (1u << 21)
++
++struct ct_bank { uint64_t tm, srot; uint16_t mask; };
++static const struct ct_bank ct_banks[CT_BANKS] = {
++    {0x0c263000, 0x0c222000, 0x7fff},
++    {0x0c265000, 0x0c223000, 0x03ff}
++};
++
++enum ct_status {
++    CT_NOT_REQUESTED, CT_UNMAPPED, CT_IO_ERROR, CT_UNSUPPORTED_VERSION,
++    CT_CONTROLLER_DISABLED, CT_RESET, CT_SENSOR_DISABLED, CT_NOT_READY,
++    CT_INVALID, CT_OK
++};
++enum ct_block { CT_SROT, CT_TM };
++struct ct_reader {
++    void *context;
++    /* Return zero on success. Aligned 32-bit reads only; no write callback. */
++    int (*read)(void *, enum ct_block, uint32_t, uint32_t *);
++};
++struct ct_sample {
++    uint32_t version, control, ready;
++    uint16_t requested, enabled, valid;
++    uint32_t raw[CT_SENSORS];
++    int32_t milli_c[CT_SENSORS]; /* Usable only where status == CT_OK. */
++    enum ct_status status[CT_SENSORS];
++};
++
++static inline const char *
++ct_status_name(enum ct_status status)
++{
++    switch (status) {
++    case CT_NOT_REQUESTED: return "not-requested";
++    case CT_UNMAPPED: return "unmapped";
++    case CT_IO_ERROR: return "read-error";
++    case CT_UNSUPPORTED_VERSION: return "unsupported-version";
++    case CT_CONTROLLER_DISABLED: return "controller-disabled";
++    case CT_RESET: return "in-reset";
++    case CT_SENSOR_DISABLED: return "sensor-disabled";
++    case CT_NOT_READY: return "not-ready";
++    case CT_INVALID: return "invalid";
++    case CT_OK: return "valid";
++    }
++    return "unknown";
++}
++
++static inline void
++ct_mark(struct ct_sample *sample, enum ct_status status)
++{
++    for (unsigned i = 0; i < CT_SENSORS; ++i)
++        if (sample->requested & (1u << i)) sample->status[i] = status;
++}
++
++static inline int32_t
++ct_milli_c(uint32_t raw)
++{
++    int32_t code = (int32_t)(raw & 0xfff);
++    if (code & 0x800) code -= 0x1000;
++    return code * 100;
++}
++
++/* One fresh bounded snapshot, not a calibration or initialization operation.
++ * Disabled/unready sensors are not polled. Invalid data gets at most 3 reads;
++ * no sleep or spin-wait for the hardware to become ready.
++ */
++static inline void
++ct_collect(const struct ct_reader *reader, uint16_t mask, struct ct_sample *sample)
++{
++    *sample = (struct ct_sample){0};
++    sample->requested = mask;
++    ct_mark(sample, CT_UNMAPPED);
++    if (!reader || !reader->read) return;
++    if (reader->read(reader->context, CT_SROT, 0, &sample->version)) {
++        ct_mark(sample, CT_IO_ERROR); return;
++    }
++    if ((sample->version >> 28) != 2) {
++        ct_mark(sample, CT_UNSUPPORTED_VERSION); return;
++    }
++    if (reader->read(reader->context, CT_SROT, 4, &sample->control)) {
++        ct_mark(sample, CT_IO_ERROR); return;
++    }
++    sample->enabled = (uint16_t)((sample->control >> 3) & 0xffff);
++    if (!(sample->control & 1)) {
++        ct_mark(sample, CT_CONTROLLER_DISABLED); return;
++    }
++    if (sample->control & 2) {
++        ct_mark(sample, CT_RESET); return;
++    }
++    if (reader->read(reader->context, CT_TM, 0xe4, &sample->ready)) {
++        ct_mark(sample, CT_IO_ERROR); return;
++    }
++    for (unsigned i = 0; i < CT_SENSORS; ++i) {
++        const uint16_t bit = (uint16_t)(1u << i);
++        if (!(mask & bit)) continue;
++        if (!(sample->enabled & bit)) { sample->status[i] = CT_SENSOR_DISABLED; continue; }
++        sample->status[i] = CT_INVALID;
++        for (unsigned attempt = 0; attempt < 3; ++attempt) {
++            if (reader->read(reader->context, CT_TM, 0xa0 + 4 * i, &sample->raw[i])) {
++                sample->status[i] = CT_IO_ERROR; break;
++            }
++            if (!(sample->raw[i] & CT_VALID)) continue;
++            sample->milli_c[i] = ct_milli_c(sample->raw[i]);
++            sample->valid |= bit;
++            sample->status[i] = CT_OK;
++            break;
++        }
++    }
++}
++
++/* A peak over valid requested channels only. No valid channel => no value. */
++static inline int
++ct_peak(const struct ct_sample *sample, int32_t *milli_c)
++{
++    int found = 0;
++    for (unsigned i = 0; i < CT_SENSORS; ++i) {
++        if (!(sample->valid & sample->requested & (1u << i))) continue;
++        if (!found || sample->milli_c[i] > *milli_c) *milli_c = sample->milli_c[i];
++        found = 1;
++    }
++    return found;
++}
++#endif
