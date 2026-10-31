@@ -793,3 +793,21 @@ panic 的调用栈为 `PE_init_iokit → InitIOKit → OSlibkernInit → OSRunti
 内核前缀镜像 SHA-256 `20234ad1eec4267c96c6cd7cb6e2053d65a7cb9dd06c8a1206f1b12e331cd1c8`，签名容器 SHA-256 `7d40bff4cf27aac2feb9c284b292c6f33c5e382a12ca2df03dfc32f04f5915f1`。10727 条指令／20 段标量审计通过；独立重算清单全部源码和产物摘要，核对当前 prelink 内核确实嵌入、显式启动参数存在且没有全局 panic 禁用参数、Data 种子字节未变、GPT 与前一轮一致，前缀结束位置恰在系统分区之前。
 
 目标端传输摘要一致，既有免密写盘器核实外置介质及运行系统排除，完成全部 225 MiB 前缀写入与回读，返回零。未改写系统卷、SystemOS、固件或内置盘，没有自动重启。下一次手动启动观察策略结果行及是否越过 watchdogd；如出现新的关键服务退出，保留其现场，不能预先宣称主系统或界面启动成功。
+
+
+## 2026-10-31：越过 watchdogd，usermanagerd 重启循环
+
+运行时 `f98d3aa`，使用前述临时 watchdogd 策略镜像。屏幕照片显示启动继续推进，没有重现 watchdogd 关键进程退出 panic，并仍有周期性的进程／线程采样。`usermanagerd` 反复以 `status 0x6` 退出，按固定 XNU 的 wait 状态解码为 SIGABRT；`fairplayd` 反复以零状态退出，launchd 经 xpcproxy 创建新实例。递增的 PID 反映这些创建活动，不是存活进程数，也不证明后续服务初始化或界面成功。
+
+只读对比发现当前内存 Data 种子缺少锁定 UniXNU 离线 Data 准备脚本创建的部分空目录，包括 dslocal、PersonaVolumes 和 keybags 的目录骨架。这是待核实的依赖差异，尚不能据此认定 SIGABRT 的原因。原版 usermanagerd 还包含会话创建断言；本轮不跳过该服务、不改变密钥包启动参数，也不先补目录来掩盖第一处失败。
+
+下一轮增加 `coachz-prelink-usermanager-diagnostic.patch`：只为 usermanagerd 保存有界的首次 stdout/stderr 写入缓冲，在首次 SIGABRT 的退出路径记录原有 exit reason、当前线程保存的 EL0 PC／LR、可执行文件头、共享缓存 slide 与最多八帧用户栈链。所有用户内存读取使用 copyin，栈链限制在初始 SP 上方 64 KiB 内；每分钟采样末尾重显，避免后续 respawn 刷走现场。它保留信号、原版二进制与退出策略。空白 stdio 或不完整栈链仍需结合 PC 和原版二进制分析，不能当作没有错误。
+
+
+## 2026-10-31：usermanagerd 首次 abort 诊断介质准备
+
+源码内核与 prelink 构建成功；已完成的 27 项显示／用户态路线回归全部通过。诊断文件使用 libkern/copyio.h 引入用户内存读取接口，避免在 osfmk 文件中引入完整 BSD systm.h 的类型冲突；使用实际编译参数单独编译通过后，再完成正式构建。最终内核中确认首次 stdio、abort reason、用户态现场与栈帧输出字符串存在，真机执行和实际捕获效果仍待确认。
+
+内核前缀镜像 SHA-256 `6a31538bd8fe563d04e1c08017be542f980f4b8b23390e570d1f875bc3388f65`，签名容器 SHA-256 `4b051503f22467e8298c983afcd67b0b058fe5a8d886d8341347c6e71868d67c`。10727 条指令／20 段标量审计通过。写盘前独立核对清单全部源码及产物摘要、实际内嵌的本次 prelink 内核与诊断字符串；原有 watchdogd 策略参数仍在，没有全局 panic 禁用参数；GPT、Data 种子与上一轮逐字节相同，前缀结束于系统分区之前。
+
+既有免密写盘器核对目标与运行系统排除，完成全部 225 MiB 前缀写入和回读，返回零；系统卷与 SystemOS 未改写，没有自动重启。下一次手动启动后等到分钟采样末尾，取得 `COACHZ UM original stdout/stderr`、`COACHZ UM abort`、`COACHZ UM state` 和可用的 `COACHZ UM frame` 行，再按可执行文件头或共享缓存 slide 还原故障位置。本轮只增加可观察性，尚未修复 usermanagerd。

@@ -16,3 +16,5 @@ coachz-prelink-diagnostics.patch
 coachz-prelink-critical-state.patch
 # Temporary launchd override on memory Data, for the confirmed missing-IOWatchdog BRK.
 coachz-prelink-watchdog-policy.patch
+# Keep the first noncritical usermanagerd abort and original stdio visible after respawns.
+coachz-prelink-usermanager-diagnostic.patch

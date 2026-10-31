@@ -1,0 +1,148 @@
+--- a/osfmk/arm64/coachz_thread.c
++++ b/osfmk/arm64/coachz_thread.c
+@@ -6,6 +6,8 @@
+ #include <kern/thread.h>
+ #include <arm/thread.h>
+ #include <mach/arm/thread_status.h>
++#include <libkern/copyio.h>
++#include <os/atomic_private.h>
+ 
+ void coachz_sample_task(const char *name, int pid, task_t task);
+ void coachz_critical_user_state(const char *name, int pid);
+@@ -56,3 +58,86 @@
+ 	    (unsigned long long)get_saved_state_reg(state, 0), (unsigned long long)get_saved_state_reg(state, 1),
+ 	    (unsigned long long)get_saved_state_reg(state, 19), (unsigned long long)get_saved_state_reg(state, 20));
+ }
++
++/* Preserve the first usermanagerd failure and a bounded copy of its original stdio.
++ * The minute sampler repeats it after its thread dump so respawns cannot scroll it away.
++ */
++void coachz_usermanager_write(int pid, int fd, uint64_t address, uint64_t size);
++void coachz_usermanager_exit(int pid, unsigned ns, uint64_t code, const char *description);
++void coachz_usermanager_report(void);
++static char coachz_um_output[4096];
++static uint32_t coachz_um_output_used;
++static char coachz_um_failure[1536];
++static uint32_t coachz_um_captured;
++
++void
++coachz_usermanager_write(int pid, int fd, uint64_t address, uint64_t size)
++{
++	char bytes[256];
++	uint32_t length = size > sizeof(bytes) - 1 ? sizeof(bytes) - 1 : (uint32_t)size;
++	uint32_t at;
++
++	if (!length || os_atomic_load(&coachz_um_captured, acquire) || copyin(address, bytes, length)) {
++		return;
++	}
++	bytes[length] = 0;
++	at = os_atomic_add_orig(&coachz_um_output_used, length + 1, relaxed);
++	if (at < sizeof(coachz_um_output) - 1) {
++		uint32_t room = (uint32_t)sizeof(coachz_um_output) - 1 - at;
++		uint32_t count = length < room ? length : room;
++		memcpy(coachz_um_output + at, bytes, count);
++		if (count < room) {
++			coachz_um_output[at + count] = '\n';
++		}
++	}
++	printf("COACHZ usermanagerd[%d] fd%d: %s\n", pid, fd, bytes);
++}
++
++void
++coachz_usermanager_exit(int pid, unsigned ns, uint64_t code, const char *description)
++{
++	arm_saved_state_t *state = find_user_regs(current_thread());
++	task_t task = current_task();
++	uint64_t fp, sp;
++	size_t used;
++
++	if (!os_atomic_cmpxchg(&coachz_um_captured, 0, 1, acq_rel)) {
++		return;
++	}
++	used = snprintf(coachz_um_failure, sizeof(coachz_um_failure),
++	    "COACHZ UM abort[%d]: namespace %u code 0x%llx description %.200s\n",
++	    pid, ns, (unsigned long long)code, description ? description : "none");
++	if (!state) {
++		return;
++	}
++	used += snprintf(coachz_um_failure + used, sizeof(coachz_um_failure) - used,
++	    "COACHZ UM state: pc 0x%llx lr 0x%llx header 0x%llx cache-slide 0x%x\n",
++	    (unsigned long long)get_saved_state_pc(state), (unsigned long long)get_saved_state_lr(state),
++	    (unsigned long long)task->mach_header_vm_address, task->task_shared_region_slide);
++	sp = get_saved_state_sp(state);
++	fp = get_saved_state_fp(state);
++	for (unsigned index = 0; index < 8 && used < sizeof(coachz_um_failure) - 100; index++) {
++		uint64_t frame[2];
++		if ((fp & 15) || fp < sp || fp - sp > 65536 || copyin(fp, frame, sizeof(frame))) {
++			break;
++		}
++		used += snprintf(coachz_um_failure + used, sizeof(coachz_um_failure) - used,
++		    "COACHZ UM frame %u: fp 0x%llx lr 0x%llx\n", index,
++		    (unsigned long long)fp, (unsigned long long)frame[1]);
++		if (frame[0] <= fp) {
++			break;
++		}
++		fp = frame[0];
++	}
++	printf("%s", coachz_um_failure);
++}
++
++void
++coachz_usermanager_report(void)
++{
++	if (!os_atomic_load(&coachz_um_captured, acquire)) {
++		return;
++	}
++	printf("COACHZ UM original stdout/stderr (first failure, bounded):\n%s\n%s",
++	    coachz_um_output, coachz_um_failure);
++}
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1899,6 +1899,15 @@
+ 	bool corpse_source = false;
+ 	task_t task = proc_task(p);
+ 
++	/* Keep the first noncritical usermanagerd SIGABRT as evidence; preserve exit policy. */
++	if (p == current_proc() && !strcmp(p->p_name, "usermanagerd") &&
++	    WIFSIGNALED(rv) && WTERMSIG(rv) == SIGABRT) {
++		extern void coachz_usermanager_exit(int, unsigned, uint64_t, const char *);
++		os_reason_t reason = p->p_exit_reason;
++		coachz_usermanager_exit(proc_getpid(p), reason ? reason->osr_namespace : 0,
++		    reason ? reason->osr_code : 0, exit_reason_get_string_desc(reason));
++	}
++
+ 
+ 	if (p->p_crash_behavior != 0 || p == initproc) {
+ 		proc_handle_critical_exit(p, rv);
+--- a/bsd/kern/sys_generic.c
++++ b/bsd/kern/sys_generic.c
+@@ -680,6 +680,11 @@
+ 	uio_t uio;
+ 	int spacetype = IS_64BIT_PROCESS(p) ? UIO_USERSPACE64 : UIO_USERSPACE32;
+ 
++	if ((fd == 1 || fd == 2) && !strcmp(p->p_name, "usermanagerd")) {
++		extern void coachz_usermanager_write(int, int, uint64_t, uint64_t);
++		coachz_usermanager_write(proc_getpid(p), fd, buf, nbyte);
++	}
++
+ 	if (nbyte > INT_MAX) {
+ 		*retval = 0;
+ 		return EINVAL;
+--- a/bsd/dev/coachz_sample.c
++++ b/bsd/dev/coachz_sample.c
+@@ -18,6 +18,7 @@
+ extern void coachz_sample_task(const char *, int, task_t);
+ extern void coachz_root_prepare(void);
+ extern void coachz_usb_report(void);
++extern void coachz_usermanager_report(void);
+ 
+ static int
+ coachz_sample_proc(proc_t p, __unused void *arg)
+@@ -46,6 +47,7 @@
+ 		printf("COACHZ alive: %lu s\n", (unsigned long)sec);
+ 		proc_iterate(PROC_ALLPROCLIST, coachz_sample_proc, NULL, NULL, NULL);
+ 		coachz_usb_report();
++		coachz_usermanager_report();
+ 	}
+ }
+ 
