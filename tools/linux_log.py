@@ -97,8 +97,8 @@ def add_log(dtb):
     return result
 
 
-def compile_wrapper(out, kernel, memory, checkpoint=None, discovery=False, pattern=False, backlight=False):
-    if discovery and checkpoint is not None: raise ValueError("display discovery and XNU are separate images")
+def compile_wrapper(out, kernel, memory, checkpoint=None, discovery=False, pattern=False, backlight=False, screen=False):
+    if discovery and checkpoint is not None and not screen: raise ValueError("display discovery and XNU are separate images")
     zig = Path(os.environ.get("ZIG", ROOT / ".tools/ziglang/ziglang/zig")).resolve()
     env = dict(os.environ, ZIG_GLOBAL_CACHE_DIR=str(ROOT / ".tools/zig-cache"),
                ZIG_LOCAL_CACHE_DIR=str(ROOT / ".tools/zig-local-cache"))
@@ -110,7 +110,7 @@ def compile_wrapper(out, kernel, memory, checkpoint=None, discovery=False, patte
     assembly = out / "payload.S"
     assembly.write_text('.global LINUX_MEMORY_SIZE\n.set LINUX_MEMORY_SIZE, ' + str(memory) + '\n.section .linux, "a"\n.incbin "' + quoted + '"\n')
     if checkpoint is not None:
-        if len(checkpoint)<1152 or checkpoint[:8]!=b'TRXNUC01' or int.from_bytes(checkpoint[8:12],'little') not in (1,2,3,4,5,6,7,8,9,10,11):
+        if len(checkpoint)<1152 or checkpoint[:8]!=b'TRXNUC01' or int.from_bytes(checkpoint[8:12],'little') not in (1,2,3,4,5,6,7,8,9,10,11,12):
             raise ValueError("invalid source-XNU checkpoint payload header")
         payload_path = out / "xnu-checkpoint.bin"
         payload_path.write_bytes(checkpoint)
@@ -127,17 +127,19 @@ def compile_wrapper(out, kernel, memory, checkpoint=None, discovery=False, patte
                "-DPROBE_DISPLAY_DISCOVERY=" + str(int(discovery)),
                "-DPROBE_DISPLAY_PATTERN=" + str(int(pattern)),
                "-DPROBE_DISPLAY_BACKLIGHT=" + str(int(backlight)),
+               "-DPROBE_XNU_SCREEN=" + str(int(screen)),
                "-Wl,--build-id=none", "-Wl,--no-undefined", "-Wl,-z,max-page-size=4096",
                "-Wl,-T," + str(ROOT / ("boot/xnu-chain.ld" if checkpoint is not None else "boot/chain.ld")),
                *[str(ROOT / "boot" / name) for name in ("entry.S", "probe.c", "fdt.c", "checkpoint.c")],
                *([str(ROOT / "boot" / name) for name in
                   ("xnu_checkpoint.c", "xnu_load.c", "xnu_memory.c", "xnu_tables.c", "xnu_cinit.c", "xnu_cpu.c", "xnu_platform.c", "xnu_pe.c", "xnu_diagnostics.c", "xnu_topology.c")] if checkpoint is not None else []),
-               *([str(ROOT / "boot" / name) for name in ("coreboot.c","display_state.c","display.c","xnu_memory.c")] if discovery else []),
+               *([str(ROOT / "boot" / name) for name in ("coreboot.c","display_state.c","display.c",*(() if screen else ("xnu_memory.c",)))] if discovery else []),
+               *([str(ROOT / "boot/xnu_screen.c")] if screen else []),
                *([str(ROOT / "boot/display_ec.c")] if backlight else []),
                str(assembly), "-o", str(elf)]
     relocations=audit_sources(zig,CPU,[Path(arg) for arg in command if arg.endswith('.c')],env,
         out/'relocation-audit',('PROBE_UART=0','PROBE_RESET_EL=0','PROBE_LINUX_CHAIN=1',
-        'PROBE_XNU_CHECKPOINT='+str(int(checkpoint is not None)), 'PROBE_DISPLAY_DISCOVERY='+str(int(discovery)),'PROBE_DISPLAY_PATTERN='+str(int(pattern)),'PROBE_DISPLAY_BACKLIGHT='+str(int(backlight))))
+        'PROBE_XNU_CHECKPOINT='+str(int(checkpoint is not None)), 'PROBE_DISPLAY_DISCOVERY='+str(int(discovery)),'PROBE_DISPLAY_PATTERN='+str(int(pattern)),'PROBE_DISPLAY_BACKLIGHT='+str(int(backlight)),'PROBE_XNU_SCREEN='+str(int(screen))))
     subprocess.run(command, env=env, check=True)
     linked = elf.read_bytes()
     image = extract_image(linked)
@@ -169,12 +171,17 @@ def main():
     p.add_argument("--display-discovery", action="store_true", help="separate read-only display metadata/MMIO discovery, without XNU")
     p.add_argument("--display-pattern", action="store_true", help="discovery plus the first scanout restart; writes display registers and the framebuffer, no EC or backlight")
     p.add_argument("--display-backlight", action="store_true", help="display pattern plus EC backlight; sends runtime EC commands, never writes EC firmware")
+    p.add_argument("--xnu-screen", type=Path, help="screen-output XNU payload: keeps the display on and never returns to Linux")
     p.add_argument("--output", type=Path, default=ROOT / "build/linux-log")
     a = p.parse_args()
     if sum(map(bool, (a.display_discovery, a.display_pattern, a.display_backlight))) > 1: p.error("choose one display mode")
+    if a.xnu_screen and (a.display_discovery or a.display_pattern or a.display_backlight or a.xnu_checkpoint): p.error("xnu screen is its own image")
+    a.screen = bool(a.xnu_screen)
+    a.display_backlight = a.display_backlight or a.screen
     a.pattern = a.display_pattern or a.display_backlight
     a.display_discovery = a.display_discovery or a.pattern
     if a.display_discovery and a.xnu_checkpoint: p.error("display discovery and XNU require separate images")
+    a.xnu_checkpoint = a.xnu_checkpoint or a.xnu_screen
     out, source, futility = a.output.resolve(), a.source.resolve(), str(a.futility.resolve())
     if out.exists() or out.is_relative_to(Path("/dev")) or not source.is_file():
         p.error("source must be a file and output a new ordinary directory outside /dev")
@@ -201,7 +208,7 @@ def main():
     kernel_node = child(images, kernels.pop())
     kernel, memory = linux_image(kernel_node.props["data"], cstring(kernel_node.props["compression"]))
     wrapper, layout = compile_wrapper(out, kernel, memory,
-        a.xnu_checkpoint.read_bytes() if a.xnu_checkpoint else None, discovery=a.display_discovery, pattern=a.pattern, backlight=a.display_backlight)
+        a.xnu_checkpoint.read_bytes() if a.xnu_checkpoint else None, discovery=a.display_discovery, pattern=a.pattern, backlight=a.display_backlight, screen=a.screen)
     kernel_node.props["data"], kernel_node.props["compression"] = wrapper, string("none")
     hashes(kernel_node, True)
     count = 0
@@ -248,7 +255,9 @@ def main():
         code_files += ("boot/coreboot.h", "boot/coreboot.c", "boot/display.h", "boot/display_state.c", "boot/display.c", "boot/xnu_memory.c", "boot/xnu_checkpoint.h", "tools/read_display.py")
     if a.display_backlight:
         code_files += ("boot/display_ec.c",)
-    report = {"schema": 1, "display_discovery": a.display_discovery, "display_pattern": a.pattern, "display_backlight": a.display_backlight, "xnu_checkpoint": bool(a.xnu_checkpoint), "hardware_boot_tested": False,
+    if a.screen:
+        code_files += ("boot/xnu_screen.c", "tools/xnu_screen.py")
+    report = {"schema": 1, "display_discovery": a.display_discovery, "display_pattern": a.pattern, "display_backlight": a.display_backlight, "xnu_screen": a.screen, "xnu_checkpoint": bool(a.xnu_checkpoint), "hardware_boot_tested": False,
               "toolchain": {"zig": "0.15.2", "cpu": CPU},
               "code_sha256": {name: sha((ROOT / name).read_bytes()) for name in code_files},
               "source_sha256": sha(source.read_bytes()),

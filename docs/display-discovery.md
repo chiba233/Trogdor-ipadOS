@@ -119,3 +119,12 @@ INTF 帧／行计数的偏移来自 Linux DPU 驱动，锁定固件源码没有�
 这些只是 EC 运行状态命令，不写 EC 固件或闪存。每个等待都有上限，所有路径都释放片选；EC 失败只丢失背光，错误码写入日志，棋盘格和 Linux 交接照常完成。EC 客户端依公开协议另写，未复制 GPL 的 Depthcharge 代码。`read_probe.py --display-backlight` 校验 64 个字段，接受 EC 失败的完整记录。
 
 三个编译开关相互独立，已验证的发现镜像和画面实验镜像逐字节不变。2026-10-31 该实验已在真机通过，不用手电可见棋盘格，见 [硬件记录](hardware-tests.md)。
+
+
+## XNU 屏幕输出（payload version 12）
+
+`linux_log.py --xnu-screen` 生成独立镜像：探针按已验证的顺序恢复 scanout 和背光，不再停止，随后把源码 XNU 装入 RAM 中的高地址窗口并跳转，不再返回 Linux，所有结果都看屏幕。窗口基址由私有设备树选定，运行时仍由 `xnu_range_allowed()` 重新核对，并与 framebuffer 比对。装载失败时才走原有的 HVC 路径回到 Linux 读日志。
+
+内核用 `tools/kernel_source.py --platform coachz-screen` 单独构建，`platform/coachz-screen` 比 `platform/coachz` 只多一个控制台补丁，已验收检查点使用的内核和配置不变。控制台改编自 ios-sweet（MIT）的早期 framebuffer 调试补丁，按 4K 页和 `boot_args.Video` 重新参数化：`arm_init` 中用一个 1 GiB 的 Normal-NC L1 块把 framebuffer 映射到 bootstrap TTBR0，`arm_vm_init` 在移除 TTBR0 前切到低全局区与内核之间的别名；启动阶段标记、kprintf 和 panic 字符串都画到屏幕上。
+
+屏幕右上角的绿色方块表示探针已完成。这张镜像不验收任何 XNU 阶段的状态，只显示实际跑到哪里；组件 prelink 仍未接入，不预期能进入用户态。

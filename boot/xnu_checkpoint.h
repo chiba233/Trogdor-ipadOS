@@ -27,6 +27,8 @@ int xnu_platform_valid(const struct xnu_expected *);
 int xnu_cpu_valid(const struct xnu_expected *);
 int xnu_cinit_valid(const struct xnu_expected *);
 int xnu_tables_valid(const uint64_t *, const struct xnu_expected *);
+struct display_video;
+int xnu_screen_load(const uint8_t *,size_t,const void *,uint64_t,uint64_t,const struct display_video *,struct xnu_handoff *);
 int fdt_range_clear(const void *, uint64_t, uint64_t);
 int xnu_range_allowed(const void *, uint64_t, uint64_t);
 uint64_t xnu_topology_reg_offset(const uint8_t *,size_t);

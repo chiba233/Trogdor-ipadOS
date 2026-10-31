@@ -7,6 +7,9 @@
 #ifndef PROBE_DISPLAY_BACKLIGHT
 #define PROBE_DISPLAY_BACKLIGHT 0
 #endif
+#ifndef PROBE_XNU_SCREEN
+#define PROBE_XNU_SCREEN 0
+#endif
 void probe_value(const char *,uint64_t);
 int fdt_range_clear(const void *,uint64_t,uint64_t);
 static uint64_t be64(const uint8_t *p) { return (uint64_t)fdt_be32(p)<<32|fdt_be32(p+4); }
@@ -89,9 +92,17 @@ static uint64_t pattern_ticks(void) {
 static void pattern_wait(uint64_t ticks) {
     uint64_t start=pattern_ticks();while(pattern_ticks()-start<ticks)__asm__ volatile("yield");
 }
+#if PROBE_XNU_SCREEN
+struct display_video display_video;
+/* Black, with a green corner meaning the probe finished and XNU comes next. */
+static uint32_t pattern_pixel(uint32_t x,uint32_t y,const struct cb_display *b) {
+    return x+64>=b->width && y<32?0xff00ff00u:0xff000000u;
+}
+#else
 static uint32_t pattern_pixel(uint32_t x,uint32_t y,const struct cb_display *b) {
     return (x*8/b->width+y*6/b->height)&1?0xffffffffu:0xff000000u;
 }
+#endif
 /* Restart the scanout Depthcharge stopped, hold it, then stop it the same way. No EC or backlight. */
 static void display_pattern(const struct cb_display *b,uint32_t pa,struct display_pattern_result *o) {
     uint64_t freq;__asm__ volatile("mrs %0, cntfrq_el0":"=r"(freq));
@@ -121,6 +132,12 @@ static void display_pattern(const struct cb_display *b,uint32_t pa,struct displa
         pattern_write(COACHZ_BACKLIGHT_PORT+4,b->bl_polarity?2u:0u,&o->writes);
         o->gpio_on=pattern_read(COACHZ_BACKLIGHT_PORT+4,&o->fault);
     }
+#endif
+#if PROBE_XNU_SCREEN
+    /* The screen stays on: XNU owns it from here and never returns. */
+    display_video.pa=pa;display_video.bytes=(uint64_t)b->stride*b->height;
+    display_video.width=b->width;display_video.height=b->height;display_video.stride=b->stride;display_video.ready=!o->fault;
+    return;
 #endif
     pattern_wait(freq*(DISPLAY_HOLD_SECONDS-1));
     o->frame1=pattern_read(DISPLAY_FRAME,&o->fault);o->line1=pattern_read(DISPLAY_LINE,&o->fault);

@@ -1,0 +1,3 @@
+[soc]
+name = "SC7180"
+description = "Architectural CPU/GIC preparation only; peripherals unqualified"

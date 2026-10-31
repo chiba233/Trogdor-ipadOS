@@ -46,6 +46,7 @@ def main():
     p.add_argument('--build', action='store_true', help='also compile the source kernel; no prelink or boot')
     p.add_argument('--jobs', type=int, default=min(os.cpu_count() or 2, 8))
     p.add_argument('--output', type=Path, default=ROOT / 'build/xnu-source')
+    p.add_argument('--platform', default='coachz', help='board directory under platform/; coachz-screen adds the screen console')
     a = p.parse_args()
     out = a.output.resolve()
     if a.jobs < 1 or out.is_relative_to(Path('/dev')):
@@ -60,7 +61,7 @@ def main():
     from unixnu import cli, feeds, kernel, tree
     from unixnu.config import Context
     arguments = cli.parser().parse_args(['defconfig', 'coachz_defconfig', '-D',
-        str(ROOT / 'platform/coachz'), '--out', str(out), '-j', str(a.jobs),
+        str(ROOT / 'platform' / a.platform), '--out', str(out), '-j', str(a.jobs),
         '--local-module', 'refer:xnu=' + str(xnu)])
     ctx = Context(arguments)
     cli.cmd_defconfig(ctx)

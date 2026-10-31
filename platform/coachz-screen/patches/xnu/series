@@ -1,0 +1,6 @@
+# Retain Darwin 23 prelink interfaces. The optional OS boot-progress patch
+# depends on a qualified UFS/owner-root baseline absent from Coachz.
+component:XnuPrelink/patches/xnu-10063.141.1-security-init.patch
+component:XnuPrelink/patches/xnu-10063.141.1-sparse-index.patch
+# Screen console for bring-up, adapted from ios-sweet (MIT).
+coachz-screen-console.patch

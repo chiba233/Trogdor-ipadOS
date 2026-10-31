@@ -1,0 +1,479 @@
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -58,6 +58,7 @@
+ #include <pexpert/arm/consistent_debug.h>
+ #include <pexpert/device_tree.h>
+ #include <arm64/proc_reg.h>
++#include <arm64/coachz_early.h>
+ #include <arm/pmap.h>
+ #include <arm/caches_internal.h>
+ #include <arm/cpu_internal.h>
+@@ -360,6 +361,8 @@
+ 	/* If kernel integrity is supported, use a constant copy of the boot args. */
+ 	const_boot_args = *args;
+ 	BootArgs = args = &const_boot_args;
++	coachz_early_init(args);
++	coachz_early_mark(1, "arm_init: boot args copied");
+ 
+ 	cpu_data_init(&BootCpuData);
+ #if defined(HAS_APPLE_PAC)
+@@ -368,7 +371,9 @@
+ 	BootCpuData.jop_key = ml_default_jop_pid();
+ #endif /* defined(HAS_APPLE_PAC) */
+ 
++	coachz_early_mark(2, "cpu_data_init done");
+ 	PE_init_platform(FALSE, args); /* Get platform expert set up */
++	coachz_early_mark(3, "PE_init_platform done");
+ 
+ #if __arm64__
+ 	configure_timer_apple_regs();
+@@ -440,6 +445,7 @@
+ #endif
+ 
+ 	ml_parse_cpu_topology();
++	coachz_early_mark(4, "ml_parse_cpu_topology done");
+ 
+ 
+ 	master_cpu = ml_get_boot_cpu_number();
+@@ -468,12 +474,15 @@
+ 	 * preemption level is not really meaningful for the bootstrap thread.
+ 	 */
+ 	thread->machine.preemption_count = 0;
++	coachz_early_mark(5, "calling cpu_bootstrap");
+ 	cpu_bootstrap();
++	coachz_early_mark(6, "cpu_bootstrap done");
+ 
+ 	rtclock_early_init();
+ 
+ 	kernel_debug_string_early("kernel_startup_bootstrap");
+ 	kernel_startup_bootstrap();
++	coachz_early_mark(7, "kernel_startup_bootstrap done");
+ 
+ 	/*
+ 	 * Initialize the timer callout world
+@@ -482,6 +491,7 @@
+ 
+ 	cpu_init();
+ 
++	coachz_early_mark(8, "cpu_init done");
+ 	processor_bootstrap();
+ 
+ 	if (PE_parse_boot_argn("maxmem", &maxmem, sizeof(maxmem))) {
+@@ -529,7 +539,9 @@
+ 	__builtin_arm_wsr("pan", 1);
+ #endif  /* __ARM_PAN_AVAILABLE__ */
+ 
++	coachz_early_mark(9, "calling arm_vm_init");
+ 	arm_vm_init(xmaxmem, args);
++	coachz_early_mark(20, "arm_vm_init done");
+ 
+ 	if (debug_boot_arg) {
+ 		patch_low_glo();
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -40,6 +40,7 @@
+ 
+ #include <machine/atomic.h>
+ #include <arm64/proc_reg.h>
++#include <arm64/coachz_early.h>
+ #include <arm64/lowglobals.h>
+ #include <arm/cpu_data_internal.h>
+ #include <arm/misc_protos.h>
+@@ -1817,6 +1818,44 @@
+ #define ARM64_PHYSMAP_SLIDE_RANGE (1ULL << 30) // 1 GB
+ #define ARM64_PHYSMAP_SLIDE_MASK  (ARM64_PHYSMAP_SLIDE_RANGE - 1)
+ 
++/*
++ * Keep the screen console alive once the bootstrap TTBR0 goes away: a Normal-NC
++ * alias in the unused blocks between low globals and the kernel.
++ */
++#define COACHZ_EARLY_ALIAS_BLOCK 16
++
++static uintptr_t
++coachz_early_map_final(void)
++{
++	uint64_t pa, bytes;
++	if (!coachz_early_range(&pa, &bytes)) {
++		return 0;
++	}
++	const uintptr_t va = (gVirtBase & ~(uintptr_t)(ARM_TT_L1_SIZE - 1)) + COACHZ_EARLY_ALIAS_BLOCK * ARM_TT_L2_SIZE;
++	const uint64_t base = pa & ~(uint64_t)(ARM_TT_L2_SIZE - 1);
++	const uint64_t blocks = (pa + bytes - base + ARM_TT_L2_SIZE - 1) / ARM_TT_L2_SIZE;
++	if (va + blocks * ARM_TT_L2_SIZE > gVirtBase) {
++		return 0;
++	}
++	tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
++	if ((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) != (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE)) {
++		return 0;
++	}
++	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
++	for (uint64_t i = 0; i < blocks; i++) {
++		if (l2[((va + i * ARM_TT_L2_SIZE) & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT] != ARM_TTE_EMPTY) {
++			return 0;
++		}
++	}
++	for (uint64_t i = 0; i < blocks; i++) {
++		l2[((va + i * ARM_TT_L2_SIZE) & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT] = (base + i * ARM_TT_L2_SIZE) |
++		    ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
++		    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++	}
++	__asm__ volatile ("dsb ishst" ::: "memory");
++	return va;
++}
++
+ void
+ arm_vm_init(uint64_t memory_size, boot_args * args)
+ {
+@@ -2147,6 +2186,8 @@
+ 
+ 	arm_set_user_tbi();
+ 
++	const uintptr_t coachz_alias = coachz_early_map_final();
++	coachz_early_mark(10, coachz_alias ? "screen alias mapped" : "screen alias FAILED");
+ 	arm_vm_physmap_init(args);
+ 	set_mmu_ttb_alternate(cpu_ttep & TTBR_BADDR_MASK);
+ 
+@@ -2154,10 +2195,16 @@
+ 	ml_enable_monitor();
+ #endif
+ 
++	if (coachz_alias) {
++		coachz_early_relocate(coachz_alias);
++	} else {
++		coachz_early_disable();
++	}
+ 	set_mmu_ttb(invalid_ttep & TTBR_BADDR_MASK);
+ 
+ 	flush_mmu_tlb();
+ 	kva_active = TRUE;
++	coachz_early_mark(11, "TTBR0 off");
+ 	// global table pointers may need to be different due to physical aperture remapping
+ 	cpu_tte = (tt_entry_t*)(phystokv(cpu_ttep));
+ 	invalid_tte = (tt_entry_t*)(phystokv(invalid_ttep));
+@@ -2253,7 +2300,9 @@
+     }
+ #endif
+ #endif
++	coachz_early_mark(12, "calling pmap_bootstrap");
+ 	pmap_bootstrap(dynamic_memory_begin);
++	coachz_early_mark(13, "pmap_bootstrap done");
+ 
+ 	disable_preemption();
+ 
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -84,6 +84,9 @@
+ #include <stdatomic.h>
+ #include <sys/pgo.h>
+ #include <console/serial_protos.h>
++#if defined(__arm64__)
++#include <arm64/coachz_early.h>
++#endif
+ #include <IOKit/IOBSD.h>
+ 
+ #if !(MACH_KDP && CONFIG_KDP_INTERACTIVE_DEBUGGING)
+@@ -1133,6 +1136,10 @@
+     uint64_t panic_options_mask, void *panic_data_ptr, unsigned long panic_caller)
+ {
+ #pragma clang diagnostic pop
++#if defined(__arm64__)
++	/* No CPU, thread or debugger state is required for this first panic copy. */
++	coachz_early_panic(panic_format_str, panic_args);
++#endif
+ 
+ #if defined(__x86_64__) && (DEVELOPMENT || DEBUG)
+ 	read_lbr();
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -788,6 +788,49 @@
+ }
+ #endif /* HIBERNATION */
+ 
++/* Coachz: kprintf drawn by the bring-up screen console. */
++extern int coachz_early_active(void);
++extern void coachz_early_putc(char c);
++
++static void
++coachz_fb_init(void)
++{
++}
++
++static unsigned int
++coachz_fb_transmit_ready(void)
++{
++	return 1;
++}
++
++static void
++coachz_fb_transmit_data(uint8_t c)
++{
++	coachz_early_putc((char)c);
++}
++
++static unsigned int
++coachz_fb_receive_ready(void)
++{
++	return 0;
++}
++
++static uint8_t
++coachz_fb_receive_data(void)
++{
++	return 0;
++}
++
++SECURITY_READ_ONLY_LATE(static struct pe_serial_functions) coachz_fb_serial_functions =
++{
++	.init = coachz_fb_init,
++	.transmit_ready = coachz_fb_transmit_ready,
++	.transmit_data = coachz_fb_transmit_data,
++	.receive_ready = coachz_fb_receive_ready,
++	.receive_data = coachz_fb_receive_data,
++	.device = SERIAL_COACHZ_FB
++};
++
+ int
+ serial_init(void)
+ {
+@@ -827,6 +870,10 @@
+ 	}
+ 
+ 	PE_parse_boot_argn("disable-uart-irq", &disable_uart_irq, sizeof(disable_uart_irq));
++
++	if (coachz_early_active()) {
++		register_serial_functions(&coachz_fb_serial_functions);
++	}
+ 
+ #ifdef PI3_UART
+ 	if (SecureDTFindEntry("name", "gpio", &entryP) == kSuccess) {
+--- a/pexpert/pexpert/arm/protos.h
++++ b/pexpert/pexpert/arm/protos.h
+@@ -47,7 +47,8 @@
+ 	SERIAL_DOCKCHANNEL=0x2,
+ 	SERIAL_PI3_UART=0x4,
+ 	SERIAL_VMAPPLE_UART=0x8,
+-	SERIAL_DCC_UART=0x10
++	SERIAL_DCC_UART=0x10,
++	SERIAL_COACHZ_FB=0x20
+ } serial_device_t;
+ 
+ kern_return_t serial_irq_enable(serial_device_t device);
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -53,6 +53,7 @@
+ osfmk/arm64/arm_vm_init.c	optional config_pmap_ppl
+ osfmk/arm64/arm64_hypercall.c	standard
+ osfmk/arm/io_map.c		standard
++osfmk/arm64/coachz_early.c	standard
+ osfmk/arm64/loose_ends.c	standard
+ osfmk/arm/locks_arm.c	standard
+ osfmk/arm64/locore.s	optional nos_arm_asm
+diff --git a/osfmk/arm64/coachz_early.c b/osfmk/arm64/coachz_early.c
+new file mode 100644
+--- /dev/null
++++ b/osfmk/arm64/coachz_early.c
+@@ -0,0 +1,181 @@
++/*
++ * Coachz screen console for kernel bring-up, adapted from sweet_early.c in
++ * ios-sweet (MIT, Copyright (c) 2026 dipa-studio). The boot probe restarts the
++ * scanout Depthcharge stopped and describes it in boot_args.Video.
++ *
++ * No allocation, locks, ADT parsing or per-CPU state: panic() can reach this
++ * before a current thread exists. Until arm_vm_init replaces it, the
++ * framebuffer is mapped VA=PA in the bootstrap TTBR0 as Normal Non-Cacheable.
++ */
++#include <arm64/coachz_early.h>
++#include <arm64/proc_reg.h>
++#include <kern/misc_protos.h>
++
++#define EARLY_SCALE 2u
++#define EARLY_CELL_W (8u * EARLY_SCALE)
++#define EARLY_CELL_H (16u * EARLY_SCALE)
++#define EARLY_BLACK 0xff000000u
++#define EARLY_WHITE 0xffffffffu
++
++extern unsigned char iso_font[256 * 16];
++extern uint64_t bootstrap_pagetables[];
++
++static volatile uint32_t *early_fb;
++static uint64_t early_pa, early_bytes;
++static uint32_t early_width, early_height, early_stride;
++static uint32_t early_rows, early_cols, early_row, early_col;
++static unsigned int early_panicking;
++
++static void
++coachz_early_clear_row(uint32_t row)
++{
++	for (uint32_t y = 0; y < EARLY_CELL_H; y++) {
++		volatile uint32_t *line = early_fb + (row * EARLY_CELL_H + y) * early_stride;
++		for (uint32_t x = 0; x < early_width; x++) {
++			line[x] = EARLY_BLACK;
++		}
++	}
++}
++
++static void
++coachz_early_newline(void)
++{
++	early_col = 0;
++	early_row = (early_row + 1) % early_rows;
++	coachz_early_clear_row(early_row);
++	coachz_early_clear_row((early_row + 1) % early_rows);
++}
++
++void
++coachz_early_putc(char c)
++{
++	if (early_fb == NULL) {
++		return;
++	}
++	if (c == '\r') {
++		early_col = 0;
++		return;
++	}
++	if (c == '\n') {
++		coachz_early_newline();
++		return;
++	}
++	if (early_col >= early_cols) {
++		coachz_early_newline();
++	}
++	const unsigned char *glyph = iso_font + (unsigned char)c * 16;
++	for (uint32_t gy = 0; gy < 16; gy++) {
++		for (uint32_t sy = 0; sy < EARLY_SCALE; sy++) {
++			volatile uint32_t *line = early_fb +
++			    (early_row * EARLY_CELL_H + gy * EARLY_SCALE + sy) * early_stride +
++			    early_col * EARLY_CELL_W;
++			for (uint32_t gx = 0; gx < 8; gx++) {
++				uint32_t pixel = (glyph[gy] & (1u << gx)) ? EARLY_WHITE : EARLY_BLACK;
++				for (uint32_t sx = 0; sx < EARLY_SCALE; sx++) {
++					line[gx * EARLY_SCALE + sx] = pixel;
++				}
++			}
++		}
++	}
++	early_col++;
++}
++
++static void
++coachz_early_string(const char *s)
++{
++	while (*s) {
++		coachz_early_putc(*s++);
++	}
++}
++
++void
++coachz_early_init(const boot_args *args)
++{
++	uint64_t pa = args->Video.v_baseAddr;
++	uint32_t width = (uint32_t)args->Video.v_width;
++	uint32_t height = (uint32_t)args->Video.v_height;
++	uint32_t row_bytes = (uint32_t)args->Video.v_rowBytes;
++
++	if (pa == 0 || width == 0 || height < EARLY_CELL_H * 2 || row_bytes < width * 4) {
++		return;
++	}
++	uint64_t *slot = &bootstrap_pagetables[pa >> ARM_TT_L1_SHIFT];
++	if (*slot != 0) {
++		return;
++	}
++	*slot = (pa & ~(uint64_t)(ARM_TT_L1_SIZE - 1)) | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
++	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++	__asm__ volatile ("dsb ish; isb" ::: "memory");
++
++	early_pa = pa;
++	early_bytes = (uint64_t)row_bytes * height;
++	early_width = width;
++	early_height = height;
++	early_stride = row_bytes / 4;
++	early_rows = height / EARLY_CELL_H;
++	early_cols = width / EARLY_CELL_W;
++	early_row = early_col = 0;
++	early_fb = (volatile uint32_t *)(uintptr_t)pa;
++	coachz_early_clear_row(0);
++	coachz_early_clear_row(1);
++}
++
++void
++coachz_early_mark(unsigned int stage, const char *label)
++{
++	coachz_early_string("COACHZ ");
++	if (stage >= 10) {
++		coachz_early_putc((char)('0' + (stage / 10) % 10));
++	}
++	coachz_early_putc((char)('0' + stage % 10));
++	coachz_early_string(": ");
++	coachz_early_string(label);
++	coachz_early_putc('\n');
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++void
++coachz_early_panic(const char *fmt, va_list *args)
++{
++	if (early_panicking) {
++		return;
++	}
++	early_panicking = 1;
++	coachz_early_string("\nCOACHZ PANIC: ");
++	va_list copy;
++	va_copy(copy, *args);
++	_doprnt(fmt, &copy, coachz_early_putc, 16);
++	va_end(copy);
++	coachz_early_putc('\n');
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++int
++coachz_early_active(void)
++{
++	return early_fb != NULL;
++}
++
++int
++coachz_early_range(uint64_t *pa, uint64_t *bytes)
++{
++	if (early_fb == NULL) {
++		return 0;
++	}
++	*pa = early_pa;
++	*bytes = early_bytes;
++	return 1;
++}
++
++void
++coachz_early_relocate(uintptr_t block_va)
++{
++	early_fb = (volatile uint32_t *)(block_va + (early_pa & (ARM_TT_L2_SIZE - 1)));
++}
++
++void
++coachz_early_disable(void)
++{
++	early_fb = NULL;
++}
+diff --git a/osfmk/arm64/coachz_early.h b/osfmk/arm64/coachz_early.h
+new file mode 100644
+--- /dev/null
++++ b/osfmk/arm64/coachz_early.h
+@@ -0,0 +1,18 @@
++/* Coachz screen console for kernel bring-up; see coachz_early.c. */
++#ifndef _ARM64_COACHZ_EARLY_H_
++#define _ARM64_COACHZ_EARLY_H_
++
++#include <stdarg.h>
++#include <stdint.h>
++#include <pexpert/arm64/boot.h>
++
++void coachz_early_init(const boot_args *args);
++void coachz_early_mark(unsigned int stage, const char *label);
++void coachz_early_putc(char c);
++void coachz_early_panic(const char *fmt, va_list *args);
++int coachz_early_active(void);
++int coachz_early_range(uint64_t *pa, uint64_t *bytes);
++void coachz_early_relocate(uintptr_t block_va);
++void coachz_early_disable(void);
++
++#endif

@@ -1,5 +1,11 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 #include "xnu_checkpoint.h"
+#ifndef PROBE_XNU_SCREEN
+#define PROBE_XNU_SCREEN 0
+#endif
+#if PROBE_XNU_SCREEN
+#include "display.h"
+#endif
 extern uint8_t _xnu_payload_start[],_xnu_payload_end[],_xnu_window[],_image_end[];
 void probe_value(const char *,uint64_t);
 struct xnu_expected xnu_expected;
@@ -13,6 +19,14 @@ struct xnu_handoff xnu_prepare(void) {
     __asm__ volatile("mrs %0, CurrentEL":"=r"(el));
     /* x19 is saved in the EL2 snapshot before any XNU code executes. */
     extern uint64_t xnu_saved[10];
+#if PROBE_XNU_SCREEN
+    int started=el==4 && xnu_screen_load(_xnu_payload_start,(size_t)(_xnu_payload_end-_xnu_payload_start),
+        (const void *)(uintptr_t)xnu_saved[0],cpu&0xff00ffffffull,freq,&display_video,&out);
+    probe_value("XNU copied=",(uint64_t)started);
+    /* entry.S enables FP and clears the frame registers for mode>=5, as XNU expects. */
+    if(started)expected.mode=7;
+    return out;
+#endif
     int allowed=(el==4 && (uintptr_t)_image_end<(1ull<<38) && (size_t)(_image_end-_xnu_window)==XNU_ARENA_BYTES &&
         xnu_range_allowed((const void *)(uintptr_t)xnu_saved[0],(uintptr_t)_xnu_window,XNU_ARENA_BYTES));
     int loaded=allowed && xnu_load(_xnu_payload_start,(size_t)(_xnu_payload_end-_xnu_payload_start),
