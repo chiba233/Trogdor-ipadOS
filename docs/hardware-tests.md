@@ -811,3 +811,30 @@ panic 的调用栈为 `PE_init_iokit → InitIOKit → OSlibkernInit → OSRunti
 内核前缀镜像 SHA-256 `6a31538bd8fe563d04e1c08017be542f980f4b8b23390e570d1f875bc3388f65`，签名容器 SHA-256 `4b051503f22467e8298c983afcd67b0b058fe5a8d886d8341347c6e71868d67c`。10727 条指令／20 段标量审计通过。写盘前独立核对清单全部源码及产物摘要、实际内嵌的本次 prelink 内核与诊断字符串；原有 watchdogd 策略参数仍在，没有全局 panic 禁用参数；GPT、Data 种子与上一轮逐字节相同，前缀结束于系统分区之前。
 
 既有免密写盘器核对目标与运行系统排除，完成全部 225 MiB 前缀写入和回读，返回零；系统卷与 SystemOS 未改写，没有自动重启。下一次手动启动后等到分钟采样末尾，取得 `COACHZ UM original stdout/stderr`、`COACHZ UM abort`、`COACHZ UM state` 和可用的 `COACHZ UM frame` 行，再按可执行文件头或共享缓存 slide 还原故障位置。本轮只增加可观察性，尚未修复 usermanagerd。
+
+
+## 2026-10-31：首版 usermanagerd 诊断未取得可见现场
+
+运行时 `da224a1`，使用前述首次 abort 诊断镜像。照片仍显示 usermanagerd 以 `0x6` 反复退出、fairplayd 零状态退出及周期线程采样，没有取得预期的 `COACHZ UM` 现场。不能把这个结果记为诊断验收通过，也不能由照片断定钩子一定没有执行。
+
+核对最终内核机器码确认 proc_prepareexit 内确实调用新增 helper，周期采样也确实调用 report；原版钩子同时要求目标是 current_proc 且 wait 状态为 SIGABRT，report 在没有捕获时静默返回。此外，屏幕控制台换行在行数边界循环回顶部覆盖，并非保留历史的滚动终端。这些实现使现有照片无法区分未命中、输出被覆盖与其他退出上下文，尚未确定 usermanagerd 的根因。
+
+本地修订的诊断 v2 去除状态和 current_proc 的过滤，只按目标名称观察首次退出，明确输出原始 wait 状态、处理者 PID、自身／其他上下文和 exit reason。只有自身退出才 copyin 当前用户栈；其他上下文仅保存目标任务最多三个线程的 PC／LR／x16 快照，不将其冒充故障线程或调用栈。完成记录后用 release/acquire 发布。采样每十秒显示 v2 标记或完整现场，捕获后暂停全量线程／介质日志，降低覆盖速度。原版进程、退出策略和 Data 种子不变。源码内核与 prelink 已构建，27 项既有基础回归通过；最终机器码中的退出与报告调用已核对。镜像 SHA-256 为 `b7306195702fdeaff77ecd67482548f2448f51a26522e2a23d7f0724af9ec48f`，实际内嵌内核、v2 字符串、清单、相同 GPT 与 Data 字节已核对；既有免密写盘器完成 225 MiB 前缀写入与全量回读并返回零。没有自动重启，真机诊断仍未验收，调试修改保持未提交。
+
+
+## 2026-10-31：v2 捕获正常初始化任务，确认 keybags 目录缺失
+
+前述本地 v2 镜像的屏幕照片取得了 `COACHZ UM v2` 记录、保存的 EL0 状态和三帧用户栈链，可见性修订实际工作。这次记录的 wait 状态为零、自身上下文、reason 为零，属于正常退出的早期 usermanagerd 初始化任务，不是之后 daemon 的 SIGABRT；首个退出锁存使后续异常未被保留。
+
+原版输出显示 Default persona 创建成功，随后原子写入 `/private/var/keybags/persona.kb` 的临时文件 `persona.kb.writing` 时，open_dprotected_np 返回错误 2／No such file or directory。结合之前对 Data 种子的只读目录核对，keybags 父目录确实缺失；这是已经取得的具体文件系统失败，尚不能单凭它断定后续 SIGABRT 的完整根因。
+
+本地修订 `coachz-prelink-keybags-directory.patch` 只在已成功挂载的内存 Data 上创建空的 keybags 与 backup 目录，走原有 mkdir 系统调用和 VFS，使用根所有的 0700 目录并复核类型／所有者，原版 usermanagerd 自己生成 persona.kb；没有写入人工密钥、用户记录或系统卷。诊断 v3 单独记录正常任务次数与末尾输出，正常退出后继续等待首次非零退出，保留后者的 reason、上下文和可用的用户态现场。本地源码内核与 prelink 构建通过，27 项既有基础回归通过。最终机器码确认真实 mkdir／VFS 目录校验和正常／异常分流，镜像 SHA-256 为 `0141f559173c7640ae03f9cbbb568b8ecc0067c43a9765742803a2fa1cc00158`；实际内嵌内核、清单、相同 GPT 与 Data 种子逐字节核对后，既有免密写盘器完成 225 MiB 前缀写入及全量回读，返回零。没有自动重启；这些是测试准备，修订保持未提交，目录问题与后续 daemon 行为仍待真机确认。
+
+
+## 2026-10-31：补齐 keybags 目录后推进到 SpringBoard 进程
+
+使用上一节同一镜像，屏幕显示 v3 正常初始化退出计数为一，原版 UMD_INIT 在此前的 persona.kb 原子写入报错点之后继续输出已加载的 System／Default persona、选择用户 501、加载前台用户及普通模式会话设置；未再显示原先的目录不存在错误。在两个不同时间的照片中，v3 均仍等待异常退出，尚未捕获到 usermanagerd 的非零退出。这是本次观察区间内的结果，不代表所有用户管理功能或长期稳定性已验收。
+
+同次启动的屏幕出现 SpringBoard 的退出记录，wait 状态为 `0x6`／SIGABRT，证明启动已推进到该进程的退出路径；尚没有可见界面，也没有其真实故障 PC／调用栈。locationd、sharingd、chronod 等也出现 SIGABRT，liveactivitiesd 则为 SIGTRAP；不据相同信号断定相同根因。
+
+`Too many corpses being created` 是 proc_prepareexit 在原有崩溃处理阶段调用 task_mark_corpse 失败后的诊断，不是本次进程为何 abort 的解释。下一步保留已通过的目录准备与 usermanagerd 诊断，单独记录 SpringBoard 的首个非零退出 reason、上下文、可执行文件头、共享缓存 slide 和可用用户栈，先定位实际依赖失败。

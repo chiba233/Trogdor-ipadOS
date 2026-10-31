@@ -1,0 +1,68 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8341,6 +8341,54 @@
+ extern int coachz_data_publish(void);
+ extern int coachz_data_volume_device(char *, size_t);
+ 
++/* Only empty directories on the mounted volatile Data seed; original usermanagerd
++ * creates persona.kb itself. Reuse mkdir's real VFS path with a user scratch pointer.
++ */
++static int
++coachz_data_keybags_prepare(proc_t p, user_addr_t scratch)
++{
++	const char *const paths[] = {"/private/var/keybags", "/private/var/keybags/backup"};
++	struct mkdir_args request = {.path = scratch + 0x100, .mode = 0700};
++	vfs_context_t context = vfs_context_kernel();
++	int32_t result = 0;
++	int error;
++
++	for (unsigned index = 0; index < sizeof(paths) / sizeof(paths[0]); index++) {
++		vnode_t vnode = NULLVP;
++		struct vnode_attr attributes;
++		error = copyout(paths[index], request.path, strlen(paths[index]) + 1);
++		if (!error) {
++			error = mkdir(p, &request, &result);
++		}
++		if (error == EEXIST) {
++			error = 0;
++		}
++		if (!error) {
++			error = vnode_lookup(paths[index], VNODE_LOOKUP_NOFOLLOW, &vnode, context);
++		}
++		if (!error && vnode_vtype(vnode) != VDIR) {
++			error = ENOTDIR;
++		}
++		if (!error) {
++			VATTR_INIT(&attributes);
++			VATTR_WANTED(&attributes, va_uid);
++			VATTR_WANTED(&attributes, va_mode);
++			error = vnode_getattr(vnode, &attributes, context);
++			if (!error && (attributes.va_uid != 0 || (attributes.va_mode & 0022))) {
++				error = EACCES;
++			}
++		}
++		if (vnode) {
++			vnode_put(vnode);
++		}
++		printf("COACHZ Data: keybags directory %u: %d\n", index, error);
++		if (error) {
++			return error;
++		}
++	}
++	return 0;
++}
++
+ static void
+ coachz_data_prepare(proc_t p, user_addr_t scratch)
+ {
+@@ -8392,6 +8440,10 @@
+ 	    "COACHZ Data: mount %s at /private/var read-write: %d\n", device_path, error);
+ 	printf("%s", coachz_systemos_note + used);
+ 	if (!error) {
++		error = coachz_data_keybags_prepare(p, scratch);
++		if (error) {
++			panic("Coachz memory Data keybags directory setup failed: %d", error);
++		}
+ 		error = coachz_watchdog_policy_prepare();
+ 		if (error) {
+ 			panic("Coachz temporary watchdog launch policy failed: %d", error);

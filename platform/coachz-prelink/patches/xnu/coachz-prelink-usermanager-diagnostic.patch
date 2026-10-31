@@ -9,21 +9,24 @@
  
  void coachz_sample_task(const char *name, int pid, task_t task);
  void coachz_critical_user_state(const char *name, int pid);
-@@ -56,3 +58,86 @@
+@@ -56,3 +58,144 @@
  	    (unsigned long long)get_saved_state_reg(state, 0), (unsigned long long)get_saved_state_reg(state, 1),
  	    (unsigned long long)get_saved_state_reg(state, 19), (unsigned long long)get_saved_state_reg(state, 20));
  }
 +
-+/* Preserve the first usermanagerd failure and a bounded copy of its original stdio.
-+ * The minute sampler repeats it after its thread dump so respawns cannot scroll it away.
++/* The first abnormal exit is evidence even when another task processes it. Only a self-exit
++ * can safely use copyin for its user frames. Publish the note after construction.
 + */
 +void coachz_usermanager_write(int pid, int fd, uint64_t address, uint64_t size);
-+void coachz_usermanager_exit(int pid, unsigned ns, uint64_t code, const char *description);
-+void coachz_usermanager_report(void);
++void coachz_usermanager_exit(int, unsigned, uint64_t, const char *, task_t, int, int, int);
++int coachz_usermanager_report(void);
 +static char coachz_um_output[4096];
 +static uint32_t coachz_um_output_used;
-+static char coachz_um_failure[1536];
++static char coachz_um_failure[2048];
 +static uint32_t coachz_um_captured;
++static unsigned coachz_um_normal_exits;
++static int coachz_um_normal_pid;
++static char coachz_um_normal_tail[512];
 +
 +void
 +coachz_usermanager_write(int pid, int fd, uint64_t address, uint64_t size)
@@ -49,26 +52,69 @@
 +}
 +
 +void
-+coachz_usermanager_exit(int pid, unsigned ns, uint64_t code, const char *description)
++coachz_usermanager_exit(int pid, unsigned ns, uint64_t code, const char *description,
++    task_t task, int self, int caller, int status)
 +{
-+	arm_saved_state_t *state = find_user_regs(current_thread());
-+	task_t task = current_task();
++	arm_saved_state_t *state;
 +	uint64_t fp, sp;
 +	size_t used;
 +
++	/* The -t boot task exits normally before the long-running daemon starts.
++	 * Keep its tail separately; it must not consume the later failure slot.
++	 */
++	if (status == 0) {
++		if (!os_atomic_cmpxchg(&coachz_um_captured, 0, 1, acq_rel)) {
++			return;
++		}
++		used = strnlen(coachz_um_output, sizeof(coachz_um_output));
++		unsigned start = used > sizeof(coachz_um_normal_tail) - 1 ?
++		    (unsigned)(used - (sizeof(coachz_um_normal_tail) - 1)) : 0;
++		snprintf(coachz_um_normal_tail, sizeof(coachz_um_normal_tail), "%s", coachz_um_output + start);
++		memset(coachz_um_output, 0, sizeof(coachz_um_output));
++		os_atomic_store(&coachz_um_output_used, 0, relaxed);
++		coachz_um_normal_pid = pid;
++		coachz_um_normal_exits++;
++		os_atomic_store(&coachz_um_captured, 0, release);
++		return;
++	}
 +	if (!os_atomic_cmpxchg(&coachz_um_captured, 0, 1, acq_rel)) {
 +		return;
 +	}
 +	used = snprintf(coachz_um_failure, sizeof(coachz_um_failure),
-+	    "COACHZ UM abort[%d]: namespace %u code 0x%llx description %.200s\n",
-+	    pid, ns, (unsigned long long)code, description ? description : "none");
-+	if (!state) {
-+		return;
++	    "COACHZ UM v3 exit[%d]: status 0x%x self %d caller %d\n"
++	    "COACHZ UM reason: namespace %u code 0x%llx description %.200s\n",
++	    pid, status, self, caller, ns, (unsigned long long)code, description ? description : "none");
++	if (task == TASK_NULL) {
++		goto done;
 +	}
 +	used += snprintf(coachz_um_failure + used, sizeof(coachz_um_failure) - used,
-+	    "COACHZ UM state: pc 0x%llx lr 0x%llx header 0x%llx cache-slide 0x%x\n",
-+	    (unsigned long long)get_saved_state_pc(state), (unsigned long long)get_saved_state_lr(state),
++	    "COACHZ UM image: header 0x%llx cache-slide 0x%x\n",
 +	    (unsigned long long)task->mach_header_vm_address, task->task_shared_region_slide);
++	if (!self) {
++		thread_t thread;
++		unsigned index = 0;
++		task_lock(task);
++		queue_iterate(&task->threads, thread, thread_t, task_threads) {
++			if (index == 3) {
++				break;
++			}
++			state = find_user_regs(thread);
++			used += snprintf(coachz_um_failure + used, sizeof(coachz_um_failure) - used,
++			    "COACHZ UM target t%u (sample): pc 0x%llx lr 0x%llx x16 0x%llx\n",
++			    index++, state ? (unsigned long long)get_saved_state_pc(state) : 0ULL,
++			    state ? (unsigned long long)get_saved_state_lr(state) : 0ULL,
++			    state ? (unsigned long long)get_saved_state_reg(state, 16) : 0ULL);
++		}
++		task_unlock(task);
++		goto done;
++	}
++	state = find_user_regs(current_thread());
++	if (!state) {
++		goto done;
++	}
++	used += snprintf(coachz_um_failure + used, sizeof(coachz_um_failure) - used,
++	    "COACHZ UM state: pc 0x%llx lr 0x%llx\n",
++	    (unsigned long long)get_saved_state_pc(state), (unsigned long long)get_saved_state_lr(state));
 +	sp = get_saved_state_sp(state);
 +	fp = get_saved_state_fp(state);
 +	for (unsigned index = 0; index < 8 && used < sizeof(coachz_um_failure) - 100; index++) {
@@ -84,17 +130,29 @@
 +		}
 +		fp = frame[0];
 +	}
++done:
++	os_atomic_store(&coachz_um_captured, 2, release);
 +	printf("%s", coachz_um_failure);
 +}
 +
-+void
++int
 +coachz_usermanager_report(void)
 +{
-+	if (!os_atomic_load(&coachz_um_captured, acquire)) {
-+		return;
++	unsigned phase = os_atomic_load(&coachz_um_captured, acquire);
++	printf("COACHZ UM v3 init: normal exits %u last pid %d\n",
++	    coachz_um_normal_exits, coachz_um_normal_pid);
++	if (coachz_um_normal_exits) {
++		printf("COACHZ UM init stdout/stderr tail:\n%s\n", coachz_um_normal_tail);
 +	}
-+	printf("COACHZ UM original stdout/stderr (first failure, bounded):\n%s\n%s",
-+	    coachz_um_output, coachz_um_failure);
++	if (phase != 2) {
++		printf("COACHZ UM v3: waiting for abnormal exit (capture %u)\n", phase);
++		return 0;
++	}
++	size_t length = strnlen(coachz_um_output, sizeof(coachz_um_output));
++	unsigned start = length > 1024 ? (unsigned)(length - 1024) : 0;
++	printf("COACHZ UM v3 abnormal stdout/stderr tail:\n%s\n%s",
++	    coachz_um_output + start, coachz_um_failure);
++	return 1;
 +}
 --- a/bsd/kern/kern_exit.c
 +++ b/bsd/kern/kern_exit.c
@@ -102,13 +160,13 @@
  	bool corpse_source = false;
  	task_t task = proc_task(p);
  
-+	/* Keep the first noncritical usermanagerd SIGABRT as evidence; preserve exit policy. */
-+	if (p == current_proc() && !strcmp(p->p_name, "usermanagerd") &&
-+	    WIFSIGNALED(rv) && WTERMSIG(rv) == SIGABRT) {
-+		extern void coachz_usermanager_exit(int, unsigned, uint64_t, const char *);
++	/* Observe usermanagerd exits without assuming their caller; retain normal task counts too. */
++	if (!strcmp(p->p_name, "usermanagerd") || !strcmp(p->p_comm, "usermanagerd")) {
++		extern void coachz_usermanager_exit(int, unsigned, uint64_t, const char *, task_t, int, int, int);
 +		os_reason_t reason = p->p_exit_reason;
 +		coachz_usermanager_exit(proc_getpid(p), reason ? reason->osr_namespace : 0,
-+		    reason ? reason->osr_code : 0, exit_reason_get_string_desc(reason));
++		    reason ? reason->osr_code : 0, exit_reason_get_string_desc(reason), task,
++		    p == current_proc(), proc_getpid(current_proc()), rv);
 +	}
 +
  
@@ -116,11 +174,12 @@
  		proc_handle_critical_exit(p, rv);
 --- a/bsd/kern/sys_generic.c
 +++ b/bsd/kern/sys_generic.c
-@@ -680,6 +680,11 @@
+@@ -680,6 +680,12 @@
  	uio_t uio;
  	int spacetype = IS_64BIT_PROCESS(p) ? UIO_USERSPACE64 : UIO_USERSPACE32;
  
-+	if ((fd == 1 || fd == 2) && !strcmp(p->p_name, "usermanagerd")) {
++	if ((fd == 1 || fd == 2) &&
++	    (!strcmp(p->p_name, "usermanagerd") || !strcmp(p->p_comm, "usermanagerd"))) {
 +		extern void coachz_usermanager_write(int, int, uint64_t, uint64_t);
 +		coachz_usermanager_write(proc_getpid(p), fd, buf, nbyte);
 +	}
@@ -134,15 +193,32 @@
  extern void coachz_sample_task(const char *, int, task_t);
  extern void coachz_root_prepare(void);
  extern void coachz_usb_report(void);
-+extern void coachz_usermanager_report(void);
++extern int coachz_usermanager_report(void);
  
  static int
  coachz_sample_proc(proc_t p, __unused void *arg)
-@@ -46,6 +47,7 @@
+@@ -36,16 +37,23 @@
+ coachz_sample_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+ 	static int chan;
++	unsigned ticks = 0;
+ 
+ 	for (;;) {
+ 		clock_sec_t sec;
+ 		clock_usec_t usec;
+ 
+-		(void)tsleep(&chan, PZERO, "coachz", 60 * hz);
++		(void)tsleep(&chan, PZERO, "coachz", 10 * hz);
++		/* Keep the captured note readable on the wrapping screen console. */
++		if (coachz_usermanager_report() || ++ticks < 6) {
++			continue;
++		}
++		ticks = 0;
+ 		clock_get_system_microtime(&sec, &usec);
  		printf("COACHZ alive: %lu s\n", (unsigned long)sec);
  		proc_iterate(PROC_ALLPROCLIST, coachz_sample_proc, NULL, NULL, NULL);
  		coachz_usb_report();
-+		coachz_usermanager_report();
++		(void)coachz_usermanager_report();
  	}
  }
  
