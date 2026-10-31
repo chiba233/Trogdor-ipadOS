@@ -36,7 +36,7 @@ python3 tools/prepare_usb.py --key-dir upstream/vboot/tests/devkeys
 | reset-el2.kpart / reset-el2.img | 留在 EL2，FDT 与诊断检查通过后等 3 秒请求复位 |
 | reset-el1.kpart / reset-el1.img | 切换到 EL1，FDT 与诊断检查通过后等 10 秒请求复位 |
 
-`.kpart` 只含已签名内核容器；`.img` 才是带主／备 GPT 的完整介质镜像。每个镜像 64 MiB，包含一个 16 MiB ChromeOS kernel 分区，priority=1、tries=1、successful=0。制作镜像的程序不会打开或改写磁盘设备。重复生成时使用新的 `--output` 目录，避免覆盖已有文件。
+`.kpart` 只含已签名内核容器；`.img` 才是带主／备 GPT 的完整介质镜像。每个镜像 64 MiB，包含一个 16 MiB ChromeOS kernel 分区，priority=1、tries=1、successful=0。固件每次启动都会用掉一次 tries，用完就把分区标记为坏分区，所以同一次写入只能启动一次，要再启动就得重写 U 盘。例外是 `linux_log.py --xnu-screen`，它进入 XNU 后不再返回 Linux，因此设为 tries=15。制作镜像的程序不会打开或改写磁盘设备。重复生成时使用新的 `--output` 目录，避免覆盖已有文件。
 
 ## 写盘前确认
 

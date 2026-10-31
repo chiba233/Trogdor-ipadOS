@@ -23,8 +23,10 @@ def layout(disk_mib, kernel_mib):
     return disk_mib * 2048, kernel_mib * 2048
 
 
-def fragments(payload, label="Coachz probe", disk_mib=64, kernel_mib=16):
+def fragments(payload, label="Coachz probe", disk_mib=64, kernel_mib=16, tries=1):
     sectors, length = layout(disk_mib, kernel_mib)
+    if type(tries) is not int or not 1 <= tries <= 15:
+        raise ValueError("GPT tries must be 1..15")
     if not 65536 <= len(payload) <= length * SECTOR or payload[:8] != b"CHROMEOS":
         raise ValueError("expected a signed vboot kernel container within the kernel partition")
     name = label.encode("utf-16-le")
@@ -33,8 +35,9 @@ def fragments(payload, label="Coachz probe", disk_mib=64, kernel_mib=16):
     disk_guid = uuid.uuid5(uuid.NAMESPACE_URL, "urn:trogdor-ipados:" + hashlib.sha256(payload).hexdigest())
     part_guid = uuid.uuid5(disk_guid, "kernel")
     entries = bytearray(ENTRY_COUNT * ENTRY_SIZE)
-    # Priority 1, one attempt, successful=0. No other partitions are bootable.
-    attrs = (1 << 48) | (1 << 52)
+    # Priority 1, successful=0. No other partitions are bootable. The firmware uses up one
+    # try per boot and then marks the partition bad, so the medium needs rewriting.
+    attrs = (1 << 48) | (tries << 52)
     struct.pack_into("<16s16sQQQ72s", entries, 0, KERNEL_TYPE.bytes_le,
                      part_guid.bytes_le, FIRST, FIRST + length - 1, attrs, name)
     array_crc = zlib.crc32(entries)
@@ -54,7 +57,7 @@ def fragments(payload, label="Coachz probe", disk_mib=64, kernel_mib=16):
             ((sectors - 1) * SECTOR, header(sectors - 1, 1, sectors - 33))]
 
 
-def create_image(source, output, label="Coachz probe", disk_mib=64, kernel_mib=16):
+def create_image(source, output, label="Coachz probe", disk_mib=64, kernel_mib=16, tries=1):
     sectors, length = layout(disk_mib, kernel_mib)
     source, output = Path(source).resolve(), Path(output).resolve()
     if not source.is_file():
@@ -63,7 +66,7 @@ def create_image(source, output, label="Coachz probe", disk_mib=64, kernel_mib=1
         raise ValueError("kernel container exceeds partition")
     if output == source or output.suffix != ".img" or output.is_relative_to(Path("/dev")):
         raise ValueError("output must be a separate .img file outside /dev")
-    parts = fragments(source.read_bytes(), label, disk_mib, kernel_mib)
+    parts = fragments(source.read_bytes(), label, disk_mib, kernel_mib, tries)
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("xb") as dest:
         dest.truncate(sectors * SECTOR)

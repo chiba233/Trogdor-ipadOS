@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -41,6 +42,18 @@ def materialize_xnu(source, destination):
     return destination
 
 
+def patched_drivers(base, platform, out):
+    """Copy the pinned drivers a platform patches, leaving upstream clean; returns --local-module options."""
+    options = []
+    for patch in sorted((ROOT / 'platform' / platform / 'patches/drivers').glob('*.patch')):
+        copy = out / 'reference' / patch.stem
+        shutil.rmtree(copy, ignore_errors=True)
+        shutil.copytree(base / 'drivers' / patch.stem, copy, ignore=shutil.ignore_patterns('.git'))
+        subprocess.run(['patch', '--batch', '--silent', '-p1', '-d', str(copy), '-i', str(patch)], check=True)
+        options += ['--local-module', 'driver:' + patch.stem + '=' + str(copy)]
+    return options
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--build', action='store_true', help='also compile the source kernel; no prelink or boot')
@@ -62,7 +75,7 @@ def main():
     from unixnu.config import Context
     arguments = cli.parser().parse_args(['defconfig', 'coachz_defconfig', '-D',
         str(ROOT / 'platform' / a.platform), '--out', str(out), '-j', str(a.jobs),
-        '--local-module', 'refer:xnu=' + str(xnu)])
+        '--local-module', 'refer:xnu=' + str(xnu), *patched_drivers(base, a.platform, out)])
     ctx = Context(arguments)
     cli.cmd_defconfig(ctx)
     # cmd_defconfig writes .config; Context keeps the original in-memory snapshot.

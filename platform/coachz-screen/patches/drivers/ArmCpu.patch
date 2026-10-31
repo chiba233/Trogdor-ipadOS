@@ -1,0 +1,34 @@
+--- a/ArmCpu.cpp
++++ b/ArmCpu.cpp
+@@ -87,7 +87,9 @@
+ OSDefineMetaClassAndStructors (ArmCpu, IOCPU)
+ 
+ // Redistributor ISENABLER0: SGIs 0..15 (only SGI 0 is used by the kernel; the others let the self-SGI probe tell which INTIDs the GIC accepts) and PPI 27.
+-static const uint32_t kSgiPpiEnable = 0xffffU | (1U << 27);
++// SC7180 wires the virtual timer to PPI 3 (INTID 19), not the usual INTID 27: see /timer in the firmware FDT.
++static const uint32_t kVirtualTimerIntid = 19;
++static const uint32_t kSgiPpiEnable = 0xffffU | (1U << kVirtualTimerIntid);
+ 
+ static const uint32_t kIpiSpiBase = 1008;   // INTIDs 1008..1015 stand for 'IPI to logical core 0..7'
+ 
+@@ -353,6 +355,10 @@
+     armcpu_gic_boot[7] = static_cast<uint32_t> (sre);
+   }
+   armcpu_gic_ready = 1;
++  if (!secondary) {
++    kprintf ("COACHZ GIC: IGROUPR0=%x ISENABLER0=%x GICD_CTLR=%x PMR=%x IGRPEN1=%x SRE=%x\n", armcpu_gic_boot[0], armcpu_gic_boot[1],
++             armcpu_gic_boot[2], armcpu_gic_boot[5], armcpu_gic_boot[6], armcpu_gic_boot[7]);
++  }
+ }
+ 
+ 
+@@ -565,7 +571,8 @@
+     armcpu_irq_id=static_cast<uint32_t>(id & 0xffffff);
+     if ((id & 0xffffff) >= 1020) { armcpu_irq_phase=0;break; }
+     if(diagnosePower && ++drained>128)panic("ArmCpu: IRQ drain exceeds 128 id=%llx timer=%llu IPI=%llu",id,armcpu_timer_interrupts,armcpu_ipi_interrupts);
+-    if ((id & 0xffffff) == 27) {
++    if ((id & 0xffffff) == kVirtualTimerIntid) {
++      if (armcpu_timer_interrupts == 0) { kprintf ("COACHZ: first timer interrupt\n"); }
+       armcpu_timer_interrupts = armcpu_timer_interrupts + 1;
+       armcpu_core_timer[logicalId & 7] = armcpu_core_timer[logicalId & 7] + 1;
+       armcpu_irq_phase=2;

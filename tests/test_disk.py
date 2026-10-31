@@ -48,6 +48,15 @@ class DiskTests(unittest.TestCase):
         self.assertFalse(any(arrays[0][128:]))
         self.assertEqual(b[first * SECTOR:first * SECTOR + len(self.payload())], self.payload())
 
+    def test_tries_default_to_one_and_stay_in_the_gpt_field(self):
+        data = b"CHROMEOS" + bytes(65536)
+        attrs = lambda **kw: struct.unpack_from("<Q", fragments(data, **kw)[2][1], 48)[0]
+        self.assertEqual(attrs(), (1 << 48) | (1 << 52))
+        self.assertEqual(attrs(tries=15), (1 << 48) | (15 << 52))
+        for tries in (0, 16, True):
+            with self.assertRaises(ValueError):
+                fragments(data, tries=tries)
+
     def test_invalid_unsigned_oversized_containers_and_labels_are_rejected(self):
         for data in (b"CHROMEOS", bytes(65536), b"CHROMEOS" + bytes(LENGTH * SECTOR)):
             with self.assertRaises(ValueError):

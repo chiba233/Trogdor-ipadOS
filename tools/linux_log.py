@@ -246,7 +246,8 @@ def main():
                    stdout=subprocess.DEVNULL)
     if subprocess.check_output([futility, "dump_kernel_config", str(kpart)]) != cmdline:
         p.error("signed command line differs from baseline")
-    create_image(kpart, image, "EL1 probe Linux log", disk_mib=128, kernel_mib=96)
+    # The screen image never returns to Linux, and an unexplained panic can need a plain retry.
+    create_image(kpart, image, "EL1 probe Linux log", disk_mib=128, kernel_mib=96, tries=15 if a.screen else 1)
     code_files = ("boot/entry.S", "boot/probe.c", "boot/fdt.c", "boot/checkpoint.c", "boot/chain.ld",
                   "tools/linux_log.py", "tools/fdt.py", "tools/build.py", "tools/artifacts.py",
                   "tools/sign.py", "tools/disk.py", "tools/read_probe.py", "tools/relocation_audit.py")

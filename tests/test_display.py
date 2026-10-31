@@ -287,12 +287,14 @@ class DisplayTests(unittest.TestCase):
         for line in ('CONFIG_XNU_DT_PANIC_REGION=y','# CONFIG_XNU_NATIVE_AES is not set','CONFIG_XNU_CRYPTO_BOOTSTRAP="source"','# CONFIG_XNU_TRUST_CACHE_RUNTIME is not set'):
             self.assertIn(line,config)
         self.assertIn('kt_fixed_zones=120',(ROOT/'tools/xnu_screen.py').read_text())
+        self.assertIn('kVirtualTimerIntid = 19;',(ROOT/'platform/coachz-screen/patches/drivers/ArmCpu.patch').read_text())
         self.assertNotIn('coachz-screen-console.patch',(ROOT/'platform/coachz/patches/xnu/series').read_text())
 
     def test_hardware_verified_ramdisk_userspace_route_is_unchanged(self):
         from xnu_screen import COMMAND_LINE,add_ramdisk_property
         self.assertIn('rd=md0',COMMAND_LINE)
         self.assertIn('copy(window+disk,p+ramdisk,',(ROOT/'boot/xnu_screen.c').read_text())
+        self.assertIn('tries=15 if a.screen else 1',(ROOT/'tools/linux_log.py').read_text())
         patch=(ROOT/'platform/coachz-screen/patches/xnu/coachz-screen-console.patch').read_text()
         for fixed in ('amfi_interface_register(&coachz_amfi);','bsd/kern/coachz_amfi.c\t\tstandard','if (!iomediaClass) {','if (!ioblockstoragedriverClass) {'):
             self.assertIn(fixed,patch)

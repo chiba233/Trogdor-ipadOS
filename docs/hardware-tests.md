@@ -631,3 +631,18 @@ panic 的调用栈为 `PE_init_iokit → InitIOKit → OSlibkernInit → OSRunti
 这只有屏幕证据，没有逐字段核对。运行的是自写的静态测试程序，不是 launchd，也没有 dyld、共享缓存或任何 iPadOS 用户态。`Failed to open swap file` 符合预期，内存盘根上没有可写文件系统。
 
 未确认：计时器中断。程序每 5 秒用 `select` 睡眠后应打印 `COACHZ init: timer tick N`，这张照片里 PID 那行之后还没有 tick，但拍摄时刻距启动多久未知，不能据此判断。`zone` 随机 panic 这一轮未出现，原因仍未查明。
+
+
+## 2026-10-31：定时器中断在真机上工作
+
+运行时与配置见随本节提交，镜像 SHA-256 `e0960fd1de0dbe69ff0294c23a06c8b9f3fe0f6a1c7592eed5e90f5f0cd29aeb`。
+
+上一节的镜像停在 PID 1 那行，等了很久也没有 tick。真机设备树 `/timer` 写明虚拟定时器是 PPI 3，也就是 INTID 19，内核也确实使用虚拟定时器，而 ArmCpu 只使能并识别写死的 INTID 27，所以定时器中断从未到达内核。`platform/coachz-screen/patches/drivers/ArmCpu.patch` 改为 19，并增加两行屏幕诊断。
+
+屏幕照片依次显示 `COACHZ GIC: IGROUPR0=0 ISENABLER0=87eff GICD_CTLR=12 PMR=f0 IGRPEN1=1 SRE=7`、`COACHZ: first timer interrupt`、PID 1 那行，然后是 `COACHZ init: timer tick 1` 到 `4`。这说明定时器中断能从 GIC 到达 `rtclock_intr`，线程也能按定时被唤醒，`select` 超时后程序继续运行。这是屏幕证据，没有用外部时钟测量 tick 的实际间隔。
+
+`ISENABLER0` 的预期值是 `0x8ffff`，实际读回 `0x87eff`：第 19 位已置上，第 8 和第 15 位没有生效，`IGROUPR0` 也读回 0。原因未验证，可能是非安全访问看不到或被安全固件保留。内核目前只用到 SGI 0 和这个定时器。
+
+同一轮还查清了另一个现象：同一次写入的 U 盘第二次按 Ctrl+U 无法启动。U 盘本身正常，是镜像设置了 `tries=1, successful=0`，固件第一次启动就用完次数并标记坏分区，Debian 下读到的分区属性为 0。屏幕镜像现在设为 `tries=15`，写入后属性是 `0xf1000000000000`，启动一次后读到 `0xe1000000000000`，符合每次启动扣减一次。其他镜像仍是一次。
+
+未解决：随机 zone panic 最近几轮未出现，原因仍未查明。没有 SMP、完整组件 prelink、存储驱动、launchd 或 iPadOS 启动。
