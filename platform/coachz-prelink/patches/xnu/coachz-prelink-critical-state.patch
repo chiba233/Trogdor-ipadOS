@@ -1,0 +1,50 @@
+--- a/osfmk/arm64/coachz_thread.c
++++ b/osfmk/arm64/coachz_thread.c
+@@ -8,6 +8,7 @@
+ #include <mach/arm/thread_status.h>
+ 
+ void coachz_sample_task(const char *name, int pid, task_t task);
++void coachz_critical_user_state(const char *name, int pid);
+ 
+ void
+ coachz_sample_task(const char *name, int pid, task_t task)
+@@ -31,3 +32,27 @@
+ 	}
+ 	task_unlock(task);
+ }
++
++/* The exiting thread's saved EL0 state, immediately before a critical-process panic.
++ * Keep the executable header alongside PC so a photograph can be symbolicated with ASLR.
++ * This observes the failure; it does not change signal delivery or panic policy.
++ */
++void
++coachz_critical_user_state(const char *name, int pid)
++{
++	thread_t thread = current_thread();
++	task_t task = current_task();
++	arm_saved_state_t *state = find_user_regs(thread);
++
++	if (!state) {
++		printf("COACHZ critical %s[%d]: no saved user state\n", name, pid);
++		return;
++	}
++	printf("COACHZ critical %s[%d]: pc 0x%llx lr 0x%llx sp 0x%llx fp 0x%llx header 0x%llx\n",
++	    name, pid, (unsigned long long)get_saved_state_pc(state),
++	    (unsigned long long)get_saved_state_lr(state), (unsigned long long)get_saved_state_sp(state),
++	    (unsigned long long)get_saved_state_fp(state), (unsigned long long)task->mach_header_vm_address);
++	printf("COACHZ critical regs: x0 0x%llx x1 0x%llx x19 0x%llx x20 0x%llx\n",
++	    (unsigned long long)get_saved_state_reg(state, 0), (unsigned long long)get_saved_state_reg(state, 1),
++	    (unsigned long long)get_saved_state_reg(state, 19), (unsigned long long)get_saved_state_reg(state, 20));
++}
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1870,6 +1870,9 @@
+ 
+ 	sync(p, (void *)NULL, (int *)NULL);
+ 
++	extern void coachz_critical_user_state(const char *, int);
++	coachz_critical_user_state(p->p_name, proc_getpid(p));
++
+ 	if (p->p_exit_reason == OS_REASON_NULL) {
+ 		panic_with_options(0, NULL, DEBUGGER_OPTION_INITPROC_PANIC, "%s -- no exit reason available -- (signal %d, exit status %d %s)",
+ 		    prefix_str, WTERMSIG(rv), WEXITSTATUS(rv), ((proc_getcsflags(p) & CS_KILLED) ? "CS_KILLED" : ""));

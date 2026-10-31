@@ -12,3 +12,5 @@ coachz-prelink-root.patch
 coachz-prelink-systemos.patch
 # Load tmpfs, and report thread states on the screen console every minute.
 coachz-prelink-diagnostics.patch
+# Saved EL0 state on critical-process exit, for symbolication of screen failures.
+coachz-prelink-critical-state.patch

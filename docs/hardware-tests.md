@@ -752,6 +752,26 @@ panic 的调用栈为 `PE_init_iokit → InitIOKit → OSlibkernInit → OSRunti
 
 第十轮（`949d85cb313118e25bbe8d2c25119245206bb13f5748ebdcfd6e2ae819de7f29`）：在 `/chosen` 加 `ephemeral-storage = 1`，同样的 panic，这个属性已撤掉。
 
-修正：Data 种子由 `.tools` 里的私有脚本在 Mac 上用 sudo 生成，复制系统卷 `/private/var` 的骨架（不含 `staged_system_apps`）并保留真实属主，卷不设角色。第十一轮镜像 `ebaeb9b7fec898d62faf949258eaf0014a99caedcdb227dfed0d760ec952110a` 已写入，尚无真机结果。
+修正：Data 种子由 `.tools` 里的私有脚本在 Mac 上用 sudo 生成，复制系统卷 `/private/var` 的骨架（不含 `staged_system_apps`）并保留真实属主，卷不设角色。第十一轮镜像 `ebaeb9b7fec898d62faf949258eaf0014a99caedcdb227dfed0d760ec952110a` 已取得屏幕结果：`COACHZ Data: mount ... at /private/var read-write: 0`，无角色的 APFS 种子挂载成功。launchd 越过此前的 tzinit 失败，继续执行多个系统服务；本轮最终停止在 watchdogd。
 
-都只有屏幕证据。根和 SystemOS 都只读，没有可写的 Data 卷；放行未封存根卷和放行 SystemOS 共享缓存都不是验证。
+都只有屏幕证据。根和 SystemOS 都只读，`/private/var` 是可写的内存 APFS 种子，重启丢失；放行未封存根卷和放行 SystemOS 共享缓存都不是验证。
+
+
+## 2026-10-31：可写内存 Data 挂载成功，启动停止于 watchdogd
+
+运行时 `ac5e2c0`，第十一轮镜像同前。屏幕直接显示 SystemOS 挂载成功和 `/private/var read-write: 0`，并显示 launchd 执行 `contextstored`、`WirelessRadioManagerd`、`healthd`、`usernotificationsd`、`countryd`、`mobileassetd`、`usermanagerd`、`watchdogd` 等进程。这里只确认进程执行和挂载结果，不据此认定所有服务初始化成功；例如屏幕另有 usermanagerd 的异常退出。
+
+最终关键进程退出为 `watchdogd`，`exit reason namespace 2 subcode 0x5`、description none，随后触发关键进程退出 panic。按固定 XNU 的 `bsd/sys/reason.h` 与信号定义，这是 `OS_REASON_SIGNAL / SIGTRAP`。core dump 还因目标文件无法创建而失败；这个后续错误不是已定位的 SIGTRAP 根因。没有真实用户态故障 PC 或调用栈，不能直接认定是缺少 IOWatchdog。
+
+同版原始 watchdogd 与 launchd 经摘要核对，与锁定 UniXNU 已有分支分析输入一致。复用其 `check-watchdogd-branches.py` 的有界离线执行，四种分支通过：原生环境没有 IOWatchdog 服务时主动 BRK；虚拟环境缺服务时正常退出；打开服务失败时另一处 BRK；正常连接时返回成功。外部 API 是桩，这验证原始二进制控制流，不是这次真机故障位置的证明。
+
+下一轮只增加关键进程 panic 前当前退出线程的保存 EL0 PC、LR、SP、FP、可执行文件基址与少量寄存器输出，便于按 ASLR 还原位置。保持原版服务、信号处理和 panic 策略，不添加虚假的 watchdog 硬件服务，也不全局禁用关键进程 panic。补丁为 `coachz-prelink-critical-state.patch`；当前无该诊断的真机结果。
+
+
+## 2026-10-31：watchdogd 用户态现场诊断介质准备
+
+本轮仅增加关键进程 panic 前的当前退出线程现场输出，原有 Data 种子、信号处理与关键进程 panic 策略不变。源码内核与组件 prelink 构建成功，最终内核中确认新增符号和输出字符串；已有 26 项显示／用户态路线回归通过，原版 watchdogd 的四种离线连接分支通过，外部 API 为桩。
+
+内核前缀镜像 SHA-256 `bb7a9f3ad8d1192b580329010986427c30f2c1b75a218270c8199ccfe77fc86c`，签名容器 SHA-256 `9502a0c19bf9e56d33faa256cf6ca5672bb666d35846ab37cfc23e4afff9c549`。10727 条指令／20 段标量审计通过；重新核对清单源码和全部产物摘要、实际嵌入的本次 prelink 内核，GPT 布局与此前镜像一致。
+
+通过既有免密写盘器核实外置介质与运行系统排除，完成 225 MiB 内核前缀写入和全量回读，写盘器返回零。没有改动系统卷或 SystemOS 分区，没有写固件或内置盘，没有自动重启。尚待手动启动取得 `COACHZ critical` 的 PC／LR／可执行文件基址；不能把介质准备或离线 BRK 分支当作真机根因已定位。
