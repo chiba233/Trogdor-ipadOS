@@ -740,6 +740,10 @@ panic 的调用栈为 `PE_init_iokit → InitIOKit → OSlibkernInit → OSRunti
 
 第五轮（`ccd81166fb7a993cdfc4a2e5c28b273df236c3c8ac30874018344aedebce48bf`）：`vm_unix.c` 只额外放行内核自己挂上的那个只读 SystemOS 挂载。这一轮在挂根之前就 panic：`pmap_ttne: Attempt to demote L2 block`，调用栈 `bsd_init → bsd_bufferinit → kmem_alloc → pmap_enter`。屏幕控制台在 `arm_vm_init` 里把帧缓冲区以 2 MiB 块映射到低端全局变量和内核之间，但这段虚拟地址没有从 kernel map 预留，kmem 的随机区间可能分到它。此前未解释的随机 zone panic 很可能同源，这一点未证实。
 
-修正：`coachz-screen-console.patch` 记下别名映射的范围，`pmap_virtual_region` 把它报告为第 4 段，`kmem_init` 在放置 kmem 区间之前就占住它。这个补丁两条屏幕路线共用；屏幕路线本身没有重新上机。第六轮镜像 `791e86405fcc19a5ce8ee55d5c7db2baa900773a6bbecae16bc174eae0d05505` 已写入，尚无真机结果。
+修正：`coachz-screen-console.patch` 记下别名映射的范围，`pmap_virtual_region` 把它报告为第 4 段，`kmem_init` 在放置 kmem 区间之前就占住它。这个补丁两条屏幕路线共用；屏幕路线本身没有重新上机。
+
+第六轮（`791e86405fcc19a5ce8ee55d5c7db2baa900773a6bbecae16bc174eae0d05505`）：没有再出现 `pmap_ttne` panic。SystemOS 挂上，共享缓存映射通过，原版 launchd 真正运行：屏幕显示 `hello, launchd UUID`、`Darwin Bootstrapper Version 7.0.0`、`boot-mode set by sysctl: main`、`entering ondemand mode`，随后执行启动任务。`exclaves-boot` 和 `fsck` 通过，`fsck` 判定不是主 OS 或诊断 OS 而跳过检查。`mount-phase-1` 的 `mount -P 1`（PID 3）打印 `data volume missing, but not required in env: 0`、`DT_get_fstab_entries: failed to get filesystem entry at: /filesystems/fstab`、`failed to get boot manifest hash`，以 66 退出，launchd 因关键启动任务失败而 panic。UniXNU 记录过同样的三行和退出码，缺的是 `/chosen/boot-manifest-hash`。
+
+修正：主系统 ADT 的 `/chosen` 写入一个 48 字节的 `boot-manifest-hash`，是固定标签和两个卷 UUID 的 SHA-384。它只是这组未签名镜像的身份，不是度量，也不验证任何东西。第七轮镜像 `3d0c1243dea59facdbaea8c84faf277e1d8018b879d119ddb9bb1ee5601df3fa` 尚无真机结果。
 
 都只有屏幕证据。根和 SystemOS 都只读，没有可写的 Data 卷；放行未封存根卷和放行 SystemOS 共享缓存都不是验证。

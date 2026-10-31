@@ -17,6 +17,8 @@ VERSION = 12
 COMMAND_LINE = '-v debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam kt_fixed_zones=120 rd=md0 cs_enforcement_disable=1'
 # Original AMFI runs in the prelinked kernel: the init program is trusted through the static trust cache.
 PRELINK_COMMAND_LINE = '-v debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam rd=md0'
+# The Cryptex1,SystemOS volume of the pinned IPSW, mounted by coachz-prelink-systemos.patch.
+SYSTEMOS_UUID = '8846FE78-2910-4297-AF97-D59BB6F8FC16'
 OS_PROFILE = Path(__file__).resolve().parents[1] / 'upstream/unixnu/profiles/os/ipados-17.7.11-21H461/profile.toml'
 
 
@@ -145,6 +147,10 @@ def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=T
         root.child('chosen').set('osenvironment', environment.encode() + b'\0')
     if root_uuid:
         root.child('chosen').set('root-matching', root_matching(root_uuid))
+        # mount -P 1 of the original launchd exits 66 without it. An identity of this unsigned image set,
+        # not a measurement: nothing here is verified.
+        root.child('chosen').set('boot-manifest-hash', hashlib.sha384(
+            b'Coachz unsealed USB boot set\0' + root_uuid.encode() + b'\0' + SYSTEMOS_UUID.encode()).digest())
     memory_map = root.child('chosen').child('memory-map')
     # Without a RAMDisk entry IOFindBSDRoot makes no md0, and rd= names a disk partition.
     if ram_root:

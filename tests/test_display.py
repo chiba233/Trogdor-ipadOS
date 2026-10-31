@@ -369,6 +369,7 @@ class DisplayTests(unittest.TestCase):
         self.assertEqual(chosen['osenvironment'],b'main\0')
         self.assertIn(b'<key>UUID</key><string>04769D26-2CA0-4825-B443-E2E5F88300F2</string>',chosen['root-matching'])
         self.assertTrue(chosen['root-matching'].endswith(b'</dict>\0'))
+        self.assertEqual(len(chosen['boot-manifest-hash']),48)
         self.assertEqual(struct.unpack_from('<QQ',props['TrustCache'])[1],56)
 
     def test_hardware_verified_scanout_restart_order_is_unchanged(self):
