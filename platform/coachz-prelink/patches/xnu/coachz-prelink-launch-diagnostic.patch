@@ -1,15 +1,16 @@
 --- a/osfmk/arm64/coachz_thread.c
 +++ b/osfmk/arm64/coachz_thread.c
-@@ -8,6 +8,8 @@
+@@ -8,6 +8,9 @@
  #include <mach/arm/thread_status.h>
  #include <libkern/copyio.h>
  #include <os/atomic_private.h>
 +#include <kern/clock.h>
 +#include <vm/vm_map.h>
++#include <kern/cpu_number.h>
  
  void coachz_sample_task(const char *name, int pid, task_t task);
  void coachz_critical_user_state(const char *name, int pid);
-@@ -314,12 +316,181 @@
+@@ -314,12 +317,207 @@
  done:
  	os_atomic_store(&coachz_sb_captured, 2, release);
  	printf("%s", coachz_sb_failure);
@@ -45,8 +46,8 @@
 +	clock_usec_t microseconds;
 +	clock_get_system_microtime(&seconds, &microseconds);
 +	return (uint32_t)seconds;
- }
- 
++}
++
 +void
 +coachz_launch_signal(int sender, const char *sender_name, int target, const char *target_name, int signum)
 +{
@@ -153,11 +154,37 @@
 +		vm_map_deallocate(map);
 +	}
 +	proc_rele(p);
+ }
+ 
++/* ArmCpu's secondary-CPU evidence (steps: 1 nub, 2 registered, 3 start thread, 4 CPU_ON, 5 initCPU, 6 GIC, 7 running). */
++extern volatile uint32_t armcpu_smp_requested, armcpu_smp_running;
++extern volatile uint32_t armcpu_smp_step[8], armcpu_smp_fail[8], armcpu_core_timer[8], armcpu_core_sgi[8];
++extern volatile int32_t armcpu_smp_psci_rc[8];
++
++static void
++coachz_smp_report(void)
++{
++	uint64_t count = 2000000, start, end, hz;
++
++	__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(hz));
++	__asm__ volatile ("isb\n\tmrs %0, cntpct_el0" : "=r"(start));
++	__asm__ volatile ("1: subs %0, %0, #1\n\tb.ne 1b" : "+r"(count) :: "cc");
++	__asm__ volatile ("isb\n\tmrs %0, cntpct_el0" : "=r"(end));
++	uint64_t us = hz ? (end - start) * 1000000 / hz : 0;
++	printf("COACHZ SMP v1: requested %u, %u secondary running; loop on cpu %d: %llu per us\n",
++	    armcpu_smp_requested, armcpu_smp_running, cpu_number(), us ? 2000000 / us : 0);
++	printf("COACHZ SMP cores:");
++	for (unsigned index = 0; index < 4; index++) {
++		printf(" [%u step %u rc %d fail %u timer %u sgi %u]", index, armcpu_smp_step[index],
++		    armcpu_smp_psci_rc[index], armcpu_smp_fail[index], armcpu_core_timer[index], armcpu_core_sgi[index]);
++	}
++	printf("\n");
 +}
 +
 +static void
 +coachz_launch_report(void)
 +{
++	coachz_smp_report();
 +	uint32_t kills = os_atomic_load(&coachz_kill_count, relaxed);
 +	uint32_t launches = os_atomic_load(&coachz_launch_count, relaxed);
 +	printf("COACHZ LS v1: %u SIGKILL, %u lsd/SpringBoard events, now %u s\n", kills, launches,

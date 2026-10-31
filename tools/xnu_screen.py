@@ -137,8 +137,28 @@ def root_matching(uuid):
             '<dict><key>UUID</key><string>%s</string></dict></dict>' % uuid).encode() + b'\0'
 
 
-def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=True, root_uuid=None):
+def smp_tree(root, count):
+    """CPU0..count-1, the A55 cluster: SC7180 numbers its cores in MPIDR Affinity1. PSCI is called by SMC."""
+    if count <= 1:
+        return
+    cpus = root.child('cpus')
+    boot = cpus.child('cpu0')
+    for index in range(1, count):
+        cpu = cpus.child('cpu%d' % index)
+        for key, _, value in boot.props:
+            if key not in ('name', 'reg', 'state'):
+                cpu.set(key, value)
+        cpu.set('reg', struct.pack('<I', index << 8))
+        cpu.set('state', b'waiting\0')
+    psci = root.child('psci')
+    psci.set('compatible', b'arm,psci-1.0\0')
+    psci.set('method', b'smc\0')
+
+
+def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=True, root_uuid=None, cpus=1):
     root = read_tree(adt)
+    if cpus > 1:
+        smp_tree(root, cpus)
     table = tomllib.loads(OS_PROFILE.read_text())['adt']
     apply_identity(root, table['root'])
     for name in ('chosen', 'product', 'defaults'):
@@ -164,7 +184,7 @@ def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=T
 
 
 def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=False, root_cache=None, root_device=None,
-         root_uuid=None, data_seed=None, data_uuid=None, display=False):
+         root_uuid=None, data_seed=None, data_uuid=None, display=False, cpus=1):
     if window & 0x1fffff or memory & 0x1fffff:
         raise ValueError('window base and size must be 2 MiB aligned')
     kernel = macho(data)
@@ -189,6 +209,15 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         command_line += ' coachz-display=1 offline-legacy-register=1 offline-legacy-gop=1 offline-legacy-phase=4'
         command_line += ' offline-legacy-pm=1 offline-legacy-validate=1 offline-legacy-transfer=1 offline-legacy-cpu-present=1'
         command_line += ' sheng-vsync=60 sheng-early-retire=0 coachz-reset-mgcache=1'
+    if cpus != 1:
+        # BCM2837's board configuration allows four CPUs in one cluster: CPU0..3, all A55.
+        if not root_uuid or not prelinked or not 2 <= cpus <= 4:
+            raise ValueError('secondary CPUs need the prelinked main OS and 2 to 4 CPUs')
+        if command_line.count(' cpus=1 ') != 1:
+            raise ValueError('the command line must limit XNU to the boot CPU before SMP widens it')
+        # cpus=N is the topology XNU parses; a CPU beyond it gets no logical number and ArmCpu skips it.
+        command_line = command_line.replace(' cpus=1 ', ' cpus=%d ' % cpus)
+        command_line += ' sheng-smp=1 armcpu-self-ipi=1 armcpu-el2-entry=1'
     if data_uuid:
         if not root_uuid or data_seed is not None or not re.fullmatch(r'[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}', data_uuid):
             raise ValueError('an external Data UUID needs the main OS root and no memory Data seed')
@@ -212,7 +241,7 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         # The restore volume, from memory or from disk, runs as the restore OS environment; the main OS does not.
         environment = 'restore' if root_cache and not root_uuid else None
         adt = prelink_tree(adt, window, tree, ramdisk, cache, environment, ram_root=not disk_root or bool(data_seed),
-                           root_uuid=root_uuid)
+                           root_uuid=root_uuid, cpus=cpus)
         ramdisk = ramdisk + cache + bytes(-len(cache) % 4096)
     else:
         adt = add_ramdisk_property(adt, window + up(tree + len(adt) + 52), len(ramdisk))
@@ -250,6 +279,7 @@ def main():
     p.add_argument('--root-device', help='with --prelinked: root on this BSD disk instead of a RAM disk, such as disk1s1')
     p.add_argument('--root-uuid', help='with --prelinked: the main OS, rooted on the APFS volume of this UUID')
     p.add_argument('--display', action='store_true', help='main OS: publish the firmware framebuffer through original MobileFramebuffer Legacy')
+    p.add_argument('--smp', type=int, default=1, help='main OS: start CPU0..N-1 (up to 4) through PSCI')
     p.add_argument('--data-uuid', help='with --root-uuid: selected external Data APFS volume UUID')
     p.add_argument('--data-image', type=Path, help='with --root-uuid: APFS Data seed, the RAM disk the kernel mounts on /private/var')
     a = p.parse_args()
@@ -263,7 +293,7 @@ def main():
     payload = pack(a.kernel.read_bytes(), a.adt.read_bytes(), a.window, a.memory, prelinked=a.prelinked,
                    ramdisk=a.root_image.read_bytes() if a.root_image else None,
                    root_cache=[cache.read_bytes() for cache in a.root_trust_cache] or None, root_device=a.root_device,
-                   root_uuid=a.root_uuid, data_seed=a.data_image.read_bytes() if a.data_image else None, data_uuid=a.data_uuid, display=a.display)
+                   root_uuid=a.root_uuid, data_seed=a.data_image.read_bytes() if a.data_image else None, data_uuid=a.data_uuid, display=a.display, cpus=a.smp)
     a.output.parent.mkdir(parents=True, exist_ok=True)
     a.output.write_bytes(payload)
     print('Built screen-output XNU payload', hashlib.sha256(payload).hexdigest())

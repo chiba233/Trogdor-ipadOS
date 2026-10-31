@@ -89,7 +89,10 @@ def adt_fields(data):
         if len(found['/chosen'][name][1]) != 8:
             raise ValueError('invalid ADT DRAM field')
     cpus = [p for path, p in found.items() if path.startswith('/cpus/')]
-    if len(cpus) != 1 or len(cpus[0]['reg'][1]) != 4 or len(cpus[0]['timebase-frequency'][1]) != 4:
+    if len(cpus) > 1:
+        # Secondary CPUs may follow the boot CPU; exactly one is running.
+        cpus = [p for p in cpus if p.get('state', (0, b''))[1].rstrip(b'\0') == b'running']
+    if len(cpus) != 1 or len(cpus[0]['reg'][1]) != 4 or len(cpus[0].get('timebase-frequency', (0, b''))[1]) != 4:
         raise ValueError('checkpoint requires one typed boot CPU')
     return (found['/chosen']['dram-base'][0], found['/chosen']['dram-size'][0],
             int.from_bytes(cpus[0]['reg'][1], 'little'),

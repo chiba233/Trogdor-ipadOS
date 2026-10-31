@@ -1,6 +1,59 @@
 --- a/ArmCpu.cpp
 +++ b/ArmCpu.cpp
-@@ -87,7 +87,9 @@
+@@ -13,6 +13,52 @@
+ // Kernel-internal entries used for secondary CPU startup (Darwin 23 osfmk).
+ extern "C" vm_offset_t ml_static_vtop (vm_offset_t);
+ extern "C" char LowResetVectorBase[], LowResetVectorEnd[], ResetHandlerData[], const_boot_args[];
++// Coachz: TF-A's PSCI CPU_ON starts a core at EL2, but XNU's reset vector runs at EL1. This position-
++// independent stub repeats boot/entry.S's EL2 setup, also opens the GICv3 system registers to EL1 and gives
++// EL1 the real MIDR/MPIDR, then erets to the physical reset vector passed as the PSCI context id (x0).
++extern "C" char armcpu_el2_entry[], armcpu_el2_entry_end[];
++__asm__ (
++  "  .text\n"
++  "  .balign 4\n"
++  "  .globl _armcpu_el2_entry\n"
++  "_armcpu_el2_entry:\n"
++  "  mrs x9, CurrentEL\n"
++  "  cmp x9, #8\n"
++  "  b.ne 1f\n"
++  "  mov x9, #0x80000000\n"        // HCR_EL2.RW: AArch64 EL1, no stage-2 translation
++  "  msr hcr_el2, x9\n"
++  "  mov x9, #0x33ff\n"            // CPTR_EL2 RES1, no FP trapping
++  "  msr cptr_el2, x9\n"
++  "  msr mdcr_el2, xzr\n"
++  "  mrs x9, cnthctl_el2\n"
++  "  orr x9, x9, #3\n"             // EL1 physical timer and counter access
++  "  msr cnthctl_el2, x9\n"
++  "  msr cntvoff_el2, xzr\n"
++  "  mrs x9, S3_4_C12_C9_5\n"      // ICC_SRE_EL2: SRE and Enable, so EL1 uses the GICv3 system registers
++  "  orr x9, x9, #1\n"             // SRE
++  "  orr x9, x9, #8\n"             // Enable
++  "  msr S3_4_C12_C9_5, x9\n"
++  "  isb\n"
++  "  msr S3_4_C12_C11_0, xzr\n"    // ICH_HCR_EL2
++  "  mrs x9, midr_el1\n"
++  "  msr vpidr_el2, x9\n"
++  "  mrs x9, mpidr_el1\n"
++  "  msr vmpidr_el2, x9\n"
++  "  mov x9, #0x0800\n"
++  "  movk x9, #0x30d0, lsl #16\n"  // SCTLR_EL1 RES1, M/C/I disabled
++  "  msr sctlr_el1, x9\n"
++  "  msr elr_el2, x0\n"
++  "  mov x9, #0x3c5\n"             // DAIF masked, EL1h
++  "  msr spsr_el2, x9\n"
++  "  mov x0, #0\n"
++  "  isb\n"
++  "  eret\n"
++  "1:\n"
++  "  mov x9, x0\n"
++  "  mov x0, #0\n"
++  "  br x9\n"
++  "  .globl _armcpu_el2_entry_end\n"
++  "_armcpu_el2_entry_end:\n");
+ extern "C" kern_return_t processor_start (processor_t);
+ extern "C" kern_return_t kernel_thread_start (void (*) (void *, wait_result_t), void *, thread_t *);
+ extern "C" void thread_deallocate (thread_t);
+@@ -87,7 +133,9 @@
  OSDefineMetaClassAndStructors (ArmCpu, IOCPU)
  
  // Redistributor ISENABLER0: SGIs 0..15 (only SGI 0 is used by the kernel; the others let the self-SGI probe tell which INTIDs the GIC accepts) and PPI 27.
@@ -11,7 +64,7 @@
  
  static const uint32_t kIpiSpiBase = 1008;   // INTIDs 1008..1015 stand for 'IPI to logical core 0..7'
  
-@@ -353,6 +355,10 @@
+@@ -353,6 +401,10 @@
      armcpu_gic_boot[7] = static_cast<uint32_t> (sre);
    }
    armcpu_gic_ready = 1;
@@ -22,7 +75,16 @@
  }
  
  
-@@ -565,7 +571,8 @@
+@@ -531,6 +583,8 @@
+     setCPUState (kIOCPUStateRunning);
+     armcpu_smp_step[logicalId] = 7;
+     armcpu_smp_running = armcpu_smp_running + 1;
++    kprintf ("COACHZ SMP: cpu %u running, mpidr 0x%llx, %u secondary cores up\n", logicalId,
++             static_cast<unsigned long long> (mpidr), armcpu_smp_running);
+     // XNU clears SIGPdisabled for a core the first time that core takes an IPI, and cpu_signal() silently skips a core until then; Apple's
+     // CPU driver provokes it with a self-IPI from initCPU (osfmk/kern/machine.c, processor_up).
+     if (gSelfIpi) { signalCPU (this); }
+@@ -565,7 +619,8 @@
      armcpu_irq_id=static_cast<uint32_t>(id & 0xffffff);
      if ((id & 0xffffff) >= 1020) { armcpu_irq_phase=0;break; }
      if(diagnosePower && ++drained>128)panic("ArmCpu: IRQ drain exceeds 128 id=%llx timer=%llu IPI=%llu",id,armcpu_timer_interrupts,armcpu_ipi_interrupts);
@@ -32,3 +94,26 @@
        armcpu_timer_interrupts = armcpu_timer_interrupts + 1;
        armcpu_core_timer[logicalId & 7] = armcpu_core_timer[logicalId & 7] + 1;
        armcpu_irq_phase=2;
+@@ -769,9 +824,20 @@
+   cleanToMemory (LowResetVectorBase, 0x10000);   // reset vector, start_cpu and the code up to the MMU enable
+   cleanToMemory (ResetHandlerData, 0x1000);
+   cleanToMemory (const_boot_args, 0x1000);
+-  armcpu_smp_step[logicalId] = 4;
+-  int64_t result = psciCall (hvc, 0xc4000003ULL, affinity & 0xff00ffffffULL, entry, 0);
++  uint64_t target = entry, context = 0;
++  unsigned el2 = 0;
++  PE_parse_boot_argn ("armcpu-el2-entry", &el2, sizeof (el2));
++  if (el2 == 1) {
++    cleanToMemory (armcpu_el2_entry, static_cast<size_t> (armcpu_el2_entry_end - armcpu_el2_entry));
++    target = static_cast<uint64_t> (ml_static_vtop (reinterpret_cast<vm_offset_t> (armcpu_el2_entry)));
++    context = entry;
++  }
++  armcpu_smp_step[logicalId] = 4;
++  int64_t result = psciCall (hvc, 0xc4000003ULL, affinity & 0xff00ffffffULL, target, context);
+   armcpu_smp_psci_rc[logicalId] = static_cast<int32_t> (result);
++  kprintf ("COACHZ SMP: cpu %u affinity 0x%llx CPU_ON entry 0x%llx via %s: %lld\n", logicalId,
++           static_cast<unsigned long long> (affinity), static_cast<unsigned long long> (target),
++           el2 == 1 ? "EL2 stub" : "reset vector", static_cast<long long> (result));
+   return result == 0 ? KERN_SUCCESS : KERN_FAILURE;
+ }
+ 

@@ -1034,3 +1034,27 @@ SpringBoard 启动后 49 秒的 lsd 快照：5 个线程；主线程处于等待
 `_runServerMainRunLoop` → `CFRunLoopServiceMachPort`，即主循环在等待请求；两个工作队列线程
 处于可运行状态。lsd 没有卡在主线程上，结合帧间隔，SpringBoard 等待 lsd 超时与帧率低都与
 全部负载挤在一颗 A55 上相符；其余核心（含两颗 A76）尚未启动。
+
+
+## 2026-10-31：四颗 A55 经 PSCI 启动并参与调度
+
+`tools/xnu_screen.py --smp 4`（只用于 prelink 主系统）在 ADT 中补出 `cpu1`～`cpu3`
+（`reg` 0x100/0x200/0x300，state `waiting`）与 `/psci`（`arm,psci-1.0`，method `smc`），
+把命令行的 `cpus=1` 改为 `cpus=4`，并加入 `sheng-smp=1 armcpu-self-ipi=1
+armcpu-el2-entry=1`。BCM2837 板级配置限定 4 颗 CPU、1 个簇，因此本步只启动 CPU0～3，全为
+A55。`coachz-prelink-smp.patch` 让复位向量按 MPIDR Aff0 与 Aff1 查找本核数据：SC7180 设置
+MPIDR.MT，核号位于 Aff1，原代码在无 `HAS_CLUSTER` 时只比较 Aff0。TF-A 的 CPU_ON 在
+实现 EL2 时从 EL2 启动新核，ArmCpu 私有补丁加入位置无关的 EL2 入口：重复 `boot/entry.S`
+的 EL2 设置，打开 `ICC_SRE_EL2`，写入真实 MIDR/MPIDR，再 eret 到以 PSCI context id 传入的
+复位向量物理地址。
+
+k27、k28 实际仍带 `cpus=1`：XNU 只解析启动核，ADT 中的其余 CPU 没有逻辑编号，ArmCpu
+跳过它们，k28 报告显示三颗从核均停在步骤 0。k27 观察到的“变快”因此与多核无关，原因未确定。
+
+k29 照片中的周期报告：`3 secondary running`，CPU1～3 均为步骤 7、PSCI 返回 0、无失败码；
+开机 31 秒时四颗核的定时器中断计数分别约为 23171、22914、22821、22799。显示后端启动时的
+测速在 MPIDR 0x81000300（CPU3）上运行，报告测速在 CPU2 上运行，确认调度已使用从核。
+四颗核测速均约每微秒 757 次，与 k26 单核时的约 1515 次相比约为一半，与小核 768 MHz 档位
+相符；这是计数循环估算，不是调频寄存器读数。四颗核的 SGI 计数均为 0：自 IPI 与跨核 IPI
+都未被接收，跨核唤醒目前只能依靠各核自身的定时器。尚未验证 A76 大核、调频、IPI 与长期
+稳定性。

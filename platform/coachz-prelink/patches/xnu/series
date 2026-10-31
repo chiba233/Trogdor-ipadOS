@@ -42,3 +42,6 @@ coachz-prelink-mgcache-reset.patch
 
 # Who sends SIGKILL through kill(), and when lsd and SpringBoard start and exit.
 coachz-prelink-launch-diagnostic.patch
+
+# SC7180 numbers its cores in MPIDR Affinity1: match both levels at the reset vector.
+coachz-prelink-smp.patch
