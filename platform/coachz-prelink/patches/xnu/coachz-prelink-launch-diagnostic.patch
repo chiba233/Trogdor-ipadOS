@@ -1,17 +1,20 @@
 --- a/osfmk/arm64/coachz_thread.c
 +++ b/osfmk/arm64/coachz_thread.c
-@@ -8,6 +8,7 @@
+@@ -8,6 +8,8 @@
  #include <mach/arm/thread_status.h>
  #include <libkern/copyio.h>
  #include <os/atomic_private.h>
 +#include <kern/clock.h>
++#include <vm/vm_map.h>
  
  void coachz_sample_task(const char *name, int pid, task_t task);
  void coachz_critical_user_state(const char *name, int pid);
-@@ -316,10 +317,84 @@
+@@ -314,12 +316,181 @@
+ done:
+ 	os_atomic_store(&coachz_sb_captured, 2, release);
  	printf("%s", coachz_sb_failure);
- }
- 
++}
++
 +/* The first SIGKILLs sent through kill(), and the first lsd and SpringBoard starts and exits,
 + * with seconds since boot, so the report shows who killed SpringBoard while it waited on lsd.
 + */
@@ -27,6 +30,11 @@
 +static uint32_t coachz_kill_count;
 +static struct coachz_launch_event coachz_launches[10];
 +static uint32_t coachz_launch_count;
++/* lsd seen while the first SpringBoard waits on it: two snapshots, 45 s and 80 s after that start. */
++static int coachz_lsd_pid;
++static uint32_t coachz_sb_started;
++static char coachz_lsd_snapshots[2][1024];
++static uint32_t coachz_lsd_snapshot_count;
 +void coachz_launch_signal(int, const char *, int, const char *, int);
 +void coachz_launch_process(int, const char *, int, int);
 +
@@ -37,8 +45,8 @@
 +	clock_usec_t microseconds;
 +	clock_get_system_microtime(&seconds, &microseconds);
 +	return (uint32_t)seconds;
-+}
-+
+ }
+ 
 +void
 +coachz_launch_signal(int sender, const char *sender_name, int target, const char *target_name, int signum)
 +{
@@ -63,7 +71,88 @@
 +	}
 +	coachz_launches[index] = (struct coachz_launch_event){ .seconds = coachz_launch_seconds(),
 +		                                                .pid = pid, .other_pid = exited, .status = status };
++	if (!exited && !strcmp(name, "lsd")) {
++		os_atomic_store(&coachz_lsd_pid, pid, relaxed);
++	} else if (!exited && !coachz_sb_started) {
++		coachz_sb_started = coachz_launches[index].seconds;
++	}
 +	strlcpy(coachz_launches[index].name, name, sizeof(coachz_launches[index].name));
++}
++
++struct proc;
++extern struct proc *proc_find(int);
++extern int proc_rele(struct proc *);
++extern task_t proc_task(struct proc *);
++
++static void
++coachz_lsd_snapshot(char *out, size_t size, uint32_t now)
++{
++	struct proc *p = proc_find(os_atomic_load(&coachz_lsd_pid, relaxed));
++	uint64_t pc[5] = {}, lr[5] = {}, x16[5] = {}, fp = 0, sp = 0;
++	unsigned state[5] = {}, hint[5] = {}, count = 0, threads;
++	size_t used;
++	task_t task;
++	thread_t thread;
++	vm_map_t map;
++
++	if (!p) {
++		snprintf(out, size, "COACHZ LSD at %u s: lsd not found\n", now);
++		return;
++	}
++	task = proc_task(p);
++	task_lock(task);
++	threads = task->thread_count;
++	queue_iterate(&task->threads, thread, thread_t, task_threads) {
++		arm_saved_state_t *saved = find_user_regs(thread);
++		if (count == 5) {
++			break;
++		}
++		state[count] = (unsigned)thread->state;
++		hint[count] = (unsigned)thread->block_hint;
++		if (saved) {
++			pc[count] = get_saved_state_pc(saved);
++			lr[count] = get_saved_state_lr(saved);
++			x16[count] = get_saved_state_reg(saved, 16);
++			if (!count) {
++				fp = get_saved_state_fp(saved);
++				sp = get_saved_state_sp(saved);
++			}
++		}
++		count++;
++	}
++	task_unlock(task);
++	used = snprintf(out, size, "COACHZ LSD at %u s (SB +%u s): threads %u header 0x%llx slide 0x%x\n", now,
++	    now - coachz_sb_started, threads, (unsigned long long)task->mach_header_vm_address,
++	    task->task_shared_region_slide);
++	for (unsigned index = 0; index < count && used < size; index++) {
++		used += snprintf(out + used, size - used, "COACHZ LSD t%u state 0x%x hint %u pc 0x%llx lr 0x%llx x16 0x%llx\n",
++		    index, state[index], hint[index], (unsigned long long)pc[index], (unsigned long long)lr[index],
++		    (unsigned long long)x16[index]);
++	}
++	/* The main thread's frame chain, read from lsd's own map. */
++	map = get_task_map_reference(task);
++	if (map) {
++		if (used < size) {
++			used += snprintf(out + used, size - used, "COACHZ LSD t0 frames:");
++		}
++		for (unsigned index = 0; index < 8 && used < size; index++) {
++			uint64_t frame[2];
++			if ((fp & 15) || fp < sp || fp - sp > 65536 ||
++			    vm_map_read_user(map, (vm_map_offset_t)fp, frame, sizeof(frame)) != KERN_SUCCESS) {
++				break;
++			}
++			used += snprintf(out + used, size - used, " 0x%llx", (unsigned long long)frame[1]);
++			if (frame[0] <= fp) {
++				break;
++			}
++			fp = frame[0];
++		}
++		if (used < size) {
++			snprintf(out + used, size - used, "\n");
++		}
++		vm_map_deallocate(map);
++	}
++	proc_rele(p);
 +}
 +
 +static void
@@ -82,6 +171,15 @@
 +		printf("COACHZ LS %u s: %s(%d) %s 0x%x\n", coachz_launches[index].seconds,
 +		    coachz_launches[index].name, coachz_launches[index].pid,
 +		    coachz_launches[index].other_pid ? "exit" : "exec", coachz_launches[index].status);
++	}
++	uint32_t now = coachz_launch_seconds(), taken = coachz_lsd_snapshot_count;
++	if (taken < 2 && coachz_sb_started && os_atomic_load(&coachz_lsd_pid, relaxed) &&
++	    now >= coachz_sb_started + (taken ? 80 : 45)) {
++		coachz_lsd_snapshot(coachz_lsd_snapshots[taken], sizeof(coachz_lsd_snapshots[taken]), now);
++		coachz_lsd_snapshot_count = taken + 1;
++	}
++	for (uint32_t index = 0; index < coachz_lsd_snapshot_count; index++) {
++		printf("%s", coachz_lsd_snapshots[index]);
 +	}
 +}
 +

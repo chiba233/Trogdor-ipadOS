@@ -60,7 +60,17 @@ void native_legacy_swap_validation_observed(bool accepted,unsigned reason,const 
 void native_legacy_surface_rejected(uint64_t width,uint64_t height,uint32_t format,uint32_t planes,uint64_t stride,uint64_t allocation,uint64_t bytes) {
     if(rejections<=8) kprintf("COACHZ display: rejected surface %llux%llu format %x planes %u stride %llu size %llu/%llu\n",width,height,format,planes,stride,allocation,bytes);
 }
-void native_legacy_copy_timing_observed(uint64_t,uint64_t) {}
+static uint64_t counter_read() { uint64_t value;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(value));return value; }
+static uint64_t counter_hz() { uint64_t value;__asm__ volatile("mrs %0, cntfrq_el0":"=r"(value));return value?value:1; }
+// Copy cost against the interval between copies: a slow copy and a slow producer look alike on the screen.
+void native_legacy_copy_timing_observed(uint64_t ticks,uint64_t bytes) {
+    static uint64_t copies,previous;
+    uint64_t now=counter_read(),hz=counter_hz();
+    copies++;
+    if(copies<=8 || !(copies%32)) kprintf("COACHZ display: copy %llu took %llu us for %llu bytes, %llu ms since previous\n",
+        copies,ticks*1000000/hz,bytes,previous?(now-previous)*1000/hz:0);
+    previous=now;
+}
 void native_legacy_transfer_observed(IOReturn status,const void *,uint64_t bytes) {
     lastTransfer=status;transfers++;
     if(transfers<=8 || status) kprintf("COACHZ display: CPU transfer %llu status 0x%x bytes %llu\n",transfers,status,bytes);
@@ -82,9 +92,22 @@ static bool word(IORegistryEntry *entry,const char *key,uint32_t value) {
     OSData *data=OSData::withBytes(&value,4);
     bool ok=data && entry->setProperty(key,data);OSSafeReleaseNULL(data);return ok;
 }
+// Which core runs the system and roughly how fast: a fixed count loop timed by the generic counter.
+static void cpu_probe() {
+    uint64_t midr,mpidr,count=20000000,start,end;
+    __asm__ volatile("mrs %0, midr_el1":"=r"(midr));
+    __asm__ volatile("mrs %0, mpidr_el1":"=r"(mpidr));
+    start=counter_read();
+    __asm__ volatile("1: subs %0, %0, #1\n\tb.ne 1b":"+r"(count)::"cc");
+    end=counter_read();
+    uint64_t us=(end-start)*1000000/counter_hz();
+    kprintf("COACHZ cpu: midr 0x%llx mpidr 0x%llx counter %llu Hz, 20M-iteration loop %llu us (%llu per us)\n",
+        midr,mpidr,counter_hz(),us,us?20000000/us:0);
+}
 int coachz_display_start(void) {
     int enabled=0;
     if(!PE_parse_boot_argn("coachz-display",&enabled,sizeof(enabled)) || enabled!=1)return 0;
+    cpu_probe();
     if(stage)return stage==10?0:EIO;
     stage=1;
     kern_return_t surface=OSKextLoadKextWithIdentifier("com.apple.iokit.IOSurface");
