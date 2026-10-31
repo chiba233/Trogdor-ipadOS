@@ -161,12 +161,18 @@ def main():
     parser.add_argument('--xnu-pe', action='store_true')
     parser.add_argument('--display-discovery', action='store_true')
     parser.add_argument('--display-discovery-schema1', action='store_true', help='historical 42-field records only')
+    parser.add_argument('--display-pattern', action='store_true', help='first scanout restart, no EC or backlight')
     parser.add_argument('--xnu-topology', action='store_true')
     parser.add_argument('--xnu-platform', action='store_true')
     args = parser.parse_args()
     with args.input.open('rb') as source:
         data = source.read(8193)
-    if args.display_discovery or args.display_discovery_schema1:
+    if args.display_pattern:
+        if any((args.display_discovery,args.display_discovery_schema1,args.xnu_checkpoint,args.xnu_mmu,args.xnu_highva,args.xnu_cinit,args.xnu_cpu,args.xnu_platform,args.xnu_pe,args.xnu_soc,args.xnu_topology,args.xnu_diagnostic)):
+            parser.error("display pattern requires its own strict mode")
+        from read_display import read_display_pattern_record
+        text, _ = read_display_pattern_record(data)
+    elif args.display_discovery or args.display_discovery_schema1:
         if any((args.xnu_checkpoint,args.xnu_mmu,args.xnu_highva,args.xnu_cinit,args.xnu_cpu,args.xnu_platform,args.xnu_pe,args.xnu_soc,args.xnu_topology,args.xnu_diagnostic)):
             parser.error("display discovery and XNU require separate strict modes")
         if args.display_discovery and args.display_discovery_schema1:

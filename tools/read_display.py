@@ -14,12 +14,15 @@ FIXED={'schema':2,'coreboot table verified':1,'framebuffer metadata verified':1,
 # Historical records keep their original meaning; they are never reinterpreted.
 SCHEMA1_FLAGS=('scanout consistent','Coreboot RAM','FDT range allowed','Image conflict','candidate writable')
 SCHEMA1_FIXED=dict(FIXED,schema=1)
+PATTERN=('pattern attempted','pattern mismatches','pattern hold seconds','pattern MMIO fault','pattern count enable saved',
+         'pattern TE running','pattern DSI running','pattern frame start','pattern frame end','pattern line start','pattern line end',
+         'pattern TE stopped','pattern DSI stopped')
 DEPTHCHARGE_BASE=0xf1000000
 
-def parse(data,fixed,flags):
+def parse(data,fixed,flags,extra=()):
     text,fields=read_record(data)
     if re.search(r'^(XNU |EXCEPTION)',text,re.M):raise ValueError('display discovery must be separate from XNU/fault records')
-    wanted=set(fixed)|set(METADATA)|set(REGISTERS)|set(flags)
+    wanted=set(fixed)|set(METADATA)|set(REGISTERS)|set(flags)|set(extra)
     keys=re.findall(r'^Display ([^=\n]+)=',text,re.M)
     if set(keys)!=wanted or len(keys)!=len(wanted):raise ValueError('missing/duplicate/unknown display fields')
     values={}
@@ -50,8 +53,7 @@ def metadata_consistent(v):
         pa!=0 and v['scanout stride']==v['stride'] and v['format']==0x236ff and v['unpack']==0x03020001 and
         v['table framebuffer PA'] in (0,pa))
 
-def read_display_record(data):
-    text,fields,v=parse(data,FIXED,FLAGS)
+def check_gates(v):
     pa=v['scanout PA'];end=pa+v['allocation bytes']
     metadata=metadata_consistent(v)
     relation=v['table framebuffer PA']==0 and end%0x100000==0
@@ -61,6 +63,23 @@ def read_display_record(data):
     owned=window and v['Coreboot RAM'] and v['FDT owners clear'] and not v['Image conflict']
     if v['ownership verified']!=owned:raise ValueError('contradictory display ownership')
     if v['candidate writable']!=(metadata and relation and owned):raise ValueError('contradictory display candidate')
+
+def read_display_record(data):
+    text,fields,v=parse(data,FIXED,FLAGS)
+    check_gates(v)
+    return text,fields
+
+def read_display_pattern_record(data):
+    """Accepts any completed attempt; whether the timing engine ran is read from the counters."""
+    fixed={k:b for k,b in FIXED.items() if k!='hardware writes'};fixed['schema']=3
+    text,fields,v=parse(data,fixed,FLAGS,PATTERN+('hardware writes',))
+    check_gates(v)
+    if v['pattern attempted']!=v['candidate writable']:raise ValueError('pattern must follow the candidate')
+    if v['hardware writes']==0:
+        if any(v[k] for k in PATTERN if k not in ('pattern attempted','pattern mismatches','pattern count enable saved','pattern MMIO fault')):
+            raise ValueError('pattern reported without hardware writes')
+    elif (v['hardware writes'],v['pattern hold seconds'],v['pattern TE stopped'],v['pattern DSI stopped'])!=(7,20,0,0):
+        raise ValueError('pattern did not stop cleanly')
     return text,fields
 
 def read_display_record_schema1(data):

@@ -1,6 +1,9 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 #include "display.h"
 #include "fdt.h"
+#ifndef PROBE_DISPLAY_PATTERN
+#define PROBE_DISPLAY_PATTERN 0
+#endif
 void probe_value(const char *,uint64_t);
 int fdt_range_clear(const void *,uint64_t,uint64_t);
 static uint64_t be64(const uint8_t *p) { return (uint64_t)fdt_be32(p)<<32|fdt_be32(p+4); }
@@ -55,7 +58,68 @@ static const struct { char name[40];uint32_t address; } registers[DISPLAY_READS]
     {"Display GPIO config=",COACHZ_BACKLIGHT_PORT},{"Display GPIO IO=",COACHZ_BACKLIGHT_PORT+4},
     {"Display EC protocol=",0xa80068}
 };
+#if PROBE_DISPLAY_PATTERN
+#define DISPLAY_TE 0xae6b800u
+#define DISPLAY_COUNT_EN (DISPLAY_TE+0xa8) /* DPU INTF counters; offsets from Linux, not the pinned firmware. */
+#define DISPLAY_FRAME (DISPLAY_TE+0xac)
+#define DISPLAY_LINE (DISPLAY_TE+0xb0)
+#define DISPLAY_DSI 0xae94004u
+#define DISPLAY_SCANOUT 0xae05014u
+#define DISPLAY_DSI_VIDEO 0x1f3u /* Coreboot mdss_dsi_video_mode_config, four lanes. */
+#define DISPLAY_HOLD_SECONDS 20u
+struct display_pattern_result { uint32_t attempted,mismatches,writes,fault,saved,te,dsi,frame0,frame1,line0,line1,te_after,dsi_after; };
+static uint32_t pattern_read(uint32_t address,uint32_t *fault) {
+    uint32_t value=0;if(!display_read32(address,&value))*fault=1;return value;
+}
+static void pattern_write(uint32_t address,uint32_t value,uint32_t *writes) {
+    *(volatile uint32_t *)(uintptr_t)address=value;__asm__ volatile("dsb sy":::"memory");(*writes)++;
+}
+static uint64_t pattern_ticks(void) {
+    uint64_t ticks;__asm__ volatile("isb; mrs %0, cntpct_el0":"=r"(ticks)::"memory");return ticks;
+}
+static void pattern_wait(uint64_t ticks) {
+    uint64_t start=pattern_ticks();while(pattern_ticks()-start<ticks)__asm__ volatile("yield");
+}
+static uint32_t pattern_pixel(uint32_t x,uint32_t y,const struct cb_display *b) {
+    return (x*8/b->width+y*6/b->height)&1?0xffffffffu:0xff000000u;
+}
+/* Restart the scanout Depthcharge stopped, hold it, then stop it the same way. No EC or backlight. */
+static void display_pattern(const struct cb_display *b,uint32_t pa,struct display_pattern_result *o) {
+    uint64_t freq;__asm__ volatile("mrs %0, cntfrq_el0":"=r"(freq));
+    if(freq<1000 || freq>1000000000)return;
+    o->attempted=1;
+    for(uint32_t y=0;y<b->height;y++) {
+        volatile uint32_t *line=(volatile uint32_t *)(uintptr_t)(pa+(uint64_t)y*b->stride);
+        for(uint32_t x=0;x<b->width;x++)line[x]=pattern_pixel(x,y,b);
+    }
+    __asm__ volatile("dsb sy":::"memory");
+    for(uint32_t y=0;y<b->height;y++) {
+        volatile uint32_t *line=(volatile uint32_t *)(uintptr_t)(pa+(uint64_t)y*b->stride);
+        for(uint32_t x=0;x<b->width;x++)if(line[x]!=pattern_pixel(x,y,b))o->mismatches++;
+    }
+    o->saved=pattern_read(DISPLAY_COUNT_EN,&o->fault);
+    if(o->fault)return;
+    pattern_write(DISPLAY_COUNT_EN,3,&o->writes);pattern_write(DISPLAY_DSI,DISPLAY_DSI_VIDEO,&o->writes);
+    pattern_write(DISPLAY_SCANOUT,pa,&o->writes);pattern_write(DISPLAY_TE,1,&o->writes);
+    o->te=pattern_read(DISPLAY_TE,&o->fault);o->dsi=pattern_read(DISPLAY_DSI,&o->fault);
+    pattern_wait(freq);
+    o->frame0=pattern_read(DISPLAY_FRAME,&o->fault);o->line0=pattern_read(DISPLAY_LINE,&o->fault);
+    pattern_wait(freq*(DISPLAY_HOLD_SECONDS-1));
+    o->frame1=pattern_read(DISPLAY_FRAME,&o->fault);o->line1=pattern_read(DISPLAY_LINE,&o->fault);
+    pattern_write(DISPLAY_TE,0,&o->writes);pattern_wait(freq/50);pattern_write(DISPLAY_DSI,0,&o->writes);
+    pattern_write(DISPLAY_COUNT_EN,o->saved,&o->writes);
+    o->te_after=pattern_read(DISPLAY_TE,&o->fault);o->dsi_after=pattern_read(DISPLAY_DSI,&o->fault);
+}
+#define DISPLAY_SCHEMA 3
+#define DISPLAY_WRITES pattern.writes
+#else
+#define DISPLAY_SCHEMA 2
+#define DISPLAY_WRITES 0
+#endif
 void display_discover(const void *dt,uint64_t image,uint64_t imagesize) {
+#if PROBE_DISPLAY_PATTERN
+    struct display_pattern_result pattern={0};
+#endif
     struct cb_display b={0};struct display_state state={0};uint32_t r[DISPLAY_READS]={0},n=0;
     unsigned good=0,reads=0,fault=0,owners=0;
     if(!imagesize || image>UINT64_MAX-imagesize || !fdt_valid(dt,FDT_MAX_SIZE) || !identity(dt) ||
@@ -73,12 +137,16 @@ void display_discover(const void *dt,uint64_t image,uint64_t imagesize) {
     }
     if(reads==DISPLAY_READS && display_analyze(&b,r,image,imagesize,&state))
         owners=(unsigned)fdt_range_clear(dt,r[6],state.allocation);
+#if PROBE_DISPLAY_PATTERN
+    if(state.consistent && state.allocated && state.window && state.ram && owners && !state.conflict && !r[0] && !r[1])
+        display_pattern(&b,r[6],&pattern);
+#endif
 done:
-    probe_value("Display schema=",2);probe_value("Display coreboot table verified=",good);
+    probe_value("Display schema=",DISPLAY_SCHEMA);probe_value("Display coreboot table verified=",good);
     probe_value("Display framebuffer metadata verified=",good);probe_value("Display GPIO metadata verified=",good);
     probe_value("Display MMIO reads=",reads);probe_value("Display MMIO fault=",fault);
     probe_value("Display discovery complete=",good && reads==DISPLAY_READS && state.span!=0);
-    probe_value("Display hardware writes=",0);
+    probe_value("Display hardware writes=",DISPLAY_WRITES);
     probe_value("Display table bytes=",b.table_bytes);probe_value("Display table entries=",b.table_entries);
     probe_value("Display table framebuffer PA=",b.physical);probe_value("Display width=",b.width);probe_value("Display height=",b.height);
     probe_value("Display stride=",b.stride);probe_value("Display bpp=",b.bpp);probe_value("Display orientation=",b.orientation);
@@ -90,4 +158,13 @@ done:
     probe_value("Display FDT owners clear=",owners);probe_value("Display Image conflict=",state.conflict);
     probe_value("Display ownership verified=",owned);
     probe_value("Display candidate writable=",state.consistent && state.allocated && owned);
+#if PROBE_DISPLAY_PATTERN
+    probe_value("Display pattern attempted=",pattern.attempted);probe_value("Display pattern mismatches=",pattern.mismatches);
+    probe_value("Display pattern hold seconds=",pattern.writes?DISPLAY_HOLD_SECONDS:0);probe_value("Display pattern MMIO fault=",pattern.fault);
+    probe_value("Display pattern count enable saved=",pattern.saved);
+    probe_value("Display pattern TE running=",pattern.te);probe_value("Display pattern DSI running=",pattern.dsi);
+    probe_value("Display pattern frame start=",pattern.frame0);probe_value("Display pattern frame end=",pattern.frame1);
+    probe_value("Display pattern line start=",pattern.line0);probe_value("Display pattern line end=",pattern.line1);
+    probe_value("Display pattern TE stopped=",pattern.te_after);probe_value("Display pattern DSI stopped=",pattern.dsi_after);
+#endif
 }

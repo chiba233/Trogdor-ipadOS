@@ -101,3 +101,12 @@ schema 1 把多个条件合成 `scanout consistent` 和 `FDT range allowed` 两�
 `xnu_range_allowed()` 改为先做整体排除、再调用 `fdt_range_clear()`，判断结果和顺序不变，继续只用于 XNU arena。
 
 候选仍只表示通过只读判断，不授权写入，也不表示屏幕可见；图案实验需要单独的契约。schema 1 记录继续按原规则读取，不重新解释：`read_probe.py --display-discovery` 只接受 schema 2，历史记录使用 `--display-discovery-schema1`，两种 schema 互相拒绝。schema 2 不需要为验证规则单独启动一轮，下一个显示镜像会带上这些字段并取得真机记录。schema 2 随后已取得真机 45 字段记录，候选为真，见 [硬件记录](hardware-tests.md)。
+
+
+## 第一次画面实验（schema 3）
+
+`linux_log.py --display-pattern` 生成独立镜像。它先完成 schema 2 的全部只读判断，只有候选为真且入口 TE／DSI 都为零才继续：向完整帧写黑白棋盘格并回读，再恢复 Depthcharge 停掉的 scanout，依次写计数使能、DSI control `0x1f3`（Coreboot 四 lane 视频模式）、scanout 地址和 TE=1，保持 20 秒；然后按 Depthcharge 的顺序写 TE=0、等 20 ms、写 DSI=0，恢复计数使能后交接 Linux。共 7 次寄存器写入，不碰 EC、GPIO、背光、时钟、PHY 或 SPI，不重新初始化面板或桥接芯片。
+
+INTF 帧／行计数的偏移来自 Linux DPU 驱动，锁定固件源码没有定义，只用作时序是否运行的日志证据。`read_probe.py --display-pattern` 校验 58 个字段，只判断实验完整执行并干净停止；计数是否前进和肉眼现象分开记录。没有背光时只能用手电观察，没看到不能据此判断是哪一层失败，画面可见性须由观察单独记录。
+
+编译开关关闭时，发现镜像与已验收的 schema 2 镜像逐字节相同。

@@ -9,7 +9,7 @@ import unittest
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'tools'))
 from linux_log import compile_wrapper
-from read_display import FIXED,METADATA,REGISTERS,FLAGS,SCHEMA1_FIXED,SCHEMA1_FLAGS,read_display_record,read_display_record_schema1
+from read_display import FIXED,METADATA,REGISTERS,FLAGS,PATTERN,SCHEMA1_FIXED,SCHEMA1_FLAGS,read_display_pattern_record,read_display_record,read_display_record_schema1
 from read_probe import read_record
 from fdt import Node,encode,string,u32
 
@@ -244,6 +244,21 @@ class DisplayTests(unittest.TestCase):
             self.assertEqual(data.count(struct.pack('<I',0xb9400001)),1)
             self.assertNotIn('xnu_checkpoint_version',report)
         with self.assertRaises(ValueError):compile_wrapper(Path('/tmp'),image,4096,checkpoint=b'x',discovery=True)
+
+    def test_pattern_mode_is_separate_from_accepted_discovery(self):
+        d=values();d['schema']=3;d['hardware writes']=7;d.update(dict.fromkeys(PATTERN,0))
+        d.update({'pattern attempted':1,'pattern hold seconds':20,'pattern TE running':1,'pattern DSI running':0x1f3})
+        self.assertEqual(len(read_display_pattern_record(log(d))[1]),58)
+        for bad in ({'pattern TE stopped':1},{'pattern DSI stopped':0x1f3},{'pattern attempted':0},{'schema':2}):
+            with self.subTest(bad=bad),self.assertRaises(ValueError):read_display_pattern_record(log(dict(d,**bad)))
+        with self.assertRaises(ValueError):read_display_record(log(d))
+        image=struct.pack('<II6QII',0x91005a4d,0x14000001,0,4096,0xa,0,0,0,0x644d5241,0)+bytes(64)
+        with tempfile.TemporaryDirectory() as tmp:
+            a,b=Path(tmp)/'a',Path(tmp)/'b';a.mkdir();b.mkdir()
+            plain,_=compile_wrapper(a,image,4096,discovery=True)
+            drawn,report=compile_wrapper(b,image,4096,discovery=True,pattern=True)
+            self.assertEqual(report['display_discovery_schema'],3)
+            self.assertNotIn(b'pattern attempted',plain);self.assertIn(b'pattern attempted',drawn)
 
     def runtime_tree(self):
         return Node('',{'#address-cells':u32(2),'#size-cells':u32(2),'compatible':string('google,coachz-rev1-sku0')+string('qcom,sc7180')},[
