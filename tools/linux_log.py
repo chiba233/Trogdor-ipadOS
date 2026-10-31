@@ -116,7 +116,7 @@ def compile_wrapper(out, kernel, memory, checkpoint=None, discovery=False, patte
         payload_path.write_bytes(checkpoint)
         quoted_xnu = str(payload_path).replace("\\", "\\\\").replace('"', '\\"')
         with assembly.open('a') as stream:
-            stream.write('.section .xnu_payload, "a"\n.balign 16\n.global _xnu_payload_start, _xnu_payload_end\n_xnu_payload_start:\n.incbin "' + quoted_xnu + '"\n_xnu_payload_end:\n')
+            stream.write('// payload sha256 ' + sha(checkpoint) + ' (the compiler cache does not track .incbin)\n.section .xnu_payload, "a"\n.balign 16\n.global _xnu_payload_start, _xnu_payload_end\n_xnu_payload_start:\n.incbin "' + quoted_xnu + '"\n_xnu_payload_end:\n')
     elf = out / "probe.elf"
     command = [str(zig), "cc", "-target", "aarch64-freestanding-none", "-mcpu=" + CPU,
                "-mgeneral-regs-only", "-ffreestanding", "-fno-builtin", "-fno-pic", "-fno-pie",
@@ -148,6 +148,8 @@ def compile_wrapper(out, kernel, memory, checkpoint=None, discovery=False, patte
     expected_memory = start + memory
     extra = {}
     if checkpoint is not None:
+        if checkpoint not in image:
+            raise ValueError("Image does not contain the requested XNU payload")
         arena = symbols["_xnu_window"]["address"]
         expected_memory = arena + 24 * 1024 * 1024
         if arena % 0x200000 or arena < start + memory:
