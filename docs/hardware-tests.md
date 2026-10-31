@@ -744,6 +744,14 @@ panic 的调用栈为 `PE_init_iokit → InitIOKit → OSlibkernInit → OSRunti
 
 第六轮（`791e86405fcc19a5ce8ee55d5c7db2baa900773a6bbecae16bc174eae0d05505`）：没有再出现 `pmap_ttne` panic。SystemOS 挂上，共享缓存映射通过，原版 launchd 真正运行：屏幕显示 `hello, launchd UUID`、`Darwin Bootstrapper Version 7.0.0`、`boot-mode set by sysctl: main`、`entering ondemand mode`，随后执行启动任务。`exclaves-boot` 和 `fsck` 通过，`fsck` 判定不是主 OS 或诊断 OS 而跳过检查。`mount-phase-1` 的 `mount -P 1`（PID 3）打印 `data volume missing, but not required in env: 0`、`DT_get_fstab_entries: failed to get filesystem entry at: /filesystems/fstab`、`failed to get boot manifest hash`，以 66 退出，launchd 因关键启动任务失败而 panic。UniXNU 记录过同样的三行和退出码，缺的是 `/chosen/boot-manifest-hash`。
 
-修正：主系统 ADT 的 `/chosen` 写入一个 48 字节的 `boot-manifest-hash`，是固定标签和两个卷 UUID 的 SHA-384。它只是这组未签名镜像的身份，不是度量，也不验证任何东西。第七轮镜像 `3d0c1243dea59facdbaea8c84faf277e1d8018b879d119ddb9bb1ee5601df3fa` 尚无真机结果。
+修正：主系统 ADT 的 `/chosen` 写入一个 48 字节的 `boot-manifest-hash`，是固定标签和两个卷 UUID 的 SHA-384。它只是这组未签名镜像的身份，不是度量，也不验证任何东西。第七轮（`3d0c1243dea59facdbaea8c84faf277e1d8018b879d119ddb9bb1ee5601df3fa`）：mount 阶段通过，launchd 继续执行 `fips`、`keybag`、`usermanagerd`、`dirs_cleaner`、`xpcroleaccountd`、`init_featureflags`、`auearlyboot` 等启动任务。`tzinit` 以 30 退出（`force_system_dataset() failed: Read-only file system`），launchd 写 `/private/var/log` 也一直报 30，随后 panic。缺的是可写的 `/private/var`。
+
+第八轮：Data 种子作为内存盘 md0，内核用 UniXNU 的挂载参数把 `/dev/md0` 挂到 `/private/var`，返回 2。APFS 通过 IOMedia 挂卷，md0 在 IOKit 里没有。
+
+第九轮（`a65caafeec7d9b4f0b8a676370dacb9b9c76f37c44849429d4c339571a8cffab`）：USB 驱动把 md0 那段内存发布成可写的 IOKit 块设备 `CoachzDataBlock`，APFS 在上面发布容器和 `Data` 卷，挂载时 panic：`unencrypted data volume is not allowed`（`apfs_vfsops.c:2276`）。APFS 按卷角色限制：Data 角色的卷不能不加密。
+
+第十轮（`949d85cb313118e25bbe8d2c25119245206bb13f5748ebdcfd6e2ae819de7f29`）：在 `/chosen` 加 `ephemeral-storage = 1`，同样的 panic，这个属性已撤掉。
+
+修正：Data 种子由 `.tools` 里的私有脚本在 Mac 上用 sudo 生成，复制系统卷 `/private/var` 的骨架（不含 `staged_system_apps`）并保留真实属主，卷不设角色。第十一轮镜像 `ebaeb9b7fec898d62faf949258eaf0014a99caedcdb227dfed0d760ec952110a` 已写入，尚无真机结果。
 
 都只有屏幕证据。根和 SystemOS 都只读，没有可写的 Data 卷；放行未封存根卷和放行 SystemOS 共享缓存都不是验证。

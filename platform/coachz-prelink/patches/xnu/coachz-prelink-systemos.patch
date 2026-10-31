@@ -1,9 +1,10 @@
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -8169,6 +8169,109 @@
+@@ -8168,7 +8168,174 @@
+  * 2		NA		NA		/usr/appleinternal/sbin/launchd.debug
   * 3		2		NA		/usr/appleinternal/sbin/launchd.development
   * 4		3		1		/sbin/launchd
-  */
++ */
 +/*
 + * Coachz: the main OS keeps its dyld shared cache in the SystemOS cryptex. Before launchd, mount
 + * that volume read-only, tell dyld that ignition is done, and point launchd's dyld at the cache.
@@ -12,12 +13,12 @@
 + * follows the non-union mode of UniXNU patches/xnu/offline-owner-systemos-mount.patch
 + * (BSD-2-Clause-Patent, Copyright (c) 2026, UniXNU contributors), including its APFS mount
 + * payload. The outcome is kept for the exit of process 1.
-+ */
+  */
 +#define COACHZ_SYSTEMOS_UUID "8846FE78-2910-4297-AF97-D59BB6F8FC16"
 +extern int coachz_usb_root_device(dev_t);
 +extern int coachz_usb_volume_device(const char *, char *, size_t);
 +extern void commpage_update_dyld_flags(uint64_t);
-+char coachz_systemos_note[160];
++char coachz_systemos_note[320];
 +static mount_t coachz_systemos_mount;
 +
 +/* vm_unix.c: the SystemOS volume mounted here carries the dyld shared cache, as a Preboot cryptex would. */
@@ -107,31 +108,96 @@
 +	printf("%s", coachz_systemos_note);
 +}
 +
++/*
++ * Coachz: a writable /private/var. The memory-map RAMDisk, md0, holds an APFS Data seed made from
++ * the OS volume's /private/var. APFS mounts volumes through IOMedia, which md0 lacks, so the
++ * USB driver publishes the same memory as a block device, and the APFS volume above it is mounted
++ * read-write before launchd, with the APFS mount payload UniXNU's offline-owner-systemos-mount.patch
++ * uses for its scratch Data. Only for a read-only root on the Coachz USB disk. Changes live in
++ * memory and are lost at reboot.
++ */
++extern dev_t mdevlookup(int);
++extern int coachz_data_publish(void);
++extern int coachz_data_volume_device(char *, size_t);
++
++static void
++coachz_data_prepare(proc_t p, user_addr_t scratch)
++{
++	char device_path[64] = {0};
++	mount_t root_mount = vnode_mount(rootvnode);
++	vnode_t device_vnode = vfs_devvp(root_mount);
++	dev_t root_device = device_vnode ? vnode_specrdev(device_vnode) : NODEV;
++	uint8_t mount_data[0x150] = {0};
++	user64_addr_t spec = scratch + 0x160;
++	uint16_t mount_mode = 1;
++	uint32_t anonymous_owner = 99;
++	struct mount_args request = {.type = scratch + 0x100, .path = scratch + 0x120,
++	    .flags = 0, .data = scratch + 0x200};
++	int32_t result = 0;
++	size_t used = strlen(coachz_systemos_note);
++	int error;
++
++	if (device_vnode) {
++		vnode_put(device_vnode);
++	}
++	if (!(vfs_flags(root_mount) & MNT_RDONLY) || root_device == NODEV || !coachz_usb_root_device(root_device)) {
++		return;
++	}
++	if (mdevlookup(0) == NODEV || !coachz_data_publish() ||
++	    !coachz_data_volume_device(device_path, sizeof(device_path))) {
++		snprintf(coachz_systemos_note + used, sizeof(coachz_systemos_note) - used,
++		    "COACHZ Data: md0 %d, no APFS volume on the Data seed\n", mdevlookup(0) != NODEV);
++		printf("%s", coachz_systemos_note + used);
++		return;
++	}
++	memcpy(mount_data, &spec, sizeof(spec));
++	memcpy(mount_data + 16, &mount_mode, sizeof(mount_mode));
++	memcpy(mount_data + 0x144, &anonymous_owner, sizeof(anonymous_owner));
++	memcpy(mount_data + 0x148, &anonymous_owner, sizeof(anonymous_owner));
++	error = copyout("apfs", request.type, 5);
++	if (!error) {
++		error = copyout("/private/var", request.path, 13);
++	}
++	if (!error) {
++		error = copyout(device_path, spec, strlen(device_path) + 1);
++	}
++	if (!error) {
++		error = copyout(mount_data, request.data, sizeof(mount_data));
++	}
++	if (!error) {
++		error = mount(p, &request, &result);
++	}
++	snprintf(coachz_systemos_note + used, sizeof(coachz_systemos_note) - used,
++	    "COACHZ Data: mount %s at /private/var read-write: %d\n", device_path, error);
++	printf("%s", coachz_systemos_note + used);
++}
++
  void
  load_init_program(proc_t p)
  {
-@@ -8188,6 +8291,7 @@
+@@ -8188,6 +8355,8 @@
  	int data_error = native_owner_data_prepare(p, (user_addr_t)scratch_addr);
  	if (data_error) panic("offline scratch Data mount failed: %d", data_error);
  #endif
 +	coachz_systemos_prepare(p, (user_addr_t)scratch_addr, &init_envp);
++	coachz_data_prepare(p, (user_addr_t)scratch_addr);
  #if CONFIG_MEMORYSTATUS
  	(void) memorystatus_init_at_boot_snapshot();
  #endif /* CONFIG_MEMORYSTATUS */
 --- a/bsd/kern/kern_exit.c
 +++ b/bsd/kern/kern_exit.c
-@@ -1848,6 +1848,11 @@
+@@ -1847,6 +1847,11 @@
+ 	const char *prefix_str;
  	char prefix_str_buf[128];
  
- 	if (p == initproc) {
-+		/* Coachz: the SystemOS mount outcome, scrolled away by now on the screen console. */
++	{
++		/* Coachz: the SystemOS and Data mount outcomes, scrolled away by now on the screen console. */
 +		extern char coachz_systemos_note[];
 +		printf("%s", coachz_systemos_note);
 +	}
-+	if (p == initproc) {
+ 	if (p == initproc) {
  		if (strnstr(p->p_name, "preinit", sizeof(p->p_name))) {
  			prefix_str = "LTE preinit process exited";
- 		} else if (initproc_spawned) {
 --- a/bsd/vm/vm_unix.c
 +++ b/bsd/vm/vm_unix.c
 @@ -2630,10 +2630,13 @@

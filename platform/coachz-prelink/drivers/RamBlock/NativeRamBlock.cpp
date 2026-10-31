@@ -20,6 +20,9 @@ uint32_t coachz_usb_max_blocks(void);
 void coachz_usb_report(void);
 int coachz_usb_root_device(dev_t device);
 int coachz_usb_volume_device(const char *uuid, char *path, size_t size);
+int coachz_data_publish(void);
+int coachz_data_volume_device(char *path, size_t size);
+int mdevgetrange(int devid, uint64_t *base, uint64_t *size);
 // RamBlock's interface to the kernel patches; nothing here is a RAM disk or carries a seed.
 volatile uint32_t native_ram_block_ready = 0;
 volatile uint64_t native_ram_block_bytes = 0;
@@ -119,6 +122,86 @@ void NativeRamBlock::free()
 {
   if (gate) { IOLockFree(gate); gate = nullptr; }
   IOBlockStorageDevice::free();
+}
+
+// The writable Data seed: the memory of the md0 RAM disk as an IOKit block device, because APFS
+// mounts volumes through IOMedia and md0 has none. Read-write; changes are lost at reboot.
+class CoachzDataBlock : public IOBlockStorageDevice {
+  OSDeclareDefaultStructors(CoachzDataBlock)
+  uint8_t *memory = nullptr;
+  uint64_t capacity = 0;
+public:
+  bool setMemory(uint8_t *base, uint64_t bytes) { memory = base; capacity = bytes / 512; return memory && capacity; }
+  bool start(IOService *provider) override { return IOBlockStorageDevice::start(provider) && (registerService(), true); }
+  IOReturn doEjectMedia() override { return kIOReturnUnsupported; }
+  IOReturn doFormatMedia(UInt64) override { return kIOReturnUnsupported; }
+  UInt32 doGetFormatCapacities(UInt64 *, UInt32) const override { return 0; }
+  char *getVendorString() override { return const_cast<char *>("Coachz"); }
+  char *getProductString() override { return const_cast<char *>("Data seed"); }
+  char *getRevisionString() override { return const_cast<char *>("1.0"); }
+  char *getAdditionalDeviceInfoString() override { return const_cast<char *>("memory, lost at reboot"); }
+  IOReturn reportBlockSize(UInt64 *value) override { *value = 512; return kIOReturnSuccess; }
+  IOReturn reportEjectability(bool *value) override { *value = false; return kIOReturnSuccess; }
+  IOReturn reportMaxValidBlock(UInt64 *value) override { *value = capacity - 1; return kIOReturnSuccess; }
+  IOReturn reportMediaState(bool *present, bool *changed) override {
+    *present = true; if (changed) *changed = false; return kIOReturnSuccess;
+  }
+  IOReturn reportRemovability(bool *value) override { *value = false; return kIOReturnSuccess; }
+  IOReturn reportWriteProtection(bool *value) override { *value = false; return kIOReturnSuccess; }
+  IOReturn doSynchronizeCache() override { return kIOReturnSuccess; }
+  IOReturn doSynchronize(UInt64, UInt64, IOOptionBits) override { return kIOReturnSuccess; }
+  IOReturn getWriteCacheState(bool *value) override { *value = false; return kIOReturnSuccess; }
+  IOReturn setWriteCacheState(bool) override { return kIOReturnUnsupported; }
+  IOReturn doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block, UInt64 count,
+      IOStorageAttributes *, IOStorageCompletion *completion) override {
+    if (!buffer || !completion || !completion->action || !count || block >= capacity ||
+        count > capacity - block || buffer->getLength() < count * 512) return kIOReturnBadArgument;
+    uint8_t *at = memory + block * 512;
+    IOByteCount bytes = count * 512, moved = buffer->getDirection() == kIODirectionIn ?
+        buffer->writeBytes(0, at, bytes) : buffer->readBytes(0, at, bytes);
+    completion->action(completion->target, completion->parameter, moved == bytes ? kIOReturnSuccess : kIOReturnIOError, moved);
+    return kIOReturnSuccess;
+  }
+};
+OSDefineMetaClassAndStructors(CoachzDataBlock, IOBlockStorageDevice)
+
+extern "C" int coachz_data_publish(void)
+{
+  uint64_t base = 0, bytes = 0;
+  if (mdevgetrange(0, &base, &bytes) || !base || !bytes || (bytes & 511)) return 0;
+  IOService *resources = IOService::getResourceService();
+  CoachzDataBlock *device = OSTypeAlloc(CoachzDataBlock);
+  bool started = device && device->init(nullptr) && device->setMemory(reinterpret_cast<uint8_t *>(base), bytes) &&
+                 resources && device->attach(resources);
+  if (started && !device->start(resources)) { device->detach(resources); started = false; }
+  OSSafeReleaseNULL(device);
+  return started;
+}
+
+// The /dev path of the APFS volume above the Data seed, once IOKit publishes it (up to 10 s).
+extern "C" int coachz_data_volume_device(char *path, size_t size)
+{
+  if (!path || size < 6) return 0;
+  path[0] = 0;
+  for (unsigned attempt = 0; attempt < 100 && !path[0]; attempt++) {
+    OSDictionary *matching = IOService::serviceMatching("IOMedia");
+    OSString *content = OSString::withCString("41504653-0000-11AA-AA11-00306543ECAC");
+    OSIterator *iterator = matching && content && matching->setObject("Content", content) ?
+        IOService::getMatchingServices(matching) : nullptr;
+    OSSafeReleaseNULL(content); OSSafeReleaseNULL(matching);
+    while (iterator && !path[0]) {
+      IOService *media = OSDynamicCast(IOService, iterator->getNextObject());
+      if (!media) break;
+      OSString *name = OSDynamicCast(OSString, media->getProperty(kIOBSDNameKey));
+      unsigned depth = 0;
+      for (IOService *provider = media; name && provider && depth < 64; provider = provider->getProvider(), depth++) {
+        if (OSDynamicCast(CoachzDataBlock, provider)) { snprintf(path, size, "/dev/%s", name->getCStringNoCopy()); break; }
+      }
+    }
+    OSSafeReleaseNULL(iterator);
+    if (!path[0]) IOSleep(100);
+  }
+  return path[0] != 0;
 }
 
 // Shows on the screen console whether the storage stack above us came up.

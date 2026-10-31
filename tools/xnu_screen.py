@@ -164,7 +164,7 @@ def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=T
 
 
 def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=False, root_cache=None, root_device=None,
-         root_uuid=None):
+         root_uuid=None, data_seed=None):
     if window & 0x1fffff or memory & 0x1fffff:
         raise ValueError('window base and size must be 2 MiB aligned')
     kernel = macho(data)
@@ -181,8 +181,11 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         if not re.fullmatch(r'[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}', root_uuid):
             raise ValueError('invalid root volume UUID')
         command_line = command_line.replace(' rd=md0', '')
+    if data_seed is not None and not root_uuid:
+        raise ValueError('a Data seed goes with the main OS root')
     if disk_root:
-        ramdisk = b''
+        # The main OS can carry its Data seed as the RAM disk: md0, mounted on /private/var by the kernel.
+        ramdisk = data_seed or b''
     ramdisk = init_ramdisk() if ramdisk is None else ramdisk
     span = kernel.end - kernel.base
     bias = kernel.base & 0x1fffff
@@ -193,7 +196,8 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         ramdisk += bytes(-len(ramdisk) % 4096)
         # The restore volume, from memory or from disk, runs as the restore OS environment; the main OS does not.
         environment = 'restore' if root_cache and not root_uuid else None
-        adt = prelink_tree(adt, window, tree, ramdisk, cache, environment, ram_root=not disk_root, root_uuid=root_uuid)
+        adt = prelink_tree(adt, window, tree, ramdisk, cache, environment, ram_root=not disk_root or bool(data_seed),
+                           root_uuid=root_uuid)
         ramdisk = ramdisk + cache + bytes(-len(cache) % 4096)
     else:
         adt = add_ramdisk_property(adt, window + up(tree + len(adt) + 52), len(ramdisk))
@@ -230,6 +234,7 @@ def main():
                    help='an original trust cache module of the root; repeat for the main OS and its cryptexes')
     p.add_argument('--root-device', help='with --prelinked: root on this BSD disk instead of a RAM disk, such as disk1s1')
     p.add_argument('--root-uuid', help='with --prelinked: the main OS, rooted on the APFS volume of this UUID')
+    p.add_argument('--data-image', type=Path, help='with --root-uuid: APFS Data seed, the RAM disk the kernel mounts on /private/var')
     a = p.parse_args()
     if a.output.exists() or a.output.resolve().is_relative_to(Path('/dev')):
         p.error('output must be a new ordinary file')
@@ -241,7 +246,7 @@ def main():
     payload = pack(a.kernel.read_bytes(), a.adt.read_bytes(), a.window, a.memory, prelinked=a.prelinked,
                    ramdisk=a.root_image.read_bytes() if a.root_image else None,
                    root_cache=[cache.read_bytes() for cache in a.root_trust_cache] or None, root_device=a.root_device,
-                   root_uuid=a.root_uuid)
+                   root_uuid=a.root_uuid, data_seed=a.data_image.read_bytes() if a.data_image else None)
     a.output.parent.mkdir(parents=True, exist_ok=True)
     a.output.write_bytes(payload)
     print('Built screen-output XNU payload', hashlib.sha256(payload).hexdigest())
