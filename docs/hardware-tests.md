@@ -1276,3 +1276,12 @@ k54 起第一帧之后屏幕不再显示诊断文字（`coachz-console-band=0`�
 - Wi-Fi：`SMEM v12 inventory status 0`，14 个分区项，global 和 apps-modem 分区都解析到了。SMP2P 项 428、GLINK 项 478～480 都不存在，因为基带没有启动。没有启动 WCN3990，也没有发布网卡。
 - 加速度计：EC 枚举出 3 个传感器。传感器 0 是 BMI 加速度计，12.5 Hz、±4 g，静止时读数合成约 1 g，错误数 0。陀螺仪 ODR 为 0（未启用），传感器 2 的类型 5 这个驱动不支持。没有接 CoreMotion，屏幕不会自动旋转。转动机身时重力依次落到 +Y、+Z、-X 轴，幅值一直约 1 g。
 - 合盖（k62，`coachz-switches=1`，说明在 `docs/plans/switches.md`）：`supported 0xf raw 0x5`，bit 0（LID_OPEN）在 `0x5`、`0x4`、`0x5` 之间变化了一次，错误数 0。机主依次做了合盖和拆底座，而日志在开机 127 秒、这两次变化之后就停了，bit 2（BASE_ATTACHED）没有变化。所以不能认定 EC 漏报了底座；日志在拆底座前后为什么停止还没有查明。这只读取状态，不触发锁屏或睡眠。
+
+## 系统音频（k63）
+
+`coachz-speaker=2`：内核启动 `CoachzAudio` 服务，launchd 之前把 `CoachzAudio.driver` 写到 Data 卷，并用 bindfs union 挂到 `/System/Library/Audio/Plug-Ins/HAL`。插件的 CDHash 放在单独的 trust cache 模块里，打包时用 `--root-trust-cache` 传入。
+
+- 机主反馈：系统声音正常，“声音完美”。这是听感判断，没有录音或频谱对照。
+- 日志：`plug-in mount stage 3 status 0`，host clock 请求返回 0，输出开关 5 次、累计约 11.8 秒，校正 0 次，没有 `@crash`，没有 panic。
+- 路由显示为 “Speaker” 和音响图标。插件把设备报成 Thunderbolt，因为内置设备只能走 Apple 的端口描述，USB 设备又要带 HAL 不接受的位置信息（UniXNU-sheng 的结论）。
+- 没验证：麦克风输入（输入环目前是静音）、音量条、耳机插孔、均衡和扬声器保护。

@@ -12,7 +12,7 @@
  		clock_usec_t usec;
 --- a/iokit/Kernel/CoachzSpeaker.cpp
 +++ b/iokit/Kernel/CoachzSpeaker.cpp
-@@ -0,0 +1,223 @@
+@@ -0,0 +1,229 @@
 +// SPDX-License-Identifier: BSD-2-Clause
 +// A one-second 440 Hz tone on the Coachz speaker (coachz-speaker=1), played once after boot: SC7180 LPASS read DMA into the
 +// secondary MI2S, the MAX98360A-compatible amplifier enabled by GPIO23. The register addresses, values and order are the
@@ -28,6 +28,7 @@
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
 +void coachz_speaker_start(void);
++void coachz_audio_start(void);
 +}
 +
 +namespace {
@@ -123,7 +124,8 @@
 +{
 +	static bool started;
 +	int enabled = 0;
-+	if (started || !PE_parse_boot_argn("coachz-speaker", &enabled, sizeof(enabled)) || enabled != 1) {
++	// 1 plays the test tone; 2 starts the system's audio service on the same clocks instead (package/CoachzAudio.cpp).
++	if (started || !PE_parse_boot_argn("coachz-speaker", &enabled, sizeof(enabled)) || (enabled != 1 && enabled != 2)) {
 +		return;
 +	}
 +	started = true;
@@ -171,6 +173,10 @@
 +	wr(kBitD, 0xffaf);
 +	wr(kBitCfg, (5u << 8) | (2u << 12));
 +	wr(kBitCmd, 1);
++	if (enabled == 2) {
++		coachz_audio_start();
++		return;
++	}
 +	// 5. One second of tone the DMA can address (32 bits, the SMMU passing LPASS through as firmware left it). All kernel memory lies
 +	// above 4 GiB, so the buffer is low DRAM outside the kernel's window, just past the USB DMA pool (no reserved-memory node covers it).
 +	const uint64_t pa = 0x81200000ull;

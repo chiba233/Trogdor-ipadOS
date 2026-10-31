@@ -93,3 +93,6 @@ coachz-prelink-motion.patch
 
 # Lid, tablet mode and base state from the Chrome EC, query only (coachz-switches=1), docs/plans/switches.md.
 coachz-prelink-switches.patch
+
+# The audio server plug-in on the Data volume, shown beside the system's through a bindfs union (coachz-speaker=2).
+coachz-prelink-audio.patch

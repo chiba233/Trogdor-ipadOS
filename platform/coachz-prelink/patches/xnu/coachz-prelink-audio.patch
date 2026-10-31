@@ -1,0 +1,119 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8673,7 +8673,108 @@
+ 	    CAST_USER_ADDR_T("/private/var/datamigrator/migrate"), UIO_SYSSPACE, 0));
+ }
+ 
++/*
++ * The audio server plug-in (package/CoachzAudioPlugIn.c), whose files the kernel carries (coachz-speaker=2). They are written to the Data
++ * volume each boot and shown beside the system's plug-ins through a read-only bindfs union, because the OS volume cannot change.
++ */
++extern const unsigned char coachz_audio_bundle_exec[], coachz_audio_bundle_plist[], coachz_audio_bundle_resources[];
++extern const uint64_t coachz_audio_bundle_exec_size, coachz_audio_bundle_plist_size, coachz_audio_bundle_resources_size;
++static volatile int coachz_audio_mount_stage, coachz_audio_mount_status = -1;
++
+ static int
++coachz_audio_write(const char *path, const unsigned char *bytes, uint64_t size, int mode)
++{
++	vfs_context_t context = vfs_context_kernel();
++	struct vnode_attr attributes;
++	vnode_t target = NULLVP;
++	int close_error;
++	int error = vnode_open(path, O_CREAT | O_TRUNC | O_NOFOLLOW | FWRITE, mode, 0, &target, context);
++
++	if (error) {
++		return error;
++	}
++	error = vn_rdwr(UIO_WRITE, target, (caddr_t)(uintptr_t)bytes, (int)size, 0, UIO_SYSSPACE, IO_UNIT | IO_SYNC,
++	    vfs_context_ucred(context), NULL, vfs_context_proc(context));
++	if (!error) {
++		/* vnode_open leaves O_TRUNC to its caller: set the length explicitly. */
++		VATTR_INIT(&attributes);
++		VATTR_SET(&attributes, va_mode, mode);
++		VATTR_SET(&attributes, va_data_size, size);
++		error = vnode_setattr(target, &attributes, context);
++	}
++	close_error = vnode_close(target, FWRITE, context);
++	return error ? error : close_error;
++}
++
++static void
++coachz_audio_prepare(proc_t p, user_addr_t scratch)
++{
++	static const char *const directories[] = {"/private/var/coachz", "/private/var/coachz/audio", "/private/var/coachz/audio/CoachzAudio.driver",
++		                                  "/private/var/coachz/audio/CoachzAudio.driver/_CodeSignature"};
++	static const char source[] = "/private/var/coachz/audio", point[] = "/System/Library/Audio/Plug-Ins/HAL";
++	int mode = 0, error = 0;
++
++	if (!PE_parse_boot_argn("coachz-speaker", &mode, sizeof(mode)) || mode != 2) {
++		return;
++	}
++	for (unsigned index = 0; index < sizeof(directories) / sizeof(directories[0]) && !error; index++) {
++		struct mkdir_args request = {.path = scratch + 0x100, .mode = 0755};
++		int32_t result = 0;
++		error = copyout(directories[index], request.path, strlen(directories[index]) + 1);
++		if (!error) {
++			error = mkdir(p, &request, &result);
++			error = error == EEXIST ? 0 : error;
++		}
++	}
++	if (!error) {
++		error = coachz_audio_write("/private/var/coachz/audio/CoachzAudio.driver/CoachzAudio", coachz_audio_bundle_exec,
++		    coachz_audio_bundle_exec_size, 0755);
++	}
++	if (!error) {
++		error = coachz_audio_write("/private/var/coachz/audio/CoachzAudio.driver/Info.plist", coachz_audio_bundle_plist,
++		    coachz_audio_bundle_plist_size, 0644);
++	}
++	if (!error) {
++		error = coachz_audio_write("/private/var/coachz/audio/CoachzAudio.driver/_CodeSignature/CodeResources",
++		    coachz_audio_bundle_resources, coachz_audio_bundle_resources_size, 0644);
++	}
++	if (error) {
++		printf("COACHZ audio: plug-in files: %d\n", error);
++		return;
++	}
++	{
++		extern volatile int native_bindfs_boot_mount;
++		const user_addr_t offset = 0xa00;
++		struct mount_args request = {.type = scratch + offset, .path = scratch + offset + 0x20,
++			                     .flags = MNT_RDONLY | MNT_UNION, .data = scratch + offset + 0x100};
++		int32_t result = 0;
++		vnode_t probe = NULLVP;
++
++		coachz_audio_mount_stage = 1;
++		if ((error = copyout("bindfs", request.type, 7)) || (error = copyout(point, request.path, sizeof(point))) ||
++		    (error = copyout(source, request.data, sizeof(source)))) {
++			coachz_audio_mount_status = error;
++		} else {
++			native_bindfs_boot_mount = 1;
++			error = mount(p, &request, &result);
++			native_bindfs_boot_mount = 0;
++			coachz_audio_mount_status = error;
++			if (!error) {
++				coachz_audio_mount_stage = 2;
++				/* The union must show the plug-in beside the system's own. */
++				error = vnode_lookup("/System/Library/Audio/Plug-Ins/HAL/CoachzAudio.driver", 0, &probe, vfs_context_kernel());
++				coachz_audio_mount_status = error;
++				if (!error) {
++					vnode_put(probe);
++					coachz_audio_mount_stage = 3;
++				}
++			}
++		}
++	}
++	printf("COACHZ audio: plug-in mount stage %d status %d\n", coachz_audio_mount_stage, coachz_audio_mount_status);
++}
++
++static int
+ coachz_watchdog_policy_prepare(void)
+ {
+ 	const char policy[] = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+@@ -8819,6 +8920,7 @@
+ 		}
+ 		coachz_mobilegestalt_cache_reset();
+ 		coachz_setup_prepare();
++		coachz_audio_prepare(p, scratch);
+ 	}
+ }
+ 

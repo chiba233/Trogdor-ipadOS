@@ -266,7 +266,8 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         # CoreImage calls an empty OpenGL table in iconservicesagent, which Settings waits on (coachz-prelink-software-render.patch).
         command_line += ' coachz-null-call=1'
         # The drivers under test: Chrome EC battery, a speaker tone and the volume buttons (docs/plans/battery-speaker.md, input.md).
-        command_line += ' coachz-battery=1 coachz-speaker=1 coachz-buttons=1'
+        # coachz-speaker=2 starts the audio service; its plug-in's trust cache module comes with --root-trust-cache (build-coachz-audio.py).
+        command_line += ' coachz-battery=1 coachz-speaker=2 coachz-buttons=1'
         # The panel backlight behind the system's brightness control, and the Zed keyboard (docs/plans/backlight.md, input.md).
         command_line += ' coachz-backlight=1 coachz-usb-keyboard=1'
         # Read-only probes: SoC temperatures and the SMEM inventory, with their nodes from prelink_tree (docs/plans/thermal.md, wifi.md).

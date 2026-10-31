@@ -55,3 +55,5 @@
 - 扬声器：持续播放（环形缓冲、周期中断、欠载）、AudioServerPlugIn 与 audioserver 接入、音量。参考 UniXNU-sheng 的 `ShengAudioService.cpp` / `ShengAudioPlugIn.c`。
 - 机身按键和键盘见 `docs/plans/input.md`，屏幕背光见 `docs/plans/backlight.md`（同样已写好、未接入构建）。
 - Wi-Fi（WCN3990，参考 ios-flame）和 GPU（A618，参考 UniXNU Adreno/AdrenoMetal 与 sweet 的 legacy HFI）尚未开始写代码。
+
+系统音频已经上机（`coachz-speaker=2`），记录在 `docs/hardware-tests.md` 的“系统音频（k63）”。`=1` 的一秒测试音代码还在。

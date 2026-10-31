@@ -166,6 +166,8 @@ def main():
                 os.environ['XNU_EXTRA_LD_ARCHIVES'] += ' -Wl,-force_load,' + str(ctx.tree / 'build/sheng-hid-input/libCoachzHid.a')
             if (ROOT / 'platform' / a.platform / 'scripts/build-coachz-backlight.py').is_file():
                 os.environ['XNU_EXTRA_LD_ARCHIVES'] += ' -Wl,-force_load,' + str(ctx.tree / 'build/coachz-backlight/libCoachzBacklight.a')
+            if (ROOT / 'platform' / a.platform / 'scripts/build-coachz-audio.py').is_file():
+                os.environ['XNU_EXTRA_LD_ARCHIVES'] += ' -Wl,-force_load,' + str(ctx.tree / 'build/coachz-audio/libCoachzAudio.a')
         kernel.build(ctx, modules)
         candidate = ctx.tree / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf'
         if not candidate.is_file():
