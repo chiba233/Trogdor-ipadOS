@@ -372,6 +372,19 @@ class DisplayTests(unittest.TestCase):
         self.assertEqual(len(chosen['boot-manifest-hash']),48)
         self.assertEqual(struct.unpack_from('<QQ',props['TrustCache'])[1],56)
 
+    def test_temporary_watchdog_policy_only_opts_in_with_main_os_memory_data(self):
+        from test_xnu_checkpoint import fixture, adt
+        from xnu_checkpoint import HEADER
+        from xnu_screen import pack, PRELINK_COMMAND_LINE
+        cache = struct.pack('<I16sI', 2, bytes(16), 0)
+        self.assertNotIn('coachz-disable-watchdogd', PRELINK_COMMAND_LINE)
+        for seed in (None, bytes(4096)):
+            payload = pack(bytes(fixture()), adt(), 0x40000000, 1 << 30, prelinked=True,
+                           root_uuid='04769D26-2CA0-4825-B443-E2E5F88300F2',
+                           root_cache=[cache], data_seed=seed)
+            command = HEADER.unpack_from(payload)[-1].split(b'\0', 1)[0].split()
+            self.assertEqual(b'coachz-disable-watchdogd=1' in command, seed is not None)
+
     def test_hardware_verified_scanout_restart_order_is_unchanged(self):
         source=(ROOT/'boot/display.c').read_text()
         self.assertEqual(re.findall(r'pattern_write\(DISPLAY_(\w+),',source),['COUNT_EN','DSI','SCANOUT','TE','TE','DSI','COUNT_EN'])

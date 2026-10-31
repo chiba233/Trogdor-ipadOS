@@ -1,0 +1,79 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8272,6 +8272,63 @@
+ 	printf("%s", coachz_systemos_note);
+ }
+ 
++/* Temporary bring-up policy, using launchd's original root-owned disabled.plist loader.
++ * The only job disabled is watchdogd: its native missing-IOWatchdog path BRKs on this
++ * board. Both files live in the newly mounted memory Data and vanish at reboot.
++ * No system-volume bytes, daemon binary, VM identity or global panic policy change.
++ */
++static int
++coachz_watchdog_policy_file(const char *path, const char *bytes, int length)
++{
++	vfs_context_t context = vfs_context_kernel();
++	vnode_t vnode = NULLVP;
++	struct vnode_attr attributes;
++	int error, close_error;
++
++	error = vnode_open(path, O_CREAT | O_EXCL | O_NOFOLLOW | FWRITE, 0644, 0, &vnode, context);
++	if (error) {
++		return error;
++	}
++	if (length) {
++		error = vn_rdwr(UIO_WRITE, vnode, (caddr_t)bytes, length, 0, UIO_SYSSPACE,
++		    IO_UNIT | IO_SYNC, vfs_context_ucred(context), NULL, vfs_context_proc(context));
++	}
++	if (!error) {
++		VATTR_INIT(&attributes);
++		VATTR_WANTED(&attributes, va_uid);
++		VATTR_WANTED(&attributes, va_mode);
++		VATTR_WANTED(&attributes, va_data_size);
++		error = vnode_getattr(vnode, &attributes, context);
++		if (!error && (attributes.va_uid != 0 || (attributes.va_mode & 0022) ||
++		    attributes.va_data_size != (uint64_t)length)) {
++			error = EACCES;
++		}
++	}
++	close_error = vnode_close(vnode, FWRITE, context);
++	return error ? error : close_error;
++}
++
++static int
++coachz_watchdog_policy_prepare(void)
++{
++	const char policy[] = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
++	    "<plist version=\"1.0\"><dict><key>com.apple.watchdogd</key><true/></dict></plist>\n";
++	int disable = 0;
++	int error;
++
++	if (!PE_parse_boot_argn("coachz-disable-watchdogd", &disable, sizeof(disable)) || disable != 1) {
++		return 0;
++	}
++	error = coachz_watchdog_policy_file("/private/var/db/com.apple.xpc.launchd/disabled.plist",
++	    policy, (int)sizeof(policy) - 1);
++	if (!error) {
++		/* Prevent first-boot migration from replacing the deliberately installed override. */
++		error = coachz_watchdog_policy_file("/private/var/db/com.apple.xpc.launchd/disabled.migrated", "", 0);
++	}
++	printf("COACHZ policy: watchdogd disabled in memory Data: %d\n", error);
++	return error;
++}
++
+ /*
+  * Coachz: a writable /private/var. The memory-map RAMDisk, md0, holds an APFS Data seed made from
+  * the OS volume's /private/var. APFS mounts volumes through IOMedia, which md0 lacks, so the
+@@ -8334,6 +8391,12 @@
+ 	snprintf(coachz_systemos_note + used, sizeof(coachz_systemos_note) - used,
+ 	    "COACHZ Data: mount %s at /private/var read-write: %d\n", device_path, error);
+ 	printf("%s", coachz_systemos_note + used);
++	if (!error) {
++		error = coachz_watchdog_policy_prepare();
++		if (error) {
++			panic("Coachz temporary watchdog launch policy failed: %d", error);
++		}
++	}
+ }
+ 
+ void

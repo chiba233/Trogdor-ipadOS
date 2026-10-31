@@ -183,6 +183,9 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         command_line = command_line.replace(' rd=md0', '')
     if data_seed is not None and not root_uuid:
         raise ValueError('a Data seed goes with the main OS root')
+    if data_seed:
+        # The real board has no IOWatchdog service yet; the override lives only in memory Data.
+        command_line += ' coachz-disable-watchdogd=1'
     if disk_root:
         # The main OS can carry its Data seed as the RAM disk: md0, mounted on /private/var by the kernel.
         ramdisk = data_seed or b''

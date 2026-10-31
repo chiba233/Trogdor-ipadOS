@@ -775,3 +775,21 @@ panic 的调用栈为 `PE_init_iokit → InitIOKit → OSlibkernInit → OSRunti
 内核前缀镜像 SHA-256 `bb7a9f3ad8d1192b580329010986427c30f2c1b75a218270c8199ccfe77fc86c`，签名容器 SHA-256 `9502a0c19bf9e56d33faa256cf6ca5672bb666d35846ab37cfc23e4afff9c549`。10727 条指令／20 段标量审计通过；重新核对清单源码和全部产物摘要、实际嵌入的本次 prelink 内核，GPT 布局与此前镜像一致。
 
 通过既有免密写盘器核实外置介质与运行系统排除，完成 225 MiB 内核前缀写入和全量回读，写盘器返回零。没有改动系统卷或 SystemOS 分区，没有写固件或内置盘，没有自动重启。尚待手动启动取得 `COACHZ critical` 的 PC／LR／可执行文件基址；不能把介质准备或离线 BRK 分支当作真机根因已定位。
+
+
+## 2026-10-31：watchdogd 真机故障偏移确认与临时策略
+
+运行时 `0bab269`，使用前述同一诊断镜像。屏幕取得 `COACHZ critical watchdogd` 的 PC、LR、SP、FP、可执行文件头与寄存器；按头地址消除 ASLR 后，PC 相对主程序头的偏移为 `0xab0c`，与同版原始 watchdogd 的缺少 IOWatchdog 分支内 BRK 完全相符。信号仍是 SIGTRAP，服务查找分支对应的寄存器为零；这次把此前的离线分支判断与真机停止位置接上。原始进程地址和照片保持私有。
+
+下一轮使用 launchd 已有的根域禁用策略，只临时禁用 `com.apple.watchdogd`，让启动继续暴露后续依赖。`coachz-disable-watchdogd=1` 仅由带内存 Data 种子的主系统打包路径加入；成功挂载内存 `/private/var` 后、launchd 执行前创建 root 所有且不可由组／其他人写入的 `disabled.plist` 与 `disabled.migrated`，全部随内存 Data 在重启时丢失。拒绝覆盖已有文件，失败明确报告。没有修改原版 launchd 或 watchdogd、没有伪装 VM，也没有禁用全局关键进程 panic；这不是看门狗硬件支持。
+
+同版原始 launchd 的有界离线执行使用本次实际 XML：root 所有策略禁用 watchdogd、非 root 策略拒绝、其他 job 保持启用，三种情况通过；文件系统和 libxpc API 为桩，不能提前认定真机会采用该策略。保留已验收的 critical-state 输出，下一轮实际启动结果仍待取得。
+
+
+## 2026-10-31：临时 watchdogd 启动策略介质准备
+
+补丁为 `coachz-prelink-watchdog-policy.patch`，由带内存 Data 的主系统负载显式启用，保留现有 critical-state 诊断。源码内核与 prelink 构建成功；27 项显示／用户态路线回归通过，新增一条实际负载打包回归确认无内存 Data 的路线不会自动启用策略。原版 launchd 的三种离线策略情况和实际 XML 校验通过；真实 VFS 创建和真机策略采用仍待确认。
+
+内核前缀镜像 SHA-256 `20234ad1eec4267c96c6cd7cb6e2053d65a7cb9dd06c8a1206f1b12e331cd1c8`，签名容器 SHA-256 `7d40bff4cf27aac2feb9c284b292c6f33c5e382a12ca2df03dfc32f04f5915f1`。10727 条指令／20 段标量审计通过；独立重算清单全部源码和产物摘要，核对当前 prelink 内核确实嵌入、显式启动参数存在且没有全局 panic 禁用参数、Data 种子字节未变、GPT 与前一轮一致，前缀结束位置恰在系统分区之前。
+
+目标端传输摘要一致，既有免密写盘器核实外置介质及运行系统排除，完成全部 225 MiB 前缀写入与回读，返回零。未改写系统卷、SystemOS、固件或内置盘，没有自动重启。下一次手动启动观察策略结果行及是否越过 watchdogd；如出现新的关键服务退出，保留其现场，不能预先宣称主系统或界面启动成功。
