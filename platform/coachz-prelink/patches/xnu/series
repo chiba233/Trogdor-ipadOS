@@ -78,3 +78,6 @@ coachz-prelink-speaker.patch
 
 # Volume buttons from the Chrome EC, and the keyboard/consumer device they and the Zed keyboard report through.
 coachz-prelink-input.patch
+
+# Adreno 618: clock and power inventory, a bounded CX + GMU clock window with rollback, GMU firmware into TCM, GPU SMMU inventory (coachz-gpu=1 to 4).
+coachz-prelink-gpu.patch

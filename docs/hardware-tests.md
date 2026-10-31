@@ -1257,3 +1257,12 @@ k54 起第一帧之后屏幕不再显示诊断文字（`coachz-console-band=0`�
 - 键盘（`coachz-usb-keyboard=1`，`coachz_usb_hid.c`）：`keyboard at 2, vendor 18d1 product 504c, interface 0 ... protocol 0 idle -6 queue 1`。
   SET_IDLE 失败（-6），打字不受影响。**机主确认键盘能用。** 开机早期有一行 `the keyboard device is not ready for report 0`，因为报告先于 HID 设备到达。
 - 这次开机全程没有 panic 和 `@crash`，系统盘正常。
+
+## Adreno 618 前几级（k56～k59）
+
+路线和寄存器依据在 `docs/plans/gpu.md`。每级都正常开到主屏幕，电池、键盘和测试音不受影响。GPU 还没有执行任何命令，界面仍是 CPU 渲染。
+
+- `coachz-gpu=1`：`mode 1 stage 1 restored 0: ok`。GPLL0 已锁定（`d0100005`），cfg-ahb 在运行（`00000009`），CX GDSC 未上电（`00222001`），cx-gmu 关闭（`80004220`）。
+- `coachz-gpu=2`：`mode 2 stage 7 restored 1: ok`，轮询 CX 1 次、时钟 2 次。窗口内 CX 上电（`f8222000`），GMU 寄存器可读，CM3_SYSRESET 为 1。撤销后只有 RCG cfg 和 cx-gmu 的 wake/sleep 字段保持改动，符合计划。
+- `coachz-gpu=3`：32768 字节的 `a630_gmu.bin` 写入 TCM，8192 个字读回，0 处不一致，FNV-1a `0x51c28be8` 和按原文件算出的相同，CM3 始终在复位。固件取自 Debian，不进仓库，打包时用 `--gmu-firmware` 传入。
+- `coachz-gpu=4`：只读 GPU SMMU。sCR0 `00000001`（CLIENTPD=1，旁路），IDR0 `78016606`，IDR1 `20008008`，6 个 stream 组，8 个 context bank，页 4 KiB，bank 从 +0x8000 起。SMR 和 S2CR 全为 0，每个 bank 的 SCTLR、TCR、FSR 全为 0，CBAR 都是 `00010000`。固件没有留下任何配置。
