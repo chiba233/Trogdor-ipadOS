@@ -4,7 +4,9 @@ HP Chromebook x2 11（Google Coachz / SC7180，骁龙 7c）的 **原生 iPadOS �
 
 **现在能做到的（都在真机上确认过）：** 从外接 USB 盘启动 iPadOS 17.7.11，进入主屏幕和 Dock，触摸和键盘可用，Safari 和设置能启动，系统声音从扬声器播放，状态栏显示电量，亮度滑块能调背光。八个 CPU 核都在工作。
 
-**还不行的：** 界面全靠 CPU 绘制。GPU 已经能在真机上执行命令，但还没有接到系统上，所以没有 Metal，也没有 GPU 合成。没有网络（Wi-Fi 和蜂窝都没有），也没有验证过长时间稳定性。这是一个实验项目，离日常使用还很远。
+**最新进展：** 界面已经由 Adreno 618 合成上屏，走 Metal → metal2vulkan → Turnip 这条路，都在真机上跑通了。
+
+**还不行的：** GPU 帧率还低，控制台文字还会盖在界面上，没有 GPU 电源管理。没有网络（Wi-Fi 和蜂窝都没有），也没有验证过长时间稳定性。这是一个实验项目，离日常使用还很远。
 
 ## 架构
 
@@ -59,26 +61,26 @@ flowchart TB
 
 ### GPU
 
-这是目前的重点。路线很明确：**硬件这边照主线 Linux，iPadOS 这边用 UniXNU 现成的 Metal 翻译层**，中间的 A618 内核后端要自己写。Turnip 只依赖一组固定的内核接口，所以上层可以基本不动。
+这是目前的重点。路线很明确：**硬件这边照主线 Linux，iPadOS 这边用 UniXNU 现成的 Metal 翻译层**，中间的 A618 内核后端是这个项目改编的。Turnip 只依赖一组固定的内核接口，所以上层基本不用动。
 
-绿色是真机验证过的，黄色是编译过但没上过机的，灰色是还没接上的。
+图里每一层都在真机上跑通了，下一步是性能。
 
 ```mermaid
 flowchart TB
-    APP["App、QuartzCore（CARenderServer）"]:::todo
+    APP["QuartzCore（CARenderServer）"]:::ok
     subgraph US["系统进程里"]
-        META["AdrenoMetal 插件<br/>发布 Metal 设备"]:::built
-        M2V["metal2vulkan<br/>AIR → SPIR-V"]:::built
-        TU["Turnip（Mesa）<br/>SPIR-V → NIR → IR3"]:::built
+        META["AdrenoMetal 插件<br/>发布 Metal 设备"]:::ok
+        M2V["metal2vulkan<br/>AIR → SPIR-V"]:::ok
+        TU["Turnip（Mesa）<br/>SPIR-V → NIR → IR3"]:::ok
     end
     subgraph KS["内核里"]
-        KMD["A618 内核驱动<br/>内存、地址空间、提交、fence"]:::todo
+        KMD["A618 内核驱动<br/>内存、地址空间、提交、fence"]:::ok
         GMU["GMU：固件、HFI、电源"]:::ok
         SMMU["GPU SMMU：页表"]:::ok
         CP["CP：SQE、ring、IB、fence"]:::ok
     end
     GPU["Adreno 618"]:::ok
-    SCAN["合成结果送到 scanout"]:::todo
+    SCAN["合成结果送到 scanout"]:::ok
     SCREEN["屏幕"]
     APP --> META --> M2V --> TU --> KMD
     KMD --> GMU --> GPU
@@ -86,11 +88,9 @@ flowchart TB
     KMD --> CP --> GPU
     GPU --> SCAN --> SCREEN
     classDef ok fill:#2e7d32,color:#ffffff,stroke:#1b5e20
-    classDef built fill:#f9a825,color:#000000,stroke:#f57f17
-    classDef todo fill:#9e9e9e,color:#000000,stroke:#616161
 ```
 
-GPU 的启动顺序。下面每一步都在真机上跑通了，寄存器和顺序都按主线 Linux：
+GPU 的启动顺序，寄存器和顺序都按主线 Linux：
 
 ```mermaid
 flowchart LR
@@ -104,7 +104,7 @@ flowchart LR
     S8 --> S9["ME_INIT<br/>CP 写内存和 fence"]
 ```
 
-到这一步，GPU 已经真正执行了命令，但还没有运行过着色器，也没有画过东西，而且验证跑完就全部关掉。详情见 [GPU 计划](docs/plans/gpu.md) 和 [硬件记录](docs/hardware-tests.md)。
+之后 GPU 保持开机，板级代码把它交给 Turnip 和 Metal。详情见 [GPU 计划](docs/plans/gpu.md) 和 [硬件记录](docs/hardware-tests.md)。
 
 ## 当前进度
 
@@ -123,10 +123,11 @@ flowchart LR
 | 电池、背光、Zed 键盘 | 通过 | 状态栏电量和 Debian 一致，亮度滑块和键盘可用 |
 | 音量键 | 部分 | 按键能到 HID；音量条还没确认 |
 | 系统音频 | 通过（听感） | 经原版音频服务播放，机主听到正常，日志无校正、无崩溃；路由显示为 iPad，图标是音响；麦克风没接 |
+| 内存 | 通过 | XNU 用上 4 GiB 地址以上连续的 6 GiB，约 5.83 GiB 可用 |
 | SMP | 部分 | 八个核上线，IPI 正常，空闲核优先选 A76；频率固定在最高档，没有温控，不是真正的大小核调度 |
 | 温度、加速度计、合盖 | 只读 | 能读到值；没有接温控和 CoreMotion，屏幕不会自动旋转 |
-| GPU 启动和命令执行 | 通过 | CP 经 SMMU 从 ring 和 IB 写内存，fence 到达，所有故障寄存器为 0；跑完全部关掉 |
-| GPU 常驻驱动、Metal、GPU 合成 | 进行中 | Turnip 和 Metal 插件已编译通过，没上过机 |
+| GPU 启动和命令执行 | 通过 | CP 经 SMMU 从 ring 和 IB 写内存，fence 到达，所有故障寄存器为 0 |
+| GPU 合成界面（Metal、Turnip） | 通过，帧率低 | 机主看到界面，日志：提交 400 次全部完成，198 帧上屏，无故障、无崩溃；App 自己用 Metal 还没确认，没有 GPU 电源管理和温控 |
 | Wi-Fi、蜂窝网络 | 未实现 | 只读过 SMEM，基带还没启动；下一步是 MPSS 冷启动 |
 
 屏幕照片阶段没有逐字段核对。早期有一个原因不明的随机 zone panic，最近几轮没有再出现，但没有解决。系统从未整机卡死，屏幕和诊断输出一直在跑。详情见 [状态](docs/status.md) 和 [硬件记录](docs/hardware-tests.md)。

@@ -4,6 +4,8 @@
 // USB mass storage device behind it instead of memory. Read-only: the kernel reports the medium
 // as write protected unless the explicit, validated external Data partition is selected.
 // In that mode only sectors wholly inside that partition can be written.
+#include <IOKit/IODeviceTreeSupport.h>
+#include <machine/machine_routines.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOBSD.h>
 #include <IOKit/storage/IOBlockStorageDevice.h>
@@ -497,5 +499,23 @@ extern "C" int coachz_usb_volume_device(const char *uuid, char *path, size_t siz
 }
 
 extern "C" int native_ram_block_volume_device(const char *, dev_t *, char *, size_t) { return 0; }
-extern "C" int native_ram_block_gpu_addon(const uint8_t **, uint64_t *) { return 0; }
+// The Metal plug-in the loader placed (/chosen/memory-map/GpuAddon, tools/xnu_gpu_userland.py), for coachz_gpu_prepare in kern_exec.c. 0 without one.
+extern "C" int native_ram_block_gpu_addon(const uint8_t **data, uint64_t *bytes) {
+  if (!data || !bytes) return 0;
+  *data = nullptr;
+  *bytes = 0;
+  IORegistryEntry *map = IORegistryEntry::fromPath("/chosen/memory-map", gIODTPlane);
+  if (!map) return 0;
+  OSData *range = OSDynamicCast(OSData, map->getProperty("GpuAddon"));
+  uint64_t physical = 0, size = 0;
+  if (range && range->getLength() == 16) {
+    memcpy(&physical, range->getBytesNoCopy(), 8);
+    memcpy(&size, static_cast<const uint8_t *>(range->getBytesNoCopy()) + 8, 8);
+  }
+  map->release();
+  if (!physical || !size) return 0;
+  *data = reinterpret_cast<const uint8_t *>(ml_static_ptovirt(physical));
+  *bytes = size;
+  return *data != nullptr;
+}
 extern "C" int native_ram_block_volume_seed(const char *, dev_t *, char *, size_t, uint64_t *, uint64_t *, uint8_t *) { return 0; }

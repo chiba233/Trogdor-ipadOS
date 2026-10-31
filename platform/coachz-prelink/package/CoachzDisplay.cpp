@@ -15,6 +15,10 @@
 #include <sys/errno.h>
 extern "C" kmod_info_t g_kernel_kmod_info;
 extern "C" void coachz_early_band(uint32_t rows);
+extern "C" IOService *native_gop_presenter_create(void);
+extern "C" bool native_gop_gpu_offer(IOService *,void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height);
+extern "C" void native_gop_presenter_set_source(IOService *presenter,IOService *nub);
+static IOService *gpuHandoff;
 extern "C" void coachz_display_static_init(void) __asm__("__GLOBAL__sub_I_NativeLegacyDisplay.cpp");
 extern "C" IOService *native_legacy_display_allocate(void);
 extern "C" kern_return_t OSKextLoadKextWithIdentifier(const char *);
@@ -108,7 +112,10 @@ void native_legacy_transfer_observed(IOReturn status,const void *,uint64_t bytes
     if(transfers<=8 || status) kprintf("COACHZ display: CPU transfer %llu status 0x%x bytes %llu\n",transfers,status,bytes);
 }
 void native_legacy_retirement_observed(IOService *) { retirements++; }
-bool native_legacy_gpu_offer(void *,IOMemoryDescriptor *,uint64_t,uint32_t,uint32_t) { return false; }
+// sheng-fb-gpu=1: frames go to the GPU client when one is connected, and are copied by the CPU until then or if it goes away.
+bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *memory,uint64_t stride,uint32_t width,uint32_t height) {
+    return gpuHandoff && native_gop_gpu_offer(gpuHandoff,display,memory,stride,width,height);
+}
 void native_legacy_gpu_fallback_observed(int status) { kprintf("COACHZ display: GPU offer unsupported %d\n",status); }
 __attribute__((noreturn)) void native_legacy_backend_guard(unsigned slot,void *,void *caller) {
     panic("Coachz display: unqualified slot %u caller %p stage %u registrations %u clients %u frames %llu transfers %llu status %x retire %llu vsync %llu",
@@ -194,6 +201,21 @@ int coachz_display_start(void) {
     kprintf("COACHZ display: calling original start\n");
     if(!display->start(nub))return EIO;
     stage=10;
+    {
+        // The hand-off presenter, away from the display subsystem's node as in UniXNU-sheng: the original display code enumerates that node's children.
+        unsigned gpu=0;PE_parse_boot_argn("sheng-fb-gpu",&gpu,sizeof gpu);
+        if(gpu==1) {
+            IOService *handoff=native_gop_presenter_create();
+            bool attachedHandoff=false;
+            if(handoff)native_gop_presenter_set_source(handoff,nub);
+            if(handoff && handoff->init() && (attachedHandoff=handoff->attach(parent)) && handoff->start(parent))gpuHandoff=handoff;
+            else {
+                if(attachedHandoff)handoff->detach(parent);
+                OSSafeReleaseNULL(handoff);
+            }
+            kprintf("COACHZ display: GPU hand-off presenter %d\n",gpuHandoff!=nullptr);
+        }
+    }
     kprintf("COACHZ display: original Legacy active, mode %lux%lu scale 2 registered %u\n",video.v_width,video.v_height,registrations);
     // The panel backlight service below the display (CoachzBacklightStart.cpp, coachz-backlight=1 or 2): a failure leaves the display as it is.
     if(int backlight=coachz_backlight_start(display))kprintf("COACHZ display: backlight start-up failed: %d\n",backlight);

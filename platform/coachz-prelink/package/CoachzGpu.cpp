@@ -1,0 +1,230 @@
+// SPDX-License-Identifier: MIT
+// The Adreno 618 board code (coachz-gpu=9): coachz_gpu_seq.h has left the GMU running and GX up with a618's hw_init registers
+// written; this file builds the GPU's SMMU context with the Adreno740 kit, starts the CP on its ring and hands the live objects to
+// NativeAdrenoPublish, which serves Turnip, then publishes the accelerator the original Metal discovery looks for. Order adapted
+// from UniXNU-sheng package/GpuPowerProbe.cpp (MIT); the CP start itself is Linux a6xx_cp_init, which the A740's differs from.
+// There is no power collapse and no interrupt: GPU_SET stays up, and the ring's waiters poll.
+#include <IOKit/IOLib.h>
+#include <IOKit/IOService.h>
+#include <IOKit/IOPlatformExpert.h>
+#include <IOKit/IODeviceMemory.h>
+#include <IOKit/IOMemoryDescriptor.h>
+#include <kern/clock.h>
+#include <kern/thread.h>
+#include <libkern/c++/OSMetaClass.h>
+#include <libkern/OSKextLib.h>
+#include <string.h>
+#include "NativeAdrenoABI.h"
+#include "NativeAdrenoGpuContext.h"
+#include "NativeAdrenoRing.h"
+#include "NativeAdrenoSubmit.h"
+#include "NativeAdrenoTimer.h"
+#include "AdrenoPM4.h"
+
+extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *, NativeAdrenoSubmit *, NativeAdrenoRing *, const NativeAdrenoRingClock *,
+    const NativeAdrenoTimer *, const NativeAdrenoAbiDeviceInfo *, uint32_t, uint32_t);
+extern "C" volatile uint32_t native_adreno_pool_mib;
+extern "C" volatile uint32_t native_adreno_wc_enabled;
+extern "C" void native_adreno_accelerator_static_init(void) __asm__("__GLOBAL__sub_I_NativeAdrenoAccelerator.cpp");
+extern "C" IOService *native_adreno_accelerator_allocate(void);
+extern "C" unsigned native_adreno_accelerator_instance_size(void);
+extern "C" kern_return_t OSKextLoadKextWithIdentifier(const char *);
+extern "C" void native_adreno_metal_report(void);
+extern "C" volatile uint64_t native_gop_gpu_offers, native_gop_gpu_completions, native_gop_gpu_failures, native_gop_gpu_abandoned;
+extern kmod_info_t g_kernel_kmod_info;
+
+// NativeAdrenoPublish's sink for the plug-in's cache export to the boot log disk, which this board does not have.
+extern "C" int boot_log_export_put(uint32_t, uint32_t, uint32_t, const void *, uint32_t) {return 0;}
+
+namespace {
+enum : uint32_t {
+    CpSqeCntl = 0x0808, CpSqeInstrBase = 0x0830, RbbmSecvidTrustCntl = 0xf400, RbbmStatus = 0x0210, RbbmInt0Status = 0x0201, CpHwFault = 0x0821,
+    CpProtectStatus = 0x0824, Pm4MeInit = 0x48, SmmuScr0 = 0, SmmuSgfsr = 0x48,
+    // What the kit requires of the global configuration before it routes a stream: global fault interrupt and reports on, an unmatched stream faults.
+    SmmuKitGlobal = (1u << 2) | (1u << 10), SmmuS2cr = 0xc00, SmmuS2crFault = 2u << 16, SmmuGroups = 6, SmmuGmuGroup = 1
+};
+// The original IOAcceleratorES as audited (UniXNU scripts/data/ioaccelerator-base-abi.json): the bindings in build-coachz-gpu.py use this address.
+const uint64_t kOriginalAcceleratorMetaclass = 0xfffffff006aeb688ull;
+
+volatile uint8_t *gCore, *gSmmu;
+NativeAdrenoRing gRing;
+NativeAdrenoSubmit gSubmit;
+NativeAdrenoTimer gTimer;
+NativeAdrenoGmuContextReport gReport;
+NativeAdrenoGpuBuffer gBuffers[GpuBufferCount];
+IOMemoryMap *gMaps[GpuBufferCount];
+// Linux: chip 0x06010800, 512 KiB of GMEM at 1 MiB, UBWC 2.0 with highest bank bit 14 and swizzle 6 (a6xx_catalog.c, a6xx_calc_ubwc_config).
+// The client's addresses are the driver's window of the one 2 GiB space, as NativeAdrenoPublish expects.
+const NativeAdrenoAbiDeviceInfo gDeviceInfo = {0x06010800u, 0x80000u, 0x100000ull, 0x1fffffffff000ull, 0x20000000ull, 0x60000000ull,
+    14u, 6u, 0u, 2u, NativeAdrenoDeviceClientIova, 0u};
+
+uint32_t coreRead(uint32_t reg) {
+    const uint32_t value = *reinterpret_cast<volatile uint32_t *>(gCore + size_t(reg) * 4);
+    __asm__ volatile("dsb sy" ::: "memory");
+    return value;
+}
+void coreWrite(uint32_t reg, uint32_t value) {
+    __asm__ volatile("dsb sy" ::: "memory");
+    *reinterpret_cast<volatile uint32_t *>(gCore + size_t(reg) * 4) = value;
+    __asm__ volatile("dsb sy" ::: "memory");
+}
+int ringWrite(void *, uint32_t reg, uint32_t value) {coreWrite(reg, value); return 0;}
+int ringRead(void *, uint32_t reg, uint32_t *value) {*value = coreRead(reg); return 0;}
+int ringBarrier(void *) {__asm__ volatile("dsb sy" ::: "memory"); return 0;}
+// The ring, memptrs and lists are Normal non-cacheable on both sides (GPU PTE attribute 0, CPU write-combine): only ordering.
+int ringPublish(void *, const volatile uint32_t *, size_t) {__asm__ volatile("dsb sy" ::: "memory"); return 0;}
+int ringAcquire(void *, volatile uint32_t *, size_t) {__asm__ volatile("dsb sy" ::: "memory"); return 0;}
+uint64_t ringNow(void *) {
+    clock_sec_t sec = 0;
+    clock_usec_t usec = 0;
+    clock_get_system_microtime(&sec, &usec);
+    return uint64_t(sec) * 1000000 + usec;
+}
+int ringIdle(void *) {IODelay(20); return 0;}
+int timerRead(void *, uint32_t reg, uint32_t *value) {*value = coreRead(reg); return 0;}
+
+void cpState(const char *when) {
+    printf("COACHZ gpu9: %s rbbm 0x%x int 0x%x hw fault 0x%x protect 0x%x bank0 fsr 0x%x gfsr 0x%x\n", when, coreRead(RbbmStatus), coreRead(RbbmInt0Status),
+        coreRead(CpHwFault), coreRead(CpProtectStatus), *reinterpret_cast<volatile uint32_t *>(gSmmu + 0x8000 + 0x58),
+        *reinterpret_cast<volatile uint32_t *>(gSmmu + SmmuSgfsr));
+}
+
+// Every ten seconds, what reached the driver: whether the plug-in opened it, what it reports, what the CP has run and what reached the screen.
+void reportThread(void *, wait_result_t) {
+    for (;;) {
+        IOSleep(10000);
+        native_adreno_metal_report();
+        printf("COACHZ gpu9: ring submissions %u fence %u/%u, frames offered %llu shown %llu failed %llu abandoned %llu\n", gRing.submissions(), gRing.completedFence(),
+            gRing.lastSubmitted(), static_cast<unsigned long long>(native_gop_gpu_offers), static_cast<unsigned long long>(native_gop_gpu_completions),
+            static_cast<unsigned long long>(native_gop_gpu_failures), static_cast<unsigned long long>(native_gop_gpu_abandoned));
+        cpState("now");
+    }
+}
+
+// The SQE firmware, the kit's GPU context and the CP's first packets.
+bool startCp(volatile uint8_t *smmu, size_t smmuBytes, const uint32_t *sqe, uint32_t sqeBytes) {
+    unsigned pool = 512;
+    PE_parse_boot_argn("coachz-gpu-pool", &pool, sizeof pool);
+    native_adreno_pool_mib = pool;
+    native_adreno_wc_enabled = 1;
+    *reinterpret_cast<volatile uint32_t *>(smmu + SmmuScr0) = *reinterpret_cast<volatile uint32_t *>(smmu + SmmuScr0) | SmmuKitGlobal;
+    // The groups nothing uses fault, as Linux's arm_smmu_device_reset leaves them; their reset value would translate into bank 0.
+    for (unsigned group = 0; group < SmmuGroups; ++group) {
+        if (group != SmmuGmuGroup) *reinterpret_cast<volatile uint32_t *>(smmu + SmmuS2cr + 4 * group) = SmmuS2crFault;
+    }
+    __asm__ volatile("dsb sy" ::: "memory");
+    // Bank 0 and stream 0, as Linux's Adreno SMMU; group 1 and bank 1 are the GMU's. The kit routes two streams: sc7180.dtsi names only stream 0 for
+    // the GPU, so the second is an unused stream on a free group.
+    const IOReturn context = NativeAdrenoGpuContextBringup(smmu, smmuBytes, 0, 2, 0, 0, 2, 1, nullptr, &gReport);
+    printf("COACHZ gpu9: context status 0x%x step %u program %u/%u route %u/%u verified %u output bits %u spans %u pool status %u\n", context, gReport.step,
+        gReport.program_status, gReport.program_enabled, gReport.route_status, gReport.route_phase, gReport.routes_verified, gReport.output_bits, gReport.spans,
+        native_adreno_pool_mib);
+    if (context) return false;
+    if (NativeAdrenoGpuContextBuffers(gBuffers)) {
+        printf("COACHZ gpu9: context buffers refused\n");
+        return false;
+    }
+    volatile uint8_t *cpu[GpuBufferCount] = {};
+    for (unsigned i = 0; i < GpuBufferCount; ++i) {
+        IODeviceMemory *memory = IODeviceMemory::withRange(gBuffers[i].physical, gBuffers[i].bytes);
+        gMaps[i] = memory ? memory->map(kIOMapAnywhere | kIOMapWriteCombineCache) : nullptr;
+        if (memory) memory->release();
+        if (!gMaps[i]) {
+            printf("COACHZ gpu9: buffer %u did not map\n", i);
+            return false;
+        }
+        cpu[i] = reinterpret_cast<volatile uint8_t *>(gMaps[i]->getVirtualAddress());
+    }
+    // The file without its first dword, as adreno_fw_create_bo copies it.
+    const uint32_t words = sqeBytes / 4 - 1;
+    if (words * 4 > gBuffers[0].bytes) {
+        printf("COACHZ gpu9: SQE firmware of %u bytes does not fit\n", sqeBytes);
+        return false;
+    }
+    volatile uint32_t *image = reinterpret_cast<volatile uint32_t *>(cpu[0]);
+    for (uint32_t i = 0; i < words; ++i) image[i] = sqe[i + 1];
+    __asm__ volatile("dsb sy" ::: "memory");
+    coreWrite(CpSqeInstrBase, uint32_t(gBuffers[0].iova));
+    coreWrite(CpSqeInstrBase + 1, uint32_t(gBuffers[0].iova >> 32));
+    const NativeAdrenoRingIo io{nullptr, ringWrite, ringRead, ringBarrier, nullptr, nullptr};
+    const NativeAdrenoRingCache cache{nullptr, ringPublish, ringAcquire};
+    IOReturn status = gRing.attach(&io, &cache, const_cast<uint8_t *>(cpu[1]), gBuffers[1].bytes, gBuffers[1].iova, const_cast<uint8_t *>(cpu[2]),
+        gBuffers[2].bytes, gBuffers[2].iova);
+    if (status) {
+        printf("COACHZ gpu9: ring attach 0x%x\n", status);
+        return false;
+    }
+    coreWrite(CpSqeCntl, 1);
+    // a6xx_cp_init: multiple hardware contexts, error detection, no header dump, no workarounds.
+    uint32_t init[9] = {0, 0x2fu, 3u, 0x20000000u, 0, 0, 0, 0, 0};
+    if (AdrenoPM4Type7(Pm4MeInit, 8, &init[0]) != AdrenoPM4Success) return false;
+    uint32_t fence = 0, observed = 0;
+    status = gRing.submit(init, 9, &fence);
+    const NativeAdrenoRingClock clock{nullptr, ringNow, ringIdle};
+    const NativeAdrenoRingFence waited = status ? NativeAdrenoRingFenceArgument : gRing.wait(fence, &clock, 200000, &observed);
+    printf("COACHZ gpu9: ME_INIT submit 0x%x fence %u wait %d observed %u\n", status, fence, int(waited), observed);
+    cpState("after ME_INIT");
+    if (waited != NativeAdrenoRingFenceComplete) return false;
+    coreWrite(RbbmSecvidTrustCntl, 0);   // no zap shader on this board: Linux leaves secure mode this way
+    return true;
+}
+
+// The accelerator the original _MTLRegisterDevices finds: its class derives from the original IOAcceleratorES, which exists once IOGPUFamily loaded.
+bool publishAccelerator() {
+    const kern_return_t kext = OSKextLoadKextWithIdentifier("com.apple.iokit.IOGPUFamily");
+    const OSSymbol *name = OSSymbol::withCString("IOAcceleratorES");
+    const OSMetaClass *parent = name ? OSMetaClass::getMetaClassWithName(name) : nullptr;
+    OSSafeReleaseNULL(name);
+    printf("COACHZ gpu9: IOGPUFamily load 0x%x, IOAcceleratorES %p size %u\n", kext, parent, parent ? parent->getClassSize() : 0);
+    if (!parent || parent->getClassSize() != 136 || uint64_t(VM_KERNEL_UNSLIDE(parent)) != kOriginalAcceleratorMetaclass) {
+        printf("COACHZ gpu9: the accelerator base differs from the audited one (unslid 0x%llx)\n", static_cast<unsigned long long>(VM_KERNEL_UNSLIDE(parent)));
+        return false;
+    }
+    void *handle = OSMetaClass::preModLoad(g_kernel_kmod_info.name);
+    if (!handle) return false;
+    native_adreno_accelerator_static_init();
+    const OSReturn loaded = OSMetaClass::postModLoad(handle);
+    if (loaded || native_adreno_accelerator_instance_size() != 136) {
+        printf("COACHZ gpu9: accelerator class registration 0x%x\n", loaded);
+        return false;
+    }
+    IOService *accelerator = native_adreno_accelerator_allocate();
+    if (!accelerator || !accelerator->init()) {
+        if (accelerator) accelerator->release();
+        return false;
+    }
+    // The two keys the discovery reads, no Apple GPU identity; and who may open it in place of the sandbox verdict.
+    accelerator->setProperty("MetalPluginName", "NativeAdrenoMetal");
+    accelerator->setProperty("MetalPluginClassName", "NativeAdrenoMetalDevice");
+    accelerator->setProperty("NativeSandboxGrantProcess", "backboardd,iconservicesagent,WidgetRenderer_Default,PosterBoard");
+    if (!accelerator->attach(IOService::getPlatform())) {
+        accelerator->release();
+        return false;
+    }
+    accelerator->registerService();
+    return true;
+}
+}  // namespace
+
+// Called once from coachz_gpu_start with the windows it mapped; the seq left the GMU up. Nonzero when the driver is serving.
+extern "C" int coachz_gpu_driver_start(volatile uint8_t *core, volatile uint8_t *smmu, size_t smmuBytes, const uint32_t *sqe, uint32_t sqeBytes) {
+    gCore = core;
+    gSmmu = smmu;
+    if (!core || !smmu || !sqe || !startCp(smmu, smmuBytes, sqe, sqeBytes)) {
+        printf("COACHZ gpu9: CP not started; rendering stays on the CPU\n");
+        return 0;
+    }
+    NativeAdrenoVm *vm = NativeAdrenoGpuContextVm();
+    IOReturn status = vm ? gSubmit.attach(vm, &gRing) : kIOReturnNotReady;
+    const NativeAdrenoTimeIo timer{nullptr, timerRead};
+    const IOReturn timed = gTimer.attach(&timer, NativeAdrenoTimeCp);
+    const NativeAdrenoRingClock clock{nullptr, ringNow, ringIdle};
+    if (!status) status = native_adreno_publish(vm, &gSubmit, &gRing, &clock, timed ? nullptr : &gTimer, &gDeviceInfo, 32, gReport.output_bits);
+    printf("COACHZ gpu9: published 0x%x, timer 0x%x\n", status, timed);
+    if (status) return 0;
+    const bool accelerator = publishAccelerator();
+    printf("COACHZ gpu9: accelerator %d\n", accelerator);
+    thread_t thread = THREAD_NULL;
+    if (kernel_thread_start(reportThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
+    return accelerator;
+}

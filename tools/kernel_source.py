@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / 'tools'))
 import usb_stack
 
 COMPONENTS = ('drivers/AppleKeyStoreState', 'drivers/ArmCpu', 'drivers/ArmDTPlatform', 'drivers/RamBlock', 'drivers/SoftwareAES', 'kits/XnuPrelink')
+GPU_COMPONENTS = ('drivers/Adreno740', 'drivers/AdrenoMetal', 'kits/AdrenoPM4', 'kits/ArmSmmu4K')
 REFERENCES = {'xnu', 'libplatform', 'libdispatch', 'AvailabilityVersions', 'libpthread',
               'corecrypto-2023', 'IOStorageFamily'}
 
@@ -85,6 +86,8 @@ def main():
     display_options = []
     if (ROOT / 'platform' / a.platform / 'scripts/build-coachz-display.py').is_file():
         selected.append('drivers/GopFramebuffer')
+    if (ROOT / 'platform' / a.platform / 'scripts/build-coachz-gpu.py').is_file():
+        selected += GPU_COMPONENTS
     subprocess.run(['git', '-C', str(base), 'submodule', 'update', '--init', '--depth=1',
                     *selected], check=True)
     if 'drivers/GopFramebuffer' in selected:
@@ -135,6 +138,20 @@ def main():
               if m.origin == 'git' and (m.kind != 'refer' or m.name in REFERENCES)}
     feeds.fetch(ctx, modules, only=wanted)
     tree.assemble(ctx, modules)
+    if (ROOT / 'platform' / a.platform / 'scripts/build-coachz-gpu.py').is_file():
+        # The A740 framework with its A618 patch, and the kits: only the board's own recipe uses them, so they stay out of the component list,
+        # whose Adreno740 entry would also pull in the SM8550 GMU code.
+        gpu = out / 'reference/Adreno740-a618'
+        shutil.rmtree(gpu, ignore_errors=True)
+        shutil.copytree(base / 'drivers/Adreno740', gpu, ignore=shutil.ignore_patterns('.git'))
+        subprocess.run(['patch', '--batch', '--silent', '-p1', '-d', str(gpu), '-i', str(ROOT / 'platform' / a.platform / 'patches/gpu/Adreno740.patch')], check=True)
+        # NativeAdrenoAccelerator.cpp includes ../NativeMetal/, the driver's older directory name.
+        links = {gpu.parent / 'NativeMetal': base / 'drivers/AdrenoMetal', ctx.tree / 'drivers/Adreno740': gpu, ctx.tree / 'kits/AdrenoPM4': base / 'kits/AdrenoPM4',
+                 ctx.tree / 'kits/ArmSmmu4K': base / 'kits/ArmSmmu4K'}
+        for link, target in links.items():
+            link.unlink(missing_ok=True)
+            link.symlink_to(target.resolve())
+        os.environ['COACHZ_UNIXNU'] = str(base.resolve())
     sources = {}
     for (kind, name), module in modules.items():
         if module.path is not None and kind in ('refer', 'driver', 'kit'):
@@ -168,6 +185,8 @@ def main():
                 os.environ['XNU_EXTRA_LD_ARCHIVES'] += ' -Wl,-force_load,' + str(ctx.tree / 'build/coachz-backlight/libCoachzBacklight.a')
             if (ROOT / 'platform' / a.platform / 'scripts/build-coachz-audio.py').is_file():
                 os.environ['XNU_EXTRA_LD_ARCHIVES'] += ' -Wl,-force_load,' + str(ctx.tree / 'build/coachz-audio/libCoachzAudio.a')
+            if (ROOT / 'platform' / a.platform / 'scripts/build-coachz-gpu.py').is_file():
+                os.environ['XNU_EXTRA_LD_ARCHIVES'] += ' -Wl,-force_load,' + str(ctx.tree / 'build/coachz-gpu/libCoachzGpu.a')
         kernel.build(ctx, modules)
         candidate = ctx.tree / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf'
         if not candidate.is_file():

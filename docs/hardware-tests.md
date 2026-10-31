@@ -1338,3 +1338,24 @@ k68（改成两次 32 位写之后）：
 - 收尾：GBIF 三次停止都是第 1 次轮询确认，软复位后关机，`mode 8 stage 7 restored 1: ok`，GX GDSCR 回到 `0x00222001`。系统照常运行到日志结束（122 秒），没有 `@crash` 和 panic。
 
 这证明 CP 能跑 SQE 固件，能经 SMMU 读命令并写内存。没有运行任何着色器，也没有画任何东西。跑完全部关掉，GPU 不留给系统使用，所以渲染仍然在 CPU 上。
+
+## GPU 合成上屏（k69～k72）
+
+四块（常驻驱动、Turnip、Metal、合成器）合并成一张镜像测试，说明在 `docs/plans/gpu.md`。
+
+- k69：SMMU 工具包在路由 stream 时拒绝（全局配置不符），CP 没启动。同时预留 768 MiB，而 XNU 当时只配了 1 GiB，jetsam（namespace 1 code 4）杀光了进程，所以没进界面。插件 9 个文件写入，挂载成功。
+- k70：内存窗口 4 GiB，约 3.95 GiB 可用页，进桌面，没有 jetsam。SMMU 工具包还要求空闲 stream 组先 fault。CPU 继续合成。
+- k71：内存窗口 6 GiB，约 5.83 GiB 可用页。SMMU、ME_INIT、发布服务、`AGXAccelerator` 全部通过，基类地址和审计记录一致。合成器发现 Metal 后选了 `b3a8` 表面，显示驱动拒绝，帧计数为 0。
+- k72：ADT 改成 sRGB。**机主看到了界面，日志确认由 GPU 合成：** 开机约 112 秒内 ring 提交 400 次，fence 400/400；199 帧交给 GPU，198 帧完成，失败 0、放弃 0；CPU 拷贝帧数 0。RBBM、CP、protect 都是 0，bank 0 fsr 只有 FORMAT 字段，gfsr 0。没有 `@crash` 和 panic。
+
+k72 的性能数据（插件自己的统计，355 MHz）：
+- 提交到完成 374 次，平均 40 ms，最长 101 ms。
+- 有内容的帧约 9 Mpix，是屏幕的 3 倍。
+- 首次运行编译 83 条管线，共 5.2 秒，最长一条 397 ms。缓存 hit 30、miss 112。
+- 温度峰值 45 °C（TSENS），时长只有约两分钟。
+
+已知问题和没验证的：
+- 屏幕控制台的文字盖在界面上（跑码）。它靠第一帧 CPU 拷贝来静音，GPU 路径没有这一帧。
+- 机主反馈帧率不高。没有给内存发带宽投票，也没有动态调频。
+- 还没有确认 App 自己能用 Metal。放行的进程只有 backboardd、iconservicesagent、WidgetRenderer_Default 和 PosterBoard。
+- GPU 没有电源管理（GPU_SET 一直保持）、没有中断、没有复位和每进程页表。长时间稳定性没有验证。

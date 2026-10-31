@@ -10,12 +10,13 @@
  bsd/dev/unix_startup.c			standard
 --- a/bsd/dev/coachz_gpu.c
 +++ b/bsd/dev/coachz_gpu.c
-@@ -0,0 +1,208 @@
+@@ -0,0 +1,221 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/*
 + * Adreno 618 first stages on Coachz (coachz-gpu=1 inventory, =2 bounded CX + GMU clock window, =3 also the GMU firmware into
 + * TCM, =4 the window plus a read-only GPU SMMU inventory, =5 the GMU's SMMU bank checked by translation, =6 also the firmware started
-+ * up to its init result, =7 also GX, SPTPRAC, HFI and GPU_SET, =8 also the GPU core and CP running three visible commands): maps GCC, GPUCC, the GMU register block and the GPU SMMU, runs
++ * up to its init result, =7 also GX, SPTPRAC, HFI and GPU_SET, =8 also the GPU core and CP running three visible commands,
++ * =9 the same start left running for the driver in package/CoachzGpu.cpp): maps GCC, GPUCC, the GMU register block and the GPU SMMU, runs
 + * coachz_gpu_run() (coachz_gpu_seq.h) once from the sampler thread and prints what it found and restored. The firmware is /chosen/memory-map CoachzGmuFirmware, placed by tools/xnu_screen.py
 + * --gmu-firmware in the loader's kernel data after the trust cache.
 + */
@@ -29,7 +30,10 @@
 +#include "coachz_gpu_seq.h"
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern int coachz_gpu_driver_start(volatile uint8_t *core, volatile uint8_t *smmu, size_t smmu_bytes, const uint32_t *sqe, uint32_t sqe_bytes);
 +void coachz_gpu_start(void);
++/* coachz-gpu=9: set once the driver has served or given up; launchd waits for it (coachz-prelink-gpu-addon.patch). */
++volatile int coachz_gpu_ready;
 +
 +static uintptr_t gpu_window[GPU_BLOCKS];
 +
@@ -83,7 +87,9 @@
 +		    r->core_registers_done, r->sqe_version, r->core_wptr, r->core_init_polls, r->core_idle_polls, r->core_state[0], r->core_state[1], r->core_state[2],
 +		    r->core_state[3], r->core_state[4], r->core_state[5], r->core_state[6]);
 +	}
-+	delay(1500000);
++	if (r->mode != 9) {   /* launchd waits for mode 9, and a panic reaches the log ring by itself */
++		delay(1500000);
++	}
 +}
 +
 +/* An image tools/xnu_screen.py placed, as (physical base, size); NULL without one. */
@@ -123,7 +129,7 @@
 +{
 +	static int started;
 +	unsigned mode = 0;
-+	if (started || !PE_parse_boot_argn("coachz-gpu", &mode, sizeof(mode)) || (mode < 1 || mode > 8)) {
++	if (started || !PE_parse_boot_argn("coachz-gpu", &mode, sizeof(mode)) || (mode < 1 || mode > 9)) {
 +		return;
 +	}
 +	started = 1;
@@ -144,7 +150,7 @@
 +	}
 +	volatile uint64_t *pool = mode >= 5 ? (volatile uint64_t *)ml_io_map(GMU_POOL_PA, GMU_POOL_BYTES) : NULL;
 +	uint32_t sqe_bytes = 0;
-+	const uint32_t *sqe = mode == 8 ? gpu_firmware("CoachzSqeFirmware", 4u + GPU_SQE_MAX, &sqe_bytes) : NULL;
++	const uint32_t *sqe = mode >= 8 ? gpu_firmware("CoachzSqeFirmware", 4u + GPU_SQE_MAX, &sqe_bytes) : NULL;
 +	const struct coachz_gpu_io io = {NULL, gpu_read, gpu_write, gpu_delay, gpu_read64, gpu_write64, pool, gpu_note, sqe, sqe_bytes};
 +	static struct coachz_gpu_report r;
 +	uint32_t image_bytes = 0;
@@ -198,7 +204,7 @@
 +		gpu_print("gx state", r.gx_state, 8);
 +		printf("COACHZ gpu: shutdown sptprac off polls %u, tcs idle %u of 4, gx at the end 0x%x\n", r.sptprac_off_polls, r.tcs_idle, r.gx_end);
 +	}
-+	if (mode == 8 && r.own_core_map) {
++	if (mode >= 8 && r.own_core_map) {
 +		printf("COACHZ gpu: dcvs polls %u return %u; sqe version 0x%x; registers done %u; me init polls %u, idle polls %u\n", r.dcvs_polls, r.dcvs_return,
 +		    r.sqe_version, r.core_registers_done, r.core_init_polls, r.core_idle_polls);
 +		printf("COACHZ gpu: cp results: ring write polls %u, indirect buffer write polls %u, fence polls %u, read pointer shadow %u of %u\n", r.core_ring_polls,
@@ -218,10 +224,17 @@
 +		gpu_print("gcc after", r.gcc_after, GPU_GCC_REGS);
 +		gpu_print("gpucc after", r.cc_after, GPU_CC_REGS);
 +	}
++	if (mode == 9) {
++		printf("COACHZ gpu: dcvs polls %u return %u, registers done %u, left up %u\n", r.dcvs_polls, r.dcvs_return, r.core_registers_done, r.stage == 8);
++		if (r.stage == 8) {
++			coachz_gpu_driver_start((volatile uint8_t *)gpu_window[GPU_CORE], (volatile uint8_t *)gpu_window[GPU_SMMU], GPU_SMMU_SIZE, sqe, sqe_bytes);
++		}
++		coachz_gpu_ready = 1;
++	}
 +}
 --- a/bsd/dev/coachz_gpu_seq.h
 +++ b/bsd/dev/coachz_gpu_seq.h
-@@ -0,0 +1,412 @@
+@@ -0,0 +1,416 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/*
 + * Adreno 618 (SC7180) first bring-up stages: the GPU clock/power inventory, a bounded CX + GMU clock window with full rollback, and
@@ -514,11 +527,11 @@
 +    struct coachz_gpu_report *r) {
 +	*r = (struct coachz_gpu_report){0};
 +	r->mode = mode;
-+	if (mode == 8 && (!io->sqe || io->sqe_bytes < 16u || io->sqe_bytes % 4u || io->sqe_bytes - 4u > 0x10000u)) {
++	if (mode >= 8 && (!io->sqe || io->sqe_bytes < 16u || io->sqe_bytes % 4u || io->sqe_bytes - 4u > 0x10000u)) {
 +		r->error = "no usable SQE firmware: nothing read or changed";
 +		return;
 +	}
-+	if ((mode == 3 || mode == 6 || mode == 7 || mode == 8) && (!image || image_bytes < 4 || image_bytes > GMU_TCM_BYTES || image_bytes % 4)) {
++	if ((mode == 3 || mode >= 6) && (!image || image_bytes < 4 || image_bytes > GMU_TCM_BYTES || image_bytes % 4)) {
 +		r->error = "no usable GMU firmware: nothing read or changed";
 +		return;
 +	}
@@ -527,7 +540,7 @@
 +	/* GPUCC sits behind the GPU AHB branch: with it stopped, any GPUCC access stalls the bus. */
 +	gpu_snapshot(io, r->gcc_before, r->cc_before, ahb_running);
 +	r->stage = 1;
-+	if (mode < 2 || mode > 8) {
++	if (mode < 2 || mode > 9) {
 +		if (!ahb_running) r->error = "GPU AHB branch off: GPUCC not read";
 +		return;
 +	}
@@ -629,6 +642,10 @@
 +			r->error = "CM3 not held in reset: firmware not written";
 +		}
 +	}
++	if (mode == 9 && !r->error && r->core_registers_done) {
++		r->stage = 8;   /* left up for the driver: nothing rolled back */
++		return;
++	}
 +	r->stage = 6;
 +	gpu_rollback(io, r);
 +	r->stage = r->restored && !r->error ? 7 : 6;
@@ -636,7 +653,7 @@
 +#endif
 --- a/bsd/dev/coachz_gpu_gmu.h
 +++ b/bsd/dev/coachz_gpu_gmu.h
-@@ -0,0 +1,719 @@
+@@ -0,0 +1,725 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/*
 + * Adreno 618 GMU memory and firmware start (coachz-gpu=5 and 6), inside the CX + GMU clock window of coachz_gpu_seq.h.
@@ -648,7 +665,8 @@
 + * the PDC's sequence and TCS commands: Linux leaves those programmed too, and nothing starts them while the GPU is off.
 + * Mode 7, only after that init result: the firmware powers GX (the boot OOB with the rail votes from CMD DB), SPTPRAC, the legacy HFI
 + * start with Linux's message order, and the GPU_SET OOB, then Linux's forced shutdown. The GPU core itself is still not touched.
-+ * Mode 8 adds the GPU core and the CP inside that GPU_SET: coachz_gpu_core.h.
++ * Mode 8 adds the GPU core and the CP inside that GPU_SET: coachz_gpu_core.h. Mode 9 stops after hw_init with everything still up, GPU_SET
++ * included, and the driver in package/CoachzGpu.cpp takes over; only a failure before that point rolls back.
 + *
 + * Values and order follow Linux a6xx_gmu.c, a6xx_gmu.xml, a6xx.xml, arm-smmu.c and io-pgtable-arm.c (reference only, rewritten here).
 + * The SMMU's table walk is not coherent; the pool is mapped uncached, so what is written is what it reads.
@@ -1247,6 +1265,11 @@
 +		r->cgc_before[0] = gpu_r(io, GPU_GMU, GMU_CGC_MODE_CNTL);
 +		r->cgc_before[1] = gpu_r(io, GPU_GMU, GMU_CGC_DELAY_CNTL);
 +		r->cgc_before[2] = gpu_r(io, GPU_GMU, GMU_CGC_HYST_CNTL);
++		if (r->mode == 9) {
++			r->own_core = 1;
++			core_registers(io, r);
++			return;
++		}
 +		core_run(io, r);
 +		return;
 +	}
@@ -1358,13 +1381,14 @@
 +#endif
 --- a/bsd/dev/coachz_gpu_core.h
 +++ b/bsd/dev/coachz_gpu_core.h
-@@ -0,0 +1,429 @@
+@@ -0,0 +1,431 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/*
 + * Adreno 618 core and CP (coachz-gpu=8), inside the GPU_SET OOB of coachz_gpu_gmu.h: the lowest GPU frequency, a stage-1 bank for the
 + * GPU's stream 0, a6xx hw_init's registers for a618, SQE started, ME_INIT, then three commands the host can see the result of: a memory
 + * write from the ring, one from an indirect buffer, and a CACHE_FLUSH_TS fence. Nothing here renders. The SQE firmware (linux-firmware
 + * qcom/a630_sqe.fw) goes in from an ignored path, as the GMU's does. Everything stops again before GX is shut down.
++ * coachz-gpu=9 runs only the frequency and hw_init parts here and leaves everything up: package/CoachzGpu.cpp takes over.
 + *
 + * Values and order follow Linux a6xx_gpu.c, a6xx_catalog.c and a6xx.xml (reference only, rewritten here). The tables were converted by
 + * script from a615_hwcg and a630_protect_regs, the ones a618 uses. No interrupt is wired: the host polls.
@@ -1452,6 +1476,7 @@
 +#define GMU_CGC_HYST_CNTL 0x24c2cu
 +#define GMU_CX_BUSY_MASK 0x24c38u
 +#define CORE_PERF_LOWEST 1u                             /* 180 MHz: index 0 is the "off" level */
++#define CORE_PERF_RUN 3u                                /* 355 MHz for the driver, no thermal control yet */
 +
 +/* PM4 (adreno_pm4.xml) */
 +#define PM4_NOP 0x10u
@@ -1632,7 +1657,7 @@
 +/* The lowest frequency, before GPU_SET as a6xx_gmu_resume does: 1 on an acknowledged request. */
 +static inline int core_set_frequency(const struct coachz_gpu_io *io, struct coachz_gpu_report *r) {
 +	gpu_w(io, GPU_GMU, GMU_DCVS_ACK_OPTION, 0);
-+	gpu_w(io, GPU_GMU, GMU_DCVS_PERF_SETTING, 3u << 28 | CORE_PERF_LOWEST);
++	gpu_w(io, GPU_GMU, GMU_DCVS_PERF_SETTING, 3u << 28 | (r->mode >= 9 ? CORE_PERF_RUN : CORE_PERF_LOWEST));
 +	gpu_w(io, GPU_GMU, GMU_DCVS_BW_SETTING, 0xffu);
 +	gpu_w(io, GPU_GMU, GMU_HOST2GMU_INTR_SET, 1u << GMU_OOB_DCVS_SET);
 +	r->dcvs_polls = gmu_poll_long(io, GMU_GMU2HOST_INTR_INFO, 1u << GMU_OOB_DCVS_ACK, 1u << GMU_OOB_DCVS_ACK);

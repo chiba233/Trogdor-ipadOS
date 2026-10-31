@@ -120,6 +120,31 @@ class PatchTests(unittest.TestCase):
             self.assertEqual(int(count), body.count('\n'), name)
 
 
+class DriverTests(unittest.TestCase):
+    def test_the_a740_framework_is_patched_for_a618(self):
+        patch = (ROOT / 'platform/coachz-prelink/patches/gpu/Adreno740.patch').read_text()
+        # Kernel objects above the 1 MiB GMEM window; the a6xx_submit() fence, no threads, and no hardware read-pointer shadow.
+        for fact in ['+    GpuSqeIova=0x1000000', '+    RingFenceEvent = 0x04', '+    RingNoUpdate = 1u << 27', '+    RingFramedFenceWords = 7']:
+            self.assertIn(fact, patch)
+
+    def test_the_driver_only_starts_after_hw_init(self):
+        seq = new_file(PATCH, 'bsd/dev/coachz_gpu_seq.h')
+        self.assertIn('if (mode == 9 && !r->error && r->core_registers_done) {', seq)
+        glue = new_file(PATCH, 'bsd/dev/coachz_gpu.c')
+        self.assertLess(glue.index('if (r.stage == 8) {'), glue.index('coachz_gpu_ready = 1;'))
+        board = (ROOT / 'platform/coachz-prelink/package/CoachzGpu.cpp').read_text()
+        self.assertIn('0x06010800u, 0x80000u, 0x100000ull', board)   # a618's chip, GMEM size and base
+        self.assertIn('native_adreno_publish(vm,', board)
+        self.assertLess(board.index('coreWrite(CpSqeCntl, 1);'), board.index('coreWrite(RbbmSecvidTrustCntl, 0);'))
+
+    def test_launchd_waits_and_the_plug_in_is_shown(self):
+        patch = (ROOT / 'platform/coachz-prelink/patches/xnu/coachz-prelink-gpu-addon.patch').read_text()
+        self.assertIn('+coachz_gpu_prepare(proc_t p, user_addr_t scratch)', patch)
+        self.assertIn('native_gpu_addon_install(p, scratch);', patch)
+        self.assertIn('NativeAdrenoMetal.bundle/Info.plist', patch)
+        self.assertIn('coachz-prelink-gpu-addon.patch', (ROOT / 'platform/coachz-prelink/patches/xnu/series').read_text())
+
+
 class CoreTests(unittest.TestCase):
     def test_register_facts(self):
         source = new_file(PATCH, 'bsd/dev/coachz_gpu_core.h')
@@ -185,6 +210,8 @@ class LoaderTests(unittest.TestCase):
                 screen.pack(b'', b'', 0, 0, prelinked=True, gpu=6)   # and so does stage 6
             with self.assertRaises(ValueError):
                 screen.pack(b'', b'', 0, 0, prelinked=True, gpu=8, gmu_firmware=bytes(16))   # stage 8 also needs the SQE firmware
+            with self.assertRaises(ValueError):
+                screen.pack(b'', b'', 0, 0, prelinked=True, gpu=9, gmu_firmware=bytes(16), sqe_firmware=bytes(16))   # the driver also needs the plug-in
             root2 = screen.Node()
             root2.set('name', b'device-tree\0')
             root2.child('chosen').child('memory-map')

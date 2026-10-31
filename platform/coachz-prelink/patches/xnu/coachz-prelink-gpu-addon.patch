@@ -1,0 +1,60 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7222,6 +7222,8 @@
+ uint8_t native_owner_data_seed_sha256[32];
+ char native_owner_data_device_path[64];
+ 
++#endif /* XNU_OWNER_DATA_MOUNT: the addon helpers below also serve coachz_gpu_prepare, on this board's own Data route. */
++
+ /* Boot-time read-only union views of owner-provided GPU addon content over sealed system directories, mounted after the Data mount and
+  * before launchd starts: the Adreno Metal plugin bundle over /System/Library/Extensions (the original Metal discovery loads
+  * /System/Library/Extensions/<MetalPluginName>.bundle) and an owner launchd job over /System/Library/LaunchDaemons (a process outside
+@@ -7518,6 +7520,7 @@
+  * boot log: 1 mount points made, 2 preboot shown, 3 System bound, 4 usr bound, 5 an extension of WebKit visible through the path. */
+ volatile int native_cryptex_os_stage = 0;
+ volatile int native_cryptex_os_status = -1;
++#if defined(XNU_OWNER_DATA_MOUNT) && XNU_OWNER_DATA_MOUNT
+ static int
+ native_cryptex_os_bind(proc_t p, user_addr_t scratch, const char *source, const char *point, int flags)
+ {
+@@ -8706,6 +8709,32 @@
+ 	return error ? error : close_error;
+ }
+ 
++/*
++ * coachz-gpu=9: the driver is coming up on the sampler thread (bsd/dev/coachz_gpu.c), and the render server looks for the Metal device only once, so
++ * launchd waits for it, at most 20 s. Then the Metal plug-in and Turnip go on the Data volume from the loader's addon and appear in the system's
++ * extensions directory through a read-only union, as with sheng-gpu-addon=1 but without that route's other preparations. A driver that gave up leaves
++ * no accelerator, so the plug-in is simply never loaded.
++ */
++extern volatile int coachz_gpu_ready;
++static void
++coachz_gpu_prepare(proc_t p, user_addr_t scratch)
++{
++	unsigned mode = 0;
++	if (!PE_parse_boot_argn("coachz-gpu", &mode, sizeof(mode)) || mode != 9) {
++		return;
++	}
++	for (unsigned i = 0; i < 400 && !coachz_gpu_ready; i++) {
++		delay(50000);
++	}
++	printf("COACHZ gpu: driver ready %d when launchd starts\n", coachz_gpu_ready);
++	native_gpu_addon_install(p, scratch);
++	static const char source[] = "/private/var/ngpu/addons", point[] = "/System/Library/Extensions";
++	native_gpu_addon_mount(p, scratch, 0x400, source, sizeof(source), point, sizeof(point), "/System/Library/Extensions/AGXMetalA10.bundle",
++	    "/System/Library/Extensions/NativeAdrenoMetal.bundle/Info.plist", &native_gpu_addon_stage, &native_gpu_addon_status);
++	printf("COACHZ gpu: plug-in files %d written %d same %d failed %d error %d, mount stage %d status %d\n", native_gpu_addon_files, native_gpu_addon_written,
++	    native_gpu_addon_same, native_gpu_addon_failed, native_gpu_addon_error, native_gpu_addon_stage, native_gpu_addon_status);
++}
++
+ static void
+ coachz_audio_prepare(proc_t p, user_addr_t scratch)
+ {
+@@ -8921,6 +8950,7 @@
+ 		coachz_mobilegestalt_cache_reset();
+ 		coachz_setup_prepare();
+ 		coachz_audio_prepare(p, scratch);
++		coachz_gpu_prepare(p, scratch);
+ 	}
+ }
+ 

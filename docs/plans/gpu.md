@@ -15,7 +15,7 @@
 | 4a | RSCC/PDC 序列（0x0b290000 / 0x0b490000）、释放 CM3、等 `FW_INIT_RESULT` 签名，再把 CM3 放回复位 | 真机通过（mode 6），签名 `0xbabeface` |
 | 4b | GX OOB、SPTPRAC，之后用 legacy HFI 启动（sweet 的两队列传输） | 真机通过（mode 7），固件版本 `0x10060000`，5 条消息全部成功 |
 | 5 | 最低频率、stream 0 的 bank、`hw_init`、SQE 固件、ME_INIT，再让 CP 写内存（ring 和 IB 各一次）和 fence | 真机通过（mode 8）。跑完全部关掉，还不是常驻驱动 |
-| 6 | Turnip Darwin KMD、Metal 发布、接系统合成器 | 待写 |
+| 6 | 常驻驱动（mode 9）、Turnip Darwin 后端、Metal 发布、GPU 合成上屏 | 真机通过，界面由 GPU 合成，帧率还低 |
 
 ## 第一阶段做了什么
 
@@ -113,6 +113,24 @@ GPU 核心寄存器不能用 64 位写。很多寄存器不是 8 字节对齐，
 
 每个可能卡住机器的步骤之前都打印一行 `step N next` 并等 1.5 秒，让日志环落盘。
 
+## 第 6 阶段（mode 9）：常驻驱动和 GPU 合成
+
+机主决定把常驻内核驱动、Turnip、Metal 和合成器合并成一张镜像一起测。`coachz-gpu=9` 走完 mode 8 的 `hw_init` 就不再回滚，GPU_SET 一直保持，没有电源折叠，也没有中断（等待方轮询）。
+
+内核这边：
+- `platform/coachz-prelink/package/CoachzGpu.cpp` 是板级代码。Adreno740 的框架（内存、地址空间、提交、IOUserClient）沿用，补丁在 `patches/gpu/Adreno740.patch`：内核对象移到 16 MiB 以上（A618 的 GMEM 在 1 MiB），ring 改成 `a6xx_submit` 的帧，关掉硬件读指针影子。
+- SMMU 用 UniXNU 的 ArmSmmu4K。它要求全局配置先开 GFIE 和 USFCFG，空闲的 stream 组先设成 fault，所以这两步放在它之前。bank 0 给 GPU，bank 1 给 GMU。
+- `AGXAccelerator` 派生自原版 `IOAcceleratorES`，基类地址按审计记录绑定，运行时再核对一次。
+- launchd 最多等驱动 20 秒，然后写插件并挂载（`coachz-prelink-gpu-addon.patch`）。
+- 显示经 `sheng-fb-gpu=1` 交接。GPU 客户端没连上时，继续用 CPU 拷贝，所以驱动失败也不会没有画面。
+- ADT 的 `artwork-display-gamut` 必须是 sRGB。P3 时合成器选 `b3a8` 表面，显示驱动不接受。
+
+上层：Turnip 和 Metal 插件按 UniXNU 的脚本编译（`build-turnip-darwin.py`、`build-adreno-metal-plugin.py`），`tools/xnu_gpu_userland.py` 打成 addon 和信任缓存。打包参数是 `--gpu 9 --gmu-firmware ... --sqe-firmware ... --gpu-addon ... --root-trust-cache ...`。工具需要 glslang、ninja、shaderc、llvm、vulkan-headers、Rust 的 `aarch64-apple-ios` 目标，以及 `.cache` 下的 meson、mako、bison 3.8.2，版本钉在 UniXNU 的 `scripts/data` 里。插件的头文件还用旧目录名，要在 `drivers/` 下把 `NativeMetal`、`NativeMobileDisplay` 链接到 `AdrenoMetal`、`GopFramebuffer`。主机仿真链接时缺 `proc_selfpid`，要临时补桩；改完要还原，否则 `kernel_source.py` 的干净检查不通过。
+
+内存：XNU 只接受一段连续内存。这台 4 GiB 地址以上有连续 6 GiB，所以 `--memory 0x180000000`。默认的 1 GiB 放不下 BO 池，768 MiB 的预留曾让 jetsam 杀光进程。池现在 512 MiB（`coachz-gpu-pool`），从内核内存里要。
+
+每 10 秒的 `COACHZ gpu9:` 行报告插件连接、ring 提交和帧数。
+
 ## 主机验证
 
 - `python3 -m unittest tests.test_gpu`：5 项通过。
@@ -174,6 +192,6 @@ GPU 核心寄存器不能用 64 位写。很多寄存器不是 8 字节对齐，
 
 ## 还没做的
 
-见上表第 6 阶段。机主决定把常驻内核驱动、Turnip、Metal 和合成器合并成一张镜像一起测。另外：
+表里的阶段都走通了，接下来是性能。另外：
 - GPU 中断（SPI 300/304/305）还没接。
 - 带宽投票（interconnect / BCM）还没有 RPMh 客户端。GX 的 ARC 投票不需要：表从 CMD DB 读，由 GMU 固件代投。

@@ -96,3 +96,6 @@ coachz-prelink-switches.patch
 
 # The audio server plug-in on the Data volume, shown beside the system's through a bindfs union (coachz-speaker=2).
 coachz-prelink-audio.patch
+
+# coachz-gpu=9: launchd waits for the driver, and the Metal plug-in is installed and shown in the extensions directory.
+coachz-prelink-gpu-addon.patch

@@ -597,6 +597,22 @@ int main(void) {
 	gmu_live = 1;
 	gx_allowed = 1;
 	core_live = 1;
+	coachz_gpu_run(&io, 9, image, sizeof(image), &r);
+	CHECK("mode 9 stays up for the driver", r.stage == 8 && !r.error && faults == 0 && r.core_registers_done && !r.restored && sysreset == 0 && cx_on() && !(smmu[SMMU_SCR0 / 4] & SMMU_SCR0_CLIENTPD) &&
+	    gpu_set_seen && !core_cp_on && dcvs_value == (3u << 28 | CORE_PERF_RUN) && r.fw_init == 0xbabefaceu && r.hfi_done == 5 && !cp_op_count);
+
+	reset();
+	gmu_live = 1;
+	gx_allowed = 1;
+	core_live = 1;
+	refuse_message = HFI_MSG_BW_TABLE;
+	coachz_gpu_run(&io, 9, image, sizeof(image), &r);
+	CHECK("a failed mode 9 rolls back instead", r.error && r.stage == 6 && r.restored && faults == 0 && sysreset == 1 && !cx_on() && smmu[SMMU_SCR0 / 4] == 1);
+
+	reset();
+	gmu_live = 1;
+	gx_allowed = 1;
+	core_live = 1;
 	cp_silent = 1;
 	coachz_gpu_run(&io, 8, image, sizeof(image), &r);
 	CHECK("a write that never lands stops and shuts down", r.error && r.stage == 6 && r.restored && faults == 0 && !r.core_ring_polls && r.core_init_polls && !core_cp_on && sw_resets == 1 && sysreset == 1 && !cx_on());
