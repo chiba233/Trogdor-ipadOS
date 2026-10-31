@@ -270,7 +270,7 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         # The panel backlight behind the system's brightness control, and the Zed keyboard (docs/plans/backlight.md, input.md).
         command_line += ' coachz-backlight=1 coachz-usb-keyboard=1'
         # Read-only probes: SoC temperatures and the SMEM inventory, with their nodes from prelink_tree (docs/plans/thermal.md, wifi.md).
-        command_line += ' coachz-thermal=1 coachz-wifi=1 coachz-motion=1'
+        command_line += ' coachz-thermal=1 coachz-wifi=1 coachz-motion=1 coachz-switches=1'
     if gpu:
         # Adreno 618 bring-up stages (docs/plans/gpu.md): 1 inventory, 2 CX + GMU clock window, 3 also the GMU firmware into TCM,
         # 4 the window with a read-only GPU SMMU inventory.

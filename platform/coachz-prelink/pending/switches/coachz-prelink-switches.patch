@@ -1,0 +1,265 @@
+--- a/iokit/conf/files
++++ b/iokit/conf/files
+@@ -55,2 +55,3 @@
+ iokit/Kernel/CoachzBattery.cpp			optional iokitcpp
++iokit/Kernel/CoachzSwitches.cpp			optional iokitcpp
+ iokit/Kernel/CoachzSpeaker.cpp			optional iokitcpp
+--- a/bsd/dev/coachz_sample.c
++++ b/bsd/dev/coachz_sample.c
+@@ -51,2 +51,4 @@
+ 	coachz_input_start();
++	extern void coachz_switches_start(void);
++	coachz_switches_start(); /* optional EC lid/tablet/base state (coachz-switches=1) */
+ 	/* The Chrome EC battery service (iokit/Kernel/CoachzBattery.cpp, coachz-battery=1): IOKit is up by the time this thread runs. */
+--- /dev/null
++++ b/iokit/Kernel/CoachzSwitches.cpp
+@@ -0,0 +1,133 @@
++// SPDX-License-Identifier: BSD-2-Clause
++// Lid/tablet/base state provider. No power-policy or keyboard-injection side effects.
++#include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOWorkLoop.h>
++#include <IOKit/IOTimerEventSource.h>
++#include <IOKit/IOMessage.h>
++#include <libkern/c++/OSBoolean.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSString.h>
++#include <pexpert/pexpert.h>
++#include <kern/clock.h>
++#include "coachz_switches.h"
++
++extern "C" {
++int coachz_ec_command(uint16_t, uint8_t, const void *, uint32_t, void *, uint32_t, uint32_t *);
++void coachz_switches_start(void);
++}
++
++namespace {
++int command(void *, uint16_t cmd, uint8_t version, const void *args, uint32_t size,
++    void *reply, uint32_t room, uint32_t *length) {
++    return coachz_ec_command(cmd, version, args, size, reply, room, length);
++}
++const cs_bus bus = {nullptr, command};
++bool number(OSDictionary *dictionary, const char *key, uint64_t value) {
++    OSNumber *n = OSNumber::withNumber(value, 64);
++    bool ok = n && dictionary->setObject(key, n);
++    OSSafeReleaseNULL(n);
++    return ok;
++}
++}
++
++class CoachzSwitches : public IOService {
++    OSDeclareDefaultStructors(CoachzSwitches)
++    IOWorkLoop *loop = nullptr;
++    IOTimerEventSource *timer = nullptr;
++    cs_tracker tracker = {};
++    uint64_t sequence = 0;
++    bool stopping = false;
++
++    bool refresh() {
++        cs_sample sample;
++        cs_collect(&bus, &sample);
++        enum cs_notice notice = cs_track(&tracker, &sample);
++        ++sequence;
++        uint64_t ns = 0;
++        absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++        OSDictionary *state = OSDictionary::withCapacity(15);
++        if (!state) return sample.status == CS_READY;
++        OSString *status = OSString::withCString(cs_status_name(sample.status));
++        bool ok = status && state->setObject("Status", status) &&
++            number(state, "Error", (uint64_t)(int64_t)sample.error) &&
++            number(state, "HostSequence", sequence) && number(state, "HostCompletionNS", ns) &&
++            number(state, "CommandVersions", sample.versions) && number(state, "SupportedMask", sample.supported) &&
++            number(state, "TransitionCount", tracker.transitions) &&
++            state->setObject("Baseline", sample.baseline ? kOSBooleanTrue : kOSBooleanFalse);
++        OSSafeReleaseNULL(status);
++        if (sample.status == CS_READY) {
++            ok = ok && number(state, "RawState", sample.raw) && number(state, "KnownState", sample.known) &&
++                number(state, "ChangedMask", sample.changed);
++            const struct { const char *key; uint32_t bit; } fields[] = {
++                {"LidOpen", CS_LID_OPEN}, {"TabletMode", CS_TABLET_MODE},
++                {"BaseAttached", CS_BASE_ATTACHED}, {"FrontProximity", CS_FRONT_PROXIMITY}};
++            for (const auto &field : fields) if (sample.supported & field.bit)
++                ok = ok && state->setObject(field.key, sample.known & field.bit ? kOSBooleanTrue : kOSBooleanFalse);
++        }
++        // A single immutable property prevents stale booleans being paired with a new valid timestamp.
++        bool replaced = ok && setProperty("SwitchState", state);
++        state->release();
++        if (replaced && notice != CS_QUIET)
++            messageClients(kIOMessageServicePropertyChange); // Interested clients re-read SwitchState.
++        if (notice != CS_QUIET)
++            printf("COACHZ switches: %s error %d supported 0x%x raw 0x%x changed 0x%x baseline %d transitions %llu\n",
++                cs_status_name(sample.status), sample.error, sample.supported, sample.raw,
++                sample.changed, sample.baseline, (unsigned long long)tracker.transitions);
++        return sample.status == CS_READY;
++    }
++
++    static void tick(OSObject *owner, IOTimerEventSource *sender) {
++        CoachzSwitches *self = OSDynamicCast(CoachzSwitches, owner);
++        if (!self || self->stopping) return;
++        bool ready = self->refresh();
++        sender->setTimeoutMS(ready ? 200 : 5000); // Back off on unsupported or failing EC commands.
++    }
++    static IOReturn quiesce(OSObject *owner, void *, void *, void *, void *) {
++        CoachzSwitches *self = OSDynamicCast(CoachzSwitches, owner);
++        if (!self) return kIOReturnBadArgument;
++        self->stopping = true;
++        if (self->timer) { self->timer->cancelTimeout(); self->timer->disable(); }
++        return kIOReturnSuccess;
++    }
++
++public:
++    bool start(IOService *provider) override {
++        if (!IOService::start(provider)) return false;
++        loop = IOWorkLoop::workLoop();
++        timer = IOTimerEventSource::timerEventSource(this, &CoachzSwitches::tick);
++        if (!loop || !timer || loop->addEventSource(timer) != kIOReturnSuccess) {
++            OSSafeReleaseNULL(timer); OSSafeReleaseNULL(loop);
++            IOService::stop(provider); return false;
++        }
++        setName("CoachzECPhysicalSwitches");
++        setProperty("Policy", "state-provider-only");
++        setProperty("PollIntervalMS", (uint64_t)200, 32);
++        setProperty("TimestampMeaning", "host-command-completion");
++        timer->setTimeoutMS(1);
++        return true;
++    }
++    void stop(IOService *provider) override {
++        if (loop) loop->runAction(&CoachzSwitches::quiesce, this);
++        if (loop && timer) loop->removeEventSource(timer);
++        OSSafeReleaseNULL(timer); OSSafeReleaseNULL(loop);
++        IOService::stop(provider);
++    }
++};
++OSDefineMetaClassAndStructors(CoachzSwitches, IOService)
++
++extern "C" void coachz_switches_start(void) {
++    static bool started;
++    unsigned mode = 0;
++    if (started || !PE_parse_boot_argn("coachz-switches", &mode, sizeof(mode)) || mode != 1) return;
++    started = true;
++    IOService *platform = IOService::getPlatform();
++    CoachzSwitches *service = OSTypeAlloc(CoachzSwitches);
++    if (!platform || !service || !service->init()) { OSSafeReleaseNULL(service); return; }
++    if (!service->attach(platform)) { service->release(); return; }
++    if (!service->start(platform)) { service->detach(platform); service->release(); return; }
++    service->registerService();
++    service->release(); // Platform attachment retains it.
++}
+--- /dev/null
++++ b/iokit/Kernel/coachz_switches.h
+@@ -0,0 +1,113 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++/* Current-state queries only. See SOURCES.md for the EC-side handlers. */
++#ifndef COACHZ_SWITCHES_H
++#define COACHZ_SWITCHES_H
++#include <stdint.h>
++
++#define CS_COMMAND 0x0061u
++#define CS_REPLY 64u
++#define CS_LID_OPEN (1u << 0)
++#define CS_TABLET_MODE (1u << 1)
++#define CS_BASE_ATTACHED (1u << 2)
++#define CS_FRONT_PROXIMITY (1u << 3)
++#define CS_KNOWN 0x0fu
++enum cs_status { CS_READY, CS_ERROR, CS_VERSION_UNSUPPORTED, CS_NO_KNOWN_SWITCHES };
++enum { CS_SHORT = -1, CS_VERSION = -2 };
++enum cs_notice { CS_QUIET, CS_BASELINE, CS_CHANGED, CS_UNAVAILABLE };
++
++struct cs_bus {
++    void *context;
++    int (*command)(void *, uint16_t, uint8_t, const void *, uint32_t, void *, uint32_t, uint32_t *);
++};
++struct cs_sample {
++    enum cs_status status;
++    int error;
++    uint32_t versions, supported, raw, known, changed;
++    int baseline;
++};
++struct cs_tracker {
++    uint32_t supported, previous;
++    uint64_t transitions;
++    enum cs_status last_status;
++    int have_previous, seen;
++};
++
++static inline uint32_t cs_le32(const uint8_t *p) {
++    return p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++static inline int
++cs_query(const struct cs_bus *bus, uint8_t info_type, uint32_t *value)
++{
++    const uint8_t args[2] = {info_type, 4}; /* SWITCH event type, never BUTTON or GET_NEXT_EVENT. */
++    uint8_t reply[CS_REPLY];
++    uint32_t length = 0;
++    int error = bus->command(bus->context, CS_COMMAND, 1, args, sizeof(args), reply, sizeof(reply), &length);
++    if (error) return error;
++    if (length != 4) return CS_SHORT;
++    *value = cs_le32(reply);
++    return 0;
++}
++
++static inline void
++cs_collect(const struct cs_bus *bus, struct cs_sample *sample)
++{
++    sample->status = CS_ERROR; sample->error = 0;
++    sample->versions = sample->supported = sample->raw = sample->known = sample->changed = 0;
++    sample->baseline = 0;
++    uint8_t command = CS_COMMAND, reply[CS_REPLY];
++    uint32_t length = 0;
++    int error = bus->command(bus->context, 0x0008, 0, &command, 1, reply, sizeof(reply), &length);
++    if (!error && length != 4) error = CS_SHORT;
++    if (error) { sample->error = error; return; }
++    sample->versions = cs_le32(reply);
++    if (!(sample->versions & (1u << 1))) {
++        sample->status = CS_VERSION_UNSUPPORTED; sample->error = CS_VERSION; return;
++    }
++    error = cs_query(bus, 1, &sample->supported); /* SUPPORTED */
++    if (error) { sample->error = error; return; }
++    if (!(sample->supported & CS_KNOWN)) { sample->status = CS_NO_KNOWN_SWITCHES; return; }
++    error = cs_query(bus, 2, &sample->raw); /* CURRENT, no event/FIFO dequeue. */
++    if (error) { sample->error = error; return; }
++    sample->known = sample->raw & sample->supported & CS_KNOWN;
++    sample->status = CS_READY;
++}
++
++/* Missing data is not a closed lid or detached keyboard. A new capability
++ * mask or an error gap starts a fresh baseline instead of inventing an edge.
++ */
++static inline enum cs_notice
++cs_track(struct cs_tracker *tracker, struct cs_sample *sample)
++{
++    enum cs_notice notice = CS_QUIET;
++    sample->changed = 0; sample->baseline = 0;
++    if (sample->status != CS_READY) {
++        if (!tracker->seen || sample->status != tracker->last_status) notice = CS_UNAVAILABLE;
++        tracker->have_previous = 0;
++    } else {
++        if (!tracker->have_previous || sample->supported != tracker->supported) {
++            sample->baseline = 1;
++            notice = CS_BASELINE;
++        } else {
++            sample->changed = (sample->known ^ tracker->previous) & sample->supported & CS_KNOWN;
++            if (sample->changed) { ++tracker->transitions; notice = CS_CHANGED; }
++        }
++        tracker->supported = sample->supported;
++        tracker->previous = sample->known;
++        tracker->have_previous = 1;
++    }
++    tracker->last_status = sample->status;
++    tracker->seen = 1;
++    return notice;
++}
++
++static inline const char *cs_status_name(enum cs_status status) {
++    switch (status) {
++    case CS_READY: return "valid";
++    case CS_ERROR: return "query-error";
++    case CS_VERSION_UNSUPPORTED: return "unsupported-command-version";
++    case CS_NO_KNOWN_SWITCHES: return "no-known-switches";
++    }
++    return "unknown";
++}
++#endif

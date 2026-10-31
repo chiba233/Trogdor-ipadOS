@@ -90,3 +90,6 @@ coachz-prelink-wifi.patch
 
 # Latest EC accelerometer and gyroscope readings, query only (coachz-motion=1), docs/plans/motion.md.
 coachz-prelink-motion.patch
+
+# Lid, tablet mode and base state from the Chrome EC, query only (coachz-switches=1), docs/plans/switches.md.
+coachz-prelink-switches.patch
