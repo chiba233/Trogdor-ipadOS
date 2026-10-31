@@ -274,6 +274,14 @@ class DisplayTests(unittest.TestCase):
             data,report=compile_wrapper(Path(tmp),image,4096,discovery=True,pattern=True,backlight=True)
             self.assertEqual((report['display_discovery_schema'],len(report['c_relocations'])),(4,8));self.assertIn(b'backlight hello',data)
 
+    def test_hardware_verified_backlight_sequence_is_unchanged(self):
+        ec=(ROOT/'boot/display_ec.c').read_text();source=(ROOT/'boot/display.c').read_text()
+        for fixed in ('#define QUP 0x00a80000u','command(1,data,4,reply,4)','command(0x25,data,4,0,0)','uint8_t data[4]={(uint8_t)duty,(uint8_t)(duty>>8),2,0};'):
+            self.assertIn(fixed,ec)
+        self.assertIn('#define DISPLAY_BACKLIGHT_DUTY 52428u',source)
+        order=[source.index(s) for s in ('display_ec_hello(freq','display_ec_backlight(freq,DISPLAY_BACKLIGHT_DUTY','b->bl_polarity?2u:0u','b->bl_polarity?0u:2u','display_ec_backlight(freq,0,','pattern_write(DISPLAY_TE,0,')]
+        self.assertEqual(order,sorted(order))
+
     def test_hardware_verified_scanout_restart_order_is_unchanged(self):
         source=(ROOT/'boot/display.c').read_text()
         self.assertEqual(re.findall(r'pattern_write\(DISPLAY_(\w+),',source),['COUNT_EN','DSI','SCANOUT','TE','TE','DSI','COUNT_EN'])
