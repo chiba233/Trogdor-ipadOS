@@ -57,6 +57,16 @@ class SmpTreeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             adt_fields(root.write())
 
+    def test_clock_measurement_runs_on_each_core_with_interrupts_off(self):
+        patch = (Path(__file__).resolve().parents[1] / 'platform/coachz-prelink/patches/xnu/coachz-prelink-measure.patch').read_text()
+        body = patch.split('+coachz_core_mhz(uint64_t *loop2)', 1)[1].split('+}', 1)[0]
+        self.assertLess(body.index('ml_set_interrupts_enabled(FALSE)'), body.index('.rept 32'))
+        self.assertLess(body.index('.rept 32'), body.index('ml_set_interrupts_enabled(enabled)'))
+        self.assertIn('+		thread_bind(processor_array[index]);', patch)
+        self.assertIn('+	thread_bind(PROCESSOR_NULL);', patch)
+        # The A76 domain's state register sits at 0x18325800 + 0x920, beyond a 0x3000 mapping (k36 data abort).
+        self.assertIn('+		freq_regs = ml_io_map(0x18323000, 0x4000);', patch)
+
     def test_all_cores_share_one_pset(self):
         # The single-cluster Clutch scheduler panics in thread_select() with a second pset.
         patch = (Path(__file__).resolve().parents[1] / 'platform/coachz-prelink/patches/xnu/coachz-prelink-smp.patch').read_text()
@@ -69,7 +79,8 @@ class SmpTreeTests(unittest.TestCase):
         strings = re.compile(r'(?:__asm__|\basm\b)[^"]*\("([^"]*)"')
         patch = (root / 'platform/coachz-screen/patches/drivers/ArmCpu.patch').read_text()
         console = (root / 'platform/coachz-screen/patches/xnu/coachz-screen-console.patch').read_text()
-        for line in (patch + console).splitlines():
+        measure = (root / 'platform/coachz-prelink/patches/xnu/coachz-prelink-measure.patch').read_text()
+        for line in (patch + console + measure).splitlines():
             if line.startswith('+'):
                 for text in strings.findall(line):
                     self.assertNotIn(';', text, line)

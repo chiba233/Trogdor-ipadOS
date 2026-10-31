@@ -63,15 +63,23 @@ void native_legacy_surface_rejected(uint64_t width,uint64_t height,uint32_t form
 static uint64_t counter_read() { uint64_t value;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(value));return value; }
 static uint64_t counter_hz() { uint64_t value;__asm__ volatile("mrs %0, cntfrq_el0":"=r"(value));return value?value:1; }
 // Copy cost against the interval between copies: a slow copy and a slow producer look alike on the screen.
-// The periodic report reads frames copied, the last copy in us and the gap before it in ms.
-extern "C" { volatile uint64_t coachz_frame_stats[3]; }
+// The periodic report reads frames copied, the last copy in us and the gap before it in ms; for its window, the slowest
+// and fastest copy, the longest gap and a mask of the cores that copied (it resets those and keeps [8], the count it last saw).
+extern "C" { volatile uint64_t coachz_frame_stats[9]; }
 void native_legacy_copy_timing_observed(uint64_t ticks,uint64_t bytes) {
     static uint64_t copies,previous;
     uint64_t now=counter_read(),hz=counter_hz();
     copies++;
     if(copies<=8 || !(copies%32)) kprintf("COACHZ display: copy %llu took %llu us for %llu bytes, %llu ms since previous\n",
         copies,ticks*1000000/hz,bytes,previous?(now-previous)*1000/hz:0);
-    coachz_frame_stats[0]=copies;coachz_frame_stats[1]=ticks*1000000/hz;coachz_frame_stats[2]=previous?(now-previous)*1000/hz:0;
+    uint64_t us=ticks*1000000/hz,gap=previous?(now-previous)*1000/hz:0,mpidr;
+    __asm__ volatile("mrs %0, mpidr_el1":"=r"(mpidr));
+    const uint64_t core=(mpidr>>8)&0xff;   // SC7180 numbers its cores in Affinity1
+    coachz_frame_stats[0]=copies;coachz_frame_stats[1]=us;coachz_frame_stats[2]=gap;coachz_frame_stats[6]=core;
+    if(us>coachz_frame_stats[3])coachz_frame_stats[3]=us;
+    if(us<coachz_frame_stats[4])coachz_frame_stats[4]=us;
+    if(gap>coachz_frame_stats[5])coachz_frame_stats[5]=gap;
+    if(core<64)coachz_frame_stats[7]|=1ull<<core;
     previous=now;
 }
 void native_legacy_transfer_observed(IOReturn status,const void *,uint64_t bytes) {

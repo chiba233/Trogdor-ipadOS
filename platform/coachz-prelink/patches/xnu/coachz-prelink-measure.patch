@@ -1,0 +1,312 @@
+--- a/osfmk/arm64/coachz_early.c
++++ b/osfmk/arm64/coachz_early.c
+@@ -181,6 +181,8 @@
+ 		return;
+ 	}
+ 	early_panicking = 1;
++	/* A panic gets the whole screen again; the current row is inside the band, so it stays valid. */
++	early_rows = early_height / EARLY_CELL_H;
+ 	coachz_early_string("\nCOACHZ PANIC: ");
+ 	va_list copy;
+ 	va_copy(copy, *args);
+@@ -212,6 +214,23 @@
+ coachz_early_relocate(uintptr_t block_va)
+ {
+ 	early_fb = (volatile uint32_t *)(block_va + (early_pa & (ARM_TT_L2_SIZE - 1)));
++}
++
++/*
++ * Keep later output in the top rows, so the rest of the screen shows the system's own frames. Other CPUs may be
++ * printing: every row they can still hold is below the old row count, so it stays inside the framebuffer.
++ */
++void
++coachz_early_band(uint32_t rows)
++{
++	if (early_fb == NULL || rows < 2 || rows >= early_rows) {
++		return;
++	}
++	early_rows = rows;
++	early_row = 0;
++	early_col = 0;
++	coachz_early_clear_row(0);
++	coachz_early_clear_row(1);
+ }
+ 
+ void
+--- a/osfmk/arm64/coachz_early.h
++++ b/osfmk/arm64/coachz_early.h
+@@ -13,6 +13,7 @@
+ int coachz_early_active(void);
+ int coachz_early_range(uint64_t *pa, uint64_t *bytes);
+ void coachz_early_relocate(uintptr_t block_va);
++void coachz_early_band(uint32_t rows);
+ void coachz_early_disable(void);
+ 
+ #endif
+--- a/osfmk/arm64/coachz_thread.c
++++ b/osfmk/arm64/coachz_thread.c
+@@ -474,7 +474,7 @@
+ extern volatile uint32_t armcpu_smp_requested, armcpu_smp_running, armcpu_boot_mpidr;
+ extern volatile uint32_t armcpu_smp_step[8], armcpu_smp_fail[8], armcpu_core_timer[8], armcpu_core_sgi[8];
+ extern volatile uint32_t armcpu_smp_sys[8][5], armcpu_boot_sys[5], armcpu_freq[3][6];
+-extern volatile uint64_t coachz_frame_stats[3];
++extern volatile uint64_t coachz_frame_stats[9];
+ extern volatile int32_t armcpu_smp_psci_rc[8];
+ extern void armcpu_group1_sgi_probe(uint64_t *);
+ static char coachz_sgi_probe[256];
+@@ -625,11 +625,255 @@
+ 	}
+ }
+ 
++/*
++ * k36 measurements, one compact block every ten seconds:
++ *  - each core's busy share from its idle time, and its timer/SGI counts in the window;
++ *  - each core's clock from a chain of dependent adds (one per cycle on A55 and A76), with interrupts off,
++ *    next to the older two-instruction loop whose rate depends on how that loop is fetched;
++ *  - the hardware's current vote of the two CPU frequency domains (cpufreq-hw offset 0x704, units of 19.2 MHz);
++ *  - frame copies in the window: count, fastest/slowest copy, longest gap, the cores that copied;
++ *  - the five processes and five backboardd threads that used the most CPU time in the window.
++ * coachz-console-band=N keeps the screen console in the top N rows once the first frame is copied.
++ */
++#include <kern/recount.h>
++#include <kern/sched_prim.h>
++#include <pexpert/pexpert.h>
++extern char *proc_name_address(void *p);
++extern void coachz_early_band(uint32_t rows);
++static unsigned coachz_compact;
++
++#define COACHZ_TOP 5
++struct coachz_usage {
++	int key;
++	uint64_t total, delta;
++	char name[20];
++};
++static struct coachz_usage coachz_tasks_seen[160], coachz_bbd_seen[32];
++static unsigned coachz_tasks_count, coachz_bbd_count;
++
++/* Remember a total under a key and return what it grew by since the last window. */
++static uint64_t
++coachz_usage_delta(struct coachz_usage *table, unsigned *count, unsigned size, int key, uint64_t total)
++{
++	for (unsigned index = 0; index < *count; index++) {
++		if (table[index].key == key) {
++			uint64_t delta = total >= table[index].total ? total - table[index].total : 0;
++			table[index].total = total;
++			return delta;
++		}
++	}
++	if (*count < size) {
++		table[(*count)++] = (struct coachz_usage){ .key = key, .total = total };
++	}
++	return 0;
++}
++
++static void
++coachz_top_insert(struct coachz_usage *top, const char *name, int key, uint64_t delta)
++{
++	unsigned at = COACHZ_TOP;
++	while (at > 0 && top[at - 1].delta < delta) {
++		at--;
++	}
++	if (at == COACHZ_TOP) {
++		return;
++	}
++	for (unsigned index = COACHZ_TOP - 1; index > at; index--) {
++		top[index] = top[index - 1];
++	}
++	top[at] = (struct coachz_usage){ .key = key, .delta = delta };
++	strlcpy(top[at].name, name, sizeof(top[at].name));
++}
++
++static uint64_t
++coachz_ms(uint64_t mach)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach, &ns);
++	return ns / 1000000;
++}
++
++/* Dependent adds per microsecond on the current core; *loop2 gets the older subs/b.ne loop's iterations per microsecond. */
++static uint64_t
++coachz_core_mhz(uint64_t *loop2)
++{
++	uint64_t hz, start, end, rounds = 200000, value = 0, count = 2000000;
++	boolean_t enabled = ml_set_interrupts_enabled(FALSE);
++	__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(hz));
++	__asm__ volatile ("isb\n\tmrs %0, cntpct_el0" : "=r"(start));
++	__asm__ volatile ("1:\n\t.rept 32\n\tadd %1, %1, #1\n\t.endr\n\tsubs %0, %0, #1\n\tb.ne 1b"
++            : "+r"(rounds), "+r"(value) :: "cc");
++	__asm__ volatile ("isb\n\tmrs %0, cntpct_el0" : "=r"(end));
++	uint64_t chain = end - start;
++	__asm__ volatile ("isb\n\tmrs %0, cntpct_el0" : "=r"(start));
++	__asm__ volatile ("1: subs %0, %0, #1\n\tb.ne 1b" : "+r"(count) :: "cc");
++	__asm__ volatile ("isb\n\tmrs %0, cntpct_el0" : "=r"(end));
++	ml_set_interrupts_enabled(enabled);
++	if (!hz || !chain || end == start) {
++		*loop2 = 0;
++		return 0;
++	}
++	*loop2 = 2000000 * hz / ((end - start) * 1000000);
++	return 32 * 200000 * hz / (chain * 1000000);
++}
++
++static void
++coachz_measure_report(void)
++{
++	static uint64_t last_time, last_idle[8];
++	static uint32_t last_timer[8], last_sgi[8];
++	static vm_offset_t freq_regs;
++	static unsigned band_rows, banded;
++	unsigned cpus = (unsigned)ml_get_cpu_count();
++	uint64_t now = mach_absolute_time(), wall = last_time ? now - last_time : 0;
++	uint64_t mhz[8] = { 0 }, loop2[8] = { 0 };
++	int where[8];
++
++	if (cpus > 8) {
++		cpus = 8;
++	}
++	if (!band_rows && !PE_parse_boot_argn("coachz-console-band", &band_rows, sizeof(band_rows))) {
++		band_rows = ~0u;
++	}
++	if (!banded && band_rows != ~0u && coachz_frame_stats[0]) {
++		coachz_early_band(band_rows);
++		banded = 1;
++		coachz_compact = 1;
++	}
++
++	printf("K36 busy%% %llus:", coachz_ms(wall) / 1000);
++	for (unsigned index = 0; index < cpus; index++) {
++		processor_t processor = processor_array[index];
++		struct recount_usage usage;
++		uint64_t idle = 0;
++		if (processor) {
++			recount_processor_usage(&processor->pr_recount, &usage, &idle);
++		}
++		uint64_t idle_delta = idle >= last_idle[index] ? idle - last_idle[index] : 0;
++		unsigned busy = wall && processor ? (unsigned)(100 - (idle_delta >= wall ? wall : idle_delta) * 100 / wall) : 0;
++		printf(" %u:%u", index, busy);
++		last_idle[index] = idle;
++	}
++	last_time = now;
++	printf(" | t/g in window:");
++	for (unsigned index = 0; index < cpus; index++) {
++		printf(" %u/%u", armcpu_core_timer[index] - last_timer[index], armcpu_core_sgi[index] - last_sgi[index]);
++		last_timer[index] = armcpu_core_timer[index];
++		last_sgi[index] = armcpu_core_sgi[index];
++	}
++	printf("\n");
++
++	for (unsigned index = 0; index < cpus; index++) {
++		where[index] = -1;
++		if (!processor_array[index]) {
++			continue;
++		}
++		thread_bind(processor_array[index]);
++		thread_block(THREAD_CONTINUE_NULL);
++		where[index] = cpu_number();
++		if (where[index] == (int)index) {
++			mhz[index] = coachz_core_mhz(&loop2[index]);
++		}
++	}
++	thread_bind(PROCESSOR_NULL);
++	thread_block(THREAD_CONTINUE_NULL);
++	printf("K36 MHz add-chain/loop2:");
++	for (unsigned index = 0; index < cpus; index++) {
++		if (where[index] == (int)index) {
++			printf(" %u:%llu/%llu", index, mhz[index], loop2[index]);
++		} else {
++			printf(" %u:on%d", index, where[index]);
++		}
++	}
++	if (!freq_regs) {
++		/* Both CPU domains: 0x18323000 and 0x18325800, each read up to its state register at +0x920. */
++		freq_regs = ml_io_map(0x18323000, 0x4000);
++	}
++	if (freq_regs) {
++		uint32_t a55 = *(volatile uint32_t *)(freq_regs + 0x704), a76 = *(volatile uint32_t *)(freq_regs + 0x2800 + 0x704);
++		uint32_t s55 = *(volatile uint32_t *)(freq_regs + 0x920), s76 = *(volatile uint32_t *)(freq_regs + 0x2800 + 0x920);
++		printf(" | vote A55 0x%x=%u MHz state %u, A76 0x%x=%u MHz state %u", a55, (a55 & 0x3ff) * 192 / 10, s55,
++		    a76, (a76 & 0x3ff) * 192 / 10, s76);
++	}
++	printf("\n");
++
++	printf("K36 frames %llu (+%llu), copy us min %llu max %llu last %llu, gap ms max %llu last %llu, cores 0x%llx last %llu\n",
++	    coachz_frame_stats[0], coachz_frame_stats[0] - coachz_frame_stats[8],
++	    coachz_frame_stats[0] != coachz_frame_stats[8] ? coachz_frame_stats[4] : 0, coachz_frame_stats[3],
++	    coachz_frame_stats[1], coachz_frame_stats[5], coachz_frame_stats[2], coachz_frame_stats[7], coachz_frame_stats[6]);
++	coachz_frame_stats[8] = coachz_frame_stats[0];
++	coachz_frame_stats[3] = 0;
++	coachz_frame_stats[4] = ~0ull;
++	coachz_frame_stats[5] = 0;
++	coachz_frame_stats[7] = 0;
++
++	{
++		struct coachz_usage top[COACHZ_TOP] = { 0 };
++		task_t task;
++		lck_mtx_lock(&tasks_threads_lock);
++		queue_iterate(&tasks, task, task_t, tasks) {
++			struct recount_times_mach times = recount_task_times(task);
++			int pid = task_pid(task);
++			void *bsd = get_bsdtask_info(task);
++			uint64_t delta = coachz_usage_delta(coachz_tasks_seen, &coachz_tasks_count,
++			    sizeof(coachz_tasks_seen) / sizeof(coachz_tasks_seen[0]), pid, times.rtm_user + times.rtm_system);
++			coachz_top_insert(top, bsd ? proc_name_address(bsd) : "kernel", pid, delta);
++		}
++		lck_mtx_unlock(&tasks_threads_lock);
++		printf("K36 top ms:");
++		for (unsigned index = 0; index < COACHZ_TOP && top[index].delta; index++) {
++			printf(" %s(%d) %llu", top[index].name, top[index].key, coachz_ms(top[index].delta));
++		}
++		printf("\n");
++	}
++
++	{
++		struct coachz_usage top[COACHZ_TOP] = { 0 };
++		struct proc *p = proc_find(os_atomic_load(&coachz_bbd_pid, relaxed));
++		if (p) {
++			task_t task = proc_task(p);
++			thread_t thread;
++			unsigned index = 0;
++			task_lock(task);
++			queue_iterate(&task->threads, thread, thread_t, task_threads) {
++				uint64_t delta = coachz_usage_delta(coachz_bbd_seen, &coachz_bbd_count,
++				    sizeof(coachz_bbd_seen) / sizeof(coachz_bbd_seen[0]), (int)thread->thread_id,
++				    recount_thread_time_mach(thread));
++				char name[20];
++				snprintf(name, sizeof(name), "t%u.c%d.p%d", index++,
++				    thread->last_processor ? thread->last_processor->cpu_id : -1, thread->sched_pri);
++				coachz_top_insert(top, name, (int)thread->thread_id, delta);
++			}
++			task_unlock(task);
++			proc_rele(p);
++		}
++		printf("K36 BBD ms:");
++		for (unsigned index = 0; index < COACHZ_TOP && top[index].delta; index++) {
++			printf(" %s %llu", top[index].name, coachz_ms(top[index].delta));
++		}
++		printf("\n");
++	}
++	uint32_t kills = os_atomic_load(&coachz_kill_count, relaxed);
++	printf("K36 SB capture %u, %u SIGKILL", os_atomic_load(&coachz_sb_captured, acquire), kills);
++	if (kills) {
++		uint32_t last = (kills < 6 ? kills : 6) - 1;
++		printf(", last %s(%d) -> %s(%d) at %u s", coachz_kills[last].name, coachz_kills[last].pid,
++		    coachz_kills[last].other_name, coachz_kills[last].other_pid, coachz_kills[last].seconds);
++	}
++	printf(", now %u s\n", coachz_launch_seconds());
++}
++
+ int
+ coachz_springboard_report(void)
+ {
+ 	unsigned phase = os_atomic_load(&coachz_sb_captured, acquire);
++	if (coachz_compact) {
++		/* Only the measurement block fits the console band; returning 1 also skips the full sampler. */
++		coachz_measure_report();
++		return 1;
++	}
+ 	coachz_launch_report();
++	coachz_measure_report();
+ 	if (phase != 2) {
+ 		printf("COACHZ SB v1: waiting for abnormal exit (capture %u)\n", phase);
+ 		return 0;

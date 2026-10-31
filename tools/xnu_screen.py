@@ -230,6 +230,8 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         command_line += ' coachz-display=1 offline-legacy-register=1 offline-legacy-gop=1 offline-legacy-phase=4'
         command_line += ' offline-legacy-pm=1 offline-legacy-validate=1 offline-legacy-transfer=1 offline-legacy-cpu-present=1'
         command_line += ' sheng-vsync=60 sheng-early-retire=0 coachz-reset-mgcache=1'
+        # Once the first frame is copied, the screen console keeps to the top 14 rows (coachz-prelink-measure.patch).
+        command_line += ' coachz-console-band=14'
     if cpus != 1:
         # coachz-prelink-smp.patch raises BCM2837's board configuration to eight CPUs in two clusters.
         if not root_uuid or not prelinked or not 2 <= cpus <= 8:
