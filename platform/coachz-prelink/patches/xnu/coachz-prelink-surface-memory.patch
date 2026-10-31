@@ -1,0 +1,88 @@
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -5835,9 +5835,10 @@
+ 
+ 	switch (wimg & (VM_WIMG_MASK)) {
+ 	case VM_WIMG_IO:
+-		// Coachz: uncached DRAM is Normal non-cacheable here, not Device-GRE. There is no GPU, so QuartzCore's software
+-		// renderer clears IOSurfaces with bzero, whose dc zva takes an alignment fault on any Device memory.
+-		if (is_dram_addr(pa)) {
++		// Coachz: kernel-managed memory is Normal non-cacheable here, not Device memory. There is no GPU, so QuartzCore's software
++		// renderer works on IOSurfaces with bzero (dc zva) and unaligned accesses, both alignment faults on any Device memory.
++		// The USB DMA pool and MMIO are outside the managed window and keep their device mappings.
++		if (pa_valid(pa)) {
+ 			pte = ARM_PTE_ATTRINDX(CACHE_ATTRINDX_WRITECOMB);
+ 		} else {
+ 			pte = ARM_PTE_ATTRINDX(CACHE_ATTRINDX_DISABLE);
+@@ -5845,11 +5846,12 @@
+ 		pte |= ARM_PTE_NX | ARM_PTE_PNX;
+ 		break;
+ 	case VM_WIMG_RT:
+-		pte = ARM_PTE_ATTRINDX(CACHE_ATTRINDX_RT);
++		/* On hardware IOSurfaces arrived here as Device-nGnRnE (MMU attribute 0), where QuartzCore's software renderer faults. */
++		pte = ARM_PTE_ATTRINDX(pa_valid(pa) ? CACHE_ATTRINDX_WRITECOMB : CACHE_ATTRINDX_RT);
+ 		pte |= ARM_PTE_NX | ARM_PTE_PNX;
+ 		break;
+ 	case VM_WIMG_POSTED:
+-		if (is_dram_addr(pa)) {
++		if (pa_valid(pa)) {
+ 			pte = ARM_PTE_ATTRINDX(CACHE_ATTRINDX_WRITECOMB);
+ 		} else {
+ 			pte = ARM_PTE_ATTRINDX(CACHE_ATTRINDX_POSTED);
+@@ -5857,7 +5859,7 @@
+ 		pte |= ARM_PTE_NX | ARM_PTE_PNX;
+ 		break;
+ 	case VM_WIMG_POSTED_REORDERED:
+-		if (is_dram_addr(pa)) {
++		if (pa_valid(pa)) {
+ 			pte = ARM_PTE_ATTRINDX(CACHE_ATTRINDX_WRITECOMB);
+ 		} else {
+ 			pte = ARM_PTE_ATTRINDX(CACHE_ATTRINDX_POSTED_REORDERED);
+@@ -5865,7 +5867,7 @@
+ 		pte |= ARM_PTE_NX | ARM_PTE_PNX;
+ 		break;
+ 	case VM_WIMG_POSTED_COMBINED_REORDERED:
+-		pte = ARM_PTE_ATTRINDX(is_dram_addr(pa) ? CACHE_ATTRINDX_WRITECOMB : CACHE_ATTRINDX_POSTED_COMBINED_REORDERED);
++		pte = ARM_PTE_ATTRINDX(pa_valid(pa) ? CACHE_ATTRINDX_WRITECOMB : CACHE_ATTRINDX_POSTED_COMBINED_REORDERED);
+ #if HAS_FEAT_XS
+ 		if (!is_dram_addr(pa)) {
+ 			pte = ARM_PTE_ATTRINDX(CACHE_ATTRINDX_POSTED_COMBINED_REORDERED_XS);
+--- a/osfmk/arm64/coachz_early.c
++++ b/osfmk/arm64/coachz_early.c
+@@ -50,6 +50,7 @@
+  * Everything this console prints, kept for the kernel log on the external disk (NativeRamBlock.cpp flushes it once a second).
+  * Writers reserve their bytes with an atomic add; the flusher can overtake one that is still copying, which at worst tears a line.
+  */
++static int early_muted;
+ char coachz_log_capture[1u << 20];
+ volatile uint64_t coachz_log_head;
+ 
+@@ -69,7 +70,7 @@
+ {
+ 	uint64_t at = __atomic_fetch_add(&coachz_log_head, 1, __ATOMIC_RELAXED);
+ 	coachz_log_capture[at & ((1u << 20) - 1)] = c;
+-	if (early_fb == NULL) {
++	if (early_fb == NULL || early_muted) {
+ 		return;
+ 	}
+ 	if (c == '\r') {
+@@ -201,6 +202,7 @@
+ 		return;
+ 	}
+ 	early_panicking = 1;
++	early_muted = 0;
+ 	/* A panic gets the whole screen again; the current row is inside the band, so it stays valid. */
+ 	early_rows = early_height / EARLY_CELL_H;
+ 	coachz_early_string("\nCOACHZ PANIC: ");
+@@ -243,6 +245,11 @@
+ void
+ coachz_early_band(uint32_t rows)
+ {
++	/* No rows: nothing more on the screen until a panic. The output still reaches the disk log. */
++	if (rows == 0) {
++		early_muted = 1;
++		return;
++	}
+ 	if (early_fb == NULL || rows < 2 || rows >= early_rows) {
+ 		return;
+ 	}

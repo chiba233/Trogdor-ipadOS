@@ -14,6 +14,7 @@
 #include <sys/proc.h>
 #include <sys/errno.h>
 extern "C" kmod_info_t g_kernel_kmod_info;
+extern "C" void coachz_early_band(uint32_t rows);
 extern "C" void coachz_display_static_init(void) __asm__("__GLOBAL__sub_I_NativeLegacyDisplay.cpp");
 extern "C" IOService *native_legacy_display_allocate(void);
 extern "C" kern_return_t OSKextLoadKextWithIdentifier(const char *);
@@ -70,6 +71,12 @@ extern "C" { volatile uint64_t coachz_frame_stats[13]; }
 // The memory attribute the source of the coming copy is mapped with, as the MMU translates it: AT S1E1R leaves the MAIR value
 // in PAR_EL1[63:56] (0xff write-back, 0x44 non-cacheable, 0 device). 0x100 marks a failed translation.
 void native_legacy_copy_source_observed(const void *source,uint64_t scanTicks) {
+    // Before the first copy, so that this full frame overwrites what the console drew. The copies after it only touch what changed.
+    static bool silenced;
+    if(!silenced) {
+        silenced=true;unsigned band=~0u;
+        if(PE_parse_boot_argn("coachz-console-band",&band,sizeof(band)) && !band)coachz_early_band(0);
+    }
     // Off unless coachz-diag bit 3 is set (see osfmk/arm64/coachz_thread.c).
     static int enabled=-1;
     if(enabled<0){unsigned diag=0;PE_parse_boot_argn("coachz-diag",&diag,sizeof(diag));enabled=(diag&8)!=0;}

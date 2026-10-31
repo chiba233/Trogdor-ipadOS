@@ -1,0 +1,230 @@
+--- a/bsd/dev/coachz_sample.c
++++ b/bsd/dev/coachz_sample.c
+@@ -40,7 +40,10 @@
+ 	static int chan;
+ 	unsigned ticks = 0;
+ 	extern void coachz_battery_start(void);
++	extern void coachz_input_start(void);
+ 
++	/* Power and volume buttons as Consumer HID, and the USB keyboard's reports (iokit/Kernel/CoachzInput.cpp, coachz-buttons=1 or 3). */
++	coachz_input_start();
+ 	/* The Chrome EC battery service (iokit/Kernel/CoachzBattery.cpp, coachz-battery=1): IOKit is up by the time this thread runs. */
+ 	coachz_battery_start();
+ 	/* A one-second tone on the speaker (iokit/Kernel/CoachzSpeaker.cpp, coachz-speaker=1), once. */
+--- a/iokit/Kernel/CoachzInput.cpp
++++ b/iokit/Kernel/CoachzInput.cpp
+@@ -0,0 +1,204 @@
++// SPDX-License-Identifier: BSD-2-Clause
++// Keyboard and Consumer input for iPadOS (coachz-buttons=1 volume, =3 volume and power): ShengHidInput's keyboard/Consumer device
++// (native_hid_input_allocate, its descriptor's report 1 a boot keyboard and report 2 the Consumer bits Menu 0, Power 1, Volume
++// Increment 2, Volume Decrement 3), published below IOHIDResource beside the touch digitizer. Reports go in through that device's
++// handleReport, vtable slot 181 of the original IOHIDDevice, as scripts/build-sheng-hid-input.py qualifies it.
++// Producers: the Chrome EC's button bitmap (EC_CMD_MKBP_INFO, current state of EC_MKBP_EVENT_BUTTON: power 0, volume up 1, volume
++// down 2), polled every 20 ms so no MKBP event is taken from another reader; and coachz_input_keyboard_report() for a USB boot
++// keyboard. The power button is opt-in: a Power press makes iPadOS sleep, which this port does not support yet.
++#include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOCatalogue.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSString.h>
++#include <libkern/c++/OSSymbol.h>
++#include <pexpert/pexpert.h>
++#include <kern/thread.h>
++extern "C" {
++#include "../../bsd/dev/coachz_ec_proto.h"
++int coachz_ec_command(uint16_t command, uint8_t version, const void *args, uint32_t size, void *reply, uint32_t room,
++    uint32_t *length);
++IOService *native_hid_input_allocate(void);
++void coachz_input_start(void);
++int coachz_input_keyboard_report(const uint8_t *boot);
++}
++
++namespace {
++const uint16_t kMkbpInfo = 0x0061;
++const uint8_t kInfoSupported = 1, kInfoCurrent = 2, kEventButton = 3;
++const unsigned kHandleReportSlot = 181;
++unsigned gEnabled;
++IOService *gDevice;
++IOLock *gLock;
++
++// The original IOHIDDevice::handleReport(report, kIOHIDReportTypeInput, 0), as NativeHidInput itself sends.
++IOReturn send(const uint8_t *report, uint32_t length) {
++	IOService *device = __atomic_load_n(&gDevice, __ATOMIC_ACQUIRE);
++	if (!device) {
++		return kIOReturnNotReady;
++	}
++	IOBufferMemoryDescriptor *buffer = IOBufferMemoryDescriptor::withBytes(report, length, kIODirectionNone);
++	if (!buffer) {
++		return kIOReturnNoMemory;
++	}
++	using HandleReport = IOReturn (*)(IOService *, IOMemoryDescriptor *, unsigned, IOOptionBits);
++	HandleReport handle = reinterpret_cast<HandleReport>((*reinterpret_cast<void ***>(device))[kHandleReportSlot]);
++	IOLockLock(gLock);
++	IOReturn result = handle(device, buffer, 0, 0);
++	IOLockUnlock(gLock);
++	buffer->release();
++	return result;
++}
++
++// IOHIDFamily's event driver for this keyboard, as CoachzHid.cpp does for the digitizer: the stock keyboard personality waits for
++// the IOKit daemon, and then the AppleUserHIDDrivers dext personality takes the device and waits for a process that never starts.
++bool addKeyboardPersonality() {
++	OSDictionary *personality = OSDictionary::withCapacity(7), *pair = OSDictionary::withCapacity(2);
++	OSArray *pairs = OSArray::withCapacity(1), *drivers = OSArray::withCapacity(1);
++	OSNumber *page = OSNumber::withNumber(1, 32), *usage = OSNumber::withNumber(6, 32), *score = OSNumber::withNumber(1000, 32);
++	OSString *bundle = OSString::withCString("com.apple.iokit.IOHIDFamily"), *driver = OSString::withCString("IOHIDEventDriver");
++	OSString *provider = OSString::withCString("IOHIDInterface"), *transport = OSString::withCString("Virtual");
++	OSString *behavior = OSString::withCString("");
++	bool added = false;
++	if (personality && pair && pairs && drivers && page && usage && score && bundle && driver && provider && transport && behavior) {
++		pair->setObject("DeviceUsagePage", page);
++		pair->setObject("DeviceUsage", usage);
++		pairs->setObject(pair);
++		personality->setObject("CFBundleIdentifier", bundle);
++		personality->setObject("IOClass", driver);
++		personality->setObject("IOProviderClass", provider);
++		personality->setObject("IOProbeScore", score);
++		personality->setObject("Transport", transport);
++		personality->setObject("HIDDefaultBehavior", behavior);
++		personality->setObject("DeviceUsagePairs", pairs);
++		drivers->setObject(personality);
++		added = gIOCatalogue->addDrivers(drivers, false);
++	}
++	OSSafeReleaseNULL(personality); OSSafeReleaseNULL(pair); OSSafeReleaseNULL(pairs); OSSafeReleaseNULL(drivers);
++	OSSafeReleaseNULL(page); OSSafeReleaseNULL(usage); OSSafeReleaseNULL(score);
++	OSSafeReleaseNULL(bundle); OSSafeReleaseNULL(driver); OSSafeReleaseNULL(provider); OSSafeReleaseNULL(transport);
++	OSSafeReleaseNULL(behavior);
++	return added;
++}
++
++int mkbpButtons(uint8_t info, uint32_t *bits) {
++	const uint8_t args[2] = {info, kEventButton};
++	uint8_t reply[EC_MAX_REPLY];
++	uint32_t length = 0;
++	int error = coachz_ec_command(kMkbpInfo, 0, args, sizeof(args), reply, sizeof(reply), &length);
++	if (!error && length < 4) {
++		error = EC_ERR_SHORT;
++	}
++	if (!error) {
++		*bits = coachz_ec_le32(reply);
++	}
++	return error;
++}
++
++// EC bits to the device's report 2 bits; only the enabled buttons.
++uint8_t consumerBits(uint32_t ec) {
++	uint8_t bits = 0;
++	if ((gEnabled & 2) && (ec & 1)) bits |= 1u << 1;   // power
++	if ((gEnabled & 1) && (ec & 2)) bits |= 1u << 2;   // volume up
++	if ((gEnabled & 1) && (ec & 4)) bits |= 1u << 3;   // volume down
++	return bits;
++}
++
++void inputThread(void *, wait_result_t) {
++	// The device's class is registered by CoachzHid.cpp when the touchscreen first answers; wait for it (at most five minutes).
++	const OSSymbol *name = OSSymbol::withCString("NativeHidInput");
++	const OSMetaClass *meta = nullptr;
++	for (unsigned waited = 0; name && !meta && waited < 300; waited++) {
++		meta = OSMetaClass::getMetaClassWithName(name);
++		if (!meta) {
++			IOSleep(1000);
++		}
++	}
++	OSSafeReleaseNULL(name);
++	OSDictionary *match = IOService::serviceMatching("IOHIDResource");
++	IOService *resource = meta && match ? IOService::waitForMatchingService(match, 5000000000ULL) : nullptr;
++	OSSafeReleaseNULL(match);
++	const bool personality = resource && addKeyboardPersonality();
++	IOService *device = resource ? native_hid_input_allocate() : nullptr;
++	bool attached = device && device->metaCast("IOHIDDevice") && device->init() && device->attach(resource);
++	bool running = attached && device->start(resource);
++	if (!running) {
++		if (attached) {
++			device->detach(resource);
++		}
++		OSSafeReleaseNULL(device);
++	}
++	printf("COACHZ input: keyboard/consumer device: class %d resource %d personality %d attached %d started %d\n",
++	    meta != nullptr, resource != nullptr, personality, attached, running);
++	OSSafeReleaseNULL(resource);
++	if (!running) {
++		return;
++	}
++	__atomic_store_n(&gDevice, device, __ATOMIC_RELEASE);
++	uint32_t supported = 0;
++	int error = mkbpButtons(kInfoSupported, &supported);
++	printf("COACHZ input: EC buttons supported 0x%x (error 0x%x), enabled %s\n", supported, (unsigned)error,
++	    gEnabled & 2 ? "volume and power" : "volume");
++	if (error) {
++		return;
++	}
++	uint8_t last = 0;
++	unsigned failures = 0;
++	for (;;) {
++		uint32_t ec = 0;
++		error = mkbpButtons(kInfoCurrent, &ec);
++		if (error) {
++			// A first failure is reported once; after many in a row the buttons are released and polling stops.
++			if (!failures++) {
++				printf("COACHZ input: EC button state error 0x%x\n", (unsigned)error);
++			}
++			if (failures == 50) {
++				const uint8_t release[2] = {2, 0};
++				send(release, sizeof(release));
++				printf("COACHZ input: EC button polling stopped after 50 failures\n");
++				return;
++			}
++		} else {
++			failures = 0;
++			const uint8_t bits = consumerBits(ec);
++			if (bits != last) {
++				const uint8_t report[2] = {2, bits};
++				IOReturn result = send(report, sizeof(report));
++				printf("COACHZ input: buttons 0x%x -> report 0x%x: 0x%x\n", ec, bits, (unsigned)result);
++				last = bits;
++			}
++		}
++		IOSleep(20);
++	}
++}
++}  // namespace
++
++// A USB boot keyboard report (modifiers, reserved, six key usages) as report 1 of the keyboard device. 0 when sent.
++extern "C" int
++coachz_input_keyboard_report(const uint8_t *boot)
++{
++	uint8_t report[9] = {1};
++	for (unsigned i = 0; i < 8; i++) {
++		report[1 + i] = boot[i];
++	}
++	return send(report, sizeof(report)) == kIOReturnSuccess ? 0 : -1;
++}
++
++// Called once from the sampler thread (bsd/dev/coachz_sample.c); the work runs on its own thread.
++extern "C" void
++coachz_input_start(void)
++{
++	static bool started;
++	thread_t thread;
++	if (started || !PE_parse_boot_argn("coachz-buttons", &gEnabled, sizeof(gEnabled)) || !(gEnabled & 3)) {
++		return;
++	}
++	started = true;
++	gLock = IOLockAlloc();
++	if (gLock && kernel_thread_start(inputThread, nullptr, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
+--- a/iokit/conf/files
++++ b/iokit/conf/files
+@@ -51,6 +51,7 @@
+ iokit/Kernel/IOPMPowerStateQueue.cpp			optional iokitcpp
+ iokit/Kernel/IOCatalogue.cpp				optional iokitcpp
+ iokit/Kernel/IOPMPowerSource.cpp			optional iokitcpp
++iokit/Kernel/CoachzInput.cpp			optional iokitcpp
+ iokit/Kernel/CoachzBattery.cpp			optional iokitcpp
+ iokit/Kernel/CoachzSpeaker.cpp			optional iokitcpp
+ iokit/Kernel/IOPMPowerSourceList.cpp			optional iokitcpp

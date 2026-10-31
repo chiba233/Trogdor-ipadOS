@@ -66,3 +66,15 @@ coachz-prelink-software-render.patch
 
 # A dc zva that faults in user space zeroes its block by ordinary stores (QuartzCore's software renderer).
 coachz-prelink-dc-zva.patch
+
+# Kernel-managed memory as Normal non-cacheable when mapped uncached, and a screen console that can stay silent.
+coachz-prelink-surface-memory.patch
+
+# Chrome EC battery: protocol-3 queries over QUP1 SE0 GENI SPI, published as an IOPMPowerSource.
+coachz-prelink-battery.patch
+
+# A one-second 440 Hz speaker tone through LPASS secondary MI2S, once after boot.
+coachz-prelink-speaker.patch
+
+# Volume buttons from the Chrome EC, and the keyboard/consumer device they and the Zed keyboard report through.
+coachz-prelink-input.patch

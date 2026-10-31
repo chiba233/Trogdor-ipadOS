@@ -1,0 +1,248 @@
+--- a/bsd/dev/coachz_sample.c
++++ b/bsd/dev/coachz_sample.c
+@@ -43,6 +43,9 @@
+ 
+ 	/* The Chrome EC battery service (iokit/Kernel/CoachzBattery.cpp, coachz-battery=1): IOKit is up by the time this thread runs. */
+ 	coachz_battery_start();
++	/* A one-second tone on the speaker (iokit/Kernel/CoachzSpeaker.cpp, coachz-speaker=1), once. */
++	extern void coachz_speaker_start(void);
++	coachz_speaker_start();
+ 	for (;;) {
+ 		clock_sec_t sec;
+ 		clock_usec_t usec;
+--- a/iokit/Kernel/CoachzSpeaker.cpp
++++ b/iokit/Kernel/CoachzSpeaker.cpp
+@@ -0,0 +1,223 @@
++// SPDX-License-Identifier: BSD-2-Clause
++// A one-second 440 Hz tone on the Coachz speaker (coachz-speaker=1), played once after boot: SC7180 LPASS read DMA into the
++// secondary MI2S, the MAX98360A-compatible amplifier enabled by GPIO23. The register addresses, values and order are the
++// hardware facts of the factory Depthcharge driver for this board (drivers/bus/i2s/sc7180.c, new_sc7180_i2s(48000, 2, 16,
++// LPASS_SECONDARY, 0x62000000)), written anew here; Linux lpass-sc7180 places the same LPAIF registers. 48 kHz, two channels,
++// 16 bits: one 32-bit DMA word per frame, a 1.536 MHz bit clock. Every wait is bounded, a failed step stops the sequence, and the
++// DMA is stopped before its buffer is freed.
++#include <IOKit/IOLib.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <pexpert/pexpert.h>
++#include <kern/clock.h>
++extern "C" {
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
++void coachz_speaker_start(void);
++}
++
++namespace {
++const uint64_t kLpass = 0x62000000;
++// LPASS clock and power (offsets from 0x62000000)
++const uint32_t kCoreGdsc = 0x1000000, kAudioGdsc = 0x0789090, kPdcGdsc = 0x0783090;
++const uint32_t kExtMclk0 = 0x0720018, kCore = 0x0d1f000, kCoreExtMclk0 = 0x0d20014, kSysnocMport = 0x0d23000, kSysnocSway = 0x0d24000;
++const uint32_t kPll = 0x0d01000;   // mode +0, l +4, cal +8, user_ctl +0xc, user_ctl_u +0x10, config_ctl_u +0x1c, opmode +0x38
++const uint32_t kBitCmd = 0x0d11000, kBitCfg = 0x0d11004, kBitM = 0x0d11008, kBitN = 0x0d1100c, kBitD = 0x0d11010, kBitBranch = 0x0d11018;
++// LPAIF, secondary interface (index 1)
++const uint32_t kModeMux = 0x0d9e000, kI2sCtl = 0x0f02000, kPcmI2sSel = 0x0f02200;
++const uint32_t kIrqEn = 0x0f0a000, kIrqRaw = 0x0f0a008, kIrqClear = 0x0f0a00c;
++const uint32_t kDmaCtl = 0x0f0d000, kDmaBase = 0x0f0d004, kDmaBufLen = 0x0f0d008, kDmaPerLen = 0x0f0d010, kDmaBaseExt = 0x0f0d040;
++const uint32_t kReset = 1u << 31;
++const uint32_t kSpkrEn = 1u << 16, kSpkrMode = 1u << 11, kLongRate = 0xfu << 18;
++const uint32_t kDmaFlags = (1u << 16) | (7u << 1) | (2u << 12) | (1u << 20) | (1u << 21);   // WPSCNT, watermark, interface, burst, dynamic clock
++const uint32_t kIrqPeriod = 1u << 3, kIrqError = 4u << 3, kIrqAll = 7u << 3;               // channel 1
++// TLMM: GPIO23 (amplifier SD_MODE) on the SOUTH tile
++const uint64_t kTlmmSouth = 0x03d00000;
++const unsigned kAmpGpio = 23;
++const uint32_t kFrames = 48000;
++
++struct Page {uint64_t pa; vm_offset_t va;};
++Page pages[16];
++unsigned pageCount;
++
++volatile uint32_t *reg(uint64_t pa) {
++	const uint64_t base = pa & ~0xfffull;
++	for (unsigned i = 0; i < pageCount; i++) {
++		if (pages[i].pa == base) {
++			return reinterpret_cast<volatile uint32_t *>(pages[i].va + (pa & 0xfff));
++		}
++	}
++	if (pageCount == sizeof(pages) / sizeof(pages[0])) {
++		return nullptr;
++	}
++	vm_offset_t va = ml_io_map(base, 0x1000);
++	if (!va) {
++		return nullptr;
++	}
++	pages[pageCount++] = {base, va};
++	return reinterpret_cast<volatile uint32_t *>(va + (pa & 0xfff));
++}
++bool mapped(const uint32_t *offsets, unsigned count) {
++	for (unsigned i = 0; i < count; i++) {
++		if (!reg(kLpass + offsets[i])) {
++			return false;
++		}
++	}
++	return true;
++}
++uint32_t rd(uint32_t offset) {return *reg(kLpass + offset);}
++void wr(uint32_t offset, uint32_t value) {*reg(kLpass + offset) = value; __asm__ volatile ("dsb sy" ::: "memory");}
++void set(uint32_t offset, uint32_t bits) {wr(offset, rd(offset) | bits);}
++void clear(uint32_t offset, uint32_t bits) {wr(offset, rd(offset) & ~bits);}
++uint64_t nowUs() {uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time(), &ns); return ns / 1000;}
++bool waitSet(uint32_t offset, uint32_t bit, uint64_t limitUs) {
++	const uint64_t start = nowUs();
++	while (!(rd(offset) & bit)) {
++		if (nowUs() - start > limitUs) {
++			return false;
++		}
++	}
++	return true;
++}
++// GPIO23 as a plain output (function 0, no pull, 2 mA), the level latched before the output is enabled.
++void amplifier(bool on) {
++	volatile uint32_t *cfg = reg(kTlmmSouth + kAmpGpio * 0x1000), *io = reg(kTlmmSouth + kAmpGpio * 0x1000 + 4);
++	if (!cfg || !io) {
++		return;
++	}
++	*io = (*io & ~2u) | (on ? 2u : 0u);
++	*cfg = (*cfg & ~0x3ffu) | 0x200u;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++// A 440 Hz sine at amplitude 4096 (about -18 dBFS) on both channels, from the fixed-point oscillator y[n] = 2cos(w) y[n-1] - y[n-2]
++// (w = 2 pi 440 / 48000, 2cos(w) in Q30, y in Q16): no floating point in the kernel. tests/ checks frequency and amplitude.
++void fillTone(uint32_t *words, uint32_t frames) {
++	const int64_t k = 2143922726;           // round(2 cos(w) * 2^30)
++	int64_t previous = 0, current = 15452226;   // y[0] = 0, y[1] = round(4096 sin(w) * 2^16)
++	for (uint32_t f = 0; f < frames; f++) {
++		const uint16_t sample = (uint16_t)(int16_t)(previous >> 16);
++		words[f] = (uint32_t)sample | (uint32_t)sample << 16;
++		const int64_t next = ((k * current) >> 30) - previous;
++		previous = current;
++		current = next;
++	}
++}
++}  // namespace
++
++extern "C" void
++coachz_speaker_start(void)
++{
++	static bool started;
++	int enabled = 0;
++	if (started || !PE_parse_boot_argn("coachz-speaker", &enabled, sizeof(enabled)) || enabled != 1) {
++		return;
++	}
++	started = true;
++	static const uint32_t used[] = {kCoreGdsc, kAudioGdsc, kPdcGdsc, kExtMclk0, kCore, kCoreExtMclk0, kSysnocMport, kSysnocSway, kPll,
++	                                kBitCmd, kModeMux, kI2sCtl, kIrqEn, kDmaCtl};
++	if (!mapped(used, sizeof(used) / sizeof(used[0])) || !reg(kTlmmSouth + kAmpGpio * 0x1000)) {
++		printf("COACHZ speaker: MMIO mapping failed\n");
++		return;
++	}
++	amplifier(false);
++	// 1. Power: each GDSC collapses unless bit 0 (SW_COLLAPSE) is clear; bit 31 reports it powered.
++	const uint32_t gdscs[3] = {kCoreGdsc, kAudioGdsc, kPdcGdsc};
++	for (unsigned i = 0; i < 3; i++) {
++		clear(gdscs[i], 1);
++		if (!waitSet(gdscs[i], 1u << 31, 100)) {
++			printf("COACHZ speaker: GDSC 0x%x did not power on: 0x%x\n", (unsigned)(kLpass + gdscs[i]), rd(gdscs[i]));
++			return;
++		}
++	}
++	set(kCoreGdsc, 1u << 11);   // retain the flip-flops
++	// 2. The interface, core and bus branches.
++	const uint32_t branches[5] = {kExtMclk0, kCore, kCoreExtMclk0, kSysnocMport, kSysnocSway};
++	for (unsigned i = 0; i < 5; i++) {
++		set(branches[i], 1);
++	}
++	// 3. The digital PLL, waiting for lock.
++	wr(kPll, 0);
++	wr(kPll + 0x4, 0x20);
++	wr(kPll + 0x8, 0x20);
++	wr(kPll + 0xc, 1 | (1u << 2) | (1u << 8) | (5u << 12));
++	wr(kPll + 0x10, 1 | (2u << 1) | (1u << 11) | (1u << 14));
++	wr(kPll + 0x1c, 7 | (6u << 4) | (4u << 11));
++	wr(kPll, 0x7c);
++	wr(kPll + 0x38, 1);
++	wr(kPll, 0x7c | 1);
++	if (!waitSet(kPll, 1u << 31, 5000)) {
++		printf("COACHZ speaker: audio PLL did not lock: mode 0x%x\n", rd(kPll));
++		return;
++	}
++	// 4. The secondary bit clock: the RCG from the PLL source, then M/N/D for 1.536 MHz.
++	wr(kBitCfg, 0x9 | (5u << 8) | (2u << 12));
++	wr(kBitCmd, 1);
++	wr(kBitM, 1);
++	wr(kBitN, 0xffb0);
++	wr(kBitD, 0xffaf);
++	wr(kBitCfg, (5u << 8) | (2u << 12));
++	wr(kBitCmd, 1);
++	// 5. One second of tone the DMA can address (32 bits, the SMMU passing LPASS through as firmware left it). All kernel memory lies
++	// above 4 GiB, so the buffer is low DRAM outside the kernel's window, just past the USB DMA pool (no reserved-memory node covers it).
++	const uint64_t pa = 0x81200000ull;
++	const vm_offset_t buffer = ml_io_map_wcomb(pa, round_page(kFrames * 4));
++	if (!buffer) {
++		printf("COACHZ speaker: no DMA buffer mapping\n");
++		return;
++	}
++	uint32_t *words = reinterpret_cast<uint32_t *>(buffer);
++	fillTone(words, kFrames);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	// 6. The read DMA and the interface, as the factory driver sets them up.
++	wr(kModeMux, 0);
++	wr(kDmaCtl, 0);
++	wr(kDmaBase, 0);
++	wr(kDmaBufLen, 0);
++	wr(kDmaPerLen, 0);
++	wr(kDmaCtl, kReset);
++	wr(kDmaCtl, 0);
++	wr(kPcmI2sSel, 0);
++	wr(kI2sCtl, kSpkrMode | kLongRate | kReset);
++	clear(kI2sCtl, kReset);
++	wr(kDmaBase, (uint32_t)pa);
++	wr(kDmaBaseExt, (uint32_t)(pa >> 32));
++	wr(kDmaBufLen, kFrames - 1);          // in 32-bit words, minus one
++	wr(kDmaPerLen, kFrames / 2 - 1);      // two periods
++	wr(kDmaCtl, kDmaFlags);
++	set(kDmaCtl, 1);
++	wr(kIrqClear, kIrqAll);
++	wr(kIrqEn, kIrqAll);
++	// 7. Amplifier on, bit clock and speaker output on; wait for both periods (one second), at most three seconds.
++	amplifier(true);
++	IODelay(2000);
++	wr(kBitBranch, 1);
++	set(kI2sCtl, kSpkrEn);
++	const uint64_t start = nowUs();
++	unsigned periods = 0;
++	uint32_t raw = 0, errors = 0;
++	while (periods < 2 && nowUs() - start < 3000000) {
++		raw = rd(kIrqRaw);
++		if (raw & kIrqError) {
++			errors++;
++			wr(kIrqClear, kIrqError);
++		}
++		if (raw & kIrqPeriod) {
++			periods++;
++			wr(kIrqClear, kIrqPeriod);
++		}
++		if (errors > 8) {
++			break;
++		}
++		IOSleep(1);
++	}
++	const uint64_t played = nowUs() - start;
++	// 8. Output off, DMA stopped, amplifier off; only then the buffer goes.
++	clear(kI2sCtl, kSpkrEn);
++	wr(kIrqClear, kIrqAll);
++	wr(kIrqEn, 0);
++	clear(kBitBranch, 1);
++	clear(kDmaCtl, 1);
++	amplifier(false);
++	IOSleep(5);
++	printf("COACHZ speaker: tone %s: %u periods, %u errors, irq 0x%x, %llu ms, DMA at 0x%llx, PLL 0x%x\n",
++	    periods == 2 ? "played" : "incomplete", periods, errors, raw, played / 1000, pa, rd(kPll));
++}
+--- a/iokit/conf/files
++++ b/iokit/conf/files
+@@ -52,6 +52,7 @@
+ iokit/Kernel/IOCatalogue.cpp				optional iokitcpp
+ iokit/Kernel/IOPMPowerSource.cpp			optional iokitcpp
+ iokit/Kernel/CoachzBattery.cpp			optional iokitcpp
++iokit/Kernel/CoachzSpeaker.cpp			optional iokitcpp
+ iokit/Kernel/IOPMPowerSourceList.cpp			optional iokitcpp
+ iokit/Kernel/IOPMGR.cpp					optional iokitcpp
+ iokit/Kernel/CoachzPMGR.cpp				optional iokitcpp

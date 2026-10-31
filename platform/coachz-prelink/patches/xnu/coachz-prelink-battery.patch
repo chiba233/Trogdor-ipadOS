@@ -1,0 +1,601 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@
+ bsd/dev/memdev.c			standard
+ bsd/dev/coachz_sample.c		standard
+ bsd/dev/coachz_touch.c		standard
++bsd/dev/coachz_ec.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/coachz_ec.c
++++ b/bsd/dev/coachz_ec.c
+@@ -0,0 +1,280 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++/*
++ * ChromeOS EC host commands (protocol 3) for the running kernel, over the GENI SPI engine (QUPv3 wrap1 SE0 at 0x00a80000)
++ * that Coreboot configured and Depthcharge used. The bus code is boot/display_ec.c, which sent HELLO and backlight commands to
++ * this EC on hardware, with larger buffers, a command version and one lock around every transaction. Every wait is bounded and
++ * every path releases chip select. Only queries are sent here: no charger, PD or EC configuration is changed.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <machine/machine_routines.h>
++#include "coachz_ec_proto.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++int coachz_ec_command(uint16_t command, uint8_t command_version, const void *args, uint32_t size, void *reply, uint32_t room,
++    uint32_t *length);
++
++#define QUP_PA 0x00a80000u
++#define GCC_PA 0x00100000u
++/* GCC votes in 0x52008 for wrap1 core_2x 18, core 19, m_ahb 20, s_ahb 21 and SE0 22; SE0's branch at 0x18014 (Coreboot sc7180). */
++#define GCC_VOTE 0x52008u
++#define GCC_VOTE_BITS (0x1fu << 18)
++#define GCC_S0_CBCR 0x18014u
++#define R_LOOPBACK 0x22cu
++#define R_DEMUX 0x250u
++#define R_BYTE_GRAN 0x254u
++#define R_TX_PACK0 0x260u
++#define R_TX_PACK1 0x264u
++#define R_WORD_LEN 0x268u
++#define R_TX_LEN 0x26cu
++#define R_RX_LEN 0x270u
++#define R_RX_PACK0 0x284u
++#define R_RX_PACK1 0x288u
++#define R_M_CMD 0x600u
++#define R_M_CTRL 0x604u
++#define R_M_STATUS 0x610u
++#define R_M_CLEAR 0x618u
++#define R_TX_FIFO 0x700u
++#define R_RX_FIFO 0x780u
++#define R_RX_STATUS 0x804u
++#define R_TX_WATERMARK 0x80cu
++#define IRQ_DONE 1u
++#define IRQ_CANCEL (1u << 4)
++#define IRQ_ABORT (1u << 5)
++#define IRQ_RX_WATERMARK (1u << 26)
++#define IRQ_RX_LAST (1u << 27)
++#define IRQ_TX_WATERMARK (1u << 30)
++#define OP_TX 1u
++#define OP_RX 2u
++#define OP_CS_ASSERT 8u
++#define OP_CS_DEASSERT 9u
++#define PARAM_FRAGMENT 4u
++#define FIFO_TX_BYTES 60u
++#define FRAME_START 0xecu
++#define FRAME_PROCESSING 0xfau
++#define FRAME_BAD_DATA 0xfbu
++#define FRAME_NOT_READY 0xfcu
++/* Transport errors, numbered after the protocol ones in coachz_ec_proto.h. */
++enum { EC_ERR_MAP = 0x10, EC_ERR_CLOCK, EC_ERR_CS, EC_ERR_TX, EC_ERR_FRAME_BUS, EC_ERR_FRAME_BAD, EC_ERR_FRAME_BUSY,
++       EC_ERR_ACCEPT_TIMEOUT, EC_ERR_PROCESS_TIMEOUT, EC_ERR_RX };
++
++static vm_offset_t qup, gcc;
++static uint64_t ec_freq, ec_last_stop;
++static lck_grp_t *ec_group;
++static lck_mtx_t *ec_lock;
++
++static uint32_t rd(uint32_t offset) { return *(volatile uint32_t *)(qup + offset); }
++static void wr(uint32_t offset, uint32_t value) { *(volatile uint32_t *)(qup + offset) = value; __asm__ volatile ("dsb sy" ::: "memory"); }
++static uint64_t ticks(void) { uint64_t t; __asm__ volatile ("isb\n\tmrs %0, cntpct_el0" : "=r"(t) :: "memory"); return t; }
++static uint64_t us(uint64_t count) { return ec_freq * count / 1000000; }
++
++static int wait_irq(uint32_t mask, uint64_t timeout) {
++	uint64_t start = ticks();
++	do {
++		uint32_t irq = rd(R_M_STATUS);
++		if (irq) {
++			wr(R_M_CLEAR, irq);
++		}
++		if (irq & mask) {
++			return 1;
++		}
++	} while (ticks() - start < timeout);
++	return 0;
++}
++
++static void cancel(void) {
++	wr(R_TX_WATERMARK, 0);
++	wr(R_M_CTRL, 1u << 2);
++	if (!wait_irq(IRQ_CANCEL, us(1000))) {
++		wr(R_M_CTRL, 1u << 1);
++		(void)wait_irq(IRQ_ABORT, us(1000));
++	}
++}
++
++static int chip_select(uint32_t op) {
++	wr(R_M_CLEAR, rd(R_M_STATUS));
++	wr(R_M_CMD, op << 27);
++	if (wait_irq(IRQ_DONE, us(1000))) {
++		return 1;
++	}
++	cancel();
++	return 0;
++}
++
++static int transfer(uint8_t *in, const uint8_t *out, uint32_t size) {
++	wr(R_LOOPBACK, 0);
++	wr(R_DEMUX, 0);
++	wr(R_WORD_LEN, 4);
++	wr(R_TX_PACK0, 0x0feu | 0x1feu << 10);
++	wr(R_TX_PACK1, 0x2feu | 0x3ffu << 10);
++	wr(R_RX_PACK0, 0x0feu | 0x1feu << 10);
++	wr(R_RX_PACK1, 0x2feu | 0x3ffu << 10);
++	wr(R_BYTE_GRAN, 0);
++	if (out) {
++		wr(R_TX_LEN, size);
++		wr(R_TX_WATERMARK, 1);
++	}
++	if (in) {
++		wr(R_RX_LEN, size);
++	}
++	wr(R_M_CMD, (out ? OP_TX : OP_RX) << 27 | PARAM_FRAGMENT);
++	uint32_t tx = out ? size : 0, rx = in ? size : 0, irq = 0;
++	uint64_t start = ticks();
++	do {
++		irq = rd(R_M_STATUS);
++		if (in && irq & (IRQ_RX_WATERMARK | IRQ_RX_LAST)) {
++			for (uint32_t words = rd(R_RX_STATUS) & 0x1ffffffu; words && rx; words--) {
++				uint32_t word = rd(R_RX_FIFO);
++				for (unsigned j = 0; j < 4 && rx; j++, rx--) {
++					*in++ = (uint8_t)(word >> (8 * j));
++				}
++			}
++		}
++		if (out && irq & IRQ_TX_WATERMARK) {
++			uint32_t chunk = tx < FIFO_TX_BYTES ? tx : FIFO_TX_BYTES, last = tx == chunk;
++			for (uint32_t sent = 0; sent < chunk; sent += 4) {
++				uint32_t word = 0;
++				for (unsigned j = 0; j < 4 && sent + j < chunk; j++) {
++					word |= (uint32_t)out[sent + j] << (8 * j);
++				}
++				wr(R_TX_FIFO, word);
++			}
++			out += chunk;
++			tx -= chunk;
++			if (last) {
++				wr(R_TX_WATERMARK, 0);
++			}
++		}
++		if (irq) {
++			wr(R_M_CLEAR, irq);
++		}
++		if (irq & IRQ_DONE) {
++			break;
++		}
++	} while (ticks() - start < us(1000000));
++	if (!(irq & IRQ_DONE) || tx || rx) {
++		cancel();
++		return 0;
++	}
++	return 1;
++}
++
++static uint32_t wait_for_frame(void) {
++	uint64_t start = ticks();
++	int accepted = 0;
++	for (;;) {
++		uint8_t byte = 0;
++		if (!transfer(&byte, 0, 1)) {
++			return EC_ERR_FRAME_BUS;
++		}
++		if (byte == FRAME_START) {
++			return 0;
++		}
++		if (byte == FRAME_PROCESSING) {
++			accepted = 1;
++		}
++		if (byte == FRAME_BAD_DATA) {
++			return EC_ERR_FRAME_BAD;
++		}
++		if (byte == FRAME_NOT_READY) {
++			return EC_ERR_FRAME_BUSY;
++		}
++		uint64_t waited = ticks() - start;
++		if (!accepted && waited > us(50000)) {
++			return EC_ERR_ACCEPT_TIMEOUT;
++		}
++		if (waited > us(1000000)) {
++			return EC_ERR_PROCESS_TIMEOUT;
++		}
++	}
++}
++
++/* Map the engine and the clock controller once, vote for the engine's clocks (firmware left them on) and wait for its branch. */
++static uint32_t ec_setup(void) {
++	if (qup) {
++		return 0;
++	}
++	__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(ec_freq));
++	if (!ec_freq) {
++		ec_freq = 19200000;
++	}
++	gcc = ml_io_map(GCC_PA, 0x60000);
++	vm_offset_t engine = ml_io_map(QUP_PA, 0x4000);
++	if (!gcc || !engine) {
++		return EC_ERR_MAP;
++	}
++	*(volatile uint32_t *)(gcc + GCC_VOTE) |= GCC_VOTE_BITS;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	uint64_t start = ticks();
++	while (*(volatile uint32_t *)(gcc + GCC_S0_CBCR) & (1u << 31)) {
++		if (ticks() - start > us(5000)) {
++			return EC_ERR_CLOCK;
++		}
++	}
++	qup = engine;
++	return 0;
++}
++
++/*
++ * One host command. reply gets up to room bytes of payload and *length its size; the EC's own reply size must fit room.
++ * Returns 0, a coachz_ec_proto.h error (EC_ERR_RESULT carries the EC result code in bits 8 and up) or a transport error.
++ */
++int
++coachz_ec_command(uint16_t command, uint8_t command_version, const void *args, uint32_t size, void *reply, uint32_t room,
++    uint32_t *length)
++{
++	uint8_t out[EC_HEADER + EC_MAX_PARAMS], in[EC_HEADER + EC_MAX_REPLY];
++	uint32_t status, payload = 0;
++
++	if (room > EC_MAX_REPLY || !length) {
++		return EC_ERR_ARGS;
++	}
++	uint32_t sent = coachz_ec_request(out, command, command_version, (const uint8_t *)args, size);
++	if (!sent) {
++		return EC_ERR_ARGS;
++	}
++	if (!ec_lock) {
++		ec_group = lck_grp_alloc_init("coachz-ec", LCK_GRP_ATTR_NULL);
++		ec_lock = lck_mtx_alloc_init(ec_group, LCK_ATTR_NULL);
++	}
++	lck_mtx_lock(ec_lock);
++	status = ec_setup();
++	if (!status) {
++		/* The EC needs 200 us between transactions. */
++		while (ticks() - ec_last_stop < us(200)) {
++			__asm__ volatile ("yield");
++		}
++		if (!chip_select(OP_CS_ASSERT)) {
++			status = EC_ERR_CS;
++		} else {
++			status = transfer(0, out, sent) ? wait_for_frame() : EC_ERR_TX;
++			/* The header first, then exactly the payload it announces. */
++			if (!status && !transfer(in, 0, EC_HEADER)) {
++				status = EC_ERR_RX;
++			}
++			if (!status) {
++				payload = coachz_ec_le16(in + 4);
++				if (payload > room) {
++					status = EC_ERR_LENGTH;
++				} else if (payload && !transfer(in + EC_HEADER, 0, payload)) {
++					status = EC_ERR_RX;
++				}
++			}
++			(void)chip_select(OP_CS_DEASSERT);
++			ec_last_stop = ticks();
++			if (!status) {
++				status = coachz_ec_response(in, EC_HEADER + payload, length);
++			}
++			if (!status) {
++				for (uint32_t i = 0; i < *length; i++) {
++					((uint8_t *)reply)[i] = in[EC_HEADER + i];
++				}
++			}
++		}
++	}
++	lck_mtx_unlock(ec_lock);
++	return (int)status;
++}
+--- a/bsd/dev/coachz_ec_proto.h
++++ b/bsd/dev/coachz_ec_proto.h
+@@ -0,0 +1,132 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++/*
++ * ChromeOS EC host command protocol 3: request framing, response checks and the battery replies Coachz reads.
++ * Pure functions, no hardware access, so the host tests run them unchanged. Layouts from the pinned Chrome EC
++ * include/ec_commands.h: ec_host_request/ec_host_response (8 bytes each), EC_CMD_BATTERY_GET_DYNAMIC 0x0601 (14 bytes),
++ * EC_CMD_CHARGE_STATE 0x00a0 GET_STATE (20 bytes), EC_CMD_GET_PROTOCOL_INFO 0x000b (12 bytes).
++ */
++#ifndef COACHZ_EC_PROTO_H
++#define COACHZ_EC_PROTO_H
++#include <stdint.h>
++
++#define EC_CMD_HELLO 0x0001u
++#define EC_CMD_GET_PROTOCOL_INFO 0x000bu
++#define EC_CMD_CHARGE_STATE 0x00a0u
++#define EC_CMD_BATTERY_GET_DYNAMIC 0x0601u
++#define EC_HEADER 8u
++#define EC_MAX_PARAMS 32u
++#define EC_MAX_REPLY 64u
++
++/* Errors: low byte the stage, the EC result code above it for EC_ERR_RESULT. */
++enum {
++	EC_ERR_ARGS = 1, EC_ERR_VERSION, EC_ERR_RESERVED, EC_ERR_LENGTH, EC_ERR_SHORT, EC_ERR_CHECKSUM, EC_ERR_RESULT
++};
++
++#define EC_BATT_FLAG_AC_PRESENT 0x01
++#define EC_BATT_FLAG_BATT_PRESENT 0x02
++#define EC_BATT_FLAG_DISCHARGING 0x04
++#define EC_BATT_FLAG_CHARGING 0x08
++#define EC_BATT_FLAG_LEVEL_CRITICAL 0x10
++#define EC_BATT_FLAG_INVALID_DATA 0x20
++
++struct coachz_ec_battery {
++	int voltage_mv, current_ma, remaining_mah, full_mah, desired_mv, desired_ma;
++	unsigned flags;
++};
++
++struct coachz_ec_charge {
++	int ac, charge_mv, charge_ma, input_ma, percent;
++};
++
++static inline uint16_t coachz_ec_le16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
++static inline uint32_t coachz_ec_le32(const uint8_t *p) {
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++/* The request: header (version 3, checksum making the byte sum zero, command, command version, data length) and params. */
++static inline uint32_t coachz_ec_request(uint8_t *out, uint16_t command, uint8_t version, const uint8_t *params, uint32_t size) {
++	if (size > EC_MAX_PARAMS) {
++		return 0;
++	}
++	out[0] = 3;
++	out[1] = 0;
++	out[2] = (uint8_t)command;
++	out[3] = (uint8_t)(command >> 8);
++	out[4] = version;
++	out[5] = 0;
++	out[6] = (uint8_t)size;
++	out[7] = (uint8_t)(size >> 8);
++	uint8_t sum = 0;
++	for (uint32_t i = 0; i < size; i++) {
++		out[EC_HEADER + i] = params[i];
++	}
++	for (uint32_t i = 0; i < EC_HEADER + size; i++) {
++		sum = (uint8_t)(sum + out[i]);
++	}
++	out[1] = (uint8_t)-sum;
++	return EC_HEADER + size;
++}
++
++/*
++ * The response as read after the frame start byte: in holds `got` bytes. A reply must be complete: it is never padded, so a short
++ * answer cannot become a valid zero. *length gets the payload length.
++ */
++static inline uint32_t coachz_ec_response(const uint8_t *in, uint32_t got, uint32_t *length) {
++	if (got < EC_HEADER) {
++		return EC_ERR_SHORT;
++	}
++	uint32_t result = coachz_ec_le16(in + 2), size = coachz_ec_le16(in + 4);
++	if (in[0] != 3) {
++		return EC_ERR_VERSION;
++	}
++	if (in[6] || in[7]) {
++		return EC_ERR_RESERVED;
++	}
++	if (size > EC_MAX_REPLY) {
++		return EC_ERR_LENGTH;
++	}
++	if (got < EC_HEADER + size) {
++		return EC_ERR_SHORT;
++	}
++	uint8_t sum = 0;
++	for (uint32_t i = 0; i < EC_HEADER + size; i++) {
++		sum = (uint8_t)(sum + in[i]);
++	}
++	if (sum) {
++		return EC_ERR_CHECKSUM;
++	}
++	if (result) {
++		return EC_ERR_RESULT | result << 8;
++	}
++	*length = size;
++	return 0;
++}
++
++/* BATTERY_GET_DYNAMIC v0: seven little-endian int16 in mV, mA (negative while discharging) and mAh, then flags. */
++static inline int coachz_ec_battery_decode(const uint8_t *p, uint32_t size, struct coachz_ec_battery *b) {
++	if (size < 14) {
++		return 0;
++	}
++	b->voltage_mv = (int16_t)coachz_ec_le16(p);
++	b->current_ma = (int16_t)coachz_ec_le16(p + 2);
++	b->remaining_mah = (int16_t)coachz_ec_le16(p + 4);
++	b->full_mah = (int16_t)coachz_ec_le16(p + 6);
++	b->flags = coachz_ec_le16(p + 8);
++	b->desired_mv = (int16_t)coachz_ec_le16(p + 10);
++	b->desired_ma = (int16_t)coachz_ec_le16(p + 12);
++	return 1;
++}
++
++/* CHARGE_STATE GET_STATE: five little-endian int32: AC present, charger voltage and current, input current limit, state of charge. */
++static inline int coachz_ec_charge_decode(const uint8_t *p, uint32_t size, struct coachz_ec_charge *c) {
++	if (size < 20) {
++		return 0;
++	}
++	c->ac = (int32_t)coachz_ec_le32(p);
++	c->charge_mv = (int32_t)coachz_ec_le32(p + 4);
++	c->charge_ma = (int32_t)coachz_ec_le32(p + 8);
++	c->input_ma = (int32_t)coachz_ec_le32(p + 12);
++	c->percent = (int32_t)coachz_ec_le32(p + 16);
++	return 1;
++}
++#endif
+--- a/bsd/dev/coachz_sample.c
++++ b/bsd/dev/coachz_sample.c
+@@ -39,7 +39,10 @@
+ {
+ 	static int chan;
+ 	unsigned ticks = 0;
++	extern void coachz_battery_start(void);
+ 
++	/* The Chrome EC battery service (iokit/Kernel/CoachzBattery.cpp, coachz-battery=1): IOKit is up by the time this thread runs. */
++	coachz_battery_start();
+ 	for (;;) {
+ 		clock_sec_t sec;
+ 		clock_usec_t usec;
+--- a/iokit/Kernel/CoachzBattery.cpp
++++ b/iokit/Kernel/CoachzBattery.cpp
+@@ -0,0 +1,147 @@
++// SPDX-License-Identifier: BSD-2-Clause
++// The Coachz battery as iPadOS reads it (coachz-battery=1): an IOPMPowerSource fed by the Chrome EC, which keeps its own charger,
++// PD and battery management. Every ten seconds it reads BATTERY_GET_DYNAMIC and CHARGE_STATE through bsd/dev/coachz_ec.c; it only
++// queries. The publishing follows UniXNU-sheng's ShengBattery.cpp (BSD-2-Clause-Patent), as iPadOS 17 consumed it on that board:
++// CurrentCapacity is the percentage with MaxCapacity 100, raw mAh in AppleRawCurrentCapacity/AppleRawMaxCapacity, the service is
++// registered only after the first valid reading (an early 0 % would read as an empty battery), and updateStatus() tells powerd.
++#include <IOKit/IOLib.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOWorkLoop.h>
++#include <IOKit/IOTimerEventSource.h>
++#include <IOKit/pwr_mgt/IOPMPowerSource.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSSymbol.h>
++#include <pexpert/pexpert.h>
++extern "C" {
++#include "../../bsd/dev/coachz_ec_proto.h"
++int coachz_ec_command(uint16_t command, uint8_t version, const void *args, uint32_t size, void *reply, uint32_t room,
++    uint32_t *length);
++void coachz_battery_start(void);
++}
++
++static const uint32_t kRefreshMs = 10000;
++
++class CoachzBattery : public IOPMPowerSource {
++	OSDeclareDefaultStructors(CoachzBattery)
++	IOWorkLoop *loop = nullptr;
++	IOTimerEventSource *timer = nullptr;
++	bool published = false;
++	int lastPercent = -1, lastFlags = -1, lastError = -1;
++	uint32_t reads = 0, failures = 0;
++
++	void number(const char *key, int64_t value) {
++		const OSSymbol *symbol = OSSymbol::withCString(key);
++		OSNumber *n = OSNumber::withNumber((unsigned long long)value, 32);
++		if (symbol && n) {
++			setPSProperty(symbol, n);
++		}
++		OSSafeReleaseNULL(n);
++		OSSafeReleaseNULL(symbol);
++	}
++	void flag(const char *key, bool value) {
++		const OSSymbol *symbol = OSSymbol::withCString(key);
++		if (symbol) {
++			setPSProperty(symbol, value ? kOSBooleanTrue : kOSBooleanFalse);
++		}
++		OSSafeReleaseNULL(symbol);
++	}
++
++	void refresh() {
++		uint8_t reply[EC_MAX_REPLY], index = 0, charge[10] = {0};   // CHARGE_STATE: cmd 0 = GET_STATE, the union and chgnum zero
++		uint32_t length = 0;
++		coachz_ec_battery b;
++		coachz_ec_charge c;
++		reads++;
++		int error = coachz_ec_command(EC_CMD_BATTERY_GET_DYNAMIC, 0, &index, 1, reply, sizeof(reply), &length);
++		if (!error && !coachz_ec_battery_decode(reply, length, &b)) {
++			error = EC_ERR_SHORT;
++		}
++		int stateError = error ? -1 : coachz_ec_command(EC_CMD_CHARGE_STATE, 0, charge, sizeof(charge), reply, sizeof(reply), &length);
++		bool haveState = !stateError && coachz_ec_charge_decode(reply, length, &c);
++		if (error || !(b.flags & EC_BATT_FLAG_BATT_PRESENT) || (b.flags & EC_BATT_FLAG_INVALID_DATA) || b.full_mah <= 0) {
++			failures++;
++			if (error != lastError) {
++				printf("COACHZ battery: read %u failed: error 0x%x flags 0x%x (last good kept, %u failures)\n", reads, (unsigned)error,
++				    error ? 0u : b.flags, failures);
++				lastError = error;
++			}
++			return;   // last good values stay published; a failed read never becomes 0 %
++		}
++		lastError = 0;
++		int percent = haveState && c.percent >= 0 && c.percent <= 100 ? c.percent : b.remaining_mah * 100 / b.full_mah;
++		bool external = (b.flags & EC_BATT_FLAG_AC_PRESENT) || (haveState && c.ac);
++		bool charging = (b.flags & EC_BATT_FLAG_CHARGING) != 0;
++		setBatteryInstalled(true);
++		setExternalConnected(external);
++		setExternalChargeCapable(external);
++		setIsCharging(charging);
++		setAtCriticalLevel((b.flags & EC_BATT_FLAG_LEVEL_CRITICAL) != 0);
++		setCurrentCapacity((unsigned)percent);
++		setMaxCapacity(100);
++		setVoltage((unsigned)(b.voltage_mv > 0 ? b.voltage_mv : 0));
++		setAmperage(b.current_ma);
++		setTimeRemaining(0xffff);   // unknown until the SBS run-time registers are read
++		flag("FullyCharged", external && !charging && percent >= 100);
++		number("InstantAmperage", b.current_ma);
++		number("AppleRawCurrentCapacity", b.remaining_mah);
++		number("AppleRawMaxCapacity", b.full_mah);
++		number("NominalChargeCapacity", b.full_mah);
++		if (percent != lastPercent || (int)b.flags != lastFlags) {
++			printf("COACHZ battery: %d %% %d mV %d mA %d/%d mAh flags 0x%x ac %d charger %d mV %d mA input %d mA (read %u, EC state %d)\n",
++			    percent, b.voltage_mv, b.current_ma, b.remaining_mah, b.full_mah, b.flags, haveState ? c.ac : -1,
++			    haveState ? c.charge_mv : -1, haveState ? c.charge_ma : -1, haveState ? c.input_ma : -1, reads, stateError);
++			lastPercent = percent;
++			lastFlags = (int)b.flags;
++		}
++		if (!published) {
++			published = true;   // the properties are in place before anyone finds the service
++			registerService();
++			printf("COACHZ battery: published\n");
++		}
++		updateStatus();
++	}
++
++	static void timerAction(OSObject *owner, IOTimerEventSource *sender) {
++		CoachzBattery *self = OSDynamicCast(CoachzBattery, owner);
++		if (!self) {
++			return;
++		}
++		self->refresh();
++		sender->setTimeoutMS(kRefreshMs);
++	}
++
++public:
++	bool startBattery() {
++		loop = IOWorkLoop::workLoop();
++		timer = IOTimerEventSource::timerEventSource(this, &CoachzBattery::timerAction);
++		if (!loop || !timer || loop->addEventSource(timer) != kIOReturnSuccess) {
++			return false;
++		}
++		timer->setTimeoutMS(1);
++		return true;
++	}
++};
++OSDefineMetaClassAndStructors(CoachzBattery, IOPMPowerSource)
++
++// Called once from the sampler thread (bsd/dev/coachz_sample.c) after IOKit is up.
++extern "C" void
++coachz_battery_start(void)
++{
++	static bool started;
++	int enabled = 0;
++	if (started || !PE_parse_boot_argn("coachz-battery", &enabled, sizeof(enabled)) || enabled != 1) {
++		return;
++	}
++	started = true;
++	CoachzBattery *battery = OSTypeAlloc(CoachzBattery);
++	if (!battery || !battery->init() || !battery->attach(IOService::getPlatform())) {
++		printf("COACHZ battery: could not attach\n");
++		OSSafeReleaseNULL(battery);
++		return;
++	}
++	if (!battery->startBattery()) {
++		printf("COACHZ battery: could not start its work loop\n");
++		battery->detach(IOService::getPlatform());
++	}
++	battery->release();   // the platform's attachment keeps it
++}
+--- a/iokit/conf/files
++++ b/iokit/conf/files
+@@ -51,6 +51,7 @@
+ iokit/Kernel/IOPMPowerStateQueue.cpp			optional iokitcpp
+ iokit/Kernel/IOCatalogue.cpp				optional iokitcpp
+ iokit/Kernel/IOPMPowerSource.cpp			optional iokitcpp
++iokit/Kernel/CoachzBattery.cpp			optional iokitcpp
+ iokit/Kernel/IOPMPowerSourceList.cpp			optional iokitcpp
+ iokit/Kernel/IOPMGR.cpp					optional iokitcpp
+ iokit/Kernel/CoachzPMGR.cpp				optional iokitcpp

@@ -239,8 +239,8 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         command_line += ' coachz-display=1 offline-legacy-register=1 offline-legacy-gop=1 offline-legacy-phase=4'
         command_line += ' offline-legacy-pm=1 offline-legacy-validate=1 offline-legacy-transfer=1 offline-legacy-cpu-present=1'
         command_line += ' sheng-vsync=60 sheng-early-retire=0 coachz-reset-mgcache=1'
-        # Once the first frame is copied, the screen console keeps to the top 18 rows (coachz-prelink-measure.patch).
-        command_line += ' coachz-console-band=18'
+        # The first frame silences the screen console until a panic (CoachzDisplay.cpp); the disk log keeps its output.
+        command_line += ' coachz-console-band=0'
         # The GT7375P touchscreen on SE4 as an IOHIDDevice digitizer (coachz-prelink-touch.patch, build-sheng-hid-input.py).
         command_line += ' coachz-touch=1'
         # UniXNU's AppleKeyStoreState: no keybag, no passcode, nothing locked (package/CoachzKeyStore.cpp).
@@ -251,6 +251,8 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         command_line += ' coachz-no-launch-constraints=1'
         # CoreImage calls an empty OpenGL table in iconservicesagent, which Settings waits on (coachz-prelink-software-render.patch).
         command_line += ' coachz-null-call=1'
+        # The drivers under test: Chrome EC battery, a speaker tone and the volume buttons (docs/plans/battery-speaker.md, input.md).
+        command_line += ' coachz-battery=1 coachz-speaker=1 coachz-buttons=1'
     if cpus != 1:
         # coachz-prelink-smp.patch raises BCM2837's board configuration to eight CPUs in two clusters.
         if not root_uuid or not prelinked or not 2 <= cpus <= 8:

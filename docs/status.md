@@ -40,7 +40,10 @@
 | SMP | 进行中（2026-10-31） | 六颗 A55 和两颗 A76 经 PSCI 启动，型号与 E／P 簇识别正确，SGI 能送达；所有核共用一个 pset，空闲核优先选 A76，大核已承担负载，但不是大小核调度；三个频率域固定在最高的非 boost 档，绑核计时测得 A55 1804、A76 2400 MHz，未被压频；升级页显示时系统合计只用约 0.37 颗核，没有动态调频和温控，见 [硬件记录](hardware-tests.md) |
 | 触摸 | 真机通过（2026-10-31） | GT7375P 经 GENI I2C、ShengHidInput 和内核 `IOHIDEventDriver` 接到 backboardd；上滑让 PreBoard 从 “Swipe up to upgrade” 进到 “Enter Passcode”，见[硬件记录](hardware-tests.md) |
 | iPadOS 主屏幕 | 真机显示（2026-11-01） | 主屏幕、Dock 和状态栏经 CPU 后端显示，Safari 和设置能启动，带云朵的 App 还是占位符；AppleKeyStore 只回答状态，没有任何保护 |
-| eMMC、GPU 与可用 iPadOS 界面 | 未实现／未验收 | backboardd 还有 `dc zva` 崩溃（k52 的修复未验证）；CPU 后端拷一帧在 A76 上约 20 ms、A55 上约 209 ms；无 GPU |
+| 电池 | 真机通过（2026-11-01） | Chrome EC 查询发布为 IOPMPowerSource，数值和 Debian 一致，状态栏显示电量 |
+| 扬声器 | 测试音通过（2026-11-01） | LPASS 经 I2S 放一次 1 秒测试音；系统和 App 还没有音频输出 |
+| 音量键 | 驱动层通过（2026-11-01） | 报告进入 HID 且返回 0；屏幕上没有音量条 |
+| eMMC、GPU 与可用 iPadOS 界面 | 未实现／未验收 | “关于本机”卡在读 MAC 地址；CPU 后端拷一帧在 A76 上约 20 ms、A55 上约 209 ms；无 GPU |
 
 ## 已执行的主机验证
 

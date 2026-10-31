@@ -26,9 +26,10 @@ HP Chromebook x2 11（Google Coachz / SC7180）的 **原生 iPadOS 移植实验*
 | XNU 里的 USB 存储驱动 | 只读挂根屏幕确认 | 内核经 GPT 和 APFS 从外接盘挂载恢复卷作只读根，`restored_update` 运行；未封存根卷是放行，不是验证，见 [硬件记录](docs/hardware-tests.md) |
 | 从外接盘启动主系统 | 屏幕确认到升级界面 | iPadOS 系统卷只读作根，外接 Data 卷可写；原版系统经 CPU 绘制到 iPadOS 主屏幕，见 [硬件记录](docs/hardware-tests.md) |
 | 触摸 | 真机通过 | 经 GENI I2C 和内核 `IOHIDEventDriver` 接到 backboardd |
-| App | 进行中 | Safari 和设置能启动，但还不稳定；带云朵的 App 还是占位符 |
+| App | 进行中 | Safari 和设置能启动；带云朵的 App 还是占位符 |
+| 电池、扬声器测试音、音量键 | 真机通过 | 状态栏显示电量，开机测试音能听到；系统音频和音量条还没有 |
 | SMP | 进行中 | 八个核上线，A55／A76 识别正确，IPI 能送达，空闲核优先选 A76；实测 A55 1804、A76 2400 MHz，界面静止时系统基本空闲；频率固定在最高档且没有温控，也不是真正的大小核调度 |
-| GPU、音频、可用界面 | 未实现 | 设备树里没有这些硬件节点，Apple 组件大多只是加载 |
+| GPU、系统音频、可用界面 | 未实现 | 设备树里没有这些硬件节点，Apple 组件大多只是加载 |
 
 屏幕照片阶段没有逐字段核对，也没有验证长时间稳定性。早期有一个原因不明的随机 zone panic，最近几轮没有再出现，但没有解决。详情见 [状态](docs/status.md) 和 [硬件记录](docs/hardware-tests.md)。
 

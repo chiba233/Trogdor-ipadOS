@@ -1231,3 +1231,21 @@ XNU 只用它们生成 IOPlatformUUID，没有它，CurrentHost 偏好写不进�
   k52 在内核里接住这个错误、用普通写入清零并记录 MMU 属性（`@dczva`），还没有真机结果。
 - 机主报告 backboardd 崩溃重启后触摸没有反应。日志里报告仍在进 HID（`to HID 911`），`user clients 1`，SpringBoard 主线程空闲在 runloop，
   所以断点在 backboardd 重启之后的上层，原因没查。k49 那次机主还看到过一次 panic，内容没有落盘；k50 起 panic 文字也写进日志区，这段写入还没有真机触发过。
+- k52、k53 的 `@dczva` 记到 `attr 0x0`：IOSurface 的 `VM_WIMG_RT` 映射在这个配置下就是 Device-nGnRnE（没有 `HAS_UCNORMAL_MEM`，
+  `CACHE_ATTRINDX_RT` 等于 `CACHE_ATTRINDX_DISABLE`），k51 改的分支没有走到。接住 `dc zva` 之后，backboardd 又在 CoreGraphics 的非对齐访问上 SIGBUS。
+- k54 让内核管理的内存（`pa_valid`）在这些不缓存映射下都用 Normal 非缓存。**真机日志：全程没有 `@crash`，`@dczva` 为 0，backboardd 和 SpringBoard
+  都没有重启，Safari 和设置都运行着。** USB DMA 池和 MMIO 在管理窗口之外，映射不变。
+- “设置 → 关于本机”仍然打不开：主线程在 `-[PSGAboutDataSource _macAddress]` 的 `dispatch_once` 上等，没有崩溃。还没有 Wi-Fi 驱动。
+
+## 电池、测试音和音量键（k53、k54）
+
+驱动由另一个会话写好，说明在 `docs/plans/battery-speaker.md` 和 `docs/plans/input.md`。
+
+- 电池：`COACHZ battery: 97 % 8466 mV 0 mA 3474/3578 mAh flags 0xb ac 1`，随后 `published`，机主确认状态栏显示电量。同一时间 Debian 的
+  `sbs-12-000b` 读到 97%、8464 mV、0 mA、3474/3580 mAh，充电器在线。
+- 测试音：k53 失败在 `no contiguous DMA buffer`，因为内核内存全在 4 GiB 以上，而 LPASS DMA 只有 32 位。k54 把缓冲放到内核窗口外的低端 DRAM
+  `0x81200000`：`tone played: 2 periods, 0 errors, irq 0x8, 1001 ms`，**机主听到了声音**。这只是一次性测试音，系统和 App 还没有音频输出。
+- 音量键：`EC buttons supported 0x7, enabled volume`，按键时 `buttons 0x4 -> report 0x8: 0x0`、`0x2 -> report 0x4: 0x0`，报告进了 HID 且返回 0。
+  屏幕上没有出现音量条，可能因为系统还没有音频设备，未验证。
+
+k54 起第一帧之后屏幕不再显示诊断文字（`coachz-console-band=0`），输出只进日志区，panic 时恢复显示。
