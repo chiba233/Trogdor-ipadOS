@@ -2,13 +2,13 @@
 
 HP Chromebook x2 11（Google Coachz / SC7180）的 **原生 iPadOS 移植实验**。
 
-目前已经能在真机上启动 XNU，并把输出直接画到屏幕上：内核带着 iPadOS 17.7.11 的 31 个 Apple 原始组件完成初始化，从内存盘启动一个自写的测试程序作为 PID 1。**还不能启动 iPadOS**，也没有运行 launchd 或任何 iPadOS 用户态。
+目前已经能在真机上启动 XNU，并把输出直接画到屏幕上：内核合并 iPadOS 17.7.11 的 Apple 原始组件后完成初始化，从内存里的恢复盘启动 Apple 原版 launchd 和恢复服务。**还不能启动 iPadOS**：跑的是恢复环境，不是主系统，没有界面，也没有存储驱动。
 
 ```text
 原厂 Coreboot → TF-A BL31 → Depthcharge（NS EL2）
   → 开发者模式签名 FIT → ARM64 探针 → EL1，恢复屏幕和背光
-  → XNU（prelink 31 个 Apple 组件）→ 内存盘上的自写 init（PID 1）
-  → 后续：launchd、存储驱动、iPadOS 用户态
+  → XNU（prelink Apple 组件）→ 内存里的恢复盘：launchd、dyld、restored_update
+  → 后续：USB 存储驱动、从 U 盘启动主系统、显示驱动
 ```
 
 ## 当前进度
@@ -20,9 +20,10 @@ HP Chromebook x2 11（Google Coachz / SC7180）的 **原生 iPadOS 移植实验*
 | 恢复屏幕和背光 | 通过 | 真机日志，加肉眼可见的棋盘格 |
 | XNU 屏幕控制台，内核初始化走完 | 通过 | 屏幕照片 |
 | 第一个用户态程序（PID 1）和定时器中断 | 通过 | 屏幕照片 |
-| prelink 31 个 Apple 组件，真实 AMFI 放行 init | 通过 | 屏幕照片，运行到至少 12 个 tick（约 1 分钟） |
-| launchd、dyld、iPadOS 用户态 | 未开始验证 | |
-| SMP、存储、触摸、GPU、音频 | 未实现 | 设备树里没有这些硬件节点，Apple 组件大多只是加载 |
+| prelink 31 个 Apple 组件（其中 1 个无代码，之后另加 tmpfs），真实 AMFI 放行 init | 通过 | 屏幕照片，运行到至少 12 个 tick（约 1 分钟） |
+| Apple launchd、dyld、恢复服务（恢复盘作根） | 运行，恢复服务按自身逻辑退出 | 屏幕照片，内核在 177 秒时仍存活 |
+| USB 存储、从 U 盘启动主系统 | 下一步，未开始 | 既定路线：先 U 盘，之后才考虑 eMMC |
+| 主系统、SMP、触摸、GPU、音频、界面 | 未实现 | 设备树里没有这些硬件节点，Apple 组件大多只是加载 |
 
 屏幕照片阶段没有逐字段核对，也没有验证长时间稳定性。早期有一个原因不明的随机 zone panic，最近几轮没有再出现，但没有解决。详情见 [状态](docs/status.md) 和 [硬件记录](docs/hardware-tests.md)。
 
@@ -129,6 +130,7 @@ python3 tools/sign.py build/uart/probe.itb \
 这部分镜像不再返回 Linux，结果都看屏幕。构建和配置见 [XNU 屏幕输出](docs/display-discovery.md#xnu-屏幕输出payload-version-12) 和 [prelink 屏幕镜像](docs/display-discovery.md#prelink-屏幕镜像)。
 
 - 屏幕控制台改编自 ios-sweet，kprintf 和 panic 调用栈都画到屏幕上。
-- 内存盘内容是 `tools/coachz_init.S` 打包成的静态程序，由 mockfs 当作 `/sbin/launchd` 启动，每 5 秒打印一次 tick。
+- 第一个用户程序是 `tools/coachz_init.S` 打包成的静态程序，由 mockfs 当作 `/sbin/launchd` 启动，每 5 秒打印一次 tick。
+- 之后改用 IPSW 的 Update 恢复内存盘作为 APFS 根，运行 Apple 原版 launchd。内核每 60 秒打印一次存活信息和线程状态。
 - SC7180 的虚拟定时器是 INTID 19，不是 ArmCpu 写死的 27，修正后定时器中断才开始工作。
 - prelink 需要用户自己提供 IPSW。IPSW、kernelcache 和合并后的内核都留在被忽略的目录里，不进仓库。

@@ -1,0 +1,37 @@
+--- a/bsd/miscfs/mockfs/mockfs_vfsops.c
++++ b/bsd/miscfs/mockfs/mockfs_vfsops.c
+@@ -139,6 +139,14 @@
+ 		buf_brelse(header_buf);
+ 	}
+ 	if (rvalue) {
++		goto done;
++	}
++	/*
++	 * mockfs comes before any filesystem a kext adds, and would take every device as
++	 * a single executable: leave anything else, such as an APFS RAM disk, to them.
++	 */
++	if (memcmp(header.magic, "N4KROOT", 8) && memcmp(header.magic, "\xcf\xfa\xed\xfe", 4)) {
++		rvalue = EINVAL;
+ 		goto done;
+ 	}
+ 	if (!memcmp(header.magic, "N4KROOT", 8)) {
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -1999,6 +1999,7 @@
+ 	p->p_acflag &= ~AFORK;
+ 
+ 	set_proc_name(imgp, p);
++	printf("COACHZ exec: pid %d %s\n", proc_getpid(p), p->p_name);
+ 
+ #if CONFIG_SECLUDED_MEMORY
+ 	if (secluded_for_apps &&
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -2192,6 +2192,7 @@
+ 	proc_unlock(p);
+ 	pid = proc_getpid(p);
+ 	exitval = p->p_xstat;
++	printf("COACHZ exit: pid %d %s status 0x%x\n", proc_getpid(p), p->p_name, exitval);
+ 	KERNEL_DEBUG_CONSTANT_IST(KDEBUG_COMMON,
+ 	    BSDDBG_CODE(DBG_BSD_PROC, BSD_PROC_EXIT) | DBG_FUNC_START,
+ 	    pid, exitval, 0, 0, 0);

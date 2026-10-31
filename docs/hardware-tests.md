@@ -650,7 +650,7 @@ panic 的调用栈为 `PE_init_iokit → InitIOKit → OSlibkernInit → OSRunti
 
 ## 2026-10-31：prelink 内核在真机上运行 init
 
-运行时与配置见随本节提交，镜像 SHA-256 `5d759e75eb57933c65c36d74751dba2d695d60746bd15b8c92dd86407512c391`。内核是 `platform/coachz-prelink`，合并了 iPadOS 17.7.11 kernelcache 里 OS profile 列出的 31 个组件。
+运行时与配置见随本节提交，镜像 SHA-256 `5d759e75eb57933c65c36d74751dba2d695d60746bd15b8c92dd86407512c391`。内核是 `platform/coachz-prelink`，合并了 iPadOS 17.7.11 kernelcache 里 OS profile 的组件：共 31 个，其中 `com.apple.iokit.IOHIDEventDriver` 是无代码组件。
 
 第一轮（只有 trust cache，没有 PMGR 补丁）的屏幕照片已经显示 `com.apple.AppleFSCompressionTypeZlib`、APFS、IOSurface、AppleImage4 的启动输出，`BSD root: md0`，以及 `init running as PID 1` 和 tick。init 不再依赖内置 AMFI 接口，而是由真实 AMFI 放行，判断依据是 init 的 cdhash 在自建 trust cache 里，并且这一版内核没有 `coachz_amfi.c`。约 5 个 tick 后出现 `panic: "AMFI: No PMGR?" @ConfigurationSettings.cpp:235`，调用栈经过 `thread_call_invoke`、`thread_call_thread`，即 AMFI 的后台线程等待 `ApplePMGRNub` 超时。
 
@@ -659,3 +659,23 @@ panic 的调用栈为 `PE_init_iokit → InitIOKit → OSlibkernInit → OSRunti
 这只有屏幕证据，没有逐字段核对，也没有验证 tick 间隔或更长时间的稳定性。运行的仍是自写的静态测试程序。`AppleImage4: magazine ... cannot be written`、`serializeVariables failed` 和 `Failed to open swap file` 都出现了，这一轮没有处理，它们符合只读内存盘根和没有 NVRAM 控制器的状态，但没有逐项验证是否无害。ADT 没有 PMGR、存储、显示等硬件节点，所以大部分组件只是加载，没有驱动硬件。
 
 未解决：随机 zone panic 原因仍未查明。没有 SMP、存储驱动、launchd、dyld 或 iPadOS 用户态。
+
+
+## 2026-10-31：Apple launchd 在恢复内存盘上运行
+
+运行时与配置见随本节提交，镜像 SHA-256 `594123564bff4ad20b17fb8626021e73f8f8aa6a7046ad992720a7af1c3e5142`。根是 IPSW 的 Update 恢复内存盘（178 MiB APFS），信任来源是它自带的 `RestoreTrustCache`。这个内核没有存储、USB 或 SPI 驱动，设备树也没有这些节点。
+
+第一轮：屏幕停在绿块约 2 分钟以上，之后出现 launchd 日志，时间戳约为 `00:02:38`。原因是内存盘在负载里没有 8 字节对齐，探针在缓存关闭时逐字节复制。屏幕显示 `com.apple.xpc.launchd` 启动 `restored_update`（PID 3），它运行了 dyld 和 ObjC 运行时，然后执行 `/sbin/mount_tmpfs /mnt5`（PID 4），之后一直没有新输出。kernelcache 里有 tmpfs，但 OS profile 没有列出它，`mount_tmpfs` 找不到时会 fork 并执行 `/sbin/kextload`。当时停住的确切位置没有查明，这也是这一轮之后才加入线程诊断的原因。
+
+第二轮：改为 16 字节对齐，把 tmpfs 加入 prelink 并在挂载根之前加载。屏幕日志时间提前到约 `00:01:16`，符合复制变快，但没有直接测量。`restored_update` 越过了 `mount_tmpfs`，这是根据后续输出推断的，那一屏 `COACHZ: tmpfs load` 和 `COACHZ exit: pid 4` 已被覆盖，没有直接看到。随后屏幕依次显示：
+
+- `restored_update: disable_watchdog failed`、`COACHZ exit: pid 5 restored_update status 0x100`。它的字符串说明这一步在找 `IOWatchdog` 服务。
+- `restored exited normally with status 1 - rebooting`，反复等待 `IOResourceMatch = IONVRAM`，然后 `unable to set restored-exit-status`。
+- `Searching for NAND service`，反复 `Waiting for NAND service to publish`。
+- `COACHZ alive: 177 s`，同时 `restored_update[3]` 的 `x16` 是 `0x14e`（`__semwait_signal`），即它在循环中睡眠。
+
+这说明 Apple 的 launchd、dyld 和恢复服务可以在这台机器上运行，内核在它们退出后仍然存活。这只有屏幕证据，没有逐字段核对。绿块左边的进度方块用户没有反馈，还没有确认。
+
+这不是主系统：没有主系统卷、共享缓存、界面或显示驱动。`restored_update` 没有走到等待电脑连接那一步，这一轮不打算补 IOWatchdog 和 NVRAM，因为恢复环境不是目标。`kpersona_find_by_type() failed` 的影响没有确认。
+
+未解决：随机 zone panic 原因未查明。根文件系统的既定路线是先做 USB 主机和大容量存储，从 U 盘启动。

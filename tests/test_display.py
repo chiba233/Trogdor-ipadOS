@@ -319,6 +319,16 @@ class DisplayTests(unittest.TestCase):
         self.assertNotIn('coachz-screen-ramdisk-root.patch','\n'.join(series))
         self.assertIn('kVirtualTimerIntid = 19;',(platform/'patches/drivers/ArmCpu.patch').read_text())
         self.assertIn('allocClassWithName("ApplePMGRNub")',(platform/'patches/xnu/coachz-prelink-pmgr.patch').read_text())
+        self.assertIn('"--root", "com.apple.filesystems.tmpfs"',(platform/'board.toml').read_text())
+        self.assertIn('xcf\\xfa\\xed\\xfe',(platform/'patches/xnu/coachz-prelink-root.patch').read_text())
+        self.assertIn('OSKextLoadKextWithIdentifier("com.apple.filesystems.tmpfs")',(platform/'patches/xnu/coachz-prelink-diagnostics.patch').read_text())
+        self.assertIn('((adt+adtsize+15)&~15ull)!=ramdisk',(ROOT/'boot/xnu_screen.c').read_text())
+        self.assertIn('ramdisk_at = (adt_at + len(adt) + 15) & ~15',(ROOT/'tools/xnu_screen.py').read_text())
+        from xnu_ipsw import im4p_payload
+        sequence=b''.join(bytes((0x16,len(item)))+item for item in (b'IM4P',b'rdsk',b'0'))+bytes((4,3))+b'abc'
+        self.assertEqual(im4p_payload(bytes((0x30,len(sequence)))+sequence,b'rdsk'),b'abc')
+        with self.assertRaises(ValueError):
+            im4p_payload(bytes((0x30,len(sequence)))+sequence,b'rtsc')
         self.assertIn('rd=md0',PRELINK_COMMAND_LINE)
         self.assertNotIn('kt_fixed_zones',PRELINK_COMMAND_LINE)
         code=struct.pack('>II',0xfade0c02,16)+bytes(8)

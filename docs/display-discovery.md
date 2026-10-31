@@ -127,7 +127,7 @@ INTF 帧／行计数的偏移来自 Linux DPU 驱动，锁定固件源码没有�
 
 内核用 `tools/kernel_source.py --platform coachz-screen` 单独构建，`platform/coachz-screen` 比 `platform/coachz` 只多一个屏幕内核补丁和一个 ArmCpu 驱动补丁，已验收检查点使用的内核和配置不变。驱动补丁把虚拟定时器中断从 INTID 27 改为 SC7180 实际使用的 INTID 19，`tools/kernel_source.py` 把它打在 `build/` 下的副本上，`upstream/` 保持干净。控制台改编自 ios-sweet（MIT）的早期 framebuffer 调试补丁，按 4K 页和 `boot_args.Video` 重新参数化：`arm_init` 中用一个 1 GiB 的 Normal-NC L1 块把 framebuffer 映射到 bootstrap TTBR0，`arm_vm_init` 在移除 TTBR0 前切到低全局区与内核之间的别名；启动阶段标记、kprintf 和 panic 字符串都画到屏幕上。
 
-屏幕右上角的绿色方块表示探针已完成。这张镜像不验收任何 XNU 阶段的状态，只显示实际跑到哪里。一次写入可以启动 15 次，其他镜像只能启动一次。
+屏幕右上角的绿色方块表示探针已完成。装载时绿块左边依次出现黄色（窗口清零完成）、橙色（内核段复制完成）和蓝色（设备树和内存盘复制完成，即将跳入 XNU）方块。这张镜像不验收任何 XNU 阶段的状态，只显示实际跑到哪里。一次写入可以启动 15 次，其他镜像只能启动一次。
 
 负载末尾带一个内存盘，装载器把它放在设备树之后，并计入 `topOfKernelData`；打包时向 `/chosen/memory-map` 写入 `RAMDisk` 属性，启动参数带 `rd=md0`。内存盘内容就是 `tools/coachz_init.S` 打包成的静态 Mach-O，mockfs 把整个设备当作 `/sbin/launchd`。程序打开 `/dev/console`，打印 PID，然后每 5 秒用 `select` 睡眠并打印一次 tick。补丁另外包含两处改编自 ios-sweet 的修改：没有 IOStorageFamily 时跳过 `IOService.cpp` 的两处断言，以及内置 AMFI 接口 `bsd/kern/coachz_amfi.c`，它不授予任何 entitlement，代码签名和页哈希校验仍由内核完成。组件 prelink 仍未接入；接入时必须删除这个内置接口，否则 AMFI kext 重复注册会 panic。
 
@@ -137,8 +137,16 @@ INTF 帧／行计数的偏移来自 Linux DPU 驱动，锁定固件源码没有�
 
 与 `coachz-screen` 的区别：
 
-- 合并 OS profile 里列出的 31 个原始组件，恢复 `CONFIG_XNU_NATIVE_AES`、trust cache 运行时和 prelink 版 corecrypto，去掉内置 AMFI 接口和 `kt_fixed_zones`。
+- 合并 OS profile 的原始组件（共 31 个，其中 `IOHIDEventDriver` 无代码），恢复 `CONFIG_XNU_NATIVE_AES`、trust cache 运行时和 prelink 版 corecrypto，去掉内置 AMFI 接口和 `kt_fixed_zones`。
 - ADT 应用 OS profile 的 `[adt]` 表，设备身份是 iPad7,1 / J120AP。
 - 负载末尾在内存盘后面放一个 trust cache，只含 init 的 cdhash（版本 2 模块，SHA-256，无约束类别），地址写入 `/chosen/memory-map/TrustCache`。真实 AMFI 不接受普通 ad-hoc 程序。
 - `coachz-prelink-pmgr.patch` 在 `bsd_init` 里加载 ApplePMGR 并发布一个没有 provider 的 `ApplePMGRNub`。原始 AMFI 在 thread call 里等待这个服务，超时就 panic；没有 provider 时它的读写不触碰硬件。做法来自 UniXNU 的 sirius 移植记录。
-- 镜像超过 96 MiB 时改用 256 MiB 磁盘和 224 MiB kernel 分区，`boot/xnu-chain.ld` 的内存上限由屏幕镜像放宽到 256 MiB。其他镜像布局不变。
+- 镜像按大小选择 128、256 或 512 MiB 磁盘，`boot/xnu-chain.ld` 的内存上限由屏幕镜像放宽到 512 MiB。96 MiB 分区放得下的镜像布局不变。
+
+### 恢复内存盘作为根
+
+`tools/xnu_ipsw.py` 把 IPSW 的 Update 恢复内存盘（APFS）和它的原版 trust cache 提取到被忽略的 `build/`，`tools/xnu_screen.py --prelinked --root-image FILE --root-trust-cache FILE` 用它们替换自写 init，并把 `osenvironment` 设为 `restore`。
+
+- `coachz-prelink-root.patch`：mockfs 排在 kext 添加的文件系统之前，又不校验内容，所以让它只接受 Mach-O，其余设备留给 APFS。同时在屏幕上打印 `COACHZ exec:` 和 `COACHZ exit:`。
+- `coachz-prelink-diagnostics.patch`：挂载根之前加载 tmpfs（`mount_tmpfs` 需要它，没有 personality 会自动加载，iOS 也没有 `/sbin/kextload`），并每 60 秒打印 `COACHZ alive` 和除 launchd 外用户线程的状态。
+- 内存盘在负载里按 16 字节对齐。探针此时缓存关闭，逐字节复制 178 MiB 要 2 分钟以上。

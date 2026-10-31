@@ -1,0 +1,135 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -999,6 +999,9 @@
+ 	bsd_init_kprintf("calling inittodr\n");
+ 	inittodr(0);
+ 
++	extern void coachz_root_prepare(void);
++	coachz_root_prepare();
++
+ 	/* Mount the root file system. */
+ 	while (TRUE) {
+ 		int err;
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -106,6 +106,7 @@
+ bsd/dev/random/randomdev.c		standard
+ 
+ bsd/dev/memdev.c			standard
++bsd/dev/coachz_sample.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -54,6 +54,7 @@
+ osfmk/arm64/arm64_hypercall.c	standard
+ osfmk/arm/io_map.c		standard
+ osfmk/arm64/coachz_early.c	standard
++osfmk/arm64/coachz_thread.c	standard
+ osfmk/arm64/loose_ends.c	standard
+ osfmk/arm/locks_arm.c	standard
+ osfmk/arm64/locore.s	optional nos_arm_asm
+diff --git a/bsd/dev/coachz_sample.c b/bsd/dev/coachz_sample.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/coachz_sample.c
+@@ -0,0 +1,60 @@
++/*
++ * Bring-up diagnostics, adapted from the process sampler of ios-sweet (MIT, Copyright
++ * (c) 2026 dipa-studio). The screen is the only output: a kernel thread prints a line
++ * every minute, which also shows the kernel and its timers are alive, and the state of
++ * each user thread except launchd's, to tell where a stopped boot waits.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/proc.h>
++#include <sys/proc_internal.h>
++#include <kern/clock.h>
++#include <kern/task.h>
++#include <kern/thread.h>
++#include <libkern/OSKextLib.h>
++
++extern task_t proc_task(proc_t);
++extern int hz;
++extern void coachz_sample_task(const char *, int, task_t);
++extern void coachz_root_prepare(void);
++
++static int
++coachz_sample_proc(proc_t p, __unused void *arg)
++{
++	char name[32];
++	task_t task = proc_task(p);
++
++	if (proc_pid(p) >= 2 && task != TASK_NULL) {
++		proc_name(proc_pid(p), name, sizeof(name));
++		coachz_sample_task(name, proc_pid(p), task);
++	}
++	return PROC_RETURNED;
++}
++
++static void
++coachz_sample_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	static int chan;
++
++	for (;;) {
++		clock_sec_t sec;
++		clock_usec_t usec;
++
++		(void)tsleep(&chan, PZERO, "coachz", 60 * hz);
++		clock_get_system_microtime(&sec, &usec);
++		printf("COACHZ alive: %lu s\n", (unsigned long)sec);
++		proc_iterate(PROC_ALLPROCLIST, coachz_sample_proc, NULL, NULL, NULL);
++	}
++}
++
++void
++coachz_root_prepare(void)
++{
++	thread_t thread;
++
++	/* tmpfs has no personality to load it, and iOS has no /sbin/kextload for mount_tmpfs. */
++	printf("COACHZ: tmpfs load: 0x%x\n", OSKextLoadKextWithIdentifier("com.apple.filesystems.tmpfs"));
++	if (kernel_thread_start(coachz_sample_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
+diff --git a/osfmk/arm64/coachz_thread.c b/osfmk/arm64/coachz_thread.c
+new file mode 100644
+--- /dev/null
++++ b/osfmk/arm64/coachz_thread.c
+@@ -0,0 +1,33 @@
++/*
++ * Thread half of bsd/dev/coachz_sample.c, adapted from ios-sweet (MIT). A thread in a
++ * system call shows the call number in x16, and its kernel wait in the state and event.
++ */
++#include <kern/task.h>
++#include <kern/thread.h>
++#include <arm/thread.h>
++#include <mach/arm/thread_status.h>
++
++void coachz_sample_task(const char *name, int pid, task_t task);
++
++void
++coachz_sample_task(const char *name, int pid, task_t task)
++{
++	thread_t thread;
++	int index = 0;
++
++	task_lock(task);
++	queue_iterate(&task->threads, thread, thread_t, task_threads) {
++		arm_saved_state_t *state = find_user_regs(thread);
++
++		if (index == 3) {
++			break;
++		}
++		printf("COACHZ %s[%d] t%d state 0x%x hint %u event 0x%llx pc 0x%llx lr 0x%llx x16 0x%llx\n",
++		    name, pid, index++, (unsigned)thread->state, (unsigned)thread->block_hint,
++		    (unsigned long long)thread->wait_event,
++		    state ? (unsigned long long)get_saved_state_pc(state) : 0ULL,
++		    state ? (unsigned long long)get_saved_state_lr(state) : 0ULL,
++		    state ? (unsigned long long)get_saved_state_reg(state, 16) : 0ULL);
++	}
++	task_unlock(task);
++}

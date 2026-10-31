@@ -116,12 +116,19 @@ def apply_identity(node, table):
             apply_identity(node.child(kind), values)
 
 
-def prelink_tree(adt, window, tree, ramdisk, cache):
+def wrap_trust_cache(module):
+    """The memory-map segment: an offset table in front of one original module."""
+    return struct.pack('<II', 1, 8) + module
+
+
+def prelink_tree(adt, window, tree, ramdisk, cache, environment=None):
     root = read_tree(adt)
     table = tomllib.loads(OS_PROFILE.read_text())['adt']
     apply_identity(root, table['root'])
     for name in ('chosen', 'product', 'defaults'):
         apply_identity(root.child(name), table[name])
+    if environment:
+        root.child('chosen').set('osenvironment', environment.encode() + b'\0')
     memory_map = root.child('chosen').child('memory-map')
     memory_map.set('RAMDisk', bytes(16))
     memory_map.set('TrustCache', bytes(16))
@@ -131,7 +138,7 @@ def prelink_tree(adt, window, tree, ramdisk, cache):
     return root.write()
 
 
-def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=False):
+def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=False, root_cache=None):
     if window & 0x1fffff or memory & 0x1fffff:
         raise ValueError('window base and size must be 2 MiB aligned')
     kernel = macho(data)
@@ -142,8 +149,9 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
     # Same placement as boot/xnu_screen.c: kernel, boot_args page, ADT, RAM disk.
     tree = up(span + bias) + 4096
     if prelinked:
-        cache = trust_cache(ramdisk)
-        adt = prelink_tree(adt, window, tree, ramdisk, cache)
+        cache = wrap_trust_cache(root_cache) if root_cache else trust_cache(ramdisk)
+        ramdisk += bytes(-len(ramdisk) % 4096)
+        adt = prelink_tree(adt, window, tree, ramdisk, cache, 'restore' if root_cache else None)
         ramdisk = ramdisk + cache + bytes(-len(cache) % 4096)
     else:
         adt = add_ramdisk_property(adt, window + up(tree + len(adt) + 52), len(ramdisk))
@@ -159,11 +167,12 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
                      for va, size, off, length, prot in kernel.segments)
     raw_at = (HEADER.size + len(table) + 15) & ~15
     adt_at = (raw_at + len(data) + 15) & ~15
-    ramdisk_at = adt_at + len(adt)
+    # Aligned so that the loader can copy in 64-bit units: byte by byte takes minutes with the caches off.
+    ramdisk_at = (adt_at + len(adt) + 15) & ~15
     header = HEADER.pack(MAGIC, VERSION, len(kernel.segments), kernel.base, kernel.entry, window, ramdisk_at, raw_at, len(data),
                          adt_at, len(adt), span, memory, base_field, size_field, affinity, frequency, raw)
     payload = header + table + bytes(raw_at - HEADER.size - len(table)) + data
-    return payload + bytes(adt_at - len(payload)) + adt + ramdisk
+    return payload + bytes(adt_at - len(payload)) + adt + bytes(ramdisk_at - adt_at - len(adt)) + ramdisk
 
 
 def main():
@@ -174,10 +183,16 @@ def main():
     p.add_argument('--memory', type=lambda v: int(v, 0), default=1 << 30)
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--prelinked', action='store_true', help='kernel carries the original components: trust the init program through a trust cache')
+    p.add_argument('--root-image', type=Path, help='with --prelinked: RAM disk root instead of the init program; from tools/xnu_ipsw.py')
+    p.add_argument('--root-trust-cache', type=Path, help='the original trust cache module of --root-image')
     a = p.parse_args()
     if a.output.exists() or a.output.resolve().is_relative_to(Path('/dev')):
         p.error('output must be a new ordinary file')
-    payload = pack(a.kernel.read_bytes(), a.adt.read_bytes(), a.window, a.memory, prelinked=a.prelinked)
+    if bool(a.root_image) != bool(a.root_trust_cache) or (a.root_image and not a.prelinked):
+        p.error('--root-image and --root-trust-cache go together and need --prelinked')
+    payload = pack(a.kernel.read_bytes(), a.adt.read_bytes(), a.window, a.memory, prelinked=a.prelinked,
+                   ramdisk=a.root_image.read_bytes() if a.root_image else None,
+                   root_cache=a.root_trust_cache.read_bytes() if a.root_trust_cache else None)
     a.output.parent.mkdir(parents=True, exist_ok=True)
     a.output.write_bytes(payload)
     print('Built screen-output XNU payload', hashlib.sha256(payload).hexdigest())

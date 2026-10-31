@@ -17,6 +17,15 @@ static void copy(volatile uint8_t *d,const uint8_t *s,size_t n) {
         while(n>=8){*(volatile uint64_t *)(uintptr_t)d=*(const volatile uint64_t *)(const void *)s;d+=8;s+=8;n-=8;}
     while(n--)*d++=*s++;
 }
+/* The caches are off and each access waits for the bus, so loading takes visible time:
+   squares left of the green corner show how far it got. Nothing else is on screen yet. */
+static void mark(const struct display_video *v,unsigned step,uint32_t color) {
+    uint64_t left=v->width-64-40*(uint64_t)step;
+    for(uint64_t y=0;y<32;y++) {
+        volatile uint32_t *row=(volatile uint32_t *)(uintptr_t)(v->pa+y*v->stride+left*4);
+        for(unsigned x=0;x<32;x++)row[x]=color;
+    }
+}
 int xnu_screen_load(const uint8_t *p,size_t len,const void *dt,uint64_t affinity,uint64_t frequency,
                     const struct display_video *video,struct xnu_handoff *out) {
     const char magic[]="TRXNUC01";
@@ -30,7 +39,7 @@ int xnu_screen_load(const uint8_t *p,size_t len,const void *dt,uint64_t affinity
     uint64_t base=v[0],entry=v[1],phys=v[2],ramdisk=v[3],raw=v[4],rawsize=v[5],adt=v[6],adtsize=v[7],span=v[8],memory=v[9];
     uint64_t bias=base&0x1fffff,input=(uintptr_t)p;
     if((phys&0x1fffff) || (memory&0x1fffff) || !span || span>memory || phys>UINT64_MAX-memory || (raw&15) ||
-       !bounded(raw,rawsize,len) || !bounded(adt,adtsize,len) || adt+adtsize!=ramdisk || ramdisk>=len || ((len-ramdisk)&4095) || !adtsize || adtsize>1048576 ||
+       !bounded(raw,rawsize,len) || !bounded(adt,adtsize,len) || ((adt+adtsize+15)&~15ull)!=ramdisk || ramdisk>=len || ((len-ramdisk)&4095) || !adtsize || adtsize>1048576 ||
        !bounded(v[10],8,adtsize) || !bounded(v[11],8,adtsize) || affinity!=v[12] || frequency!=v[13] || !frequency ||
        entry<base || (entry&3) || entry-base>=span || input>UINT64_MAX-len ||
        (input<phys+memory && phys<input+len) || !xnu_range_allowed(dt,phys,memory))return 0;
@@ -44,11 +53,13 @@ int xnu_screen_load(const uint8_t *p,size_t len,const void *dt,uint64_t affinity
     }
     volatile uint64_t *zero=(volatile uint64_t *)(uintptr_t)phys;
     for(uint64_t i=0;i<top/8;i++)zero[i]=0;
+    mark(video,1,0xffffff00u);
     volatile uint8_t *window=(volatile uint8_t *)(uintptr_t)phys;
     for(unsigned i=0;i<count;i++) {
         const uint8_t *s=p+HEADER+40*i;
         copy(window+bias+le64(s),p+raw+le64(s+16),(size_t)le64(s+24));
     }
+    mark(video,2,0xffff8000u);
     volatile uint8_t *a=window+args,*t=window+tree;
     a[0]=2;a[2]=2;
     wr64(a+8,base-bias);wr64(a+16,phys);wr64(a+24,memory);wr64(a+32,phys+top);
@@ -58,6 +69,7 @@ int xnu_screen_load(const uint8_t *p,size_t len,const void *dt,uint64_t affinity
     copy(a+0x6c,p+128,1024);wr64(a+0x478,memory);
     copy(t,p+adt,(size_t)adtsize);wr64(t+v[10],phys);wr64(t+v[11],memory);
     copy(window+disk,p+ramdisk,(size_t)(len-ramdisk));
+    mark(video,3,0xff0080ffu);
     __asm__ volatile("dsb sy; ic iallu; dsb sy; isb":::"memory");
     out->entry=phys+bias+entry-base;out->args=phys+args;
     return 1;

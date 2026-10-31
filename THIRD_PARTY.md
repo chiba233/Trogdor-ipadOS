@@ -7,7 +7,7 @@ by this project. Their tracked revisions and origins are in upstream.lock.json.
   interface references; retain their respective GPL and per-file notices.
 - UniXNU DarwinBoot: BSD-2-Clause-Patent; reference for the future XNU handoff.
 - UniXNU ArmCpu: BSD-2-Clause-Patent; `platform/coachz-screen/patches/drivers/ArmCpu.patch` modifies a build-time copy of it.
-- ios-sweet (MIT, Copyright (c) 2026 dipa-studio): `platform/coachz-screen/patches/xnu/coachz-screen-console.patch` adapts its early framebuffer console, RAM disk root changes and built-in AMFI interface; `tools/coachz_init.S` and `tools/xnu_init.py` adapt its minimal init and static Mach-O packer. Also a reference for direct native ARM64 shim loading; consult upstream
+- ios-sweet (MIT, Copyright (c) 2026 dipa-studio): `platform/coachz-screen/patches/xnu/coachz-screen-console.patch` adapts its early framebuffer console, RAM disk root changes and built-in AMFI interface; `tools/coachz_init.S` and `tools/xnu_init.py` adapt its minimal init and static Mach-O packer; `platform/coachz-prelink/patches/xnu/coachz-prelink-diagnostics.patch` adapts its process sampler. Also a reference for direct native ARM64 shim loading; consult upstream
   per-file licensing before importing any implementation.
 - Zig 0.15.2: MIT toolchain distributed by ziglang on PyPI, installed separately
   in the ignored .tools directory.

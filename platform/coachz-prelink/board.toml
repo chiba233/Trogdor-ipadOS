@@ -15,3 +15,7 @@ include = ["ArmDTPlatform", "ArmCpu", "SoftwareAES", "XnuPrelink"]
 defconfig = "coachz_defconfig"
 config_fragments = ["arch:configs/common.config", "os:configs/ipados.config"]
 patch_series = ["arch:patches/xnu/series", "device:patches/xnu/series"]
+
+[kernel.prelink]
+# The restore RAM disk mounts tmpfs: the OS profile's list does not include it.
+extra_args = ["--root", "com.apple.filesystems.tmpfs"]
