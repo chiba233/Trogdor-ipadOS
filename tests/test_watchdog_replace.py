@@ -16,7 +16,9 @@ EXTRA = r'''
 #define kalloc_data(n, f) malloc(n)
 #define kfree_data(p, n) free(p)
 #define VATTR_SET(a, f, v) ((a)->f = (v))
-static int vnode_setattr(int v,struct vnode_attr *a,int c) { (void)c;return fchmod(v,a->va_mode)?errno:0; }
+static int vnode_setattr(int v,struct vnode_attr *a,int c) {
+    (void)c;return fchmod(v,a->va_mode)||ftruncate(v,(off_t)a->va_data_size)?errno:0;
+}
 '''
 MAIN = r'''
 static int same(const char *path,const char *bytes,int length) {
@@ -35,6 +37,12 @@ int main(void) {
     assert(!chmod("disabled.plist",0666));
     assert(!coachz_watchdog_policy_file("disabled.plist",policy,sizeof(policy)-1));
     assert(!stat("disabled.plist",&after)&&(after.st_mode&07777)==0644);
+    const char launchd[]="<?xml version=\"1.0\"?>\n<plist version=\"1.0\">\n<dict>\n\t<key>com.apple.watchdogd</key>\n\t<true/>\n</dict>\n</plist>\n";
+    fd=open("disabled.plist",O_WRONLY|O_TRUNC);assert(write(fd,launchd,sizeof(launchd)-1)==sizeof(launchd)-1);close(fd);
+    assert(!stat("disabled.plist",&before));
+    assert(!coachz_watchdog_policy_file("disabled.plist",policy,sizeof(policy)-1));
+    assert(same("disabled.plist",launchd,sizeof(launchd)-1));
+    assert(!stat("disabled.plist",&after)&&before.st_ino==after.st_ino);
     fd=open("disabled.migrated",O_CREAT|O_WRONLY,0644);assert(write(fd,"x",1)==1);close(fd);
     assert(!coachz_watchdog_policy_file("disabled.migrated","",0));
     assert(!stat("disabled.migrated",&after)&&after.st_size==0);
@@ -52,14 +60,18 @@ class WatchdogReplaceTests(unittest.TestCase):
             folder = Path(scratch)
             source = folder / 'bsd/kern/kern_exec.c'
             source.parent.mkdir(parents=True)
-            # The revision's last hunk ends inside the following function; supply its opening lines.
-            following = ''.join(line[1:] for line in REPLACE.read_text().splitlines(True)[-3:])
-            source.write_text(helper + '\nstatic int\n' + following)
+            # The revision's last hunk reaches into the following function; supply its opening lines.
+            following = ('\nstatic int\ncoachz_watchdog_policy_prepare(void)\n{\n'
+                         '\tconst char policy[] = "<?xml version=\\"1.0\\" encoding=\\"UTF-8\\"?>\\n"\n')
+            source.write_text(helper + following)
             subprocess.run(['git', 'apply', str(REPLACE)], cwd=folder, check=True)
             revised = source.read_text()
             revised = revised[:revised.rindex('static int\ncoachz_watchdog_policy_prepare')]
             program = folder / 'policy.c'
-            program.write_text(SHIM.replace('unsigned va_uid, va_mode;', 'unsigned va_uid, va_gid, va_mode;') + EXTRA + revised + MAIN)
+            # Like the kernel KPI, vnode_open leaves truncation to its caller.
+            shim = SHIM.replace('unsigned va_uid, va_mode;', 'unsigned va_uid, va_gid, va_mode;')
+            shim = shim.replace('(flags&~(FREAD|FWRITE))', '(flags&~(FREAD|FWRITE|O_TRUNC))')
+            program.write_text(shim + EXTRA + revised + MAIN)
             binary = folder / 'policy-test'
             subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-unused-function',
                             str(program), '-o', str(binary)], check=True)

@@ -1,6 +1,6 @@
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -8312,16 +8312,85 @@
+@@ -8312,9 +8312,116 @@
   * The only job disabled is watchdogd: its native missing-IOWatchdog path BRKs on this
   * board. Both files live on the selected Data volume; validate and reuse them on later boots.
   * No system-volume bytes, daemon binary, VM identity or global panic policy change.
@@ -12,7 +12,7 @@
 -coachz_watchdog_policy_file(const char *path, const char *bytes, int length)
 +coachz_watchdog_policy_replace(const char *path, vnode_t vnode, const struct vnode_attr *found,
 +    const char *bytes, int length, vfs_context_t context)
- {
++{
 +	struct vnode_attr attributes;
 +	vnode_t target = NULLVP;
 +	uint64_t size = found->va_data_size;
@@ -67,6 +67,8 @@
 +		VATTR_SET(&attributes, va_uid, 0);
 +		VATTR_SET(&attributes, va_gid, 0);
 +		VATTR_SET(&attributes, va_mode, 0644);
++		/* vnode_open leaves O_TRUNC to its caller: set the length explicitly. */
++		VATTR_SET(&attributes, va_data_size, (uint64_t)length);
 +		error = vnode_setattr(target, &attributes, context);
 +	}
 +	close_error = vnode_close(target, FWRITE, context);
@@ -74,12 +76,49 @@
 +	return error ? error : close_error;
 +}
 +
++/* launchd rewrites disabled.plist in its own XML form while it runs. Accept that form when the
++ * file stays root-owned, not group/other writable, and still maps com.apple.watchdogd to true.
++ */
++static bool
++coachz_watchdog_policy_launchd_form(const char *path, vnode_t vnode, const struct vnode_attr *found,
++    vfs_context_t context)
++{
++	static const char key[] = "<key>com.apple.watchdogd</key>";
++	uint64_t size = found->va_data_size;
++	char *data, *at;
++	bool accepted = false;
++	int residual = 0;
++
++	if (vnode_vtype(vnode) != VREG || found->va_uid != 0 || (found->va_mode & 0022) ||
++	    size < sizeof(key) || size > 4096) {
++		return false;
++	}
++	data = kalloc_data((size_t)size + 1, Z_WAITOK | Z_NOFAIL);
++	if (!vn_rdwr(UIO_READ, vnode, data, (int)size, 0, UIO_SYSSPACE, 0, vfs_context_ucred(context),
++	    &residual, vfs_context_proc(context)) && !residual) {
++		data[size] = 0;
++		at = strnstr(data, key, (size_t)size);
++		if (at) {
++			at += sizeof(key) - 1;
++			while (*at == ' ' || *at == '\t' || *at == '\n' || *at == '\r') {
++				at++;
++			}
++			accepted = !strncmp(at, "<true/>", 7);
++		}
++	}
++	kfree_data(data, (size_t)size + 1);
++	if (accepted) {
++		printf("COACHZ policy: %s accepted in launchd's form, size %llu\n", path, (unsigned long long)size);
++	}
++	return accepted;
++}
++
 +static int
 +coachz_watchdog_policy_check(const char *path, const char *bytes, int length, bool replace)
-+{
+ {
  	vfs_context_t context = vfs_context_kernel();
  	vnode_t vnode = NULLVP;
- 	struct vnode_attr attributes;
+@@ -8322,6 +8429,7 @@
  	int error, close_error;
  	int flags = FWRITE;
  	bool existing = false;
@@ -87,7 +126,7 @@
  	char contents[256];
  
  	if (length < 0 || length > (int)sizeof(contents)) return EINVAL;
-@@ -8347,6 +8416,7 @@
+@@ -8347,6 +8455,7 @@
  		error = vnode_getattr(vnode, &attributes, context);
  		if (!error && (vnode_vtype(vnode) != VREG || attributes.va_uid != 0 || (attributes.va_mode & 0022) ||
  		    attributes.va_data_size != (uint64_t)length)) {
@@ -95,7 +134,7 @@
  			error = EACCES;
  		}
  	}
-@@ -8354,14 +8424,29 @@
+@@ -8354,11 +8463,30 @@
  		int residual = length;
  		error = vn_rdwr(UIO_READ, vnode, contents, length, 0, UIO_SYSSPACE,
  		    0, vfs_context_ucred(context), &residual, vfs_context_proc(context));
@@ -104,6 +143,10 @@
 +			differs = true;
 +			error = EINVAL;
 +		}
++	}
++	if (differs && length && coachz_watchdog_policy_launchd_form(path, vnode, &attributes, context)) {
++		differs = false;
++		error = 0;
  	}
  	if (existing) printf("COACHZ policy: existing file %s validated: %d\n", path, error);
 +	if (differs && replace) {
@@ -114,15 +157,12 @@
 +		return coachz_watchdog_policy_check(path, bytes, length, false);
 +	}
  	return error ? error : close_error;
- }
- 
- static int
-+coachz_watchdog_policy_file(const char *path, const char *bytes, int length)
-+{
-+	return coachz_watchdog_policy_check(path, bytes, length, true);
 +}
 +
 +static int
- coachz_watchdog_policy_prepare(void)
- {
- 	const char policy[] = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
++coachz_watchdog_policy_file(const char *path, const char *bytes, int length)
++{
++	return coachz_watchdog_policy_check(path, bytes, length, true);
+ }
+ 
+ static int

@@ -990,3 +990,26 @@ k23 的 `coachz-prelink-mgcache-reset.patch` 仅在显示路线（`coachz-reset-
 首个 SIGKILL 现场；这表明后续重启的 SpringBoard 已绘制原版系统界面。这是等待用户按
 Home 继续升级／迁移的画面，与从未完成设置或迁移的 Data 卷相符；尚无触摸或按键输入，
 不能继续操作，也不代表可用桌面。
+
+
+## 2026-10-31：launchd 重写策略文件；稳定启动到升级界面
+
+k24 照片显示，已有 `disabled.plist` 与预期不一致：root 所有、0644、356 字节，开头为标准
+XML plist 与 DOCTYPE。这是 launchd 在上一轮运行中按自身格式重写的结果。替换步骤报告
+成功，但随后复核仍返回 13：内核 `vnode_open` 不替调用者执行 `O_TRUNC`，短内容只覆盖了
+文件开头，长度仍为 356。主机测试的桩函数把 `O_TRUNC` 交给了 POSIX `open`，因此没有发现。
+
+修订后，替换写入时显式设置文件长度；已有文件若仍为 root 所有、不可被组或其他人写的普通
+文件，且 `<key>com.apple.watchdogd</key>` 之后紧跟 `<true/>`，即按 launchd 格式接受，
+不再改写。测试桩改为与内核一致不截断，新测试对旧补丁失败、对新补丁通过。
+
+同一 k25 镜像还加入 `coachz-prelink-launch-diagnostic.patch`：记录经 `kill()` 发出的前
+6 次 SIGKILL（发送者、目标、开机秒数）以及 lsd 与 SpringBoard 的前 10 次启动和退出，
+随每 10 秒的报告打印。k25 真机启动没有 panic；SpringBoard（pid 27）于 110 秒启动，lsd 于
+123 秒按需启动。291 秒的报告记录 1 次 SIGKILL：`backboardd(57) -> SpringBoard(27)`，
+发生在 201 秒，同一秒新的 SpringBoard（pid 172）启动。被杀现场去掉 slide 后的 PC 与上一轮
+相同，仍是 LaunchServices 初始化中经 XPC 同步等待 lsd 回复。操作者确认屏幕已变为白底的
+`Press home to upgrade` 界面，随后被滚动的文字控制台覆盖。
+
+因此首个 SpringBoard 在约 91 秒未完成启动时被 backboardd 结束，第二个 SpringBoard 绘制界面；
+lsd 为何在启动后迟迟不回复（例如首次建库耗时或其依赖未就绪）尚未确认。

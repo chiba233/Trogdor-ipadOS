@@ -39,3 +39,6 @@ coachz-prelink-watchdog-replace.patch
 
 # The display route rebuilds the MobileGestalt cache that boots without a display wrote.
 coachz-prelink-mgcache-reset.patch
+
+# Who sends SIGKILL through kill(), and when lsd and SpringBoard start and exit.
+coachz-prelink-launch-diagnostic.patch

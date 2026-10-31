@@ -1,0 +1,133 @@
+--- a/osfmk/arm64/coachz_thread.c
++++ b/osfmk/arm64/coachz_thread.c
+@@ -8,6 +8,7 @@
+ #include <mach/arm/thread_status.h>
+ #include <libkern/copyio.h>
+ #include <os/atomic_private.h>
++#include <kern/clock.h>
+ 
+ void coachz_sample_task(const char *name, int pid, task_t task);
+ void coachz_critical_user_state(const char *name, int pid);
+@@ -316,10 +317,84 @@
+ 	printf("%s", coachz_sb_failure);
+ }
+ 
++/* The first SIGKILLs sent through kill(), and the first lsd and SpringBoard starts and exits,
++ * with seconds since boot, so the report shows who killed SpringBoard while it waited on lsd.
++ */
++struct coachz_launch_event {
++	uint32_t seconds;
++	int pid;
++	int other_pid;
++	int status;
++	char name[24];
++	char other_name[24];
++};
++static struct coachz_launch_event coachz_kills[6];
++static uint32_t coachz_kill_count;
++static struct coachz_launch_event coachz_launches[10];
++static uint32_t coachz_launch_count;
++void coachz_launch_signal(int, const char *, int, const char *, int);
++void coachz_launch_process(int, const char *, int, int);
++
++static uint32_t
++coachz_launch_seconds(void)
++{
++	clock_sec_t seconds;
++	clock_usec_t microseconds;
++	clock_get_system_microtime(&seconds, &microseconds);
++	return (uint32_t)seconds;
++}
++
++void
++coachz_launch_signal(int sender, const char *sender_name, int target, const char *target_name, int signum)
++{
++	uint32_t index;
++	if (signum != 9 || (index = os_atomic_inc_orig(&coachz_kill_count, relaxed)) >= 6) {
++		return;
++	}
++	coachz_kills[index] = (struct coachz_launch_event){ .seconds = coachz_launch_seconds(),
++		                                             .pid = sender, .other_pid = target };
++	strlcpy(coachz_kills[index].name, sender_name, sizeof(coachz_kills[index].name));
++	strlcpy(coachz_kills[index].other_name, target_name, sizeof(coachz_kills[index].other_name));
++}
++
++/* exited: 0 for exec, 1 for exit with its wait status. */
++void
++coachz_launch_process(int pid, const char *name, int exited, int status)
++{
++	uint32_t index;
++	if ((strcmp(name, "lsd") && strcmp(name, "SpringBoard")) ||
++	    (index = os_atomic_inc_orig(&coachz_launch_count, relaxed)) >= 10) {
++		return;
++	}
++	coachz_launches[index] = (struct coachz_launch_event){ .seconds = coachz_launch_seconds(),
++		                                                .pid = pid, .other_pid = exited, .status = status };
++	strlcpy(coachz_launches[index].name, name, sizeof(coachz_launches[index].name));
++}
++
++static void
++coachz_launch_report(void)
++{
++	uint32_t kills = os_atomic_load(&coachz_kill_count, relaxed);
++	uint32_t launches = os_atomic_load(&coachz_launch_count, relaxed);
++	printf("COACHZ LS v1: %u SIGKILL, %u lsd/SpringBoard events, now %u s\n", kills, launches,
++	    coachz_launch_seconds());
++	for (uint32_t index = 0; index < kills && index < 6; index++) {
++		printf("COACHZ LS kill %u s: %s(%d) -> %s(%d)\n", coachz_kills[index].seconds,
++		    coachz_kills[index].name, coachz_kills[index].pid,
++		    coachz_kills[index].other_name, coachz_kills[index].other_pid);
++	}
++	for (uint32_t index = 0; index < launches && index < 10; index++) {
++		printf("COACHZ LS %u s: %s(%d) %s 0x%x\n", coachz_launches[index].seconds,
++		    coachz_launches[index].name, coachz_launches[index].pid,
++		    coachz_launches[index].other_pid ? "exit" : "exec", coachz_launches[index].status);
++	}
++}
++
+ int
+ coachz_springboard_report(void)
+ {
+ 	unsigned phase = os_atomic_load(&coachz_sb_captured, acquire);
++	coachz_launch_report();
+ 	if (phase != 2) {
+ 		printf("COACHZ SB v1: waiting for abnormal exit (capture %u)\n", phase);
+ 		return 0;
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -2000,6 +2000,10 @@
+ 
+ 	set_proc_name(imgp, p);
+ 	printf("COACHZ exec: pid %d %s\n", proc_getpid(p), p->p_name);
++	{
++		extern void coachz_launch_process(int, const char *, int, int);
++		coachz_launch_process(proc_getpid(p), p->p_name, 0, 0);
++	}
+ 
+ #if CONFIG_SECLUDED_MEMORY
+ 	if (secluded_for_apps &&
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -2218,6 +2218,10 @@
+ 	pid = proc_getpid(p);
+ 	exitval = p->p_xstat;
+ 	printf("COACHZ exit: pid %d %s status 0x%x\n", proc_getpid(p), p->p_name, exitval);
++	{
++		extern void coachz_launch_process(int, const char *, int, int);
++		coachz_launch_process(pid, p->p_name, 1, exitval);
++	}
+ 	KERNEL_DEBUG_CONSTANT_IST(KDEBUG_COMMON,
+ 	    BSDDBG_CODE(DBG_BSD_PROC, BSD_PROC_EXIT) | DBG_FUNC_START,
+ 	    pid, exitval, 0, 0, 0);
+--- a/bsd/kern/kern_sig.c
++++ b/bsd/kern/kern_sig.c
+@@ -1399,6 +1399,9 @@
+ 			return EPERM;
+ 		}
+ 		if (uap->signum) {
++			extern void coachz_launch_signal(int, const char *, int, const char *, int);
++			coachz_launch_signal(proc_getpid(cp), proc_best_name(cp), proc_getpid(p), proc_best_name(p),
++			    uap->signum);
+ 			psignal(p, uap->signum);
+ 		}
+ 		proc_rele(p);
