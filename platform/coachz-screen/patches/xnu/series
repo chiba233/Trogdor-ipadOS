@@ -4,3 +4,5 @@ component:XnuPrelink/patches/xnu-10063.141.1-security-init.patch
 component:XnuPrelink/patches/xnu-10063.141.1-sparse-index.patch
 # Screen console for bring-up, adapted from ios-sweet (MIT).
 coachz-screen-console.patch
+# RAM disk root and a built-in AMFI interface, needed only without prelink.
+coachz-screen-ramdisk-root.patch

@@ -1,0 +1,4 @@
+[[source]]
+name = "sc7180"
+kind = "soc"
+local = "soc"

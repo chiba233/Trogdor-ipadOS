@@ -60,10 +60,11 @@ def main():
     p.add_argument('--jobs', type=int, default=min(os.cpu_count() or 2, 8))
     p.add_argument('--output', type=Path, default=ROOT / 'build/xnu-source')
     p.add_argument('--platform', default='coachz', help='board directory under platform/; coachz-screen adds the screen console')
+    p.add_argument('--ipsw', type=Path, help='local IPSW: with --build, also prelink the original kernelcache components')
     a = p.parse_args()
     out = a.output.resolve()
-    if a.jobs < 1 or out.is_relative_to(Path('/dev')):
-        p.error('positive job count and ordinary output directory required')
+    if a.jobs < 1 or out.is_relative_to(Path('/dev')) or (a.ipsw and not a.build):
+        p.error('positive job count, ordinary output directory and --build with --ipsw required')
     base, xnu = verify('unixnu'), verify('apple-xnu')
     xnu = materialize_xnu(xnu, out / 'reference/xnu')
     subprocess.run(['git', '-C', str(base), 'submodule', 'update', '--init', '--depth=1',
@@ -108,6 +109,11 @@ def main():
             raise ValueError('build returned without the expected source kernel')
         report['source_kernel_built'] = True
         report['source_kernel_sha256'] = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        report_path.write_text(json.dumps(report, indent=2) + '\n')
+    if a.ipsw:
+        os.environ['UNIXNU_IPSW'] = str(a.ipsw.resolve())
+        report['prelinked_sha256'] = hashlib.sha256(kernel.prelink(ctx).read_bytes()).hexdigest()
+        report['prelinked'] = True
         report_path.write_text(json.dumps(report, indent=2) + '\n')
     print('Source preparation complete; report:', report_path)
     print('No prelinked kernel, hardware write or kernel boot is implied.')

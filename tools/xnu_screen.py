@@ -4,15 +4,19 @@ import argparse
 import hashlib
 from pathlib import Path
 import struct
+import tomllib
 
 from xnu_checkpoint import HEADER, MAGIC, adt_fields
-from xnu_init import ramdisk as init_ramdisk
+from xnu_init import ramdisk as init_ramdisk, trust_cache
 from xnu_macho import macho
 
 VERSION = 12
 # Without prelinked components the type distribution is skewed: the default budget of
 # 260 gives one size class more than the 32 zones kalloc allows.
 COMMAND_LINE = '-v debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam kt_fixed_zones=120 rd=md0 cs_enforcement_disable=1'
+# Original AMFI runs in the prelinked kernel: the init program is trusted through the static trust cache.
+PRELINK_COMMAND_LINE = '-v debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam rd=md0'
+OS_PROFILE = Path(__file__).resolve().parents[1] / 'upstream/unixnu/profiles/os/ipados-17.7.11-21H461/profile.toml'
 
 
 def up(value):
@@ -51,16 +55,98 @@ def add_ramdisk_property(adt, base, size):
     return result
 
 
-def pack(data, adt, window, memory, command_line=COMMAND_LINE, ramdisk=None):
+class Node:
+    """An ADT node: ordered (key, raw length word, value) properties and children."""
+    def __init__(self):
+        self.props, self.children = [], []
+
+    def name(self):
+        return next((value.split(b'\0')[0].decode() for key, _, value in self.props if key == 'name'), '')
+
+    def set(self, key, value):
+        self.props = [p for p in self.props if p[0] != key] + [(key, len(value), value)]
+
+    def child(self, name):
+        for node in self.children:
+            if node.name() == name:
+                return node
+        node = Node()
+        node.set('name', name.encode() + b'\0')
+        self.children.append(node)
+        return node
+
+    def write(self):
+        out = struct.pack('<II', len(self.props), len(self.children))
+        for key, length, value in self.props:
+            out += key.encode().ljust(32, b'\0') + struct.pack('<I', length) + value + bytes(-len(value) % 4)
+        return out + b''.join(node.write() for node in self.children)
+
+
+def read_tree(adt):
+    at = 0
+    def visit():
+        nonlocal at
+        node = Node()
+        props, children = struct.unpack_from('<II', adt, at)
+        at += 8
+        for _ in range(props):
+            key = adt[at:at + 32].split(b'\0')[0].decode()
+            length = struct.unpack_from('<I', adt, at + 32)[0]
+            size = length & 0x7fffffff
+            node.props.append((key, length, bytes(adt[at + 36:at + 36 + size])))
+            at = (at + 36 + size + 3) & ~3
+        node.children = [visit() for _ in range(children)]
+        return node
+    return visit()
+
+
+def apply_identity(node, table):
+    """Apply a typed [adt] table of the OS profile: what the original components read."""
+    for kind, values in table.items():
+        if kind == 'string':
+            for key, value in values.items():
+                node.set(key, value.encode() + b'\0')
+        elif kind == 'u32':
+            for key, value in values.items():
+                node.set(key, struct.pack('<I', value))
+        elif kind == 'bytes':
+            for key, value in values.items():
+                node.set(key, bytes.fromhex(value))
+        else:
+            apply_identity(node.child(kind), values)
+
+
+def prelink_tree(adt, window, tree, ramdisk, cache):
+    root = read_tree(adt)
+    table = tomllib.loads(OS_PROFILE.read_text())['adt']
+    apply_identity(root, table['root'])
+    for name in ('chosen', 'product', 'defaults'):
+        apply_identity(root.child(name), table[name])
+    memory_map = root.child('chosen').child('memory-map')
+    memory_map.set('RAMDisk', bytes(16))
+    memory_map.set('TrustCache', bytes(16))
+    disk = window + up(tree + len(root.write()))
+    memory_map.set('RAMDisk', struct.pack('<QQ', disk, len(ramdisk)))
+    memory_map.set('TrustCache', struct.pack('<QQ', disk + len(ramdisk), len(cache)))
+    return root.write()
+
+
+def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=False):
     if window & 0x1fffff or memory & 0x1fffff:
         raise ValueError('window base and size must be 2 MiB aligned')
     kernel = macho(data)
+    command_line = command_line or (PRELINK_COMMAND_LINE if prelinked else COMMAND_LINE)
     ramdisk = init_ramdisk() if ramdisk is None else ramdisk
     span = kernel.end - kernel.base
     bias = kernel.base & 0x1fffff
     # Same placement as boot/xnu_screen.c: kernel, boot_args page, ADT, RAM disk.
     tree = up(span + bias) + 4096
-    adt = add_ramdisk_property(adt, window + up(tree + len(adt) + 52), len(ramdisk))
+    if prelinked:
+        cache = trust_cache(ramdisk)
+        adt = prelink_tree(adt, window, tree, ramdisk, cache)
+        ramdisk = ramdisk + cache + bytes(-len(cache) % 4096)
+    else:
+        adt = add_ramdisk_property(adt, window + up(tree + len(adt) + 52), len(ramdisk))
     base_field, size_field, affinity, frequency = adt_fields(adt)
     adt = bytearray(adt)
     for at in (base_field, size_field):
@@ -87,10 +173,11 @@ def main():
     p.add_argument('--window', type=lambda v: int(v, 0), required=True, help='physical base; choose it from the private device tree')
     p.add_argument('--memory', type=lambda v: int(v, 0), default=1 << 30)
     p.add_argument('--output', type=Path, required=True)
+    p.add_argument('--prelinked', action='store_true', help='kernel carries the original components: trust the init program through a trust cache')
     a = p.parse_args()
     if a.output.exists() or a.output.resolve().is_relative_to(Path('/dev')):
         p.error('output must be a new ordinary file')
-    payload = pack(a.kernel.read_bytes(), a.adt.read_bytes(), a.window, a.memory)
+    payload = pack(a.kernel.read_bytes(), a.adt.read_bytes(), a.window, a.memory, prelinked=a.prelinked)
     a.output.parent.mkdir(parents=True, exist_ok=True)
     a.output.write_bytes(payload)
     print('Built screen-output XNU payload', hashlib.sha256(payload).hexdigest())

@@ -141,6 +141,31 @@ def ramdisk():
     return image + bytes(-len(image) % 4096)
 
 
+def cdhash(image):
+    """First 20 bytes of the SHA-256 of the signature's CodeDirectory."""
+    count = struct.unpack_from('<I', image, 16)[0]
+    at = 32
+    for _ in range(count):
+        cmd, size = struct.unpack_from('<II', image, at)
+        if cmd == LC_CODE_SIGNATURE:
+            start = struct.unpack_from('<I', image, at + 8)[0]
+            blobs = struct.unpack_from('>I', image, start + 8)[0]
+            for index in range(blobs):
+                offset = struct.unpack_from('>I', image, start + 16 + 8 * index)[0]
+                magic, length = struct.unpack_from('>II', image, start + offset)
+                if magic == 0xfade0c02:
+                    return hashlib.sha256(image[start + offset:start + offset + length]).digest()[:20]
+        at += size
+    raise ValueError('no CodeDirectory')
+
+
+def trust_cache(image):
+    """Static trust cache holding this program: one version 2 module, SHA-256, no constraint category."""
+    identity = hashlib.sha256(b'Coachz init trust cache').digest()[:16]
+    module = struct.pack('<I16sI', 2, identity, 1) + cdhash(image) + bytes((2, 0, 0, 0))
+    return struct.pack('<II', 1, 8) + module
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--output', type=Path, required=True)

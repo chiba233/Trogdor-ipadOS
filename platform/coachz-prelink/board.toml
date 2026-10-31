@@ -1,0 +1,17 @@
+schema_version = 2
+
+[board]
+name = "coachz"
+soc = "SC7180"
+soc_source = "sc7180"
+os_profile = "ipados-17.7.11-21H461"
+description = "Coachz screen kernel prelinked with the original kernelcache; factory FIT entry"
+kit = "coachz"
+
+[components]
+include = ["ArmDTPlatform", "ArmCpu", "SoftwareAES", "XnuPrelink"]
+
+[kernel]
+defconfig = "coachz_defconfig"
+config_fragments = ["arch:configs/common.config", "os:configs/ipados.config"]
+patch_series = ["arch:patches/xnu/series", "device:patches/xnu/series"]

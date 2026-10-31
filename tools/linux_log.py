@@ -108,7 +108,8 @@ def compile_wrapper(out, kernel, memory, checkpoint=None, discovery=False, patte
     payload.write_bytes(kernel)
     quoted = str(payload).replace("\\", "\\\\").replace('"', '\\"')
     assembly = out / "payload.S"
-    assembly.write_text('.global LINUX_MEMORY_SIZE\n.set LINUX_MEMORY_SIZE, ' + str(memory) + '\n.section .linux, "a"\n.incbin "' + quoted + '"\n')
+    assembly.write_text(('.global XNU_IMAGE_LIMIT\n.set XNU_IMAGE_LIMIT, ' + str(256 << 20) + '\n' if screen else '') +
+                        '.global LINUX_MEMORY_SIZE\n.set LINUX_MEMORY_SIZE, ' + str(memory) + '\n.section .linux, "a"\n.incbin "' + quoted + '"\n')
     if checkpoint is not None:
         if len(checkpoint)<1152 or checkpoint[:8]!=b'TRXNUC01' or int.from_bytes(checkpoint[8:12],'little') not in (1,2,3,4,5,6,7,8,9,10,11,12):
             raise ValueError("invalid source-XNU checkpoint payload header")
@@ -247,7 +248,9 @@ def main():
     if subprocess.check_output([futility, "dump_kernel_config", str(kpart)]) != cmdline:
         p.error("signed command line differs from baseline")
     # The screen image never returns to Linux, and an unexplained panic can need a plain retry.
-    create_image(kpart, image, "EL1 probe Linux log", disk_mib=128, kernel_mib=96, tries=15 if a.screen else 1)
+    # A prelinked kernel does not fit the usual 96 MiB partition; smaller images keep their exact layout.
+    disk_mib, kernel_mib = (256, 224) if kpart.stat().st_size > 96 << 20 else (128, 96)
+    create_image(kpart, image, "EL1 probe Linux log", disk_mib=disk_mib, kernel_mib=kernel_mib, tries=15 if a.screen else 1)
     code_files = ("boot/entry.S", "boot/probe.c", "boot/fdt.c", "boot/checkpoint.c", "boot/chain.ld",
                   "tools/linux_log.py", "tools/fdt.py", "tools/build.py", "tools/artifacts.py",
                   "tools/sign.py", "tools/disk.py", "tools/read_probe.py", "tools/relocation_audit.py")

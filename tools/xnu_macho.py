@@ -124,7 +124,8 @@ def macho(data):
         raise ValueError('entry is not in file-backed executable memory')
     count = 0
     if local is not None and local[1]:
-        if flags & 0x20 or first_segment != base:  # MH_SPLIT_SEGS uses a different origin.
+        # The origin is the first segment command, not the lowest address: prelinked components sit below __TEXT.
+        if flags & 0x20:  # MH_SPLIT_SEGS uses a different origin.
             raise ValueError('unsupported local relocation origin')
         count = audit_local(data, local, segments, sections, first_segment)
     return Kernel(base, top, entry, tuple(segments), count)

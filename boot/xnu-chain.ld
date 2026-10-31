@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 ENTRY(_start)
+/* Screen images replace this: a prelinked kernel needs more, and Depthcharge allows it. */
+PROVIDE(XNU_IMAGE_LIMIT = 80 * 1024 * 1024);
 SECTIONS {
   . = 0;
   .text : { KEEP(*(.text.head)) *(.text .text.*) }
@@ -21,6 +23,6 @@ SECTIONS {
   .xnu_window (NOLOAD) : { . += 24 * 1024 * 1024; }
   _image_end = .;
   ASSERT(SIZEOF(.linux) <= LINUX_MEMORY_SIZE, "Linux file exceeds memory size")
-  ASSERT(_image_end <= 80 * 1024 * 1024, "Checkpoint exceeds bounded Image memory")
+  ASSERT(_image_end <= XNU_IMAGE_LIMIT, "Checkpoint exceeds bounded Image memory")
   /DISCARD/ : { *(.comment) *(.eh_frame*) *(.note*) }
 }

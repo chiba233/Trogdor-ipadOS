@@ -295,7 +295,7 @@ class DisplayTests(unittest.TestCase):
         self.assertIn('rd=md0',COMMAND_LINE)
         self.assertIn('copy(window+disk,p+ramdisk,',(ROOT/'boot/xnu_screen.c').read_text())
         self.assertIn('tries=15 if a.screen else 1',(ROOT/'tools/linux_log.py').read_text())
-        patch=(ROOT/'platform/coachz-screen/patches/xnu/coachz-screen-console.patch').read_text()
+        patch=(ROOT/'platform/coachz-screen/patches/xnu/coachz-screen-ramdisk-root.patch').read_text()
         for fixed in ('amfi_interface_register(&coachz_amfi);','bsd/kern/coachz_amfi.c\t\tstandard','if (!iomediaClass) {','if (!ioblockstoragedriverClass) {'):
             self.assertIn(fixed,patch)
         self.assertIn('COACHZ userspace: init running as PID',(ROOT/'tools/coachz_init.S').read_text())
@@ -304,6 +304,41 @@ class DisplayTests(unittest.TestCase):
         out=bytes(add_ramdisk_property(tree,0x1000,0x5000))
         self.assertTrue(out.endswith(b'RAMDisk'.ljust(32,b'\0')+struct.pack('<IQQ',16,0x1000,0x5000)))
         self.assertEqual(struct.unpack_from('<I',out,8+len(prop(b'name',b'chosen\0')))[0],2)
+
+    def test_hardware_verified_prelink_route_is_unchanged(self):
+        from xnu_init import cdhash,trust_cache
+        from xnu_screen import PRELINK_COMMAND_LINE,prelink_tree,read_tree
+        platform=ROOT/'platform/coachz-prelink'
+        config=(platform/'configs/coachz_defconfig').read_text()
+        self.assertIn('CONFIG_XNU_DT_PANIC_REGION=y',config)
+        for removed in ('CONFIG_XNU_NATIVE_AES','CONFIG_XNU_CRYPTO_BOOTSTRAP','CONFIG_XNU_TRUST_CACHE_RUNTIME'):
+            self.assertNotIn(removed,config)
+        series=(platform/'patches/xnu/series').read_text().splitlines()
+        for entry in (line for line in series if line.endswith('.patch') and ':' not in line):
+            self.assertTrue((platform/'patches/xnu'/entry).is_file(),entry)
+        self.assertNotIn('coachz-screen-ramdisk-root.patch','\n'.join(series))
+        self.assertIn('kVirtualTimerIntid = 19;',(platform/'patches/drivers/ArmCpu.patch').read_text())
+        self.assertIn('allocClassWithName("ApplePMGRNub")',(platform/'patches/xnu/coachz-prelink-pmgr.patch').read_text())
+        self.assertIn('rd=md0',PRELINK_COMMAND_LINE)
+        self.assertNotIn('kt_fixed_zones',PRELINK_COMMAND_LINE)
+        code=struct.pack('>II',0xfade0c02,16)+bytes(8)
+        blob=struct.pack('>IIIII',0xfade0cc0,20+len(code),1,0,20)+code
+        image=struct.pack('<8I',0xfeedfacf,0x100000c,0,2,1,16,0,0)+struct.pack('<IIII',0x1d,16,48,len(blob))+blob
+        cache=trust_cache(image)
+        self.assertEqual(struct.unpack_from('<III',cache),(1,8,2))
+        self.assertEqual(struct.unpack_from('<I',cache,28)[0],1)
+        self.assertEqual((cache[32:52],cache[52:56]),(cdhash(image),bytes((2,0,0,0))))
+        self.assertEqual(len(cache),56)
+        prop=lambda key,value:key.ljust(32,b'\0')+struct.pack('<I',len(value))+value+bytes(-len(value)%4)
+        tree=struct.pack('<II',1,1)+prop(b'name',b'device-tree\0')+struct.pack('<II',1,1)+prop(b'name',b'chosen\0')+struct.pack('<II',1,0)+prop(b'name',b'memory-map\0')
+        out=prelink_tree(tree,0x40000000,0x4000,bytes(4096),cache)
+        root=read_tree(out)
+        self.assertEqual(root.write(),out)
+        self.assertIn(('model',8,b'iPad7,1\0'),root.props)
+        props={key:value for key,_,value in root.child('chosen').child('memory-map').props}
+        disk=0x40000000+((0x4000+len(out)+0x3fff)&~0x3fff)
+        self.assertEqual(props['RAMDisk'],struct.pack('<QQ',disk,4096))
+        self.assertEqual(props['TrustCache'],struct.pack('<QQ',disk+4096,56))
 
     def test_hardware_verified_scanout_restart_order_is_unchanged(self):
         source=(ROOT/'boot/display.c').read_text()

@@ -130,3 +130,15 @@ INTF 帧／行计数的偏移来自 Linux DPU 驱动，锁定固件源码没有�
 屏幕右上角的绿色方块表示探针已完成。这张镜像不验收任何 XNU 阶段的状态，只显示实际跑到哪里。一次写入可以启动 15 次，其他镜像只能启动一次。
 
 负载末尾带一个内存盘，装载器把它放在设备树之后，并计入 `topOfKernelData`；打包时向 `/chosen/memory-map` 写入 `RAMDisk` 属性，启动参数带 `rd=md0`。内存盘内容就是 `tools/coachz_init.S` 打包成的静态 Mach-O，mockfs 把整个设备当作 `/sbin/launchd`。程序打开 `/dev/console`，打印 PID，然后每 5 秒用 `select` 睡眠并打印一次 tick。补丁另外包含两处改编自 ios-sweet 的修改：没有 IOStorageFamily 时跳过 `IOService.cpp` 的两处断言，以及内置 AMFI 接口 `bsd/kern/coachz_amfi.c`，它不授予任何 entitlement，代码签名和页哈希校验仍由内核完成。组件 prelink 仍未接入；接入时必须删除这个内置接口，否则 AMFI kext 重复注册会 panic。
+
+## prelink 屏幕镜像
+
+`platform/coachz-prelink` 是独立的平台，`platform/coachz-screen` 保留为已验证的无 prelink 路线。构建命令是 `tools/kernel_source.py --platform coachz-prelink --output build/xnu-source-prelink --build --ipsw FILE`，打包时给 `tools/xnu_screen.py` 加 `--prelinked`。IPSW 放在被忽略的 `.tools/ipsw/`，kernelcache 和 `kernel.macho` 都留在被忽略的 `build/`，不进仓库。
+
+与 `coachz-screen` 的区别：
+
+- 合并 OS profile 里列出的 31 个原始组件，恢复 `CONFIG_XNU_NATIVE_AES`、trust cache 运行时和 prelink 版 corecrypto，去掉内置 AMFI 接口和 `kt_fixed_zones`。
+- ADT 应用 OS profile 的 `[adt]` 表，设备身份是 iPad7,1 / J120AP。
+- 负载末尾在内存盘后面放一个 trust cache，只含 init 的 cdhash（版本 2 模块，SHA-256，无约束类别），地址写入 `/chosen/memory-map/TrustCache`。真实 AMFI 不接受普通 ad-hoc 程序。
+- `coachz-prelink-pmgr.patch` 在 `bsd_init` 里加载 ApplePMGR 并发布一个没有 provider 的 `ApplePMGRNub`。原始 AMFI 在 thread call 里等待这个服务，超时就 panic；没有 provider 时它的读写不触碰硬件。做法来自 UniXNU 的 sirius 移植记录。
+- 镜像超过 96 MiB 时改用 256 MiB 磁盘和 224 MiB kernel 分区，`boot/xnu-chain.ld` 的内存上限由屏幕镜像放宽到 256 MiB。其他镜像布局不变。

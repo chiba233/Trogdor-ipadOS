@@ -1,0 +1,54 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -773,6 +773,9 @@
+ 	bsd_init_kprintf("calling bsd_bufferinit\n");
+ 	bsd_bufferinit();
+ 
++	extern void coachz_pmgr_publish(void);
++	coachz_pmgr_publish();
++
+ 	/*
+ 	 * Initialize the calendar.
+ 	 */
+--- a/iokit/conf/files
++++ b/iokit/conf/files
+@@ -53,6 +53,7 @@
+ iokit/Kernel/IOPMPowerSource.cpp			optional iokitcpp
+ iokit/Kernel/IOPMPowerSourceList.cpp			optional iokitcpp
+ iokit/Kernel/IOPMGR.cpp					optional iokitcpp
++iokit/Kernel/CoachzPMGR.cpp				optional iokitcpp
+ iokit/Kernel/IOPolledInterface.cpp			optional iokitcpp
+ 
+ iokit/Kernel/IOWorkLoop.cpp				optional iokitcpp
+diff --git a/iokit/Kernel/CoachzPMGR.cpp b/iokit/Kernel/CoachzPMGR.cpp
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/CoachzPMGR.cpp
+@@ -0,0 +1,27 @@
++/*
++ * Coachz has no Apple power manager, but the original AMFI waits for an ApplePMGRNub on
++ * a thread call and panics ("AMFI: No PMGR?") when none appears. Its read and write go
++ * through the provider stored in the nub and do nothing without one, so a real nub with
++ * no provider satisfies it. The UniXNU sirius port found this approach. No PMGR hardware
++ * is touched.
++ */
++#include <IOKit/IOService.h>
++#include <libkern/OSKextLib.h>
++#include <libkern/c++/OSMetaClass.h>
++
++extern "C" void coachz_pmgr_publish(void);
++
++void
++coachz_pmgr_publish(void)
++{
++	OSReturn status = OSKextLoadKextWithIdentifier("com.apple.driver.ApplePMGR");
++	if (status != kOSReturnSuccess) {
++		panic("Coachz PMGR: ApplePMGR did not load: %x", status);
++	}
++	IOService *nub = OSDynamicCast(IOService, OSMetaClass::allocClassWithName("ApplePMGRNub"));
++	if (nub == NULL || !nub->init() || !nub->attach(IOService::getServiceRoot())) {
++		panic("Coachz PMGR: cannot create ApplePMGRNub");
++	}
++	nub->registerService();
++	nub->release();
++}

@@ -646,3 +646,16 @@ panic 的调用栈为 `PE_init_iokit → InitIOKit → OSlibkernInit → OSRunti
 同一轮还查清了另一个现象：同一次写入的 U 盘第二次按 Ctrl+U 无法启动。U 盘本身正常，是镜像设置了 `tries=1, successful=0`，固件第一次启动就用完次数并标记坏分区，Debian 下读到的分区属性为 0。屏幕镜像现在设为 `tries=15`，写入后属性是 `0xf1000000000000`，启动一次后读到 `0xe1000000000000`，符合每次启动扣减一次。其他镜像仍是一次。
 
 未解决：随机 zone panic 最近几轮未出现，原因仍未查明。没有 SMP、完整组件 prelink、存储驱动、launchd 或 iPadOS 启动。
+
+
+## 2026-10-31：prelink 内核在真机上运行 init
+
+运行时与配置见随本节提交，镜像 SHA-256 `5d759e75eb57933c65c36d74751dba2d695d60746bd15b8c92dd86407512c391`。内核是 `platform/coachz-prelink`，合并了 iPadOS 17.7.11 kernelcache 里 OS profile 列出的 31 个组件。
+
+第一轮（只有 trust cache，没有 PMGR 补丁）的屏幕照片已经显示 `com.apple.AppleFSCompressionTypeZlib`、APFS、IOSurface、AppleImage4 的启动输出，`BSD root: md0`，以及 `init running as PID 1` 和 tick。init 不再依赖内置 AMFI 接口，而是由真实 AMFI 放行，判断依据是 init 的 cdhash 在自建 trust cache 里，并且这一版内核没有 `coachz_amfi.c`。约 5 个 tick 后出现 `panic: "AMFI: No PMGR?" @ConfigurationSettings.cpp:235`，调用栈经过 `thread_call_invoke`、`thread_call_thread`，即 AMFI 的后台线程等待 `ApplePMGRNub` 超时。
+
+第二轮加入 `coachz-prelink-pmgr.patch`，发布一个没有 provider 的 `ApplePMGRNub`。屏幕文字回绕后可以看到 tick 依次走完 1 到 9，再到 0、1、2，也就是至少 12 个，超过了上一轮 panic 的位置，没有新的 panic。
+
+这只有屏幕证据，没有逐字段核对，也没有验证 tick 间隔或更长时间的稳定性。运行的仍是自写的静态测试程序。`AppleImage4: magazine ... cannot be written`、`serializeVariables failed` 和 `Failed to open swap file` 都出现了，这一轮没有处理，它们符合只读内存盘根和没有 NVRAM 控制器的状态，但没有逐项验证是否无害。ADT 没有 PMGR、存储、显示等硬件节点，所以大部分组件只是加载，没有驱动硬件。
+
+未解决：随机 zone panic 原因仍未查明。没有 SMP、存储驱动、launchd、dyld 或 iPadOS 用户态。
