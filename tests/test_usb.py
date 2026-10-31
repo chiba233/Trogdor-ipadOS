@@ -10,7 +10,7 @@ from usb_stack import runtime_table, unpacked_registers
 
 def record(**changes):
     fields = {'entry EL': 2, 'current EL': 1, 'stage': 3, 'handoff EL': 2, 'USB A controller': 1, 'USB A USBSTS poll': 0x10,
-              'USB A disk': 1, 'USB A speed': 3, 'USB A blocks': 250069680, 'USB A block size': 512, 'USB A lba0 rc': 0,
+              'USB A disk': 1, 'USB A speed': 3, 'USB A blocks': 2000000, 'USB A block size': 512, 'USB A lba0 rc': 0,
               'USB A lba0 tail': 0xaa55 << 48, 'USB A lba1 rc': 0, 'USB A lba1 head': int.from_bytes(b'EFI PART', 'little'),
               'USB A lba2048 rc': 0, 'USB A lba2048 head': int.from_bytes(b'CHROMEOS', 'little'), 'USB A SMMU sGFSR': 0,
               'USB SMMU sGFSR': 0, 'USB fatal count': 0, 'USB done': 1}
@@ -21,7 +21,7 @@ def record(**changes):
 
 class UsbReadTests(unittest.TestCase):
     def test_hardware_verified_record_is_accepted(self):
-        self.assertEqual(read_usb_record(record())[1]['USB A blocks'], 250069680)
+        self.assertEqual(read_usb_record(record())[1]['USB A blocks'], 2000000)
 
     def test_controller_error_or_wrong_data_is_rejected(self):
         for change in ({'USB_A_USBSTS_poll': 0x1015}, {'USB_A_disk': 0}, {'USB_A_lba1_head': 0}, {'USB_A_lba2048_head': 0}):

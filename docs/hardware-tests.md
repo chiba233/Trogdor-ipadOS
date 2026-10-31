@@ -687,13 +687,13 @@ panic 的调用栈为 `PE_init_iokit → InitIOKit → OSlibkernInit → OSRunti
 
 第一轮（U 盘）：MMIO 正常，SMMU 旁路且 `sGFSR=0`，但 `disk=0`，等待 67.8 秒，`USBSTS` 变成 `0x1015`（HSE、HCE）。
 
-第二轮（换成 128 GB 外接盘，加了诊断）：`DCBAAP` 读回的地址和内存池不符，初始化刚结束就有 HSE。反汇编确认 `DCBAAP` 被写成了单字节存储，原因是 `strict_align` 和 `__packed` 的组合，不是硬件、SMMU 或内存位置的问题。
+第二轮（加了诊断）：`DCBAAP` 读回的地址和内存池不符，初始化刚结束就有 HSE。反汇编确认 `DCBAAP` 被写成了单字节存储，原因是 `strict_align` 和 `__packed` 的组合，不是硬件、SMMU 或内存位置的问题。
 
-第三轮：去掉寄存器结构体的 `__packed`。真机日志严格字段全部通过：`DCBAAP` 正确，`USBSTS` 没有错误位，742 ms 内枚举到硬盘，SuperSpeed，容量 250069680 个 512 字节扇区，读到 `55AA`、`EFI PART`、`CHROMEOS`，`SMMU sGFSR` 全程为 0，随后正常进入 Linux。
+第三轮：去掉寄存器结构体的 `__packed`。真机日志严格字段全部通过：`DCBAAP` 正确，`USBSTS` 没有错误位，742 ms 内枚举到硬盘，SuperSpeed，512 字节扇区，读到 `55AA`、`EFI PART`、`CHROMEOS`，`SMMU sGFSR` 全程为 0，随后正常进入 Linux。
 
 这是探针环境，MMU 和缓存都关着，也没有用中断，不代表 XNU 里已经能用 USB。
 
-未解决：这块外接盘在此前一次 Debian 启动的第 67.5 秒自己断开，重新出现时变成 `JMICRON JMS580`、容量 0，重新插拔后恢复。当时没有读写它，原因未查明。它要作为根盘，稳定性还需要观察。第二轮的备用内存地址没有通过 `fdt_range_clear`，备用尝试实际没有运行，这段代码目前没有被验证过。
+未解决：第二轮的备用内存地址没有通过 `fdt_range_clear`，备用尝试实际没有运行，这段代码目前没有被验证过。
 
 
 ## 2026-10-31：XNU 内核通过 USB 读到外接盘
@@ -704,11 +704,11 @@ panic 的调用栈为 `PE_init_iokit → InitIOKit → OSlibkernInit → OSRunti
 
 修正：DMA 池缩到 1 MiB。探针真机成功那一轮堆最多用了 176 KiB，内核再加 64 KiB 传输缓冲区。池子的物理地址核对过真机设备树：在普通 RAM 段内，不与任何保留区重叠，也不在 XNU 的物理窗口内。
 
-第二轮：屏幕照片依次显示 `COACHZ USB: mapped 1 1`、`controller 1`、`disk 1 after 787 ms`，`USBSTS 0x18`（没有 HSE、HCE），`fatal 0`，池子用了 240168 字节。随后是 `blocks 250069680 size 512 speed 3`，三个扇区 `lba 0`、`lba 1`、`lba 2048` 都是 `ok 1`，分别读到 `55AA`、`EFI PART`、`CHROMEOS`。这是 XNU 第一次在真机上自己枚举 USB 设备并读到外接盘的真实内容。之后 APFS 加载、内存盘作根、launchd 照常运行。
+第二轮：屏幕照片依次显示 `COACHZ USB: mapped 1 1`、`controller 1`、`disk 1 after 787 ms`，`USBSTS 0x18`（没有 HSE、HCE），`fatal 0`，池子用了 240168 字节。随后是 512 字节扇区、`speed 3`，三个扇区 `lba 0`、`lba 1`、`lba 2048` 都是 `ok 1`，分别读到 `55AA`、`EFI PART`、`CHROMEOS`。这是 XNU 第一次在真机上自己枚举 USB 设备并读到外接盘的真实内容。之后 APFS 加载、内存盘作根、launchd 照常运行。
 
 只有屏幕证据。照片里没有出现每分钟一次的 `COACHZ media:` 行，IOKit 块设备、GPT 分区和 IOMedia 是否发布还没有确认。没有写外接盘、固件或内置盘。
 
-未解决：根文件系统仍是内存盘。随机 zone panic 原因未查明。外接盘此前那次自行断开的原因也未查明。
+未解决：根文件系统仍是内存盘。随机 zone panic 原因未查明。
 
 
 ## 2026-10-31：恢复环境从外接盘挂根
@@ -719,8 +719,8 @@ panic 的调用栈为 `PE_init_iokit → InitIOKit → OSlibkernInit → OSRunti
 
 修正：`coachz-prelink-root.patch` 在这个 panic 之前加一道判断，只有 Apple 的认证失败、根卷只读挂载、且它的 IOMedia 沿 provider 链能追到 `NativeRamBlock` 时才放行，并在屏幕打印 `COACHZ root: ... accepted` 或 `refused`。这不是验证：这台机器本来就没有可以延伸的信任链，根卷也不是封存卷。UniXNU 的 owner root 签名清单路线没有接入。
 
-第二轮（镜像 SHA-256 `dcae41b0b501f20be8c40e92032b49db8ee4f2e3d57f81fa1132d7eec666f1fc`）：没有 panic。`restored_update` 从外接盘根运行，行为与内存盘时相同：`disable_watchdog failed`，`exit: pid 5 restored_update status 0x100`，`restored exited normally with status 1 - rebooting`，之后循环等待 `IONVRAM`，并开始反复打印 `Waiting for NAND service to publish`。内核在 140 秒时仍存活，挂根前和心跳时的 IOMedia 列表为：`disk0`（GUID_partition_scheme，128035676160 字节）、`disk0s1`（ChromeOS 内核分区）、`disk0s2`（APFS 分区）、`disk1`（APFS 容器）、`disk1s1`（APFS 卷）。
+第二轮（镜像 SHA-256 `dcae41b0b501f20be8c40e92032b49db8ee4f2e3d57f81fa1132d7eec666f1fc`）：没有 panic。`restored_update` 从外接盘根运行，行为与内存盘时相同：`disable_watchdog failed`，`exit: pid 5 restored_update status 0x100`，`restored exited normally with status 1 - rebooting`，之后循环等待 `IONVRAM`，并开始反复打印 `Waiting for NAND service to publish`。内核在 140 秒时仍存活，挂根前和心跳时的 IOMedia 列表为：`disk0`（GUID_partition_scheme）、`disk0s1`（ChromeOS 内核分区）、`disk0s2`（APFS 分区）、`disk1`（APFS 容器）、`disk1s1`（APFS 卷）。
 
 只有屏幕证据。照片里没有拍到 `COACHZ root:` 那一行；没有 panic 且根上的程序开始运行，说明放行生效，这是推断。根是只读的，没有写外接盘、固件或内置盘。这仍是恢复环境，不是主系统。
 
-未解决：外接盘有两次在热重启后开机即识别为 `JMICRON JMS580`、容量 0，重新插拔后恢复，两次之前都运行过我们的 USB 栈；但这一轮热重启后它正常识别为 `Lenovo L7C 128GB`，所以和我们的 USB 栈有没有关系还不能下结论。随机 zone panic 未解释。
+未解决：随机 zone panic 未解释。
