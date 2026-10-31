@@ -35,6 +35,7 @@
 | 第一个用户态程序 | 屏幕输出镜像已从内存盘运行 PID 1（2026-10-31） | 屏幕照片显示 `/sbin/launchd` 加载和 `init running as PID 1`，即 EL0 执行及 `open`、`getpid`、`write` 系统调用可用；每 5 秒的 `select` 定时唤醒也已工作，说明定时器中断正常。程序是自写的静态测试程序，不是 launchd，见 [硬件记录](hardware-tests.md) |
 | 组件 prelink | 真机通过，运行自写 init（2026-10-31） | 屏幕照片显示 OS profile 的 Apple 原始组件参与启动（共 31 个，其中 `IOHIDEventDriver` 无代码），APFS、AppleImage4 等有加载输出，真实 AMFI 通过自建 trust cache 放行 init，tick 超过了之前 `AMFI: No PMGR?` 的 panic 位置；ADT 没有这些组件对应的硬件节点，多数驱动没有实际工作，见 [硬件记录](hardware-tests.md) |
 | Apple launchd 与恢复环境 | 真机运行（2026-10-31） | 屏幕照片显示 IPSW 的 Update 恢复内存盘以 APFS 根运行，原版 launchd、dyld、`restored_update` 在原版 trust cache 下执行，`restored_update` 因没有 IOWatchdog 服务按自身逻辑退出，随后等待 IONVRAM 和 NAND 服务，内核保持存活。这不是主系统，见 [硬件记录](hardware-tests.md) |
+| iPadOS 主系统从外接盘启动 | 进行中（2026-10-31） | 系统卷按 UUID 挂成只读根，原版 launchd 已 exec；SystemOS 挂在 `/private/preboot`，dyld 找到共享缓存但映射被拒，修正和帧缓冲区别名预留尚未上机；没有 Data 卷，只有屏幕证据，见 [硬件记录](hardware-tests.md) |
 | USB 主机与大容量存储 | 探针只读实验真机通过；XNU 从外接盘只读挂根屏幕确认（2026-10-31） | 探针用 libpayload 枚举到硬盘并读到 `EFI PART`、`CHROMEOS`，严格字段通过，见 [USB 只读实验](usb-read.md)。XNU 内核里的同一套栈经 IOKit 块设备、GPT 分区和 APFS 把恢复卷挂成只读根，`restored_update` 从外接盘运行；未封存根卷是放行而不是验证，只有屏幕证据，见 [硬件记录](hardware-tests.md)。既定路线：根文件系统先从外接盘启动，之后才考虑 eMMC |
 | eMMC、触摸、GPU 与完整 iPadOS 用户态 | 未实现 | 没有原生桌面或应用运行记录 |
 

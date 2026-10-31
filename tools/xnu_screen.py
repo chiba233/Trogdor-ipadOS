@@ -117,12 +117,25 @@ def apply_identity(node, table):
             apply_identity(node.child(kind), values)
 
 
-def wrap_trust_cache(module):
-    """The memory-map segment: an offset table in front of one original module."""
-    return struct.pack('<II', 1, 8) + module
+def wrap_trust_cache(modules):
+    """The memory-map segment: a module count and offset table in front of the original modules."""
+    if isinstance(modules, bytes):
+        modules = [modules]
+    offsets, at = [], 4 + 4 * len(modules)
+    for module in modules:
+        offsets.append(at)
+        at += len(module)
+    return struct.pack('<%dI' % (1 + len(modules)), len(modules), *offsets) + b''.join(modules)
 
 
-def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=True):
+def root_matching(uuid):
+    """/chosen/root-matching: IOFindBSDRoot takes it before rd=, matching the APFS volume media by UUID.
+    rd=uuid would wait for a boot-uuid-media resource that only a file system driver kext publishes."""
+    return ('<dict><key>IOProviderClass</key><string>IOMedia</string><key>IOPropertyMatch</key>'
+            '<dict><key>UUID</key><string>%s</string></dict></dict>' % uuid).encode() + b'\0'
+
+
+def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=True, root_uuid=None):
     root = read_tree(adt)
     table = tomllib.loads(OS_PROFILE.read_text())['adt']
     apply_identity(root, table['root'])
@@ -130,6 +143,8 @@ def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=T
         apply_identity(root.child(name), table[name])
     if environment:
         root.child('chosen').set('osenvironment', environment.encode() + b'\0')
+    if root_uuid:
+        root.child('chosen').set('root-matching', root_matching(root_uuid))
     memory_map = root.child('chosen').child('memory-map')
     # Without a RAMDisk entry IOFindBSDRoot makes no md0, and rd= names a disk partition.
     if ram_root:
@@ -142,17 +157,25 @@ def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=T
     return root.write()
 
 
-def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=False, root_cache=None, root_device=None):
+def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=False, root_cache=None, root_device=None,
+         root_uuid=None):
     if window & 0x1fffff or memory & 0x1fffff:
         raise ValueError('window base and size must be 2 MiB aligned')
     kernel = macho(data)
-    if root_device and (not prelinked or not root_cache or ramdisk is not None or command_line):
+    disk_root = root_device or root_uuid
+    if disk_root and (not prelinked or not root_cache or ramdisk is not None or command_line or (root_device and root_uuid)):
         raise ValueError('a disk root needs the prelinked kernel, its trust cache and no RAM disk')
     command_line = command_line or (PRELINK_COMMAND_LINE if prelinked else COMMAND_LINE)
     if root_device:
         if not re.fullmatch(r'disk[0-9]+(s[0-9]+)*', root_device):
             raise ValueError('invalid root device name')
         command_line = command_line.replace('rd=md0', 'rd=' + root_device)
+    if root_uuid:
+        # The main OS volume by its APFS volume UUID: container numbering does not matter.
+        if not re.fullmatch(r'[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}', root_uuid):
+            raise ValueError('invalid root volume UUID')
+        command_line = command_line.replace(' rd=md0', '')
+    if disk_root:
         ramdisk = b''
     ramdisk = init_ramdisk() if ramdisk is None else ramdisk
     span = kernel.end - kernel.base
@@ -162,7 +185,9 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
     if prelinked:
         cache = wrap_trust_cache(root_cache) if root_cache else trust_cache(ramdisk)
         ramdisk += bytes(-len(ramdisk) % 4096)
-        adt = prelink_tree(adt, window, tree, ramdisk, cache, 'restore' if root_cache else None, ram_root=not root_device)
+        # The restore volume, from memory or from disk, runs as the restore OS environment; the main OS does not.
+        environment = 'restore' if root_cache and not root_uuid else None
+        adt = prelink_tree(adt, window, tree, ramdisk, cache, environment, ram_root=not disk_root, root_uuid=root_uuid)
         ramdisk = ramdisk + cache + bytes(-len(cache) % 4096)
     else:
         adt = add_ramdisk_property(adt, window + up(tree + len(adt) + 52), len(ramdisk))
@@ -195,19 +220,22 @@ def main():
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--prelinked', action='store_true', help='kernel carries the original components: trust the init program through a trust cache')
     p.add_argument('--root-image', type=Path, help='with --prelinked: RAM disk root instead of the init program; from tools/xnu_ipsw.py')
-    p.add_argument('--root-trust-cache', type=Path, help='the original trust cache module of --root-image or --root-device')
+    p.add_argument('--root-trust-cache', type=Path, action='append', default=[],
+                   help='an original trust cache module of the root; repeat for the main OS and its cryptexes')
     p.add_argument('--root-device', help='with --prelinked: root on this BSD disk instead of a RAM disk, such as disk1s1')
+    p.add_argument('--root-uuid', help='with --prelinked: the main OS, rooted on the APFS volume of this UUID')
     a = p.parse_args()
     if a.output.exists() or a.output.resolve().is_relative_to(Path('/dev')):
         p.error('output must be a new ordinary file')
-    if a.root_device:
-        if a.root_image or not a.root_trust_cache or not a.prelinked:
-            p.error('--root-device takes --root-trust-cache and --prelinked, and no --root-image')
-    elif bool(a.root_image) != bool(a.root_trust_cache) or (a.root_image and not a.prelinked):
-        p.error('--root-image and --root-trust-cache go together and need --prelinked')
+    if a.root_device or a.root_uuid:
+        if bool(a.root_device) == bool(a.root_uuid) or a.root_image or not a.root_trust_cache or not a.prelinked:
+            p.error('--root-device or --root-uuid takes --root-trust-cache and --prelinked, and no --root-image')
+    elif bool(a.root_image) != bool(a.root_trust_cache) or (a.root_image and not a.prelinked) or len(a.root_trust_cache) > 1:
+        p.error('--root-image and one --root-trust-cache go together and need --prelinked')
     payload = pack(a.kernel.read_bytes(), a.adt.read_bytes(), a.window, a.memory, prelinked=a.prelinked,
                    ramdisk=a.root_image.read_bytes() if a.root_image else None,
-                   root_cache=a.root_trust_cache.read_bytes() if a.root_trust_cache else None, root_device=a.root_device)
+                   root_cache=[cache.read_bytes() for cache in a.root_trust_cache] or None, root_device=a.root_device,
+                   root_uuid=a.root_uuid)
     a.output.parent.mkdir(parents=True, exist_ok=True)
     a.output.write_bytes(payload)
     print('Built screen-output XNU payload', hashlib.sha256(payload).hexdigest())

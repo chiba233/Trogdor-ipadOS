@@ -19,6 +19,7 @@ int coachz_usb_read(uint64_t block, uint32_t count, void **data);
 uint32_t coachz_usb_max_blocks(void);
 void coachz_usb_report(void);
 int coachz_usb_root_device(dev_t device);
+int coachz_usb_volume_device(const char *uuid, char *path, size_t size);
 // RamBlock's interface to the kernel patches; nothing here is a RAM disk or carries a seed.
 volatile uint32_t native_ram_block_ready = 0;
 volatile uint64_t native_ram_block_bytes = 0;
@@ -165,6 +166,41 @@ extern "C" int coachz_usb_root_device(dev_t device)
   }
   iterator->release();
   return matches == 1 && ours;
+}
+
+// The /dev path of the one media with this volume UUID on this driver, for the SystemOS mount.
+extern "C" int coachz_usb_volume_device(const char *uuid, char *path, size_t size)
+{
+  if (!uuid || !path || size < 6) return 0;
+  path[0] = 0;
+  OSDictionary *matching = IOService::serviceMatching("IOMedia");
+  OSDictionary *properties = OSDictionary::withCapacity(1);
+  OSString *wanted = OSString::withCString(uuid);
+  bool ready = matching && properties && wanted && properties->setObject("UUID", wanted) &&
+               matching->setObject("IOPropertyMatch", properties);
+  OSSafeReleaseNULL(wanted); OSSafeReleaseNULL(properties);
+  // The root lookup waited only for the root volume: give another container up to 10 s to publish.
+  IOService *first = ready ? IOService::waitForMatchingService(matching, 10ull * NSEC_PER_SEC) : nullptr;
+  OSSafeReleaseNULL(first);
+  OSIterator *iterator = ready ? IOService::getMatchingServices(matching) : nullptr;
+  OSSafeReleaseNULL(matching);
+  if (!iterator) return 0;
+  unsigned matches = 0;
+  bool ours = false;
+  OSString *name = nullptr;
+  while (OSObject *object = iterator->getNextObject()) {
+    IOService *media = OSDynamicCast(IOService, object);
+    if (!media || ++matches != 1) { ours = false; continue; }
+    name = OSDynamicCast(OSString, media->getProperty(kIOBSDNameKey));
+    unsigned depth = 0;
+    for (IOService *provider = media; provider && depth < 64; provider = provider->getProvider(), depth++) {
+      if (OSDynamicCast(NativeRamBlock, provider)) { ours = true; break; }
+    }
+  }
+  bool found = matches == 1 && ours && name;
+  if (found) snprintf(path, size, "/dev/%s", name->getCStringNoCopy());
+  iterator->release();
+  return found;
 }
 
 extern "C" int native_ram_block_volume_device(const char *, dev_t *, char *, size_t) { return 0; }

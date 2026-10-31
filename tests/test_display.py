@@ -325,6 +325,14 @@ class DisplayTests(unittest.TestCase):
         self.assertIn('owner_authorized = (vfs_flags(root_mount) & MNT_RDONLY) && device != NODEV && coachz_usb_root_device(device);',root_patch)
         self.assertIn('OSDynamicCast(NativeRamBlock, provider)',(platform/'drivers/RamBlock/NativeRamBlock.cpp').read_text())
         self.assertIn('#define POOL_BYTES (1ul * 1024 * 1024)',(platform/'drivers/RamBlock/coachz_usb.c').read_text())
+        self.assertIn('coachz-prelink-systemos.patch',series)
+        systemos=(platform/'patches/xnu/coachz-prelink-systemos.patch').read_text()
+        for fixed in ('const char *mountpoint = "/private/preboot";','&& !coachz_shared_cache_volume(srfmp->vp)',
+                      'return mp && mp == coachz_systemos_mount && (vfs_flags(mp) & MNT_RDONLY);'):
+            self.assertIn(fixed,systemos)
+        console=(ROOT/'platform/coachz-screen/patches/xnu/coachz-screen-console.patch').read_text()
+        self.assertIn('if (region_select == 4 && coachz_early_alias_size) {',console)
+        self.assertIn('coachz_early_alias_size = blocks * ARM_TT_L2_SIZE;',console)
         self.assertIn('OSKextLoadKextWithIdentifier("com.apple.filesystems.tmpfs")',(platform/'patches/xnu/coachz-prelink-diagnostics.patch').read_text())
         self.assertIn('((adt+adtsize+15)&~15ull)!=ramdisk',(ROOT/'boot/xnu_screen.c').read_text())
         self.assertIn('ramdisk_at = (adt_at + len(adt) + 15) & ~15',(ROOT/'tools/xnu_screen.py').read_text())
@@ -356,6 +364,11 @@ class DisplayTests(unittest.TestCase):
         disk_root=read_tree(prelink_tree(tree,0x40000000,0x4000,b'',cache,'restore',ram_root=False))
         props={key:value for key,_,value in disk_root.child('chosen').child('memory-map').props}
         self.assertNotIn('RAMDisk',props)
+        main=read_tree(prelink_tree(tree,0x40000000,0x4000,b'',cache,None,ram_root=False,root_uuid='04769D26-2CA0-4825-B443-E2E5F88300F2'))
+        chosen={key:value for key,_,value in main.child('chosen').props}
+        self.assertEqual(chosen['osenvironment'],b'main\0')
+        self.assertIn(b'<key>UUID</key><string>04769D26-2CA0-4825-B443-E2E5F88300F2</string>',chosen['root-matching'])
+        self.assertTrue(chosen['root-matching'].endswith(b'</dict>\0'))
         self.assertEqual(struct.unpack_from('<QQ',props['TrustCache'])[1],56)
 
     def test_hardware_verified_scanout_restart_order_is_unchanged(self):

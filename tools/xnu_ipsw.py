@@ -33,12 +33,18 @@ def im4p_payload(data, kind):
     return items[3]
 
 
-def extract(ipsw, output, device='j120ap', behavior='Update'):
+# The main OS: its static trust cache and the two cryptex trust caches, for the memory-map segment.
+MAIN_OS = {'StaticTrustCache': ('os-trustcache.bin', b'trst'),
+           'Cryptex1,SystemTrustCache': ('systemos-trustcache.bin', b'trcs'),
+           'Cryptex1,AppTrustCache': ('appos-trustcache.bin', b'trca')}
+
+
+def extract(ipsw, output, device='j120ap', behavior='Update', main_os=False):
     with zipfile.ZipFile(ipsw) as archive:
         manifest = plistlib.loads(archive.read('BuildManifest.plist'))
         identity = next(i for i in manifest['BuildIdentities']
                         if i['Info']['DeviceClass'] == device and i['Info']['RestoreBehavior'] == behavior)
-        files = {'RestoreRamDisk': ('ramdisk.apfs', b'rdsk'), 'RestoreTrustCache': ('trustcache.bin', b'rtsc')}
+        files = MAIN_OS if main_os else {'RestoreRamDisk': ('ramdisk.apfs', b'rdsk'), 'RestoreTrustCache': ('trustcache.bin', b'rtsc')}
         output.mkdir(parents=True, exist_ok=True)
         result = {}
         for component, (name, kind) in files.items():
@@ -52,8 +58,9 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--ipsw', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
+    p.add_argument('--main-os', action='store_true', help='the main OS trust caches instead of the restore RAM disk')
     a = p.parse_args()
-    for name, digest in extract(a.ipsw, a.output).items():
+    for name, digest in extract(a.ipsw, a.output, main_os=a.main_os).items():
         print(name, digest)
 
 

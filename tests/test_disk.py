@@ -67,7 +67,7 @@ class DiskTests(unittest.TestCase):
 
     def test_optional_root_container_follows_the_kernel_partition(self):
         root = b"NXSB" + bytes(3 << 20)
-        parts = fragments(self.payload(), disk_mib=64, kernel_mib=16, root=root)
+        parts = fragments(self.payload(), disk_mib=64, kernel_mib=16, roots=[root])
         entries = parts[2][1]
         self.assertEqual(uuid.UUID(bytes_le=bytes(entries[128:144])), APFS_TYPE)
         first, last, attrs = struct.unpack_from("<QQQ", entries, 128 + 32)
@@ -77,7 +77,23 @@ class DiskTests(unittest.TestCase):
         self.assertEqual(fragments(self.payload())[2][1][128:], bytes(127 * 128))
         for oversized in (b"", bytes((64 - 16) << 20)):
             with self.assertRaises(ValueError):
-                fragments(self.payload(), root=oversized)
+                fragments(self.payload(), roots=[oversized])
+        second = b"NXSB" + bytes(1 << 20)
+        entries = fragments(self.payload(), roots=[root, second])[2][1]
+        self.assertEqual(struct.unpack_from("<Q", entries, 256 + 32)[0], FIRST + LENGTH + 4 * 2048)
+        # The GPT follows the layout, not the kernel: a kernel-only image matches the medium.
+        other = b"CHROMEOS" + bytes(65536)
+        self.assertEqual(fragments(other, roots=[root])[1], fragments(self.payload(), roots=[root])[1])
+        self.assertNotEqual(fragments(other)[1], fragments(self.payload())[1])
+        with tempfile.TemporaryDirectory() as d:
+            source, container = Path(d) / "probe.kpart", Path(d) / "root.apfs"
+            source.write_bytes(self.payload())
+            container.write_bytes(root)
+            full = create_image(source, Path(d) / "full.img", roots=[container]).read_bytes()
+            head = create_image(source, Path(d) / "head.img", roots=[container], kernel_only=True).read_bytes()
+        self.assertEqual(len(head), (FIRST + LENGTH) * SECTOR)
+        self.assertEqual(full[:len(head)], head)
+        self.assertEqual(full[(FIRST + LENGTH) * SECTOR:][:len(root)], root)
 
     def test_existing_file_and_device_output_are_refused(self):
         with tempfile.TemporaryDirectory() as d:

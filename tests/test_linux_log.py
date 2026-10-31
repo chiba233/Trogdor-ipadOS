@@ -110,7 +110,7 @@ class LinuxLogTests(unittest.TestCase):
         self.assertEqual(struct.unpack_from('<Q', parts[1][1], 32)[0], 262143)
         self.assertEqual(struct.unpack_from('<Q', parts[2][1], 40)[0], 2048 + 96 * 2048 - 1)
         self.assertEqual(parts[3][1], payload)
-        for disk, kernel in ((64, 64), (128, 0), (1025, 96), (True, 1)):
+        for disk, kernel in ((64, 64), (128, 0), (32769, 96), (True, 1)):
             with self.subTest(disk=disk, kernel=kernel), self.assertRaises(ValueError):
                 fragments(payload, disk_mib=disk, kernel_mib=kernel)
 

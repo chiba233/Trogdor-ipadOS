@@ -724,3 +724,22 @@ panic 的调用栈为 `PE_init_iokit → InitIOKit → OSlibkernInit → OSRunti
 只有屏幕证据。照片里没有拍到 `COACHZ root:` 那一行；没有 panic 且根上的程序开始运行，说明放行生效，这是推断。根是只读的，没有写外接盘、固件或内置盘。这仍是恢复环境，不是主系统。
 
 未解决：随机 zone panic 未解释。
+
+
+## 2026-10-31：iPadOS 主系统卷从外接盘挂根
+
+外接盘按 GPT 依次放内核分区、IPSW `OS` 组件的原始 APFS 容器（UDIF 解出的那个分区）和 `Cryptex1,SystemOS` 的原始 APFS 容器，内容逐字节来自 IPSW，不进仓库。系统卷和两个 cryptex 的三个 trust cache 一起放进内存里的 trust cache 段。整盘镜像由 `tools/linux_log.py --xnu-root-partition` 生成，第一次在 Mac 上整盘写入；之后的轮次用 `--xnu-kernel-only` 只重写内核分区，GPT 只随布局变化，不随内核变化。
+
+第一轮（整盘镜像 SHA-256 `243fd48f336f9438e014681f672ee10ed8f2e0b59900722d5f9b237d379a37a0`，`rd=uuid boot-uuid=`）：两个 APFS 容器和卷都发布了，但内核一直等 `boot-uuid-media`，随后 panic `Failed to mount root device`。这个资源由 macOS 的文件系统驱动发布，这里没有。改用 ADT `/chosen/root-matching`，按 IOMedia 的 `UUID` 属性直接匹配系统卷，`IOFindBSDRoot` 先于 `rd=` 读取它。
+
+第二轮（内核前缀 `b7aa8e02c50c483f55497f0ef56d48f8dba01b6e75ab353edfda869d871d30a8`）：系统卷挂成只读根，原版 `/sbin/launchd` 作为 PID 1 被 exec。dyld 运行了 libignition，找不到 Preboot 卷（role 0x10），随后 `Library not loaded: /usr/lib/libSystem.B.dylib (no dyld cache)`，内核 panic `initproc failed to start`。
+
+第三轮（`b3d76acbc896cb5dab22b57f39856c8f44f2e8fa8c9310aa4b97e278400f2b98`，挂载点为 `/System/Cryptexes/OS`）：`COACHZ SystemOS: mount /dev/disk2s1 at /System/Cryptexes/OS: 2`。系统卷里的 `/System/Cryptexes/OS` 是指向 `../../private/preboot/Cryptexes/OS` 的符号链接，真机上那里挂 Preboot 卷。
+
+第四轮（`f6162513853915a2bd53ddd2baa10f0414cf714c8640467fc757f1880f64a48c`）：按 UniXNU 的非 union 做法，把 SystemOS 只读挂到 `/private/preboot`，设置 dyld 的禁用 ignition 标志，并给 launchd 传 `DYLD_SHARED_CACHE_DIR`。屏幕显示 `mount /dev/disk2s1 at /private/preboot: 0, dyld_flags 0x8`，dyld 找到了 `dyld_shared_cache_arm64`，但内核拒绝映射：`not on process' root volume nor preboot volume`。共享缓存只能来自根卷或 `/private/preboot/Cryptexes` 所在的卷。
+
+第五轮（`ccd81166fb7a993cdfc4a2e5c28b273df236c3c8ac30874018344aedebce48bf`）：`vm_unix.c` 只额外放行内核自己挂上的那个只读 SystemOS 挂载。这一轮在挂根之前就 panic：`pmap_ttne: Attempt to demote L2 block`，调用栈 `bsd_init → bsd_bufferinit → kmem_alloc → pmap_enter`。屏幕控制台在 `arm_vm_init` 里把帧缓冲区以 2 MiB 块映射到低端全局变量和内核之间，但这段虚拟地址没有从 kernel map 预留，kmem 的随机区间可能分到它。此前未解释的随机 zone panic 很可能同源，这一点未证实。
+
+修正：`coachz-screen-console.patch` 记下别名映射的范围，`pmap_virtual_region` 把它报告为第 4 段，`kmem_init` 在放置 kmem 区间之前就占住它。这个补丁两条屏幕路线共用；屏幕路线本身没有重新上机。第六轮镜像 `791e86405fcc19a5ce8ee55d5c7db2baa900773a6bbecae16bc174eae0d05505` 已写入，尚无真机结果。
+
+都只有屏幕证据。根和 SystemOS 都只读，没有可写的 Data 卷；放行未封存根卷和放行 SystemOS 共享缓存都不是验证。

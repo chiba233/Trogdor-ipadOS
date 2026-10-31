@@ -1,0 +1,150 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8169,6 +8169,109 @@
+  * 3		2		NA		/usr/appleinternal/sbin/launchd.development
+  * 4		3		1		/sbin/launchd
+  */
++/*
++ * Coachz: the main OS keeps its dyld shared cache in the SystemOS cryptex. Before launchd, mount
++ * that volume read-only, tell dyld that ignition is done, and point launchd's dyld at the cache.
++ * /System/Cryptexes/OS is a link into the Preboot volume, which this disk does not have, so the
++ * volume goes on /private/preboot itself. Only for a read-only root on the Coachz USB disk. This
++ * follows the non-union mode of UniXNU patches/xnu/offline-owner-systemos-mount.patch
++ * (BSD-2-Clause-Patent, Copyright (c) 2026, UniXNU contributors), including its APFS mount
++ * payload. The outcome is kept for the exit of process 1.
++ */
++#define COACHZ_SYSTEMOS_UUID "8846FE78-2910-4297-AF97-D59BB6F8FC16"
++extern int coachz_usb_root_device(dev_t);
++extern int coachz_usb_volume_device(const char *, char *, size_t);
++extern void commpage_update_dyld_flags(uint64_t);
++char coachz_systemos_note[160];
++static mount_t coachz_systemos_mount;
++
++/* vm_unix.c: the SystemOS volume mounted here carries the dyld shared cache, as a Preboot cryptex would. */
++int
++coachz_shared_cache_volume(vnode_t vp)
++{
++	mount_t mp = vp ? vnode_mount(vp) : NULL;
++	return mp && mp == coachz_systemos_mount && (vfs_flags(mp) & MNT_RDONLY);
++}
++
++static void
++coachz_systemos_prepare(proc_t p, user_addr_t scratch, user_addr_t *envp)
++{
++	const char *mountpoint = "/private/preboot";
++	const char *environment = "DYLD_SHARED_CACHE_DIR=/private/preboot/System/Library/Caches/com.apple.dyld";
++	user64_addr_t environment_vector[2] = {scratch + 0x400, USER_ADDR_NULL};
++	mount_t root_mount = vnode_mount(rootvnode);
++	vnode_t device_vnode = vfs_devvp(root_mount);
++	dev_t root_device = device_vnode ? vnode_specrdev(device_vnode) : NODEV;
++	char device_path[64] = {0};
++	uint8_t mount_data[0x150] = {0};
++	user64_addr_t spec = scratch + 0x160;
++	uint64_t mount_flags = MNT_RDONLY;
++	uint16_t mount_mode = 1;
++	uint32_t anonymous_owner = 99;
++	struct mount_args request = {.type = scratch + 0x100, .path = scratch + 0x120,
++	    .flags = MNT_RDONLY, .data = scratch + 0x200};
++	int32_t result = 0;
++	int error;
++
++	if (device_vnode) {
++		vnode_put(device_vnode);
++	}
++	if (!(vfs_flags(root_mount) & MNT_RDONLY) || root_device == NODEV || !coachz_usb_root_device(root_device)) {
++		snprintf(coachz_systemos_note, sizeof(coachz_systemos_note),
++		    "COACHZ SystemOS: skipped, root read-only %d on the USB disk %d\n",
++		    (vfs_flags(root_mount) & MNT_RDONLY) != 0, root_device != NODEV && coachz_usb_root_device(root_device));
++		printf("%s", coachz_systemos_note);
++		return;
++	}
++	if (!coachz_usb_volume_device(COACHZ_SYSTEMOS_UUID, device_path, sizeof(device_path))) {
++		snprintf(coachz_systemos_note, sizeof(coachz_systemos_note),
++		    "COACHZ SystemOS: no volume %s on the USB disk\n", COACHZ_SYSTEMOS_UUID);
++		printf("%s", coachz_systemos_note);
++		return;
++	}
++	memcpy(mount_data, &spec, sizeof(spec));
++	memcpy(mount_data + 8, &mount_flags, sizeof(mount_flags));
++	memcpy(mount_data + 16, &mount_mode, sizeof(mount_mode));
++	memcpy(mount_data + 0x144, &anonymous_owner, sizeof(anonymous_owner));
++	memcpy(mount_data + 0x148, &anonymous_owner, sizeof(anonymous_owner));
++	error = copyout("apfs", request.type, 5);
++	if (!error) {
++		error = copyout(mountpoint, request.path, strlen(mountpoint) + 1);
++	}
++	if (!error) {
++		error = copyout(device_path, spec, strlen(device_path) + 1);
++	}
++	if (!error) {
++		error = copyout(mount_data, request.data, sizeof(mount_data));
++	}
++	if (!error) {
++		error = mount(p, &request, &result);
++	}
++	if (!error) {
++		vnode_t mounted = NULLVP;
++		error = vnode_lookup(mountpoint, 0, &mounted, vfs_context_current());
++		if (!error) {
++			coachz_systemos_mount = vnode_mount(mounted);
++			vnode_put(mounted);
++		}
++	}
++	if (!error) {
++		error = copyout(environment, environment_vector[0], strlen(environment) + 1);
++	}
++	if (!error) {
++		error = copyout(environment_vector, scratch + 0x500, sizeof(environment_vector));
++	}
++	if (!error) {
++		*envp = scratch + 0x500;
++		/* dyld flag bit 3: no ignition, the cryptex is in place already. */
++		dyld_flags |= UINT64_C(8);
++		commpage_update_dyld_flags(dyld_flags);
++	}
++	snprintf(coachz_systemos_note, sizeof(coachz_systemos_note),
++	    "COACHZ SystemOS: mount %s at %s: %d, dyld_flags 0x%llx\n", device_path, mountpoint, error, dyld_flags);
++	printf("%s", coachz_systemos_note);
++}
++
+ void
+ load_init_program(proc_t p)
+ {
+@@ -8188,6 +8291,7 @@
+ 	int data_error = native_owner_data_prepare(p, (user_addr_t)scratch_addr);
+ 	if (data_error) panic("offline scratch Data mount failed: %d", data_error);
+ #endif
++	coachz_systemos_prepare(p, (user_addr_t)scratch_addr, &init_envp);
+ #if CONFIG_MEMORYSTATUS
+ 	(void) memorystatus_init_at_boot_snapshot();
+ #endif /* CONFIG_MEMORYSTATUS */
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1848,6 +1848,11 @@
+ 	char prefix_str_buf[128];
+ 
+ 	if (p == initproc) {
++		/* Coachz: the SystemOS mount outcome, scrolled away by now on the screen console. */
++		extern char coachz_systemos_note[];
++		printf("%s", coachz_systemos_note);
++	}
++	if (p == initproc) {
+ 		if (strnstr(p->p_name, "preinit", sizeof(p->p_name))) {
+ 			prefix_str = "LTE preinit process exited";
+ 		} else if (initproc_spawned) {
+--- a/bsd/vm/vm_unix.c
++++ b/bsd/vm/vm_unix.c
+@@ -2630,10 +2630,13 @@
+ #define PREBOOT_CRYPTEX_PATH "/private/preboot/Cryptexes"
+ #endif
+ 			error = vnode_lookup(PREBOOT_CRYPTEX_PATH, 0, &preboot_vp, vfs_context_current());
++			/* Coachz: the read-only SystemOS volume that kern_exec.c mounted on /private/preboot. */
++			extern int coachz_shared_cache_volume(vnode_t);
+ 			if ((error || srfmp->vp->v_mount != preboot_vp->v_mount)
+ #if defined(XNU_OWNER_CACHE_CARRIER) && XNU_OWNER_CACHE_CARRIER
+ 			    && !owner_carrier
+ #endif
++			    && !coachz_shared_cache_volume(srfmp->vp)
+ 			    ) {
+ 				SHARED_REGION_TRACE_ERROR(
+ 					("shared_region: %p [%d(%s)] map(%p:'%s'): "

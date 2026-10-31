@@ -79,7 +79,7 @@
  #include <arm64/lowglobals.h>
  #include <arm/cpu_data_internal.h>
  #include <arm/misc_protos.h>
-@@ -1817,6 +1818,44 @@
+@@ -1817,6 +1818,49 @@
  #define ARM64_PHYSMAP_SLIDE_RANGE (1ULL << 30) // 1 GB
  #define ARM64_PHYSMAP_SLIDE_MASK  (ARM64_PHYSMAP_SLIDE_RANGE - 1)
  
@@ -88,6 +88,9 @@
 + * alias in the unused blocks between low globals and the kernel.
 + */
 +#define COACHZ_EARLY_ALIAS_BLOCK 16
++/* pmap_virtual_region() reserves these from the kernel map, or kmem could hand out their addresses. */
++uintptr_t coachz_early_alias_start;
++vm_map_size_t coachz_early_alias_size;
 +
 +static uintptr_t
 +coachz_early_map_final(void)
@@ -117,6 +120,8 @@
 +		    ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
 +		    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
 +	}
++	coachz_early_alias_start = va;
++	coachz_early_alias_size = blocks * ARM_TT_L2_SIZE;
 +	__asm__ volatile ("dsb ishst" ::: "memory");
 +	return va;
 +}
@@ -124,7 +129,7 @@
  void
  arm_vm_init(uint64_t memory_size, boot_args * args)
  {
-@@ -2147,6 +2186,8 @@
+@@ -2147,6 +2191,8 @@
  
  	arm_set_user_tbi();
  
@@ -133,7 +138,7 @@
  	arm_vm_physmap_init(args);
  	set_mmu_ttb_alternate(cpu_ttep & TTBR_BADDR_MASK);
  
-@@ -2154,10 +2195,16 @@
+@@ -2154,10 +2200,16 @@
  	ml_enable_monitor();
  #endif
  
@@ -150,7 +155,7 @@
  	// global table pointers may need to be different due to physical aperture remapping
  	cpu_tte = (tt_entry_t*)(phystokv(cpu_ttep));
  	invalid_tte = (tt_entry_t*)(phystokv(invalid_ttep));
-@@ -2253,7 +2300,9 @@
+@@ -2253,7 +2305,9 @@
      }
  #endif
  #endif
@@ -160,6 +165,32 @@
  
  	disable_preemption();
  
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -2556,7 +2556,10 @@
+ 	*startp = virtual_space_start;
+ 	*endp = virtual_space_end;
+ }
++
+ 
++extern uintptr_t coachz_early_alias_start;
++extern vm_map_size_t coachz_early_alias_size;
+ 
+ boolean_t
+ pmap_virtual_region(
+@@ -2647,6 +2650,12 @@
+ 		*size = LOW_GLOBAL_BASE_ADDRESS - *startp;
+ 		ret = TRUE;
+ 	}
++	if (region_select == 4 && coachz_early_alias_size) {
++		/* The screen console's framebuffer alias from arm_vm_init: keep kmem off its blocks. */
++		*startp = coachz_early_alias_start;
++		*size = coachz_early_alias_size;
++		ret = TRUE;
++	}
+ #endif /* defined(ARM_LARGE_MEMORY) */
+ #endif /* defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR) */
+ 	return ret;
 --- a/osfmk/kern/debug.c
 +++ b/osfmk/kern/debug.c
 @@ -84,6 +84,9 @@
