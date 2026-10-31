@@ -10,12 +10,12 @@
  bsd/dev/unix_startup.c			standard
 --- a/bsd/dev/coachz_gpu.c
 +++ b/bsd/dev/coachz_gpu.c
-@@ -0,0 +1,190 @@
+@@ -0,0 +1,208 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/*
 + * Adreno 618 first stages on Coachz (coachz-gpu=1 inventory, =2 bounded CX + GMU clock window, =3 also the GMU firmware into
 + * TCM, =4 the window plus a read-only GPU SMMU inventory, =5 the GMU's SMMU bank checked by translation, =6 also the firmware started
-+ * up to its init result, =7 also GX, SPTPRAC, HFI and GPU_SET): maps GCC, GPUCC, the GMU register block and the GPU SMMU, runs
++ * up to its init result, =7 also GX, SPTPRAC, HFI and GPU_SET, =8 also the GPU core and CP running three visible commands): maps GCC, GPUCC, the GMU register block and the GPU SMMU, runs
 + * coachz_gpu_run() (coachz_gpu_seq.h) once from the sampler thread and prints what it found and restored. The firmware is /chosen/memory-map CoachzGmuFirmware, placed by tools/xnu_screen.py
 + * --gmu-firmware in the loader's kernel data after the trust cache.
 + */
@@ -78,12 +78,17 @@
 +	printf("COACHZ gpu: step %u next, %u of %u translations right, rsc stop polls %u, init 0x%x, boot oob polls %u, sptprac polls %u, hfi start polls %u, %u messages (last %u, version 0x%x), gpu oob polls %u\n",
 +	    r->gmu_step, r->ats_right, r->ats_total, r->rsc_stop_polls, r->fw_init, r->oob_boot_polls, r->sptprac_polls, r->hfi_start_polls, r->hfi_done,
 +	    r->hfi_id, r->hfi_version, r->oob_gpu_polls);
++	if (r->own_core) {
++		printf("COACHZ gpu: core registers done %u, sqe 0x%x, wptr %u, init polls %u idle polls %u, rbbm 0x%x int 0x%x hw fault 0x%x cp int 0x%x protect 0x%x rptr %u bank0 fsr 0x%x\n",
++		    r->core_registers_done, r->sqe_version, r->core_wptr, r->core_init_polls, r->core_idle_polls, r->core_state[0], r->core_state[1], r->core_state[2],
++		    r->core_state[3], r->core_state[4], r->core_state[5], r->core_state[6]);
++	}
 +	delay(1500000);
 +}
 +
-+/* The image tools/xnu_screen.py placed, as (physical base, size); NULL without one. */
++/* An image tools/xnu_screen.py placed, as (physical base, size); NULL without one. */
 +static const uint32_t *
-+gpu_firmware(uint32_t *bytes)
++gpu_firmware(const char *name, uint32_t limit, uint32_t *bytes)
 +{
 +	DTEntry entry;
 +	void const *value;
@@ -91,11 +96,11 @@
 +	uint64_t range[2];
 +
 +	if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &entry) != kSuccess ||
-+	    SecureDTGetProperty(entry, "CoachzGmuFirmware", &value, &size) != kSuccess || size != sizeof(range)) {
++	    SecureDTGetProperty(entry, name, &value, &size) != kSuccess || size != sizeof(range)) {
 +		return NULL;
 +	}
 +	memcpy(range, value, sizeof(range));
-+	if (!range[0] || !range[1] || range[1] > GMU_TCM_BYTES || range[1] % 4 || range[0] % 4096) {
++	if (!range[0] || !range[1] || range[1] > limit || range[1] % 4 || range[0] % 4096) {
 +		return NULL;
 +	}
 +	*bytes = (uint32_t)range[1];
@@ -118,16 +123,17 @@
 +{
 +	static int started;
 +	unsigned mode = 0;
-+	if (started || !PE_parse_boot_argn("coachz-gpu", &mode, sizeof(mode)) || (mode < 1 || mode > 7)) {
++	if (started || !PE_parse_boot_argn("coachz-gpu", &mode, sizeof(mode)) || (mode < 1 || mode > 8)) {
 +		return;
 +	}
 +	started = 1;
 +	static const struct { vm_offset_t base; vm_size_t size; } blocks[GPU_BLOCKS] = {
 +		[GPU_GCC] = {GPU_GCC_BASE, GPU_GCC_SIZE}, [GPU_CC] = {GPU_CC_BASE, GPU_CC_SIZE}, [GPU_GMU] = {GPU_GMU_BASE, GPU_GMU_SIZE},
 +		[GPU_SMMU] = {GPU_SMMU_BASE, GPU_SMMU_SIZE}, [GPU_PDC] = {GPU_PDC_BASE, GPU_PDC_SIZE},
-+		[GPU_PDC_SEQ] = {GPU_PDC_SEQ_BASE, GPU_PDC_SEQ_SIZE}, [GPU_CMD_DB] = {GPU_CMD_DB_BASE, GPU_CMD_DB_SIZE}};
++		[GPU_PDC_SEQ] = {GPU_PDC_SEQ_BASE, GPU_PDC_SEQ_SIZE}, [GPU_CMD_DB] = {GPU_CMD_DB_BASE, GPU_CMD_DB_SIZE},
++		[GPU_CORE] = {GPU_CORE_BASE, GPU_CORE_SIZE}};
 +	for (unsigned i = 0; i < GPU_BLOCKS; i++) {
-+		if ((mode < 6 && (i == GPU_PDC || i == GPU_PDC_SEQ)) || (mode < 7 && i == GPU_CMD_DB)) {
++		if ((mode < 6 && (i == GPU_PDC || i == GPU_PDC_SEQ)) || (mode < 7 && i == GPU_CMD_DB) || (mode < 8 && i == GPU_CORE)) {
 +			continue;
 +		}
 +		gpu_window[i] = (uintptr_t)ml_io_map(blocks[i].base, blocks[i].size);
@@ -137,10 +143,12 @@
 +		}
 +	}
 +	volatile uint64_t *pool = mode >= 5 ? (volatile uint64_t *)ml_io_map(GMU_POOL_PA, GMU_POOL_BYTES) : NULL;
-+	const struct coachz_gpu_io io = {NULL, gpu_read, gpu_write, gpu_delay, gpu_read64, gpu_write64, pool, gpu_note};
++	uint32_t sqe_bytes = 0;
++	const uint32_t *sqe = mode == 8 ? gpu_firmware("CoachzSqeFirmware", 4u + GPU_SQE_MAX, &sqe_bytes) : NULL;
++	const struct coachz_gpu_io io = {NULL, gpu_read, gpu_write, gpu_delay, gpu_read64, gpu_write64, pool, gpu_note, sqe, sqe_bytes};
 +	static struct coachz_gpu_report r;
 +	uint32_t image_bytes = 0;
-+	const uint32_t *image = mode == 3 || mode >= 6 ? gpu_firmware(&image_bytes) : NULL;
++	const uint32_t *image = mode == 3 || mode >= 6 ? gpu_firmware("CoachzGmuFirmware", GMU_TCM_BYTES, &image_bytes) : NULL;
 +	coachz_gpu_run(&io, mode, image, image_bytes, &r);
 +	printf("COACHZ gpu: mode %u stage %u restored %u: %s\n", r.mode, r.stage, r.restored, r.error ? r.error : "ok");
 +	/* GCC: gpll0-mode gpll0-vote branch-vote cfg-ahb memnoc ddrss-axi snoc-dvm */
@@ -181,7 +189,7 @@
 +		    r.smmu_fsynr0, (unsigned long long)r.smmu_far, (unsigned long long)r.fw_log, (unsigned long long)r.fw_hfi,
 +		    (unsigned long long)r.fw_dummy);
 +	}
-+	if (mode == 7 && r.fw_init_polls) {
++	if (mode >= 7 && r.fw_init_polls) {
 +		printf("COACHZ gpu: cmd db levels gfx %u mx %u cx %u, top vote 0x%x; boot oob polls %u, sptprac polls %u, hfi start polls %u, gpu oob polls %u\n",
 +		    r.db_counts[0], r.db_counts[1], r.db_counts[2], r.gx_vote_top, r.oob_boot_polls, r.sptprac_polls, r.hfi_start_polls, r.oob_gpu_polls);
 +		printf("COACHZ gpu: hfi %u messages done, last id %u status 0x%x, firmware version 0x%x, firmware error 0x%x\n", r.hfi_done, r.hfi_id, r.hfi_status,
@@ -189,6 +197,16 @@
 +		/* boot: intr-info gx-gdscr rpmh-power-state sptprac; gpu set: intr-info gx-gdscr sptprac rpmh-power-state */
 +		gpu_print("gx state", r.gx_state, 8);
 +		printf("COACHZ gpu: shutdown sptprac off polls %u, tcs idle %u of 4, gx at the end 0x%x\n", r.sptprac_off_polls, r.tcs_idle, r.gx_end);
++	}
++	if (mode == 8 && r.own_core_map) {
++		printf("COACHZ gpu: dcvs polls %u return %u; sqe version 0x%x; registers done %u; me init polls %u, idle polls %u\n", r.dcvs_polls, r.dcvs_return,
++		    r.sqe_version, r.core_registers_done, r.core_init_polls, r.core_idle_polls);
++		printf("COACHZ gpu: cp results: ring write polls %u, indirect buffer write polls %u, fence polls %u, read pointer shadow %u of %u\n", r.core_ring_polls,
++		    r.core_ib_polls, r.core_fence_polls, r.core_shadow, r.core_wptr);
++		/* rbbm-status int-0-status cp-hw-fault cp-interrupt cp-protect rptr bank0-fsr bank0-fsynr0 */
++		gpu_print("cp state", r.core_state, 8);
++		printf("COACHZ gpu: bank 0 far 0x%llx; stop: halt polls %u %u %u\n", (unsigned long long)r.core_far, r.core_halt_polls[0], r.core_halt_polls[1],
++		    r.core_halt_polls[2]);
 +	}
 +	if ((mode == 3 || mode >= 6) && r.tcm_words) {
 +		printf("COACHZ gpu: firmware %u bytes fnv 0x%08x, TCM %u words read back fnv 0x%08x, %u mismatches (first %u), cm3 reset after 0x%x\n",
@@ -203,7 +221,7 @@
 +}
 --- a/bsd/dev/coachz_gpu_seq.h
 +++ b/bsd/dev/coachz_gpu_seq.h
-@@ -0,0 +1,400 @@
+@@ -0,0 +1,412 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/*
 + * Adreno 618 (SC7180) first bring-up stages: the GPU clock/power inventory, a bounded CX + GMU clock window with full rollback, and
@@ -226,7 +244,7 @@
 +#define COACHZ_GPU_SEQ_H
 +#include <stdint.h>
 +
-+enum { GPU_GCC, GPU_CC, GPU_GMU, GPU_SMMU, GPU_PDC, GPU_PDC_SEQ, GPU_CMD_DB, GPU_BLOCKS };
++enum { GPU_GCC, GPU_CC, GPU_GMU, GPU_SMMU, GPU_PDC, GPU_PDC_SEQ, GPU_CMD_DB, GPU_CORE, GPU_BLOCKS };
 +#define GPU_GCC_BASE 0x00100000u
 +#define GPU_GCC_SIZE 0x00080000u
 +#define GPU_CC_BASE 0x05090000u
@@ -312,6 +330,9 @@
 +	void (*write64)(void *cookie, unsigned block, uint32_t offset, uint64_t value);
 +	volatile uint64_t *pool;
 +	void (*note)(void *cookie, const struct coachz_gpu_report *r);
++	/* Mode 8: the SQE firmware file. */
++	const uint32_t *sqe;
++	uint32_t sqe_bytes;
 +};
 +
 +#define GPU_GCC_REGS 7
@@ -354,6 +375,11 @@
 +	unsigned own_gx;
 +	uint32_t db_counts[3], gx_vote_top, oob_boot_polls, sptprac_polls, hfi_start_polls, oob_gpu_polls, sptprac_off_polls, tcs_idle, gx_end;
 +	uint32_t hfi_seq, hfi_id, hfi_done, hfi_status, hfi_payload, hfi_version, hfi_fw_error, gx_state[8];
++	/* Mode 8: the frequency request, the SQE firmware's version, how long each visible result took, and the CP and bank 0 afterwards. */
++	unsigned own_core, own_core_map, core_registers_done;
++	uint32_t dcvs_polls, dcvs_return, sqe_version, core_wptr, core_init_polls, core_idle_polls, core_ring_polls, core_ib_polls, core_fence_polls;
++	uint32_t core_shadow, core_state[8], core_halt_polls[3], cgc_before[3];
++	uint64_t core_far;
 +};
 +
 +static inline uint32_t gpu_fnv(uint32_t hash, uint32_t word) {
@@ -488,7 +514,11 @@
 +    struct coachz_gpu_report *r) {
 +	*r = (struct coachz_gpu_report){0};
 +	r->mode = mode;
-+	if ((mode == 3 || mode == 6 || mode == 7) && (!image || image_bytes < 4 || image_bytes > GMU_TCM_BYTES || image_bytes % 4)) {
++	if (mode == 8 && (!io->sqe || io->sqe_bytes < 16u || io->sqe_bytes % 4u || io->sqe_bytes - 4u > 0x10000u)) {
++		r->error = "no usable SQE firmware: nothing read or changed";
++		return;
++	}
++	if ((mode == 3 || mode == 6 || mode == 7 || mode == 8) && (!image || image_bytes < 4 || image_bytes > GMU_TCM_BYTES || image_bytes % 4)) {
 +		r->error = "no usable GMU firmware: nothing read or changed";
 +		return;
 +	}
@@ -497,7 +527,7 @@
 +	/* GPUCC sits behind the GPU AHB branch: with it stopped, any GPUCC access stalls the bus. */
 +	gpu_snapshot(io, r->gcc_before, r->cc_before, ahb_running);
 +	r->stage = 1;
-+	if (mode < 2 || mode > 7) {
++	if (mode < 2 || mode > 8) {
 +		if (!ahb_running) r->error = "GPU AHB branch off: GPUCC not read";
 +		return;
 +	}
@@ -606,7 +636,7 @@
 +#endif
 --- a/bsd/dev/coachz_gpu_gmu.h
 +++ b/bsd/dev/coachz_gpu_gmu.h
-@@ -0,0 +1,705 @@
+@@ -0,0 +1,719 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/*
 + * Adreno 618 GMU memory and firmware start (coachz-gpu=5 and 6), inside the CX + GMU clock window of coachz_gpu_seq.h.
@@ -618,6 +648,7 @@
 + * the PDC's sequence and TCS commands: Linux leaves those programmed too, and nothing starts them while the GPU is off.
 + * Mode 7, only after that init result: the firmware powers GX (the boot OOB with the rail votes from CMD DB), SPTPRAC, the legacy HFI
 + * start with Linux's message order, and the GPU_SET OOB, then Linux's forced shutdown. The GPU core itself is still not touched.
++ * Mode 8 adds the GPU core and the CP inside that GPU_SET: coachz_gpu_core.h.
 + *
 + * Values and order follow Linux a6xx_gmu.c, a6xx_gmu.xml, a6xx.xml, arm-smmu.c and io-pgtable-arm.c (reference only, rewritten here).
 + * The SMMU's table walk is not coherent; the pool is mapped uncached, so what is written is what it reads.
@@ -627,7 +658,7 @@
 +
 +/* The pool: past the USB DMA pool and the audio ring. No reserved-memory node covers it. */
 +#define GMU_POOL_PA 0x81400000ull
-+#define GMU_POOL_BYTES 0x10000u
++#define GMU_POOL_BYTES 0x30000u   /* the first 64 KiB for the GMU, the rest for mode 8 */
 +#define GMU_POOL_L1 0x0000u
 +#define GMU_POOL_L2 0x1000u
 +#define GMU_POOL_L3 0x2000u
@@ -1164,6 +1195,8 @@
 +	return gmu_hfi_send(io, r, HFI_MSG_TEST, test, 1u);
 +}
 +
++#include "coachz_gpu_core.h"
++
 +/* Mode 7, the firmware's init result in hand: GX, SPTPRAC, HFI and GPU_SET, in a6xx_gmu_resume's order. */
 +static inline void gmu_bring_up_gx(const struct coachz_gpu_io *io, struct coachz_gpu_report *r) {
 +	uint32_t gx[GMU_LEVELS_GX], cx[GMU_LEVELS_CX];
@@ -1196,6 +1229,7 @@
 +	}
 +	gmu_note(io, r, 6);
 +	if (!gmu_hfi_messages(io, r, gx, cx)) return;
++	if (r->mode >= 8 && !core_set_frequency(io, r)) return;
 +	gmu_note(io, r, 7);
 +	gpu_w(io, GPU_GMU, GMU_HOST2GMU_INTR_SET, 1u << GMU_OOB_GPU_SET);
 +	r->oob_gpu_polls = gmu_poll_long(io, GMU_GMU2HOST_INTR_INFO, 1u << GMU_OOB_GPU_ACK, 1u << GMU_OOB_GPU_ACK);
@@ -1206,6 +1240,14 @@
 +	r->gx_state[7] = gpu_r(io, GPU_GMU, GMU_RPMH_POWER_STATE);
 +	if (!r->oob_gpu_polls) {
 +		r->error = "the firmware did not acknowledge GPU_SET";
++		return;
++	}
++	if (r->mode >= 8) {
++		/* Saved first: core_stop puts these back. GPU_SET stays up until then, so GX cannot go away under the GPU registers. */
++		r->cgc_before[0] = gpu_r(io, GPU_GMU, GMU_CGC_MODE_CNTL);
++		r->cgc_before[1] = gpu_r(io, GPU_GMU, GMU_CGC_DELAY_CNTL);
++		r->cgc_before[2] = gpu_r(io, GPU_GMU, GMU_CGC_HYST_CNTL);
++		core_run(io, r);
 +		return;
 +	}
 +	gpu_w(io, GPU_GMU, GMU_HOST2GMU_INTR_SET, 1u << GMU_OOB_GPU_ACK);   /* the OOB cleared again: nothing uses the GPU */
@@ -1291,6 +1333,7 @@
 +static inline void gmu_undo(const struct coachz_gpu_io *io, struct coachz_gpu_report *r) {
 +	if (r->own_gx) {
 +		gmu_note(io, r, 8);
++		if (r->own_core) core_stop(io, r);
 +		gmu_gx_shutdown(io, r);
 +	}
 +	if (r->own_cm3) {
@@ -1309,7 +1352,440 @@
 +		io->delay_us(io->cookie, 500);
 +		gpu_w(io, GPU_CC, GPUCC_GX_GDSCR, r->cc_before[2]);
 +	}
++	if (r->own_core_map) core_unmap(io, r);
 +	if (r->own_smmu) gmu_unmap(io, r);
++}
++#endif
+--- a/bsd/dev/coachz_gpu_core.h
++++ b/bsd/dev/coachz_gpu_core.h
+@@ -0,0 +1,429 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++/*
++ * Adreno 618 core and CP (coachz-gpu=8), inside the GPU_SET OOB of coachz_gpu_gmu.h: the lowest GPU frequency, a stage-1 bank for the
++ * GPU's stream 0, a6xx hw_init's registers for a618, SQE started, ME_INIT, then three commands the host can see the result of: a memory
++ * write from the ring, one from an indirect buffer, and a CACHE_FLUSH_TS fence. Nothing here renders. The SQE firmware (linux-firmware
++ * qcom/a630_sqe.fw) goes in from an ignored path, as the GMU's does. Everything stops again before GX is shut down.
++ *
++ * Values and order follow Linux a6xx_gpu.c, a6xx_catalog.c and a6xx.xml (reference only, rewritten here). The tables were converted by
++ * script from a615_hwcg and a630_protect_regs, the ones a618 uses. No interrupt is wired: the host polls.
++ */
++#ifndef COACHZ_GPU_CORE_H
++#define COACHZ_GPU_CORE_H
++
++#define GPU_CORE_BASE 0x05000000u
++#define GPU_CORE_SIZE 0x00040000u
++#define CORE(reg) ((reg) * 4u)
++
++/* The GPU's part of the pool, and where it sits for the GPU: the global space starts at 16 MiB. */
++#define GPU_POOL 0x10000u
++#define GPU_L1 (GPU_POOL + 0x0000u)
++#define GPU_L2 (GPU_POOL + 0x1000u)
++#define GPU_L3 (GPU_POOL + 0x2000u)
++#define GPU_RING (GPU_POOL + 0x4000u)
++#define GPU_RING_BYTES 0x8000u
++#define GPU_RING_WORDS (GPU_RING_BYTES / 4u)
++#define GPU_MISC (GPU_POOL + 0xc000u)
++#define GPU_IB (GPU_POOL + 0xd000u)
++#define GPU_SQE (GPU_POOL + 0x10000u)
++#define GPU_SQE_MAX 0x10000u
++#define GPU_VA(pool) (0x01000000ull + (pool) - GPU_POOL)
++#define GPU_SHADOW (GPU_MISC + 0x000u)
++#define GPU_RESULT_RING (GPU_MISC + 0x100u)
++#define GPU_RESULT_IB (GPU_MISC + 0x104u)
++#define GPU_FENCE (GPU_MISC + 0x108u)
++#define GPU_RING_VALUE 0xc0ac4a01u
++#define GPU_IB_VALUE 0xc0ac4a02u
++#define GPU_FENCE_VALUE 0xc0ac4a03u
++#define GPU_BANK 0u
++#define GPU_GROUP 0u
++#define GPU_STREAM 0u
++#define SMMU_SCTLR_GPU (SMMU_SCTLR_ON | (1u << 8))   /* HUPCF: later transactions go on after a fault, as Linux's Adreno SMMU sets */
++#define SMMU_SCR0_USFCFG (1u << 10)                  /* an unmatched stream faults: nothing of the GPU's bypasses into DRAM */
++
++#define CP_RB_BASE 0x0800u
++#define CP_RB_CNTL 0x0802u
++#define CP_RB_RPTR_ADDR 0x0804u
++#define CP_RB_RPTR 0x0806u
++#define CP_RB_WPTR 0x0807u
++#define CP_SQE_CNTL 0x0808u
++#define CP_HW_FAULT 0x0821u
++#define CP_INTERRUPT_STATUS 0x0823u
++#define CP_PROTECT_STATUS 0x0824u
++#define CP_SQE_INSTR_BASE 0x0830u
++#define CP_PROTECT_CNTL 0x084fu
++#define CP_PROTECT 0x0850u
++#define RBBM_INT_0_STATUS 0x0201u
++#define RBBM_STATUS 0x0210u
++#define RBBM_GBIF_HALT 0x0016u
++#define RBBM_GBIF_HALT_ACK 0x0017u
++#define RBBM_SW_RESET_CMD 0x0043u
++#define RBBM_CLOCK_CNTL 0x00aeu
++#define RBBM_SECVID_TRUST_CNTL 0xf400u
++#define RBBM_SECVID_TSB_TRUSTED_BASE 0xf800u
++#define RBBM_SECVID_TSB_TRUSTED_SIZE 0xf802u
++#define RBBM_SECVID_TSB_CNTL 0xf803u
++#define GBIF_HALT 0x3c45u
++#define GBIF_HALT_ACK 0x3c46u
++#define UCHE_WRITE_RANGE_MAX 0x0e05u
++#define UCHE_WRITE_THRU_BASE 0x0e07u
++#define UCHE_TRAP_BASE 0x0e09u
++#define UCHE_GMEM_RANGE_MIN 0x0e0bu
++#define UCHE_GMEM_RANGE_MAX 0x0e0du
++
++#define CORE_CLOCK_CNTL_ON 0x8aa8aa82u
++#define CORE_RB_CNTL ((12u) | (2u << 8) | (1u << 27))   /* 32 KiB, 32-byte blocks, NO_UPDATE: this firmware reports through WHERE_AM_I */
++#define CORE_POLLS 1000u                                /* of 100 us */
++#define CORE_STATUS_IDLE_MASK (~1u)                     /* every bit but CP_AHB_BUSY_CX_MASTER */
++
++/* GMU side */
++#define GMU_DCVS_ACK_OPTION 0x8ff0u
++#define GMU_DCVS_PERF_SETTING 0x8ff4u
++#define GMU_DCVS_BW_SETTING 0x8ff8u
++#define GMU_DCVS_RETURN 0x8ffcu
++#define GMU_OOB_DCVS_SET 23u
++#define GMU_OOB_DCVS_ACK 31u
++#define GMU_SPTPRAC_CLOCK_CONTROL 0x200u
++#define GMU_CX_POWER_COUNTER_ENABLE 0x14100u
++#define GMU_CX_POWER_COUNTER_SELECT_0 0x14104u
++#define GMU_CGC_MODE_CNTL 0x24c24u
++#define GMU_CGC_DELAY_CNTL 0x24c28u
++#define GMU_CGC_HYST_CNTL 0x24c2cu
++#define GMU_CX_BUSY_MASK 0x24c38u
++#define CORE_PERF_LOWEST 1u                             /* 180 MHz: index 0 is the "off" level */
++
++/* PM4 (adreno_pm4.xml) */
++#define PM4_NOP 0x10u
++#define PM4_MEM_WRITE 0x3du
++#define PM4_INDIRECT_BUFFER 0x3fu
++#define PM4_EVENT_WRITE 0x46u
++#define PM4_ME_INIT 0x48u
++#define PM4_WHERE_AM_I 0x62u
++#define PM4_CACHE_FLUSH_TS 0x04u
++
++static const uint32_t core_addr_modes[12] = {0x0842u, 0x0c01u, 0x8601u, 0x8e05u, 0x9e01u, 0xbe05u, 0xa601u, 0x9601u, 0x0e00u, 0xae01u, 0xb601u, 0xf810u};
++static const struct { uint32_t reg, value; } core_hwcg[63] = {
++	{0x0b0u, 0x02222222u}, {0x0b4u, 0x02222220u}, {0x0b8u, 0x00000080u}, {0x0bcu, 0x0000f3cfu},
++	{0x0c0u, 0x02222222u}, {0x0c1u, 0x02222222u}, {0x0c4u, 0x22222222u}, {0x0c5u, 0x22222222u},
++	{0x0c8u, 0x22222222u}, {0x0c9u, 0x22222222u}, {0x0ccu, 0x00022222u}, {0x0cdu, 0x00022222u},
++	{0x0e0u, 0x77777777u}, {0x0e1u, 0x77777777u}, {0x0e4u, 0x77777777u}, {0x0e5u, 0x77777777u},
++	{0x0e8u, 0x77777777u}, {0x0e9u, 0x77777777u}, {0x0ecu, 0x00077777u}, {0x0edu, 0x00077777u},
++	{0x0d0u, 0x11111111u}, {0x0d1u, 0x11111111u}, {0x0d4u, 0x11111111u}, {0x0d5u, 0x11111111u},
++	{0x0d8u, 0x11111111u}, {0x0d9u, 0x11111111u}, {0x0dcu, 0x00011111u}, {0x0ddu, 0x00011111u},
++	{0x10bu, 0x22222222u}, {0x10cu, 0x22222222u}, {0x10du, 0x22222222u}, {0x10eu, 0x00222222u},
++	{0x110u, 0x00000004u}, {0x10fu, 0x00000002u}, {0x0f0u, 0x22222222u}, {0x0f4u, 0x00002222u},
++	{0x0f8u, 0x00002020u}, {0x0f9u, 0x00002220u}, {0x0fau, 0x00002220u}, {0x0fbu, 0x00002220u},
++	{0x100u, 0x00040f00u}, {0x101u, 0x00040f00u}, {0x102u, 0x00040f00u}, {0x103u, 0x00040f00u},
++	{0x104u, 0x05022022u}, {0x105u, 0x00005555u}, {0x106u, 0x00000011u}, {0x107u, 0x00445044u},
++	{0x108u, 0x04222222u}, {0x114u, 0x00222222u}, {0x111u, 0x00002222u}, {0x10au, 0x00000000u},
++	{0x116u, 0x04104004u}, {0x113u, 0x00000000u}, {0x11cu, 0x00000000u}, {0x109u, 0x00004000u},
++	{0x115u, 0x00000200u}, {0x112u, 0x00002222u}, {0x117u, 0x00000002u}, {0x11bu, 0x00002222u},
++	{0x118u, 0x00000222u}, {0x119u, 0x00000111u}, {0x11au, 0x00000555u}
++};
++static const uint32_t core_protect[32] = {
++	0x13fc0000u, 0x00140501u, 0x0bd0050bu, 0x8000050eu, 0x80000510u, 0x80000534u,
++	0x82080800u, 0x802008a0u, 0x809008abu, 0x02b808deu, 0x81340900u, 0x89c8098du,
++	0x80040e00u, 0x80300e03u, 0x830c3c00u, 0x7ffc3cc4u, 0x873c8630u, 0x80008e00u,
++	0x80008e08u, 0x807c8e50u, 0x876c9624u, 0x80049e70u, 0x861c9e78u, 0x873ca630u,
++	0x8000ae02u, 0x8cbcae50u, 0x8000b604u, 0x8004be02u, 0xdf7cbe20u, 0xaffcf000u,
++	0x7ffcfc00u, 0x80011c00u
++};
++/* hw_init's remaining single writes for a618, in its order; the UBWC values are highest bank bit 14, swizzle 6. */
++static const struct { uint32_t reg, value; } core_setup[] = {
++	{0x0010u, 0x00000003u},   /* RBBM_VBIF_CLIENT_QOS_CNTL */
++	{0x050bu, 0xffffffffu},   /* RBBM_PERFCTR_GPU_BUSY_MASKED */
++	{0x0e18u, 0x00000804u},   /* UCHE_FILTER_CNTL */
++	{0x0e17u, 0x00000004u},   /* UCHE_CACHE_WAYS */
++	{0x08c2u, 0x010000c0u},   /* CP_ROQ_THRESHOLDS_2 */
++	{0x08c1u, 0x8040362cu},   /* CP_ROQ_THRESHOLDS_1 */
++	{0x08c3u, 128u},          /* CP_MEM_POOL_SIZE */
++	{0x9e00u, 0x00180000u},   /* PC_DBG_ECO_CNTL: the primFifo threshold */
++	{0x098du, 0x00000001u},   /* CP_AHB_CNTL */
++	{0x0500u, 0x00000001u},   /* RBBM_PERFCTR_CNTL */
++	{0x08d0u, 0u},            /* CP_PERFCTR_CP_SEL(0): always count */
++	{0x8e08u, 0x00000002u},   /* RB_NC_MODE_CNTL */
++	{0xb604u, 0x00000002u},   /* TPL1_NC_MODE_CNTL */
++	{0xae02u, 0x00000002u},   /* SP_NC_MODE_CNTL */
++	{0x0e01u, 0x00200000u},   /* UCHE_MODE_CNTL */
++	{0x0534u, 0u},            /* RBBM_NC_MODE_CNTL */
++	{0x001fu, 0x401fffffu},   /* RBBM_INTERFACE_HANG_INT_CNTL */
++	{0x0e19u, 0x00000081u},   /* UCHE_CLIENT_PF */
++};
++
++static inline uint32_t core_r(const struct coachz_gpu_io *io, uint32_t reg) { return gpu_r(io, GPU_CORE, CORE(reg)); }
++static inline void core_w(const struct coachz_gpu_io *io, uint32_t reg, uint32_t value) { gpu_w(io, GPU_CORE, CORE(reg), value); }
++/* Two 32-bit writes, low word first, as Linux's gpu_write64: many of these registers are not 8-byte aligned, and an unaligned store to
++ * Device memory aborts. On hardware a 64-bit store to UCHE_WRITE_RANGE_MAX (0xe05, byte offset 0x3814) panicked the kernel. */
++static inline void core_w64(const struct coachz_gpu_io *io, uint32_t reg, uint64_t value) {
++	core_w(io, reg, (uint32_t)value);
++	core_w(io, reg + 1u, (uint32_t)(value >> 32));
++}
++
++static inline uint32_t core_poll(const struct coachz_gpu_io *io, uint32_t reg, uint32_t mask, uint32_t want) {
++	for (uint32_t i = 1; i <= CORE_POLLS; i++) {
++		if ((core_r(io, reg) & mask) == want) return i;
++		io->delay_us(io->cookie, 100);
++	}
++	return 0;
++}
++
++static inline uint32_t core_pool_poll(const struct coachz_gpu_io *io, uint32_t at, uint32_t want) {
++	for (uint32_t i = 1; i <= CORE_POLLS; i++) {
++		if (gmu_mem_r(io, at) == want) return i;
++		io->delay_us(io->cookie, 100);
++	}
++	return 0;
++}
++
++static inline uint32_t pm4_parity(uint32_t value) {
++	return (0x9669u >> (0xfu & (value ^ value >> 4 ^ value >> 8 ^ value >> 12 ^ value >> 16 ^ value >> 20 ^ value >> 24 ^ value >> 28))) & 1u;
++}
++static inline uint32_t pm4_type7(uint32_t opcode, uint32_t count) {
++	return 0x70000000u | count | pm4_parity(count) << 15 | opcode << 16 | pm4_parity(opcode) << 23;
++}
++
++static inline void core_ring(const struct coachz_gpu_io *io, struct coachz_gpu_report *r, uint32_t word) {
++	gmu_mem_w(io, GPU_RING + r->core_wptr * 4u, word);
++	r->core_wptr = (r->core_wptr + 1u) % GPU_RING_WORDS;
++}
++
++/* Tells the CP how far the ring goes after asking it to report its read pointer, as a6xx_flush does. */
++static inline void core_flush(const struct coachz_gpu_io *io, struct coachz_gpu_report *r) {
++	core_ring(io, r, pm4_type7(PM4_WHERE_AM_I, 2u));
++	core_ring(io, r, (uint32_t)GPU_VA(GPU_SHADOW));
++	core_ring(io, r, (uint32_t)(GPU_VA(GPU_SHADOW) >> 32));
++	core_w(io, CP_RB_WPTR, r->core_wptr);
++}
++
++/* What the CP and the SMMU say now: RBBM status and interrupts, CP fault and protect status, bank 0's fault status. */
++static inline void core_snapshot(const struct coachz_gpu_io *io, struct coachz_gpu_report *r) {
++	const uint32_t bank = r->smmu_bank_base + GPU_BANK * r->smmu_page;
++	r->core_state[0] = core_r(io, RBBM_STATUS);
++	r->core_state[1] = core_r(io, RBBM_INT_0_STATUS);
++	r->core_state[2] = core_r(io, CP_HW_FAULT);
++	r->core_state[3] = core_r(io, CP_INTERRUPT_STATUS);
++	r->core_state[4] = core_r(io, CP_PROTECT_STATUS);
++	r->core_state[5] = core_r(io, CP_RB_RPTR);
++	r->core_state[6] = gpu_r(io, GPU_SMMU, bank + SMMU_CB_FSR);
++	r->core_state[7] = gpu_r(io, GPU_SMMU, bank + SMMU_CB_FSYNR0);
++	r->core_far = gpu_r64(io, GPU_SMMU, bank + SMMU_CB_FAR);
++}
++
++/* Bank 0 over the GPU's pool, for stream 0; the GMU's bank is already live. 1 only when its translations are right. */
++static inline int core_map(const struct coachz_gpu_io *io, struct coachz_gpu_report *r) {
++	const uint32_t bank = r->smmu_bank_base + GPU_BANK * r->smmu_page, cbar = r->smmu_page + 4u * GPU_BANK, cba2r = r->smmu_page + SMMU_CBA2R + 4u * GPU_BANK;
++	gmu_table_entry(io, GPU_L1, (uint32_t)(GPU_VA(GPU_RING) >> 30), (GMU_POOL_PA + GPU_L2) | LPAE_TABLE);
++	gmu_table_entry(io, GPU_L2, (uint32_t)(GPU_VA(GPU_RING) >> 21) & 511u, (GMU_POOL_PA + GPU_L3) | LPAE_TABLE);
++	for (uint32_t at = GPU_RING; at < GPU_SQE + GPU_SQE_MAX; at += 0x1000u) {
++		gmu_table_entry(io, GPU_L3, (uint32_t)(GPU_VA(at) >> 12) & 511u, (GMU_POOL_PA + at) | LPAE_PAGE);
++	}
++	r->own_core_map = 1;
++	gpu_w(io, GPU_SMMU, cba2r, SMMU_CBA2R_VA64);
++	gpu_w(io, GPU_SMMU, cbar, SMMU_CBAR_S1);
++	gpu_w(io, GPU_SMMU, bank + SMMU_CB_TCR2, SMMU_TCR2_36BIT);
++	gpu_w64(io, GPU_SMMU, bank + SMMU_CB_TTBR0, GMU_POOL_PA + GPU_L1);
++	gpu_w(io, GPU_SMMU, bank + SMMU_CB_TCR, SMMU_TCR_32BIT);
++	gpu_w(io, GPU_SMMU, bank + SMMU_CB_MAIR0, SMMU_MAIR0_VALUE);
++	gpu_w(io, GPU_SMMU, bank + SMMU_CB_MAIR1, 0);
++	gpu_w(io, GPU_SMMU, bank + SMMU_CB_FSR, ~0u);
++	gpu_w(io, GPU_SMMU, bank + SMMU_CB_SCTLR, SMMU_SCTLR_GPU);
++	gpu_w(io, GPU_SMMU, SMMU_S2CR + 4u * GPU_GROUP, GPU_BANK);
++	gpu_w(io, GPU_SMMU, SMMU_SMR + 4u * GPU_GROUP, SMMU_SMR_VALID | GPU_STREAM);
++	if (!gmu_tlb_sync(io)) {
++		r->error = "GPU SMMU TLB sync did not finish for bank 0";
++		return 0;
++	}
++	gpu_w(io, GPU_SMMU, SMMU_SCR0, gpu_r(io, GPU_SMMU, SMMU_SCR0) | SMMU_SCR0_USFCFG);
++	static const uint32_t mapped[3] = {GPU_RING, GPU_FENCE & ~0xfffu, GPU_SQE};
++	for (unsigned i = 0; i < 3u; i++) {
++		uint64_t par = 0;
++		if (!gmu_translate(io, bank, (uint32_t)GPU_VA(mapped[i]), &par) || (par & SMMU_PAR_FAULT) || (par & SMMU_PAR_PA) != GMU_POOL_PA + mapped[i]) {
++			r->error = "bank 0 translation differs from the tables";
++			r->ats_wrong_va = (uint32_t)GPU_VA(mapped[i]);
++			r->ats_wrong_par = par;
++			return 0;
++		}
++	}
++	uint64_t miss = 0;
++	if (!gmu_translate(io, bank, (uint32_t)GPU_VA(GPU_SQE + GPU_SQE_MAX), &miss) || !(miss & SMMU_PAR_FAULT)) {
++		r->error = "bank 0 translated an unmapped address";
++		r->ats_wrong_par = miss;
++		return 0;
++	}
++	return 1;
++}
++
++/* Bank 0 and its stream as they were. */
++static inline void core_unmap(const struct coachz_gpu_io *io, struct coachz_gpu_report *r) {
++	const uint32_t bank = r->smmu_bank_base + GPU_BANK * r->smmu_page;
++	gpu_w(io, GPU_SMMU, SMMU_SMR + 4u * GPU_GROUP, r->smr[GPU_GROUP]);
++	gpu_w(io, GPU_SMMU, SMMU_S2CR + 4u * GPU_GROUP, r->s2cr[GPU_GROUP]);
++	gpu_w(io, GPU_SMMU, bank + SMMU_CB_SCTLR, r->cb[GPU_BANK][0]);
++	gpu_w(io, GPU_SMMU, bank + SMMU_CB_TCR, r->cb[GPU_BANK][1]);
++	gpu_w(io, GPU_SMMU, bank + SMMU_CB_TCR2, 0);
++	gpu_w64(io, GPU_SMMU, bank + SMMU_CB_TTBR0, 0);
++	gpu_w(io, GPU_SMMU, bank + SMMU_CB_MAIR0, 0);
++	gpu_w(io, GPU_SMMU, bank + SMMU_CB_FSR, ~0u);
++	gpu_w(io, GPU_SMMU, r->smmu_page + 4u * GPU_BANK, r->cbar[GPU_BANK]);
++	gpu_w(io, GPU_SMMU, r->smmu_page + SMMU_CBA2R + 4u * GPU_BANK, r->cba2r[GPU_BANK]);
++}
++
++/* The lowest frequency, before GPU_SET as a6xx_gmu_resume does: 1 on an acknowledged request. */
++static inline int core_set_frequency(const struct coachz_gpu_io *io, struct coachz_gpu_report *r) {
++	gpu_w(io, GPU_GMU, GMU_DCVS_ACK_OPTION, 0);
++	gpu_w(io, GPU_GMU, GMU_DCVS_PERF_SETTING, 3u << 28 | CORE_PERF_LOWEST);
++	gpu_w(io, GPU_GMU, GMU_DCVS_BW_SETTING, 0xffu);
++	gpu_w(io, GPU_GMU, GMU_HOST2GMU_INTR_SET, 1u << GMU_OOB_DCVS_SET);
++	r->dcvs_polls = gmu_poll_long(io, GMU_GMU2HOST_INTR_INFO, 1u << GMU_OOB_DCVS_ACK, 1u << GMU_OOB_DCVS_ACK);
++	gpu_w(io, GPU_GMU, GMU_GMU2HOST_INTR_CLR, 1u << GMU_OOB_DCVS_ACK);
++	gpu_w(io, GPU_GMU, GMU_HOST2GMU_INTR_SET, 1u << GMU_OOB_DCVS_ACK);
++	r->dcvs_return = gpu_r(io, GPU_GMU, GMU_DCVS_RETURN);
++	if (!r->dcvs_polls) r->error = "the firmware did not acknowledge the frequency request";
++	return r->dcvs_polls != 0;   /* a nonzero return is printed; Linux only logs it too */
++}
++
++/* The firmware the CP runs: the file without its first dword. Accepted as Linux accepts it: patched, or at least 1.90 (both have WHERE_AM_I). */
++static inline int core_load_sqe(const struct coachz_gpu_io *io, struct coachz_gpu_report *r) {
++	const uint32_t words = io->sqe_bytes / 4u - 1u;
++	r->sqe_version = io->sqe[1];
++	if (!(((io->sqe[1] & 0xfu) == 0xau && (io->sqe[3] & 0xfu) >= 1u) || (io->sqe[1] & 0xfffu) >= 0x190u)) {
++		r->error = "SQE firmware older than 1.90";
++		return 0;
++	}
++	for (uint32_t i = 0; i < words; i++) gmu_mem_w(io, GPU_SQE + i * 4u, io->sqe[i + 1u]);
++	for (uint32_t i = 0; i < words; i++) {
++		if (gmu_mem_r(io, GPU_SQE + i * 4u) != io->sqe[i + 1u]) {
++			r->error = "SQE firmware does not read back from the pool";
++			return 0;
++		}
++	}
++	return 1;
++}
++
++/* a6xx hw_init for a618, with the CP not yet running. */
++static inline void core_registers(const struct coachz_gpu_io *io, struct coachz_gpu_report *r) {
++	core_w(io, GBIF_HALT, 0);
++	(void)core_r(io, GBIF_HALT);
++	core_w(io, RBBM_GBIF_HALT, 0);
++	(void)core_r(io, RBBM_GBIF_HALT);
++	core_w(io, RBBM_SECVID_TSB_CNTL, 0);
++	core_w64(io, RBBM_SECVID_TSB_TRUSTED_BASE, 0);
++	core_w(io, RBBM_SECVID_TSB_TRUSTED_SIZE, 0);
++	for (unsigned i = 0; i < 12u; i++) core_w(io, core_addr_modes[i], 1u);
++	/* Hardware clock gating, with the SP clock off while its registers change. */
++	gpu_w(io, GPU_GMU, GMU_CGC_MODE_CNTL, 0x222u);
++	gpu_w(io, GPU_GMU, GMU_CGC_DELAY_CNTL, 0x111u);
++	gpu_w(io, GPU_GMU, GMU_CGC_HYST_CNTL, 0x555u);
++	gpu_w(io, GPU_GMU, GMU_SPTPRAC_CLOCK_CONTROL, gpu_r(io, GPU_GMU, GMU_SPTPRAC_CLOCK_CONTROL) & ~1u);
++	for (unsigned i = 0; i < 63u; i++) core_w(io, core_hwcg[i].reg, core_hwcg[i].value);
++	gpu_w(io, GPU_GMU, GMU_SPTPRAC_CLOCK_CONTROL, gpu_r(io, GPU_GMU, GMU_SPTPRAC_CLOCK_CONTROL) | 1u);
++	core_w(io, RBBM_CLOCK_CNTL, CORE_CLOCK_CNTL_ON);
++	core_w64(io, UCHE_WRITE_RANGE_MAX, 0x0001ffffffffffc0ull);
++	core_w64(io, UCHE_TRAP_BASE, 0x0001fffffffff000ull);
++	core_w64(io, UCHE_WRITE_THRU_BASE, 0x0001fffffffff000ull);
++	core_w64(io, UCHE_GMEM_RANGE_MIN, 0x100000u);
++	core_w64(io, UCHE_GMEM_RANGE_MAX, 0x100000u + 0x80000u - 1u);
++	for (unsigned i = 0; i < sizeof(core_setup) / sizeof(core_setup[0]); i++) core_w(io, core_setup[i].reg, core_setup[i].value);
++	gpu_w(io, GPU_GMU, GMU_CX_BUSY_MASK, 0xff000000u);
++	gpu_w(io, GPU_GMU, GMU_CX_POWER_COUNTER_SELECT_0, (gpu_r(io, GPU_GMU, GMU_CX_POWER_COUNTER_SELECT_0) & ~0xffu) | (1u << 5));
++	gpu_w(io, GPU_GMU, GMU_CX_POWER_COUNTER_ENABLE, 1u);
++	/* The CP may only reach what Linux lets it reach; the last span runs to the end of the register space. */
++	core_w(io, CP_PROTECT_CNTL, 0xbu);
++	for (unsigned i = 0; i < 32u; i++) core_w(io, CP_PROTECT + i, core_protect[i]);
++	r->core_registers_done = 1;
++}
++
++/* From SQE start to the three visible results. */
++static inline void core_commands(const struct coachz_gpu_io *io, struct coachz_gpu_report *r) {
++	core_w64(io, CP_SQE_INSTR_BASE, GPU_VA(GPU_SQE));
++	core_w64(io, CP_RB_BASE, GPU_VA(GPU_RING));
++	core_w(io, CP_RB_CNTL, CORE_RB_CNTL);
++	core_w64(io, CP_RB_RPTR_ADDR, GPU_VA(GPU_SHADOW));
++	gmu_note(io, r, 10);
++	core_w(io, CP_SQE_CNTL, 1u);
++	core_ring(io, r, pm4_type7(PM4_ME_INIT, 8u));
++	core_ring(io, r, 0x0000002fu);   /* multiple hardware contexts, error detection, no header dump, no workarounds */
++	core_ring(io, r, 0x00000003u);
++	core_ring(io, r, 0x20000000u);
++	for (unsigned i = 0; i < 5u; i++) core_ring(io, r, 0);
++	core_flush(io, r);
++	r->core_init_polls = core_poll(io, CP_RB_RPTR, ~0u, r->core_wptr);
++	r->core_idle_polls = core_poll(io, RBBM_STATUS, CORE_STATUS_IDLE_MASK, 0);
++	core_snapshot(io, r);
++	if (!r->core_init_polls) {
++		r->error = "the CP did not take ME_INIT";
++		return;
++	}
++	if (!r->core_idle_polls) {
++		r->error = "the GPU did not go idle after ME_INIT";
++		return;
++	}
++	core_w(io, RBBM_SECVID_TRUST_CNTL, 0);   /* no zap shader on this board: Linux leaves secure mode this way */
++	gmu_note(io, r, 11);
++	/* A memory write straight from the ring. */
++	core_ring(io, r, pm4_type7(PM4_MEM_WRITE, 3u));
++	core_ring(io, r, (uint32_t)GPU_VA(GPU_RESULT_RING));
++	core_ring(io, r, (uint32_t)(GPU_VA(GPU_RESULT_RING) >> 32));
++	core_ring(io, r, GPU_RING_VALUE);
++	core_flush(io, r);
++	r->core_ring_polls = core_pool_poll(io, GPU_RESULT_RING, GPU_RING_VALUE);
++	if (!r->core_ring_polls) {
++		core_snapshot(io, r);
++		r->error = "the CP's ring memory write never arrived";
++		return;
++	}
++	/* The same from an indirect buffer, then a fence after everything before it. */
++	gmu_mem_w(io, GPU_IB, pm4_type7(PM4_MEM_WRITE, 3u));
++	gmu_mem_w(io, GPU_IB + 4u, (uint32_t)GPU_VA(GPU_RESULT_IB));
++	gmu_mem_w(io, GPU_IB + 8u, (uint32_t)(GPU_VA(GPU_RESULT_IB) >> 32));
++	gmu_mem_w(io, GPU_IB + 12u, GPU_IB_VALUE);
++	core_ring(io, r, pm4_type7(PM4_INDIRECT_BUFFER, 3u));
++	core_ring(io, r, (uint32_t)GPU_VA(GPU_IB));
++	core_ring(io, r, (uint32_t)(GPU_VA(GPU_IB) >> 32));
++	core_ring(io, r, 4u);
++	core_ring(io, r, pm4_type7(PM4_EVENT_WRITE, 4u));
++	core_ring(io, r, PM4_CACHE_FLUSH_TS);
++	core_ring(io, r, (uint32_t)GPU_VA(GPU_FENCE));
++	core_ring(io, r, (uint32_t)(GPU_VA(GPU_FENCE) >> 32));
++	core_ring(io, r, GPU_FENCE_VALUE);
++	core_flush(io, r);
++	r->core_ib_polls = core_pool_poll(io, GPU_RESULT_IB, GPU_IB_VALUE);
++	r->core_fence_polls = core_pool_poll(io, GPU_FENCE, GPU_FENCE_VALUE);
++	r->core_shadow = gmu_mem_r(io, GPU_SHADOW);
++	core_snapshot(io, r);
++	if (!r->core_ib_polls) r->error = "the CP's indirect buffer write never arrived";
++	else if (!r->core_fence_polls) r->error = "the fence never arrived";
++}
++
++/* Mode 8, GPU_SET acknowledged. */
++static inline void core_run(const struct coachz_gpu_io *io, struct coachz_gpu_report *r) {
++	if (!core_map(io, r)) return;
++	if (!core_load_sqe(io, r)) return;
++	gmu_note(io, r, 9);
++	r->own_core = 1;
++	core_registers(io, r);
++	core_commands(io, r);
++}
++
++/* The CP stopped and the GPU's bus quiet while GX is still on: a6xx_bus_clear_pending_transactions and the software reset. */
++static inline void core_stop(const struct coachz_gpu_io *io, struct coachz_gpu_report *r) {
++	core_w(io, CP_SQE_CNTL, 0);
++	core_w(io, RBBM_GBIF_HALT, 1u);
++	r->core_halt_polls[0] = core_poll(io, RBBM_GBIF_HALT_ACK, 1u, 1u);
++	core_w(io, GBIF_HALT, 1u);
++	r->core_halt_polls[1] = core_poll(io, GBIF_HALT_ACK, 1u, 1u);
++	core_w(io, GBIF_HALT, 2u);
++	r->core_halt_polls[2] = core_poll(io, GBIF_HALT_ACK, 2u, 2u);
++	core_w(io, GBIF_HALT, 0);
++	core_w(io, RBBM_SW_RESET_CMD, 1u);
++	(void)core_r(io, RBBM_SW_RESET_CMD);
++	io->delay_us(io->cookie, 101);
++	core_w(io, RBBM_SW_RESET_CMD, 0);
++	(void)core_r(io, RBBM_SW_RESET_CMD);
++	io->delay_us(io->cookie, 1);
++	gpu_w(io, GPU_GMU, GMU_CX_POWER_COUNTER_ENABLE, 0);
++	gpu_w(io, GPU_GMU, GMU_CGC_MODE_CNTL, r->cgc_before[0]);
++	gpu_w(io, GPU_GMU, GMU_CGC_DELAY_CNTL, r->cgc_before[1]);
++	gpu_w(io, GPU_GMU, GMU_CGC_HYST_CNTL, r->cgc_before[2]);
 +}
 +#endif
 --- a/bsd/dev/coachz_sample.c

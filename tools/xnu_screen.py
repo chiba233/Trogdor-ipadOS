@@ -176,7 +176,7 @@ def smp_tree(root, count):
 
 
 def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=True, root_uuid=None, cpus=1,
-                 full_screen=False, gmu_firmware_size=0):
+                 full_screen=False, gmu_firmware_size=0, sqe_firmware_size=0):
     root = read_tree(adt)
     if cpus > 1:
         smp_tree(root, cpus)
@@ -224,11 +224,15 @@ def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=T
         # The A618 GMU firmware right after the trust cache, inside the loader's kernel data (coachz-prelink-gpu.patch, coachz-gpu=3, 6 or 7).
         memory_map.set('CoachzGmuFirmware', struct.pack('<QQ', disk + len(ramdisk) + len(cache) + (-len(cache) % 4096),
                                                         gmu_firmware_size))
+    if sqe_firmware_size:
+        # The SQE firmware after the GMU's, for coachz-gpu=8.
+        memory_map.set('CoachzSqeFirmware', struct.pack('<QQ', disk + len(ramdisk) + len(cache) + (-len(cache) % 4096) + gmu_firmware_size + (-gmu_firmware_size % 4096),
+                                                        sqe_firmware_size))
     return root.write()
 
 
 def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=False, root_cache=None, root_device=None,
-         root_uuid=None, data_seed=None, data_uuid=None, display=False, cpus=1, gpu=0, gmu_firmware=None):
+         root_uuid=None, data_seed=None, data_uuid=None, display=False, cpus=1, gpu=0, gmu_firmware=None, sqe_firmware=None):
     if window & 0x1fffff or memory & 0x1fffff:
         raise ValueError('window base and size must be 2 MiB aligned')
     kernel = macho(data)
@@ -275,8 +279,10 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
     if gpu:
         # Adreno 618 bring-up stages (docs/plans/gpu.md): 1 inventory, 2 CX + GMU clock window, 3 also the GMU firmware into TCM,
         # 4 the window with a read-only GPU SMMU inventory.
-        if not prelinked or gpu not in (1, 2, 3, 4, 5, 6, 7) or (gpu in (3, 6, 7)) != (gmu_firmware is not None):
+        if not prelinked or gpu not in (1, 2, 3, 4, 5, 6, 7, 8) or (gpu in (3, 6, 7, 8)) != (gmu_firmware is not None) or (gpu == 8) != (sqe_firmware is not None):
             raise ValueError('GPU stage 1 to 4 on the prelinked kernel; stage 3, and only it, takes the GMU firmware')
+        if sqe_firmware is not None and not (16 <= len(sqe_firmware) <= 0x10004 and len(sqe_firmware) % 4 == 0):
+            raise ValueError('The SQE firmware must be whole words and fit the 64 KiB the GPU pool has for it')
         if gmu_firmware is not None and not (4 <= len(gmu_firmware) <= 0x8000 and len(gmu_firmware) % 4 == 0):
             raise ValueError('the legacy GMU firmware fills at most the 32 KiB of ITCM and DTCM, in whole words')
         command_line += ' coachz-gpu=%d' % gpu
@@ -317,10 +323,12 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         environment = 'restore' if root_cache and not root_uuid else None
         adt = prelink_tree(adt, window, tree, ramdisk, cache, environment, ram_root=not disk_root or bool(data_seed),
                            root_uuid=root_uuid, cpus=cpus, full_screen=display,
-                           gmu_firmware_size=len(gmu_firmware) if gmu_firmware else 0)
+                           gmu_firmware_size=len(gmu_firmware) if gmu_firmware else 0, sqe_firmware_size=len(sqe_firmware) if sqe_firmware else 0)
         ramdisk = ramdisk + cache + bytes(-len(cache) % 4096)
         if gmu_firmware:
             ramdisk += gmu_firmware + bytes(-len(gmu_firmware) % 4096)
+        if sqe_firmware:
+            ramdisk += sqe_firmware + bytes(-len(sqe_firmware) % 4096)
     else:
         adt = add_ramdisk_property(adt, window + up(tree + len(adt) + 52), len(ramdisk))
     base_field, size_field, affinity, frequency = adt_fields(adt)
@@ -358,8 +366,9 @@ def main():
     p.add_argument('--root-uuid', help='with --prelinked: the main OS, rooted on the APFS volume of this UUID')
     p.add_argument('--display', action='store_true', help='main OS: publish the firmware framebuffer through original MobileFramebuffer Legacy')
     p.add_argument('--smp', type=int, default=1, help='main OS: start CPU0..N-1 (up to 8) through PSCI')
-    p.add_argument('--gpu', type=int, default=0, help='prelinked: Adreno 618 bring-up stage 1 to 7 (docs/plans/gpu.md)')
-    p.add_argument('--gmu-firmware', type=Path, help='with --gpu 3, 6 or 7: the legacy A618 GMU firmware, linux-firmware qcom/a630_gmu.bin')
+    p.add_argument('--gpu', type=int, default=0, help='prelinked: Adreno 618 bring-up stage 1 to 8 (docs/plans/gpu.md)')
+    p.add_argument('--sqe-firmware', type=Path, help='with --gpu 8: the CP firmware, linux-firmware qcom/a630_sqe.fw')
+    p.add_argument('--gmu-firmware', type=Path, help='with --gpu 3, 6, 7 or 8: the legacy A618 GMU firmware, linux-firmware qcom/a630_gmu.bin')
     p.add_argument('--data-uuid', help='with --root-uuid: selected external Data APFS volume UUID')
     p.add_argument('--data-image', type=Path, help='with --root-uuid: APFS Data seed, the RAM disk the kernel mounts on /private/var')
     a = p.parse_args()
@@ -374,7 +383,8 @@ def main():
                    ramdisk=a.root_image.read_bytes() if a.root_image else None,
                    root_cache=[cache.read_bytes() for cache in a.root_trust_cache] or None, root_device=a.root_device,
                    root_uuid=a.root_uuid, data_seed=a.data_image.read_bytes() if a.data_image else None, data_uuid=a.data_uuid, display=a.display, cpus=a.smp,
-                   gpu=a.gpu, gmu_firmware=a.gmu_firmware.read_bytes() if a.gmu_firmware else None)
+                   gpu=a.gpu, gmu_firmware=a.gmu_firmware.read_bytes() if a.gmu_firmware else None,
+                   sqe_firmware=a.sqe_firmware.read_bytes() if a.sqe_firmware else None)
     a.output.parent.mkdir(parents=True, exist_ok=True)
     a.output.write_bytes(payload)
     print('Built screen-output XNU payload', hashlib.sha256(payload).hexdigest())

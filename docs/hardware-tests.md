@@ -1318,3 +1318,23 @@ k54 起第一帧之后屏幕不再显示诊断文字（`coachz-console-band=0`�
 没有碰 GPU 核心寄存器，没有写 SQE 固件，CP 没有启动，GPU 没有执行任何命令，渲染仍然在 CPU 上。GPU 频率也没有设置，投票值只是电压档。
 
 同一次在 Debian 上只读确认：这台的设备树写着 `qcom/sc7180-trogdor/modem/{mba,qdsp6sw}.mbn` 和 `qcom,gsi-loader = "modem"`，文件都在，MPSS 运行中，`wlan0` 已启动。这是后面 Wi-Fi 的对照基准。
+
+## CP 第一次执行命令（k67、k68）
+
+`coachz-gpu=8`，说明在 `docs/plans/gpu.md`。
+
+k67：GBIF、安全寄存器、地址模式和 63 项时钟门控都写进去了，随后 kernel panic，`Unaligned kernel data abort`，FAR 落在 GPU 窗口 +`0x3814`，也就是 `UCHE_WRITE_RANGE_MAX`。原因是我对这个不是 8 字节对齐的寄存器用了 64 位写。这也是 panic 文字第一次在真机上写进日志环。
+
+k68（改成两次 32 位写之后）：
+
+- DCVS：第 2 次轮询确认，返回 0，请求的是最低档 180 MHz。没有读回实际频率。
+- SQE：`a630_sqe.fw` 版本字 `0x16ee207`（低 12 位 `0x207`），读回一致。
+- ME_INIT：第 2 次轮询，读指针追上写指针。之后 `RBBM_STATUS` 为 `0x1`，只有 CP_AHB_BUSY_CX_MASTER，即 CPU 自己的访问，GPU 空闲。
+- 从 ring 的 `CP_MEM_WRITE`：第 2 次轮询到达，值正确。
+- 从 IB 的 `CP_MEM_WRITE`：第 2 次轮询到达，值正确。
+- `CACHE_FLUSH_TS` fence：第 1 次轮询到达，值正确。
+- `WHERE_AM_I` 影子：31，等于写指针 31。
+- 故障：`RBBM_INT_0_STATUS`、`CP_HW_FAULT`、`CP_INTERRUPT_STATUS`、`CP_PROTECT_STATUS` 都是 0。bank 0 fsr `0x400`（只有 FORMAT 字段），FAR 和 FSYNR0 是 0，gfsr 0。
+- 收尾：GBIF 三次停止都是第 1 次轮询确认，软复位后关机，`mode 8 stage 7 restored 1: ok`，GX GDSCR 回到 `0x00222001`。系统照常运行到日志结束（122 秒），没有 `@crash` 和 panic。
+
+这证明 CP 能跑 SQE 固件，能经 SMMU 读命令并写内存。没有运行任何着色器，也没有画任何东西。跑完全部关掉，GPU 不留给系统使用，所以渲染仍然在 CPU 上。

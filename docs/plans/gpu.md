@@ -14,7 +14,7 @@
 | 3b | GMU stream 5 的 context bank、页表、HFI 队列和日志缓冲区映射，用 SMMU 的地址转换操作核对 | 真机通过（mode 5 的内容，由 mode 6 那次运行验证） |
 | 4a | RSCC/PDC 序列（0x0b290000 / 0x0b490000）、释放 CM3、等 `FW_INIT_RESULT` 签名，再把 CM3 放回复位 | 真机通过（mode 6），签名 `0xbabeface` |
 | 4b | GX OOB、SPTPRAC，之后用 legacy HFI 启动（sweet 的两队列传输） | 真机通过（mode 7），固件版本 `0x10060000`，5 条消息全部成功 |
-| 5 | GX 上电、SQE 固件、A6xx CP 初始化、ring 写内存和 fence | 待写。CP 初始化格式和 A740 不同 |
+| 5 | 最低频率、stream 0 的 bank、`hw_init`、SQE 固件、ME_INIT，再让 CP 写内存（ring 和 IB 各一次）和 fence | 真机通过（mode 8）。跑完全部关掉，还不是常驻驱动 |
 | 6 | Turnip Darwin KMD、Metal 发布、接系统合成器 | 待写 |
 
 ## 第一阶段做了什么
@@ -101,6 +101,16 @@ SC7180 与 SM7150 不同的地方都已按 Linux 源码改过，例如 GPU 的 G
 - 发 `GPU_SET` OOB 并确认，再清掉。GPU 核心寄存器一个都不碰。
 - 结束时走 `a6xx_gmu_force_off` 去掉 GPU 核心部分的流程：SPTPRAC 关，等 4 个 TCS 空闲，清 fence，CM3 复位，RSC 停，GX 折叠。
 
+`coachz-gpu=8`（`bsd/dev/coachz_gpu_core.h`，`--sqe-firmware` 传入 `a630_sqe.fw`，不进仓库）：
+- `GPU_SET` 之前用 DCVS 把频率设到最低档 180 MHz。
+- 同一个池里给 stream 0 建 bank 0，全局地址从 16 MiB 起，CPU 侧不缓存。这次把 `USFCFG` 打开，未匹配的 stream 会报错，不会旁路进 DRAM。
+- `hw_init` 按 A618 的分支写寄存器；时钟门控 63 项和 CP 保护 32 项，都用脚本从 Linux 的 `a615_hwcg`、`a630_protect_regs` 转换。
+- SQE 固件去掉第一个字，写进池里读回核对，版本不低于 1.90 才继续。
+- 启动 SQE，发 ME_INIT，再发一次 `CP_MEM_WRITE`、一个带 `CP_MEM_WRITE` 的 IB 和一个 `CACHE_FLUSH_TS`。每次都用 `WHERE_AM_I` 让 CP 报告读指针。
+- 结束时停 SQE，GBIF 停止并软复位，再走 mode 7 的关机流程。`GPU_SET` 一直保持到这之后，避免 GX 在读寄存器时掉电。
+
+GPU 核心寄存器不能用 64 位写。很多寄存器不是 8 字节对齐，Device 内存上的非对齐访问会 abort。k67 就是这样 panic 的，所以和 Linux 一样拆成两次 32 位。
+
 每个可能卡住机器的步骤之前都打印一行 `step N next` 并等 1.5 秒，让日志环落盘。
 
 ## 主机验证
@@ -157,10 +167,13 @@ SC7180 与 SM7150 不同的地方都已按 Linux 源码改过，例如 GPU 的 G
   - `boot oob polls N`、`gpu oob polls N` 都不为 0，`hfi 5 messages done ... status 0x0`。
   - `gx state`：`BOOT_SLUMBER` 之后 INTR_INFO 的 bit30 为 1，GX GDSCR 的 bit31 为 1（已上电），SPTPRAC 状态 `0x28`；`GPU_SET` 之后 INTR_INFO 的 bit24 为 1。
   - `shutdown sptprac off polls N, tcs idle 4 of 4`。`gpucc after` 里 GX GDSCR 回到启动前的值。
+- `=8`：`mode 8 stage 7 restored 1: ok`，另有以下几行：
+  - `cp results: ring write polls N, indirect buffer write polls N, fence polls N, read pointer shadow N of N`，轮询都不为 0，两个 N 相等。
+  - `cp state`：`RBBM_STATUS` 为 `1`（只有 CPU 自己在读），HW fault、CP 中断和 protect 都是 0，bank 0 的 fsr 只有 `0x400`。
 - 卡死或异常重启时，说明某个前提不成立，先退回上一个阶段看结果。
 
 ## 还没做的
 
-见上表第 5–6 阶段。另外：
+见上表第 6 阶段。机主决定把常驻内核驱动、Turnip、Metal 和合成器合并成一张镜像一起测。另外：
 - GPU 中断（SPI 300/304/305）还没接。
 - 带宽投票（interconnect / BCM）还没有 RPMh 客户端。GX 的 ARC 投票不需要：表从 CMD DB 读，由 GMU 固件代投。

@@ -1,5 +1,6 @@
 """Host checks of the Adreno 618 stages (coachz-prelink-gpu.patch, tools/xnu_screen.py)."""
 import importlib.util
+import re
 from pathlib import Path
 import shutil
 import struct
@@ -21,6 +22,7 @@ class SequenceTests(unittest.TestCase):
             work = Path(directory)
             (work / 'coachz_gpu_seq.h').write_text(new_file(PATCH, 'bsd/dev/coachz_gpu_seq.h'))
             (work / 'coachz_gpu_gmu.h').write_text(new_file(PATCH, 'bsd/dev/coachz_gpu_gmu.h'))
+            (work / 'coachz_gpu_core.h').write_text(new_file(PATCH, 'bsd/dev/coachz_gpu_core.h'))
             binary = work / 'gpu-model'
             subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-Wno-unused-function', '-I', str(work),
                             str(ROOT / 'tests/coachz_gpu_model_test.c'), '-o', str(binary)], check=True)
@@ -111,6 +113,48 @@ class GmuStartTests(unittest.TestCase):
         self.assertEqual(6 + 6 + 2 * 6 + 8 + 16 * 8, 160)
 
 
+class PatchTests(unittest.TestCase):
+    def test_new_file_hunks_count_their_lines(self):
+        text = (ROOT / 'platform/coachz-prelink/patches/xnu' / PATCH).read_text()
+        for name, count, body in re.findall(r'^\+\+\+ b/(\S+)\n@@ -0,0 \+1,(\d+) @@\n((?:\+.*\n)*)', text, re.M):
+            self.assertEqual(int(count), body.count('\n'), name)
+
+
+class CoreTests(unittest.TestCase):
+    def test_register_facts(self):
+        source = new_file(PATCH, 'bsd/dev/coachz_gpu_core.h')
+        # a6xx.xml dword offsets, from sc7180.dtsi's GPU base, and a6xx_gmu.xml's in bytes.
+        for fact in ['GPU_CORE_BASE 0x05000000u', 'CP_RB_BASE 0x0800u', 'CP_RB_WPTR 0x0807u', 'CP_SQE_CNTL 0x0808u', 'CP_SQE_INSTR_BASE 0x0830u', 'CP_PROTECT 0x0850u',
+                     'RBBM_SECVID_TRUST_CNTL 0xf400u', 'GBIF_HALT 0x3c45u', 'RBBM_GBIF_HALT 0x0016u', 'GMU_DCVS_PERF_SETTING 0x8ff4u', 'GMU_CGC_MODE_CNTL 0x24c24u',
+                     'CORE_RB_CNTL ((12u) | (2u << 8) | (1u << 27))', 'CORE_CLOCK_CNTL_ON 0x8aa8aa82u']:
+            self.assertIn(fact, source)
+        # The first and last of the tables Linux gives a618: a615_hwcg and a630_protect_regs.
+        self.assertIn('{0x0b0u, 0x02222222u}', source)
+        self.assertIn('{0x109u, 0x00004000u}', source)
+        self.assertIn(hex((0x3fff & 0x04ff) << 18), hex(0x13fc0000))
+        self.assertIn('0x13fc0000u', source)
+        self.assertIn('0x80011c00u'.replace('0x80011c00', '%08x' % (1 << 31 | 0x11c00)), source)
+
+    def test_no_64_bit_store_to_core_registers(self):
+        # Many are not 8-byte aligned; a 64-bit store to UCHE_WRITE_RANGE_MAX panicked the hardware.
+        source = new_file(PATCH, 'bsd/dev/coachz_gpu_core.h')
+        self.assertNotIn('gpu_w64(io, GPU_CORE', source)
+        self.assertNotIn('gpu_r64(io, GPU_CORE', source)
+
+    def test_order(self):
+        source = new_file(PATCH, 'bsd/dev/coachz_gpu_core.h')
+        run = source[source.index('static inline void core_run('):source.index('static inline void core_stop(')]
+        self.assertLess(run.index('core_map(io, r)'), run.index('core_load_sqe(io, r)'))
+        self.assertLess(run.index('core_load_sqe(io, r)'), run.index('core_registers(io, r)'))
+        self.assertLess(run.index('core_registers(io, r)'), run.index('core_commands(io, r)'))
+        commands = source[source.index('static inline void core_commands('):source.index('static inline void core_run(')]
+        self.assertLess(commands.index('CP_SQE_INSTR_BASE'), commands.index('core_w(io, CP_SQE_CNTL, 1u);'))
+        # GPU_SET stays up while the GPU's registers are in use.
+        gmu = new_file(PATCH, 'bsd/dev/coachz_gpu_gmu.h')
+        self.assertLess(gmu.index('core_run(io, r);'), gmu.index('the OOB cleared again'))
+        self.assertLess(gmu.index('if (r->own_core) core_stop(io, r);'), gmu.index('gmu_gx_shutdown(io, r);\n\t}\n\tif (r->own_cm3)'))
+
+
 class LoaderTests(unittest.TestCase):
     def test_firmware_lands_in_kernel_data_after_the_trust_cache(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -139,6 +183,16 @@ class LoaderTests(unittest.TestCase):
                 screen.pack(b'', b'', 0, 0, prelinked=True, gpu=3)   # stage 3 needs the firmware
             with self.assertRaises(ValueError):
                 screen.pack(b'', b'', 0, 0, prelinked=True, gpu=6)   # and so does stage 6
+            with self.assertRaises(ValueError):
+                screen.pack(b'', b'', 0, 0, prelinked=True, gpu=8, gmu_firmware=bytes(16))   # stage 8 also needs the SQE firmware
+            root2 = screen.Node()
+            root2.set('name', b'device-tree\0')
+            root2.child('chosen').child('memory-map')
+            adt2 = screen.prelink_tree(root2.write(), window, tree, ramdisk, cache, gmu_firmware_size=0x8000, sqe_firmware_size=0x8000 + 12)
+            entries2 = {key: value for key, _, value in screen.read_tree(adt2).child('chosen').child('memory-map').props}
+            gmu_base, _ = struct.unpack('<QQ', entries2['CoachzGmuFirmware'])
+            sqe_base, sqe_size = struct.unpack('<QQ', entries2['CoachzSqeFirmware'])
+            self.assertEqual((sqe_base, sqe_size), (gmu_base + 0x8000, 0x8000 + 12))
             with self.assertRaises(ValueError):
                 screen.pack(b'', b'', 0, 0, prelinked=True, gpu=2, gmu_firmware=bytes(16))
 

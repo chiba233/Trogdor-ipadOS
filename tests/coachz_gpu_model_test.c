@@ -16,6 +16,8 @@ static uint64_t pool[GMU_POOL_BYTES / 8];
 static int gmu_live, fw_silent, wrong_walk, released_early, notes;
 /* Mode 7: CMD DB, and the firmware: it reads the queue table and answers every message after checking it. */
 static uint32_t cmd_db[GPU_CMD_DB_SIZE / 4], hfi_ids[8], hfi_count, hfi_seq_seen, gx_allowed, no_boot_ack, refuse_message, table_good;
+/* Mode 8: the GPU's registers and a CP that walks the ring and the indirect buffer through bank 0. */
+static uint32_t core[GPU_CORE_SIZE / 4], core_live, core_cp_on, me_init_seen, sw_resets, dcvs_value, cp_silent, cp_ops[12], cp_op_count, sqe_base_ok, usf_when_started;
 static uint32_t perf_top_vote, perf_top_khz, perf_counts, perf_cx_khz, bw_first_ddr, bw_cnoc_second, init_debug, init_boot, gpu_set_seen;
 #define MODEL_BANK (0x8000u + GMU_BANK * 0x1000u)
 
@@ -37,6 +39,10 @@ static void tick(void) {
 static uint32_t model_read(void *cookie, unsigned block, uint32_t offset) {
 	(void)cookie;
 	if (block == GPU_CC && !ahb_on()) { faults++; return 0xffffffffu; }
+	if (block == GPU_CORE) {
+		if (!core_live || !gpu_set_seen || offset >= GPU_CORE_SIZE || offset % 4) { faults++; return 0xffffffffu; }
+		return core[offset / 4];
+	}
 	if (block == GPU_CMD_DB) {
 		if (offset >= GPU_CMD_DB_SIZE || offset % 4 || !gx_allowed) { faults++; return 0; }
 		return cmd_db[offset / 4];
@@ -56,6 +62,7 @@ static uint32_t model_read(void *cookie, unsigned block, uint32_t offset) {
 	}
 	if (block == GPU_GMU) {
 		if (!ahb_on() || !cx_on() || (cc[GPUCC_CX_GMU / 4] & CBCR_CLK_OFF)) { faults++; return 0xffffffffu; }
+		if (gx_allowed && !(sysreset & 1u) && offset >= GMU_DCVS_ACK_OPTION && offset <= GMU_DCVS_RETURN) return gmu_regs[offset / 4];
 		if (offset >= GMU_CM3_ITCM && offset < GMU_CM3_ITCM + GMU_TCM_BYTES) return tcm[(offset - GMU_CM3_ITCM) / 4];
 		if (gmu_live && offset != GMU_CM3_SYSRESET) return offset == GMU_CM3_CFG && !gmu_regs[offset / 4] ? 0x52u : gmu_regs[offset / 4];
 		return offset == GMU_CM3_SYSRESET ? sysreset : offset == GMU_CM3_CFG ? 0x52u : 0u;
@@ -66,10 +73,11 @@ static uint32_t model_read(void *cookie, unsigned block, uint32_t offset) {
 }
 
 /* The stage-1 walk the bank's registers describe: the PAR, with F set for anything the tables do not map. */
-static uint64_t walk(uint64_t va) {
-	const uint64_t ttbr = (uint64_t)smmu[(MODEL_BANK + SMMU_CB_TTBR0) / 4 + 1] << 32 | smmu[(MODEL_BANK + SMMU_CB_TTBR0) / 4];
-	if (!(smmu[(MODEL_BANK + SMMU_CB_SCTLR) / 4] & 1u) || !(smmu[(0x1000u + SMMU_CBA2R + 4u * GMU_BANK) / 4] & SMMU_CBA2R_VA64) ||
-	    smmu[(MODEL_BANK + SMMU_CB_TCR) / 4] != SMMU_TCR_32BIT || (smmu[(0x1000u + 4u * GMU_BANK) / 4] >> 16 & 3u) != 1u) {
+static uint64_t walk_bank(unsigned bank, uint64_t va) {
+	const uint32_t base = 0x8000u + bank * 0x1000u;
+	const uint64_t ttbr = (uint64_t)smmu[(base + SMMU_CB_TTBR0) / 4 + 1] << 32 | smmu[(base + SMMU_CB_TTBR0) / 4];
+	if (!(smmu[(base + SMMU_CB_SCTLR) / 4] & 1u) || !(smmu[(0x1000u + SMMU_CBA2R + 4u * bank) / 4] & SMMU_CBA2R_VA64) ||
+	    smmu[(base + SMMU_CB_TCR) / 4] != SMMU_TCR_32BIT || (smmu[(0x1000u + 4u * bank) / 4] >> 16 & 3u) != 1u) {
 		faults++;
 		return 1;
 	}
@@ -85,16 +93,96 @@ static uint64_t walk(uint64_t va) {
 	return wrong_walk ? table + 0x1000u : table;
 }
 
+/* A memory access as stream 0 makes it: anything the bank does not map is a fault of the run. */
+static uint32_t *cp_memory(uint64_t va) {
+	const uint64_t par = walk_bank(0, va & ~0xfffull);
+	if (par & 1u) { faults++; return NULL; }
+	return (uint32_t *)((char *)pool + (par - GMU_POOL_PA) + (va & 0xfffu));
+}
+
+/* One packet at address, whichever buffer it is in: the dwords it used. */
+static uint32_t cp_packet(uint64_t address) {
+	const uint32_t *word = cp_memory(address);
+	if (!word) return 1;
+	const uint32_t header = *word, count = header & 0x3fffu, opcode = header >> 16 & 0x7fu;
+	if (header >> 28 != 7u || (header >> 15 & 1u) != pm4_parity(count) || (header >> 23 & 1u) != pm4_parity(opcode)) { faults++; return 1; }
+	if (cp_op_count < 12) cp_ops[cp_op_count++] = opcode;
+	if (!me_init_seen && opcode != PM4_ME_INIT) faults++;
+	const uint32_t *args[4] = {NULL, NULL, NULL, NULL};
+	for (uint32_t i = 0; i < count && i < 4; i++) args[i] = cp_memory(address + 4 * (i + 1));
+	if (opcode == PM4_ME_INIT) {
+		if (count != 8 || !args[0] || *args[0] != 0x2fu || !args[1] || *args[1] != 3u || !args[2] || *args[2] != 0x20000000u) faults++;
+		me_init_seen = 1;
+	} else if (opcode == PM4_WHERE_AM_I) {
+		uint32_t *to = cp_memory((uint64_t)*args[1] << 32 | *args[0]);
+		if (count != 2 || !to) faults++; else *to = core[CORE(CP_RB_WPTR) / 4];
+	} else if (opcode == PM4_MEM_WRITE) {
+		uint32_t *to = cp_memory((uint64_t)*args[1] << 32 | *args[0]);
+		if (count != 3 || !to) faults++; else if (!cp_silent) *to = *args[2];
+	} else if (opcode == PM4_EVENT_WRITE) {
+		uint32_t *to = cp_memory((uint64_t)*args[2] << 32 | *args[1]);
+		if (count != 4 || *args[0] != PM4_CACHE_FLUSH_TS || !to) faults++; else *to = *args[3];
+	} else if (opcode == PM4_INDIRECT_BUFFER) {
+		if (count != 3) { faults++; return 1 + count; }
+		const uint64_t ib = (uint64_t)*args[1] << 32 | *args[0];
+		for (uint32_t at = 0; at < *args[2];) at += cp_packet(ib + 4 * at);
+	} else {
+		faults++;
+	}
+	return 1 + count;
+}
+
+static void cp_run(void) {
+	if (!core_cp_on) return;
+	const uint64_t base = (uint64_t)core[CORE(CP_RB_BASE) / 4 + 1] << 32 | core[CORE(CP_RB_BASE) / 4];
+	uint32_t rptr = core[CORE(CP_RB_RPTR) / 4];
+	while (rptr != core[CORE(CP_RB_WPTR) / 4]) rptr = (rptr + cp_packet(base + 4 * rptr)) % GPU_RING_WORDS;
+	core[CORE(CP_RB_RPTR) / 4] = rptr;
+}
+
+static void model_core_write(uint32_t offset, uint32_t value) {
+	if (!core_live || !gpu_set_seen || offset >= GPU_CORE_SIZE || offset % 4) { faults++; return; }
+	core[offset / 4] = value;
+	if (offset == CORE(GBIF_HALT)) core[CORE(GBIF_HALT_ACK) / 4] = value;
+	if (offset == CORE(RBBM_GBIF_HALT)) core[CORE(RBBM_GBIF_HALT_ACK) / 4] = value;
+	if (offset == CORE(RBBM_SW_RESET_CMD) && value) sw_resets++;
+	if (offset == CORE(CP_SQE_CNTL)) {
+		if (value) {
+			/* The firmware and the ring must be in place, the bank live, and an unmatched stream must fault. */
+			const uint64_t sqe = (uint64_t)core[CORE(CP_SQE_INSTR_BASE) / 4 + 1] << 32 | core[CORE(CP_SQE_INSTR_BASE) / 4];
+			const uint32_t *first = cp_memory(sqe);
+			sqe_base_ok = first && *first == 0x00000207u;
+			if (core[CORE(CP_RB_CNTL) / 4] != CORE_RB_CNTL || !core[CORE(CP_RB_BASE) / 4] || core[CORE(RBBM_CLOCK_CNTL) / 4] != CORE_CLOCK_CNTL_ON) faults++;
+			usf_when_started = smmu[SMMU_SCR0 / 4] & SMMU_SCR0_USFCFG;
+		}
+		core_cp_on = value;
+	}
+	if (offset == CORE(CP_RB_WPTR)) cp_run();
+}
+
 static uint64_t model_read64(void *cookie, unsigned block, uint32_t offset) {
+	if (offset % 8) { faults++; return 0; }
 	return (uint64_t)model_read(cookie, block, offset + 4) << 32 | model_read(cookie, block, offset);
 }
 
 static void model_write64(void *cookie, unsigned block, uint32_t offset, uint64_t value) {
 	(void)cookie;
 	writes++;
+	if (offset % 8) { faults++; return; }   /* an unaligned store to Device memory aborts: this panicked the hardware */
+	if (block == GPU_CORE) {
+		model_core_write(offset, (uint32_t)value);
+		model_core_write(offset + 4, (uint32_t)(value >> 32));
+		return;
+	}
 	if (block != GPU_SMMU || !gmu_live) { faults++; return; }
+	if (offset == 0x8000u + GPU_BANK * 0x1000u + SMMU_CB_ATS1PR) {
+		const uint64_t par = walk_bank(GPU_BANK, value);
+		smmu[(0x8000u + GPU_BANK * 0x1000u + SMMU_CB_PAR) / 4] = (uint32_t)par;
+		smmu[(0x8000u + GPU_BANK * 0x1000u + SMMU_CB_PAR) / 4 + 1] = (uint32_t)(par >> 32);
+		return;
+	}
 	if (offset == MODEL_BANK + SMMU_CB_ATS1PR) {
-		const uint64_t par = walk(value);
+		const uint64_t par = walk_bank(GMU_BANK, value);
 		smmu[(MODEL_BANK + SMMU_CB_PAR) / 4] = (uint32_t)par;
 		smmu[(MODEL_BANK + SMMU_CB_PAR) / 4 + 1] = (uint32_t)(par >> 32);
 		return;
@@ -188,7 +276,8 @@ static void model_write(void *cookie, unsigned block, uint32_t offset, uint32_t 
 		return;
 	}
 	if (block == GPU_CMD_DB) { faults++; return; }   /* read only */
-	if (block == GPU_GMU && gmu_live && (offset < GMU_CM3_ITCM || offset >= GMU_CM3_ITCM + GMU_TCM_BYTES || (gx_allowed && !(sysreset & 1u) && offset >= GMU_BOOT_SLUMBER_OPTION && offset <= GMU_MX_VOTE_IDX))) {
+	if (block == GPU_CORE) { model_core_write(offset, value); return; }
+	if (block == GPU_GMU && gmu_live && (offset < GMU_CM3_ITCM || offset >= GMU_CM3_ITCM + GMU_TCM_BYTES || (gx_allowed && !(sysreset & 1u) && ((offset >= GMU_BOOT_SLUMBER_OPTION && offset <= GMU_MX_VOTE_IDX) || (offset >= GMU_DCVS_ACK_OPTION && offset <= GMU_DCVS_RETURN))))) {
 		if (!cx_on() || (cc[GPUCC_CX_GMU / 4] & CBCR_CLK_OFF)) faults++;
 		gmu_regs[offset / 4] = value;
 		if (offset == GMU_HOST2GMU_INTR_SET) {
@@ -203,7 +292,10 @@ static void model_write(void *cookie, unsigned block, uint32_t offset, uint32_t 
 				gpu_set_seen = 1;
 			} else if (value == 1u) {
 				firmware_takes_message();
-			} else if (value != 1u << GMU_OOB_GPU_ACK) {
+			} else if (value == 1u << GMU_OOB_DCVS_SET) {
+				dcvs_value = gmu_regs[GMU_DCVS_PERF_SETTING / 4];
+				gmu_regs[GMU_GMU2HOST_INTR_INFO / 4] |= 1u << GMU_OOB_DCVS_ACK;
+			} else if (value != 1u << GMU_OOB_GPU_ACK && value != 1u << GMU_OOB_DCVS_ACK) {
 				faults++;
 			}
 		}
@@ -273,6 +365,9 @@ static void reset(void) {
 	memset(pdc_seq, 0, sizeof(pdc_seq));
 	memset(pool, 0xa5, sizeof(pool));
 	memset(cmd_db, 0, sizeof(cmd_db));
+	memset(core, 0, sizeof(core));
+	memset(cp_ops, 0, sizeof(cp_ops));
+	core_live = core_cp_on = me_init_seen = sw_resets = dcvs_value = cp_silent = cp_op_count = sqe_base_ok = usf_when_started = 0;
 	memset(hfi_ids, 0, sizeof(hfi_ids));
 	hfi_count = hfi_seq_seen = gx_allowed = no_boot_ack = refuse_message = table_good = 0;
 	perf_top_vote = perf_top_khz = perf_counts = perf_cx_khz = bw_first_ddr = bw_cnoc_second = init_debug = init_boot = gpu_set_seen = 0;
@@ -311,7 +406,11 @@ static int same_except_rcg(const uint32_t *g, const uint32_t *c) {
 }
 
 int main(void) {
-	const struct coachz_gpu_io io = {NULL, model_read, model_write, model_delay, model_read64, model_write64, pool, model_note};
+	static uint32_t sqe_file[34188 / 4];
+	sqe_file[0] = 0x4f525000u;   /* the file's first dword: the CP is given what follows it */
+	sqe_file[1] = 0x00000207u;
+	for (unsigned i = 2; i < 34188 / 4; i++) sqe_file[i] = i * 2654435761u;
+	const struct coachz_gpu_io io = {NULL, model_read, model_write, model_delay, model_read64, model_write64, pool, model_note, sqe_file, sizeof(sqe_file)};
 	struct coachz_gpu_report r;
 	static uint32_t g0[0x80000 / 4], c0[0x9000 / 4];
 	int failed = 0;
@@ -480,6 +579,43 @@ int main(void) {
 	refuse_message = HFI_MSG_PERF_TABLE;
 	coachz_gpu_run(&io, 7, image, sizeof(image), &r);
 	CHECK("a refused message stops there", r.error && r.restored && faults == 0 && r.hfi_done == 2 && r.hfi_status == 7 && hfi_count == 3 && !gpu_set_seen && sysreset == 1);
+
+	reset();
+	gmu_live = 1;
+	gx_allowed = 1;
+	core_live = 1;
+	memcpy(g0, gcc, sizeof(g0)); memcpy(c0, cc, sizeof(c0));
+	coachz_gpu_run(&io, 8, image, sizeof(image), &r);
+	CHECK("the CP runs the commands", r.stage == 7 && r.restored && !r.error && faults == 0 && r.core_registers_done && r.core_init_polls && r.core_idle_polls && r.core_ring_polls && r.core_ib_polls && r.core_fence_polls);
+	CHECK("the results are in memory", mem32(GPU_RESULT_RING) == GPU_RING_VALUE && mem32(GPU_RESULT_IB) == GPU_IB_VALUE && mem32(GPU_FENCE) == GPU_FENCE_VALUE && r.core_shadow == r.core_wptr);
+	CHECK("the firmware went in without its first dword", sqe_base_ok && mem32(GPU_SQE) == 0x207u && r.sqe_version == 0x207u);
+	CHECK("the order the CP saw", cp_op_count == 8 && cp_ops[0] == PM4_ME_INIT && cp_ops[1] == PM4_WHERE_AM_I && cp_ops[2] == PM4_MEM_WRITE && cp_ops[3] == PM4_WHERE_AM_I && cp_ops[4] == PM4_INDIRECT_BUFFER && cp_ops[5] == PM4_MEM_WRITE && cp_ops[6] == PM4_EVENT_WRITE && cp_ops[7] == PM4_WHERE_AM_I);
+	CHECK("the lowest frequency, the tables and the trust", dcvs_value == (3u << 28 | 1u) && core[CORE(0x0b0u) / 4] == 0x02222222u && core[CORE(CP_PROTECT + 31u) / 4] == (1u << 31 | 0x11c00u) && core[CORE(CP_PROTECT_CNTL) / 4] == 0xbu && core[CORE(0x8e08u) / 4] == 2u && usf_when_started);
+	CHECK("the CP is stopped and everything off", !core_cp_on && sw_resets == 1 && !core[CORE(GBIF_HALT) / 4] && !core[CORE(RBBM_SW_RESET_CMD) / 4] && r.core_halt_polls[0] && r.core_halt_polls[1] && r.core_halt_polls[2] && sysreset == 1 && !cx_on() && same_except_rcg(g0, c0) && smmu[SMMU_SCR0 / 4] == 1 && !smmu[(SMMU_SMR + 4u * GPU_GROUP) / 4] && !smmu[(0x8000u + SMMU_CB_SCTLR) / 4]);
+
+	reset();
+	gmu_live = 1;
+	gx_allowed = 1;
+	core_live = 1;
+	cp_silent = 1;
+	coachz_gpu_run(&io, 8, image, sizeof(image), &r);
+	CHECK("a write that never lands stops and shuts down", r.error && r.stage == 6 && r.restored && faults == 0 && !r.core_ring_polls && r.core_init_polls && !core_cp_on && sw_resets == 1 && sysreset == 1 && !cx_on());
+
+	reset();
+	gmu_live = 1;
+	gx_allowed = 1;
+	core_live = 1;
+	sqe_file[1] = 0x00000100u;
+	coachz_gpu_run(&io, 8, image, sizeof(image), &r);
+	sqe_file[1] = 0x00000207u;
+	CHECK("an old SQE firmware never starts", r.error && r.restored && faults == 0 && !r.own_core && !core_cp_on && sysreset == 1);
+
+	reset();
+	{
+		const struct coachz_gpu_io no_sqe = {NULL, model_read, model_write, model_delay, model_read64, model_write64, pool, model_note, NULL, 0};
+		coachz_gpu_run(&no_sqe, 8, image, sizeof(image), &r);
+	}
+	CHECK("mode 8 needs the SQE firmware", r.error && r.stage == 0 && writes == 0 && faults == 0);
 
 	reset();
 	gmu_live = 1;
