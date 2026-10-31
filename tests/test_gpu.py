@@ -20,6 +20,7 @@ class SequenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)
             (work / 'coachz_gpu_seq.h').write_text(new_file(PATCH, 'bsd/dev/coachz_gpu_seq.h'))
+            (work / 'coachz_gpu_gmu.h').write_text(new_file(PATCH, 'bsd/dev/coachz_gpu_gmu.h'))
             binary = work / 'gpu-model'
             subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-Wno-unused-function', '-I', str(work),
                             str(ROOT / 'tests/coachz_gpu_model_test.c'), '-o', str(binary)], check=True)
@@ -73,6 +74,31 @@ class SequenceTests(unittest.TestCase):
         self.assertIn('if (mode == 4) {\n\t\tgpu_read_smmu(io, r);', run)
 
 
+class GmuStartTests(unittest.TestCase):
+    def test_register_facts(self):
+        source = new_file(PATCH, 'bsd/dev/coachz_gpu_gmu.h')
+        # a6xx_gmu.xml dword offsets * 4 from the GMU base, and a6xx.xml's PDC domain * 4.
+        for dword, name in [(0x5001, 'GMU_CM3_BOOT_CONFIG'), (0x5185, 'GMU_HFI_QTBL_ADDR'), (0x5184, 'GMU_HFI_QTBL_INFO'), (0x5100, 'GMU_PWR_COL_CP_MSG'),
+                            (0x51cc, 'GMU_GENERAL_7'), (0x9307, 'GMU_RSCC_CONTROL_REQ'), (0x9311, 'GMU_AHB_FENCE_RANGE_0'), (0x50e8, 'GMU_RPMH_CTRL'),
+                            (0x1140, 'PDC_ENABLE'), (0x1148, 'PDC_SEQ_START_ADDR'), (0x1575, 'PDC_TCS1_CMD0'), (0x15d9, 'PDC_TCS3_CMD0')]:
+            self.assertIn('%s 0x%xu' % (name, dword * 4), source)
+        # a618 uses this level resource and sc7180.dtsi gives the GMU stream 5.
+        self.assertIn('PDC_ADDR_GFX 0x30090u', source)
+        self.assertIn('GMU_STREAM 5u', source)
+
+    def test_the_firmware_needs_the_checked_bank(self):
+        run = new_file(PATCH, 'bsd/dev/coachz_gpu_seq.h')
+        self.assertIn('if (gmu_map(io, r) && mode == 6) {', run)
+        source = new_file(PATCH, 'bsd/dev/coachz_gpu_gmu.h')
+        start = source[source.index('static inline void gmu_start('):source.index('static inline void gmu_undo(')]
+        for later in ['gmu_rsc_program(io, r);', 'gmu_rsc_start(io, r)', 'gpu_load_tcm(io, image, image_bytes, r);', 'gpu_w(io, GPU_GMU, GMU_CM3_SYSRESET, 0);']:
+            self.assertIn(later, start)
+        self.assertLess(start.index('gpu_load_tcm(io'), start.index('gpu_w(io, GPU_GMU, GMU_CM3_SYSRESET, 0);'))
+        # No GX and no HFI message at this stage.
+        for absent in ['GPUCC_GX_GDSCR', 'GMU_GX_VOTE', 'HOST2GMU']:
+            self.assertNotIn(absent, source)
+
+
 class LoaderTests(unittest.TestCase):
     def test_firmware_lands_in_kernel_data_after_the_trust_cache(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -99,6 +125,8 @@ class LoaderTests(unittest.TestCase):
             self.assertEqual((base % 4096, size), (0, 0x8000))
             with self.assertRaises(ValueError):
                 screen.pack(b'', b'', 0, 0, prelinked=True, gpu=3)   # stage 3 needs the firmware
+            with self.assertRaises(ValueError):
+                screen.pack(b'', b'', 0, 0, prelinked=True, gpu=6)   # and so does stage 6
             with self.assertRaises(ValueError):
                 screen.pack(b'', b'', 0, 0, prelinked=True, gpu=2, gmu_firmware=bytes(16))
 

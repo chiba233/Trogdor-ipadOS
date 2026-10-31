@@ -11,8 +11,9 @@
 | 1 | 时钟/电源清点；CX GDSC + 200 MHz GMU 时钟 + 总线分支窗口，读 GMU 寄存器后全部回滚 | 真机通过 |
 | 2 | `a630_gmu.bin`（主线 Linux 给 A618 用的 legacy GMU 固件）写入 GMU ITCM/DTCM 并逐字读回；CM3 始终保持复位 | 真机通过（mode 3） |
 | 3a | GPU SMMU（0x05040000）只读清点：全局配置、ID、故障、stream match group、各 context bank | 真机通过（mode 4） |
-| 3b | GMU stream 5 的 context bank、页表、HFI 队列和日志缓冲区映射 | 待写。按 3a 读到的真机状态设计，参考 Linux arm-smmu 和 UniXNU ArmSmmu4K |
-| 4 | RSCC/PDC 序列（0x0b290000 / 0x0b490000）、释放 CM3、等 `FW_INIT_RESULT` 签名；之后用 legacy HFI 启动（sweet 的两队列传输） | 待写。ios-extra 在这里拿到了 `0xbabeface` 签名，随后卡在 GX OOB ACK |
+| 3b | GMU stream 5 的 context bank、页表、HFI 队列和日志缓冲区映射，用 SMMU 的地址转换操作核对 | 真机通过（mode 5 的内容，由 mode 6 那次运行验证） |
+| 4a | RSCC/PDC 序列（0x0b290000 / 0x0b490000）、释放 CM3、等 `FW_INIT_RESULT` 签名，再把 CM3 放回复位 | 真机通过（mode 6），签名 `0xbabeface` |
+| 4b | GX OOB、SPTPRAC，之后用 legacy HFI 启动（sweet 的两队列传输） | 待写。ios-extra 拿到签名后卡在 GX OOB ACK（据文档转述） |
 | 5 | GX 上电、SQE 固件、A6xx CP 初始化、ring 写内存和 fence | 待写。CP 初始化格式和 A740 不同 |
 | 6 | Turnip Darwin KMD、Metal 发布、接系统合成器 | 待写 |
 
@@ -80,6 +81,21 @@ SC7180 与 SM7150 不同的地方都已按 Linux 源码改过，例如 GPU 的 G
 
 **目的**：在设计 3b 之前先知道真机上的 SMMU 现在是什么状态，包括是否已启用、各 stream 走哪个 context bank、有没有空闲 bank、固件是否留下了配置。3b 只在这些读数的基础上，按 Linux arm-smmu 的标准流程编程。
 
+## 第 3b、4a 阶段（mode 5、6）做了什么
+
+代码在 `bsd/dev/coachz_gpu_gmu.h`（补丁内），都在第一阶段的 CX + GMU 时钟窗口里运行。
+
+`coachz-gpu=5`：
+- 内存放在低端 DRAM 的 `0x81400000`（64 KiB，内核窗口之外，映射为不缓存）。SMMU 的表遍历是非一致性的，这样不用做缓存维护。
+- IOVA 按 Linux 的 legacy 布局：dummy `0x60000000`（4 KiB），debug、日志、HFI 各 16 KiB，紧跟其后。
+- bank 1、group 1 给 stream 5，bank 0、group 0 留给 GPU。4 KiB 页，32 位 VA，三级页表。未匹配的 stream 继续旁路。
+- 用 SMMU 自带的 ATS1PR 核对：每个区域的首页和末页要翻到正确的物理地址，3 个未映射地址要返回故障。这一步不需要 GMU 产生流量。
+- 只要 SMMU 不是空闲状态（sCR0 已启用、有有效的 SMR、bank 已开）就什么都不写。
+
+`coachz-gpu=6`：只有 11 个转换全部正确才继续。写 RSC 和 PDC 的序列与 TCS 命令，唤醒 RSC，写入固件，配置 HFI 地址、日志地址、芯片 ID 和投票使能，放开 CM3，等 `FW_INIT_RESULT`。结果读完后把 CM3 放回复位，停 RSC，恢复 SMMU，关 CX。PDC 的内容留着，Linux 也不清，GPU 关着时没有东西启动它。
+
+每个可能卡住机器的步骤之前都打印一行 `step N next` 并等 1.5 秒，让日志环落盘。
+
 ## 主机验证
 
 - `python3 -m unittest tests.test_gpu`：5 项通过。
@@ -126,10 +142,14 @@ SC7180 与 SM7150 不同的地方都已按 Linux 源码改过，例如 GPU 的 G
   - 每个 context bank 一行 `smmu cbN SCTLR TCR FSR`。
 
   这些读数原样保留，3b 据此设计。
+- `=6`：`mode 6 stage 7 restored 1: ok`，另有以下几行：
+  - `smmu map step 4: 11 of 11 translations right`，`sCR0 on 0x1812 after 0x1`，`fsr 0x400`。这个 fsr 只是 FORMAT 字段（AArch64），没有故障位。
+  - `init result 0xbabeface after N polls`。
+  - `cm3 reset after 0x1`。
 - 卡死或异常重启时，说明某个前提不成立，先退回上一个阶段看结果。
 
 ## 还没做的
 
-见上表第 3b–6 阶段。另外：
+见上表第 4b–6 阶段。另外：
 - GPU 中断（SPI 300/304/305）还没接。
 - 带宽投票（interconnect / BCM）和 GX 的 ARC 投票还没有 RPMh 客户端，这是第 4/5 阶段的前置。
