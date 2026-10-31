@@ -18,7 +18,7 @@
 | 仅抑制最终复位的 EL1 匹配对照 | 已观察到不自动重启 | Image 仅改一条 SMC 为 NOP，其余字节相同；与原版形成硬件对照，见 docs/control.md |
 | 原生 Linux 日志接收 | 真机验收通过 | EL1 探针→受控 HVC→EL2 Linux；8192 字节日志完整读回并校验，29 项主机测试通过，见 docs/linux-log.md |
 | 原厂显示交接只读发现 | schema 2 真机严格 45 字段通过，候选为真 | 13 次读取、零异常／写入并交接 Linux；元数据、分配关系与显示归属均成立。此前 schema 1 候选为假的原因已查明并修正。不表示画图或背光支持，见 [契约](display-discovery.md) |
-| 显示恢复 | 第一次画面实验已实现，尚无真机记录 | stop 只关背光／TE／DSI control；实际 scanout 地址、交接保留状态、EC 协议和独立测试范围见 [显示审计](display-reuse-audit.md) |
+| 显示恢复 | 第一次画面实验真机通过：全屏方格可见，帧计数 60.00 Hz，58 字段通过 | stop 只关背光／TE／DSI control；实际 scanout 地址、交接保留状态、EC 协议和独立测试范围见 [显示审计](display-reuse-audit.md) |
 | XNU 源码与装载前检查 | 源码内核已编译链接，51 项回归通过 | XNU 10063.141.1／Darwin 23.6；真实 FDT 已生成最小 ADT；本地链接指针已逐条审计；完整组件 prelink 待接入，见 docs/xnu-preparation.md |
 | 源码 XNU 装载与 boot_args 入口检查点 | 真机验收通过 | EL1 读取参数后 HVC 返回 EL2，Linux 收到唯一且通过校验的 copied／checkpoint／boot_args／current EL 四字段，见 docs/xnu-checkpoint.md |
 | XNU MMU 开启检查点 | 真机验收通过 | 完整 8192 字节日志确认 MMU／表池／硬件 AT 校验均成功，并返回 Linux；见 docs/xnu-mmu-checkpoint.md |

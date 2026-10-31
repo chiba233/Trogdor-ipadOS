@@ -1,5 +1,6 @@
 import ctypes as C
 from pathlib import Path
+import re
 import struct
 import subprocess
 import sys
@@ -259,6 +260,12 @@ class DisplayTests(unittest.TestCase):
             drawn,report=compile_wrapper(b,image,4096,discovery=True,pattern=True)
             self.assertEqual(report['display_discovery_schema'],3)
             self.assertNotIn(b'pattern attempted',plain);self.assertIn(b'pattern attempted',drawn)
+
+    def test_hardware_verified_scanout_restart_order_is_unchanged(self):
+        source=(ROOT/'boot/display.c').read_text()
+        self.assertEqual(re.findall(r'pattern_write\(DISPLAY_(\w+),',source),['COUNT_EN','DSI','SCANOUT','TE','TE','DSI','COUNT_EN'])
+        for fixed in ('#define DISPLAY_TE 0xae6b800u','#define DISPLAY_DSI 0xae94004u','#define DISPLAY_SCANOUT 0xae05014u','#define DISPLAY_DSI_VIDEO 0x1f3u','pattern_write(DISPLAY_TE,0,&o->writes);pattern_wait(freq/50);pattern_write(DISPLAY_DSI,0,&o->writes);'):
+            self.assertIn(fixed,source)
 
     def runtime_tree(self):
         return Node('',{'#address-cells':u32(2),'#size-cells':u32(2),'compatible':string('google,coachz-rev1-sku0')+string('qcom,sc7180')},[
