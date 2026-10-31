@@ -261,11 +261,11 @@ static OSStatus propertyData(AudioObjectID o, const AudioObjectPropertyAddress *
         case kAudioObjectPropertyBaseClass: REPLY(AudioClassID, kAudioObjectClassID);
         case kAudioObjectPropertyClass: REPLY(AudioClassID, kAudioDeviceClassID);
         case kAudioObjectPropertyOwner: REPLY(AudioObjectID, kPlugIn);
-        case kAudioObjectPropertyName: REPLY_STR("Speaker");
+        case kAudioObjectPropertyName: REPLY_STR("iPad");
         case kAudioObjectPropertyManufacturer: REPLY_STR("UniXNU");
         case kAudioDevicePropertyDeviceUID: REPLY_STR(kDeviceUID);
         case kAudioDevicePropertyModelUID: REPLY_STR(kModelUID);
-        case kAudioObjectPropertyModelName: REPLY_STR("Speaker");
+        case kAudioObjectPropertyModelName: REPLY_STR("iPad");
         case kAudioObjectPropertySerialNumber: REPLY_STR("0001");
         case kAudioObjectPropertyFirmwareVersion: REPLY_STR("1.0");
         case kAudioObjectPropertyIdentify: REPLY(UInt32, 0);
