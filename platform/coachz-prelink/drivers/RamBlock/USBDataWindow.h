@@ -6,6 +6,7 @@
 
 struct CoachzUSBDataWindow {
   uint64_t first = 0, blocks = 0;
+  uint64_t partitions_end = 0;  // last block of the last GPT partition, set by coachz_data_window
   bool contains(uint64_t at, uint64_t count) const {
     return blocks && count && at >= first && at - first < blocks && count <= blocks - (at - first);
   }
@@ -68,6 +69,20 @@ template<class Read> static bool coachz_data_window(uint64_t medium, Read read, 
       candidate = {first, limit - first + 1};
     }
   }
+  candidate.partitions_end = end;
   out = candidate;
   return out.blocks != 0;
+}
+
+// The kernel log ring: 64 MiB at the end of the medium, 1 MiB aligned, past every partition and before the 33 blocks of the
+// backup GPT. Its first block is a header; a read-only script reads it from Linux.
+static const uint64_t kCoachzLogBlocks = (64ull << 20) / 512;
+static inline bool coachz_log_window(uint64_t medium, const CoachzUSBDataWindow &data, CoachzUSBDataWindow &out) {
+  out = {};
+  if (!data.blocks || medium < kCoachzLogBlocks + 2048 + 33) return false;
+  uint64_t first = (medium - 33 - kCoachzLogBlocks) & ~2047ull;
+  if (first <= data.partitions_end || first + kCoachzLogBlocks > medium - 33) return false;
+  out.first = first;
+  out.blocks = kCoachzLogBlocks;
+  return true;
 }

@@ -51,3 +51,6 @@ coachz-prelink-measure.patch
 
 # Persistent Data with the display: UniXNU's skip-setup preferences (no BackBoard watchdogs, no Setup or migration screen).
 coachz-prelink-skip-setup.patch
+
+# The GT7375P touchscreen: GENI I2C on SE4, HID over I2C, fingers to ShengHidInput's digitizer.
+coachz-prelink-touch.patch

@@ -1171,8 +1171,30 @@ k40 在 launchd 之前向外接 Data 写入 UniXNU `scripts/seed-data-skip-setup
 后替换，mobile 0600）。kill 和页面都没变，这在意料之中，因为 kill 不是看门狗造成的。
 k41 按 ios-sweet NOTES.md 的结论给 `/chosen` 加上合成的 `unique-chip-id` 与 `chip-id`（0x8011）：
 XNU 只用它们生成 IOPlatformUUID，没有它，CurrentHost 偏好写不进去，迁移就记不住已完成。kill 和页面仍然一样。
-后两张照片的数字完全相同，应是同一次开机，所以重启后的情况还没验证。
+机主重启过，第二次开机结果相同。
 
-ios-sweet 的 README 记录的是：首次开机后出现锁屏，上滑解锁。UniXNU 的 `mobilegestalt.md` 说
-`home-button-type = 2` 时锁屏用上滑手势。据此推断这一页是升级后需要解锁的锁屏，而不是死路，但系统卷的
-字符串表里没有找到这句原文，也没有输入设备去上滑，所以这还没有在真机上验证。偏好和芯片 ID 的效果同样未验证。
+这一页其实不是 SpringBoard 的锁屏，见下一节。偏好和芯片 ID 的效果仍未验证。
+
+## 持久日志、触摸和 PreBoard（k42～k46）
+
+系统从未卡死。k37～k44 的照片时间相近（如 `now 101 s`），是因为机主在同一个故障阶段结束实验；曾把这个时间读成
+“100～120 秒卡死”是错的，k44 据此加的 `coachz-diag` 开关只留作减少输出。屏幕和诊断文字一直在刷新。
+
+- k45 把屏幕控制台的全部输出每秒写进外接盘末尾 64 MiB 的日志区（分区和备份 GPT 之外，写入只来自内核的这一个线程），
+  Debian 上用只读脚本取回。真机读回 166 KB，内核心跳到 148 秒还在走。之后不用再靠照片读日志。
+- k42 起 GENI I2C 通了：SE4 上读到 HID 描述符 `vid 27c6 pid 0e94`，报告描述符 1193 字节，与 Linux 一致；
+  ShengHidInput 的数字化仪挂到 IOHIDResource 下，报告全部送进 HID，错误数 0。上滑时原始 y 从约 8600 减小，
+  x 沿 2160 像素一边，方向不用翻转。
+- 但 k42～k45 的 `user clients` 一直是 0。k45 日志里有
+  `DK: AppleUserHIDEventDriver-... waiting for server com.apple.driverkit.AppleUserHIDDrivers-...`，而这个 dext
+  进程从未 exec。内核自带的数字化仪 personality 带 `IOMatchDefer`，要等 driverkitd；driverkitd 加入 OS 卷上
+  `com.apple.AppleUserHIDDrivers.dext` 的 personality（`IOProbeScore` 1），由它接管设备，XNU 最多等 120 秒。
+- k46 在发布设备前把一条内核 `IOHIDEventDriver` personality 加进 IOCatalogue（`Transport` SPI、Digitizer/Touch
+  Screen、不带 `IOMatchDefer`、`IOProbeScore` 1000）。真机日志：驱动是 `IOHIDEventDriver`，`user clients 1`，
+  没有 `DK:` 行；一次开机 141 秒内 210 帧。**机主从底边上滑，页面进入 “Enter Passcode” 并画出键盘（照片）。**
+- 这一页来自 PreBoard：`PREBOARD_SWIPE_FOR_UPGRADE` = "Swipe up to upgrade" 在 `/Applications/PreBoard.app` 的
+  字符串表里，它有 `_handleEdgeSwipe:` 和 `exiting as result of successful unlock`。日志里 PreBoard 启动后几行，
+  backboardd 就杀了第一个 SpringBoard，并新起一个。backboardd 里有 `BKAlternateSystemApp`，据此推断这是在把系统界面切给
+  PreBoard，请求方仍没有直接证据。
+- 同一份日志里 `keybagd` 报 `FATAL KEYBAG ERROR: failed to load system bag`：内核里没有 AppleKeyStore。
+- 拷一帧的时间按核分成两档（真机）：A76（CPU6、7）约 20 ms，A55（CPU0～5）约 209 ms，刷新慢和它有关，原因还没查。

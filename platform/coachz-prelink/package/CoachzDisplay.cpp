@@ -70,6 +70,11 @@ extern "C" { volatile uint64_t coachz_frame_stats[13]; }
 // The memory attribute the source of the coming copy is mapped with, as the MMU translates it: AT S1E1R leaves the MAIR value
 // in PAR_EL1[63:56] (0xff write-back, 0x44 non-cacheable, 0 device). 0x100 marks a failed translation.
 void native_legacy_copy_source_observed(const void *source,uint64_t scanTicks) {
+    // Off unless coachz-diag bit 3 is set (see osfmk/arm64/coachz_thread.c).
+    static int enabled=-1;
+    if(enabled<0){unsigned diag=0;PE_parse_boot_argn("coachz-diag",&diag,sizeof(diag));enabled=(diag&8)!=0;}
+    coachz_frame_stats[10]=scanTicks*1000000/counter_hz();
+    if(!enabled)return;
     uint64_t par;
     __asm__ volatile("at s1e1r, %1\n\tisb\n\tmrs %0, par_el1":"=r"(par):"r"(source));
     coachz_frame_stats[9]=(par&1)?0x100:par>>56;

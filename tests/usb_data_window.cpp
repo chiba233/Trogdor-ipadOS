@@ -30,5 +30,13 @@ int main(int argc,char **argv){
  disk=original;backupLast=last+999;auto *backup=disk.data()+66*512;
  put64(backup+24,backupLast);put64(backup+72,backupLast-32);
  disk[1024+54]^=0x10;refresh();assert(valid()&&w.first==first&&w.blocks==count);
- puts("PASS: actual GPT validator, both CRC copies, failed reads, overlap/size/extra partition rejection and protected-sector/overflow windows and vboot backup relocation");
+ // The kernel log ring: past every partition, before the backup GPT, 1 MiB aligned, 64 MiB; refused without room or a valid GPT.
+ CoachzUSBDataWindow log;
+ assert(w.partitions_end>=w.first+w.blocks-1);
+ assert(!coachz_log_window(w.partitions_end+1000,w,log)&&!log.blocks);
+ uint64_t medium=w.partitions_end+(1ull<<30)/512;
+ assert(coachz_log_window(medium,w,log)&&log.first>w.partitions_end&&log.first%2048==0&&log.blocks==(64ull<<20)/512&&log.first+log.blocks<=medium-33);
+ CoachzUSBDataWindow none;assert(!coachz_log_window(medium,none,log));
+ CoachzUSBDataWindow real=w;real.partitions_end=35559423;assert(coachz_log_window(250069680,real,log)&&log.first==249937920);
+ puts("PASS: actual GPT validator, both CRC copies, failed reads, overlap/size/extra partition rejection and protected-sector/overflow windows and vboot backup relocation, and the log ring placement");
 }

@@ -87,6 +87,19 @@ class SmpTreeTests(unittest.TestCase):
         from xnu_screen import COACHZ_UNIQUE_CHIP_ID
         self.assertEqual(len(COACHZ_UNIQUE_CHIP_ID), 8)
 
+    def test_log_ring_matches_the_reader_and_stays_outside_partitions(self):
+        root = Path(__file__).resolve().parents[1]
+        window = (root / 'platform/coachz-prelink/drivers/RamBlock/USBDataWindow.h').read_text()
+        reader = (root / '.tools/coachz-read-log').read_text() if (root / '.tools/coachz-read-log').is_file() else None
+        self.assertIn('uint64_t first = (medium - 33 - kCoachzLogBlocks) & ~2047ull;', window)
+        self.assertIn('if (first <= data.partitions_end || first + kCoachzLogBlocks > medium - 33) return false;', window)
+        driver = (root / 'platform/coachz-prelink/drivers/RamBlock/NativeRamBlock.cpp').read_text()
+        # Block I/O from the file system stays limited to the Data partition; only the flusher writes the ring.
+        self.assertIn('if (write && (!persistent_data || !data_window.contains(block, count))) return kIOReturnNotWritable;', driver)
+        if reader:
+            self.assertIn('first = (medium - 33 - LOG_BLOCKS) & ~2047', reader)
+            self.assertNotIn('O_RDWR', reader)
+
     def test_all_cores_share_one_pset(self):
         # The single-cluster Clutch scheduler panics in thread_select() with a second pset.
         patch = (Path(__file__).resolve().parents[1] / 'platform/coachz-prelink/patches/xnu/coachz-prelink-smp.patch').read_text()

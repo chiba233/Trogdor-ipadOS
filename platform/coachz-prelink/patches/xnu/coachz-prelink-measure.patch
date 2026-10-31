@@ -1,6 +1,26 @@
 --- a/osfmk/arm64/coachz_early.c
 +++ b/osfmk/arm64/coachz_early.c
-@@ -181,6 +181,8 @@
+@@ -46,9 +46,19 @@
+ 	coachz_early_clear_row((early_row + 1) % early_rows);
+ }
+ 
++/*
++ * Everything this console prints, kept for the kernel log on the external disk (NativeRamBlock.cpp flushes it once a second).
++ * A plain index, no atomics: this runs before the allocator and in panic; a rare torn character between CPUs is acceptable.
++ */
++char coachz_log_capture[1u << 20];
++volatile uint64_t coachz_log_head;
++
+ void
+ coachz_early_putc(char c)
+ {
++	uint64_t at = coachz_log_head;
++	coachz_log_capture[at & ((1u << 20) - 1)] = c;
++	coachz_log_head = at + 1;
+ 	if (early_fb == NULL) {
+ 		return;
+ 	}
+@@ -181,6 +191,8 @@
  		return;
  	}
  	early_panicking = 1;
@@ -9,7 +29,7 @@
  	coachz_early_string("\nCOACHZ PANIC: ");
  	va_list copy;
  	va_copy(copy, *args);
-@@ -212,6 +214,23 @@
+@@ -212,6 +224,23 @@
  coachz_early_relocate(uintptr_t block_va)
  {
  	early_fb = (volatile uint32_t *)(block_va + (early_pa & (ARM_TT_L2_SIZE - 1)));
@@ -53,7 +73,7 @@
  static uint32_t coachz_sb_started;
  static char coachz_lsd_snapshots[2][1024];
  static uint32_t coachz_lsd_snapshot_count;
-@@ -356,10 +357,100 @@
+@@ -356,10 +357,116 @@
  	return (uint32_t)seconds;
  }
  
@@ -65,6 +85,22 @@
 + */
 +static char coachz_kill_capture[2048];
 +static uint32_t coachz_kill_captured;
++/*
++ * coachz-diag: the diagnostics added after k36, off unless asked for: they answer one question each and print a lot.
++ * Bit 0 times each core, bit 1 groups waiting threads by kernel stack, bit 2 records the
++ * SpringBoard kill, bit 3 reads the frame source's memory attribute (CoachzDisplay.cpp).
++ */
++static unsigned
++coachz_diag(void)
++{
++	static unsigned value = ~0u;
++	if (value == ~0u) {
++		unsigned parsed = 0;
++		(void)PE_parse_boot_argn("coachz-diag", &parsed, sizeof(parsed));
++		value = parsed;
++	}
++	return value;
++}
 +
 +static size_t
 +coachz_user_frames(char *out, size_t size, vm_map_t map, uint64_t fp, uint64_t sp, unsigned limit)
@@ -147,14 +183,14 @@
  coachz_launch_signal(int sender, const char *sender_name, int target, const char *target_name, int signum)
  {
  	uint32_t index;
-+	if (signum == 9 && !strcmp(sender_name, "backboardd") && !strcmp(target_name, "SpringBoard") &&
++	if (signum == 9 && (coachz_diag() & 4) && !strcmp(sender_name, "backboardd") && !strcmp(target_name, "SpringBoard") &&
 +	    os_atomic_cmpxchg(&coachz_kill_captured, 0, 2, relaxed)) {
 +		coachz_capture_kill(coachz_launch_seconds());
 +	}
  	if (signum != 9 || (index = os_atomic_inc_orig(&coachz_kill_count, relaxed)) >= 6) {
  		return;
  	}
-@@ -374,6 +465,9 @@
+@@ -374,6 +481,9 @@
  coachz_launch_process(int pid, const char *name, int exited, int status)
  {
  	uint32_t index;
@@ -164,7 +200,7 @@
  	if (!exited && !strcmp(name, "backboardd")) {
  		os_atomic_store(&coachz_bbd_pid, pid, relaxed);
  		return;
-@@ -474,7 +568,7 @@
+@@ -474,7 +584,7 @@
  extern volatile uint32_t armcpu_smp_requested, armcpu_smp_running, armcpu_boot_mpidr;
  extern volatile uint32_t armcpu_smp_step[8], armcpu_smp_fail[8], armcpu_core_timer[8], armcpu_core_sgi[8];
  extern volatile uint32_t armcpu_smp_sys[8][5], armcpu_boot_sys[5], armcpu_freq[3][6];
@@ -173,7 +209,7 @@
  extern volatile int32_t armcpu_smp_psci_rc[8];
  extern void armcpu_group1_sgi_probe(uint64_t *);
  static char coachz_sgi_probe[256];
-@@ -625,11 +719,374 @@
+@@ -625,11 +735,397 @@
  	}
  }
  
@@ -415,7 +451,7 @@
 +	printf("\n");
 +
 +	static unsigned reports;
-+	const bool clocks = reports++ % 6 == 0;
++	const bool clocks = (coachz_diag() & 1) && reports++ % 6 == 0;
 +	for (unsigned index = 0; index < cpus && clocks; index++) {
 +		where[index] = -1;
 +		if (!processor_array[index]) {
@@ -518,10 +554,33 @@
 +		int pids[3] = { os_atomic_load(&coachz_bbd_pid, relaxed), os_atomic_load(&coachz_sb_pid, relaxed),
 +			        os_atomic_load(&coachz_lsd_pid, relaxed) };
 +		unsigned which = turn++ % 3;
-+		if (os_atomic_load(&coachz_kill_captured, acquire) == 1) {
++		/* In the console band, the touch lines below need the room; the kill record and wait groups are already understood. */
++		if (coachz_compact || !(coachz_diag() & 2)) {
++			(void)which;
++		} else if (os_atomic_load(&coachz_kill_captured, acquire) == 1) {
 +			printf("%s", coachz_kill_capture);
 +		} else {
 +			coachz_wait_report(pids[which], labels[which]);
++		}
++	}
++	{
++		/* Touchscreen stage 1 (bsd/dev/coachz_touch.c, coachz-touch=1): started once from here, after boot. */
++		extern void coachz_touch_start(void);
++		extern char coachz_touch_status[3][160], coachz_hid_status[160], coachz_hid_live[160], coachz_touch_stroke[160];
++		coachz_touch_start();
++		if (coachz_hid_status[0]) {
++			printf("%.160s\n", coachz_hid_status);
++		}
++		if (coachz_hid_live[0]) {
++			printf("%.160s\n", coachz_hid_live);
++		}
++		if (coachz_touch_stroke[0]) {
++			printf("%.160s\n", coachz_touch_stroke);
++		}
++		for (unsigned line = 0; line < 3; line++) {
++			if (coachz_touch_status[line][0]) {
++				printf("%.160s\n", coachz_touch_status[line]);
++			}
 +		}
 +	}
 +	uint32_t kills = os_atomic_load(&coachz_kill_count, relaxed);

@@ -161,6 +161,9 @@ def main():
                 raise ValueError('display needs the accepted prelinked ABI reference in build/coachz-display-reference')
             os.environ['COACHZ_DISPLAY_REFERENCE'] = str(reference)
             os.environ['XNU_EXTRA_LD_ARCHIVES'] += ' -Wl,-force_load,' + str(ctx.tree / 'build/native-legacy-display/libCoachzDisplay.a')
+            if (ROOT / 'platform' / a.platform / 'scripts/build-sheng-hid-input.py').is_file():
+                # The touch digitizer: ShengHidInput bound to the original IOHIDDevice, and its start-up.
+                os.environ['XNU_EXTRA_LD_ARCHIVES'] += ' -Wl,-force_load,' + str(ctx.tree / 'build/sheng-hid-input/libCoachzHid.a')
         kernel.build(ctx, modules)
         candidate = ctx.tree / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf'
         if not candidate.is_file():

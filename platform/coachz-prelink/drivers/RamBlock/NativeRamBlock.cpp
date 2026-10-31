@@ -15,6 +15,7 @@
 #include <sys/param.h>
 #include <pexpert/pexpert.h>
 #include <kern/clock.h>
+#include <kern/thread_call.h>
 #include "USBDataWindow.h"
 
 extern "C" {
@@ -49,6 +50,93 @@ int native_ram_block_volume_seed(const char *, dev_t *, char *, size_t, uint64_t
 static CoachzUSBDataWindow data_window;
 static char data_uuid[40];
 static bool persistent_data;
+
+/*
+ * The kernel log on the external disk: once a second, everything the screen console printed since the last flush
+ * (coachz_log_capture, filled by osfmk/arm64/coachz_early.c) is appended to the log ring after its header block, the header
+ * is rewritten and the drive's cache is synchronized, under the same gate as block I/O. One boot per ring: it starts again
+ * at each boot. Header: "COACHZLOG1\0", then little-endian u64 bytes stored, bytes dropped, flushes, seconds since boot.
+ */
+extern "C" {
+extern char coachz_log_capture[];
+extern volatile uint64_t coachz_log_head;
+}
+static const uint64_t kCaptureBytes = 1ull << 20;
+static CoachzUSBDataWindow log_window;
+static IOLock *log_gate;
+static thread_call_t log_call;
+static uint64_t log_taken, log_stored, log_dropped, log_flushes;
+static uint8_t *log_buffer;  // 128 blocks: the header, then up to 127 blocks to write
+static uint8_t log_tail[512];  // the bytes of the last partial block, rewritten with the next flush
+
+static void log_put(uint64_t at, uint64_t value) {
+  for (unsigned i = 0; i < 8; i++) log_buffer[at + i] = (uint8_t)(value >> (8 * i));
+}
+
+static bool log_write_header(void) {
+  uint64_t ns;
+  absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+  memset(log_buffer, 0, 512);
+  memcpy(log_buffer, "COACHZLOG1", 11);
+  log_put(16, log_stored);
+  log_put(24, log_dropped);
+  log_put(32, log_flushes);
+  log_put(40, ns / 1000000000ull);
+  return coachz_usb_write(log_window.first, 1, log_buffer);
+}
+
+static void log_flush(thread_call_param_t, thread_call_param_t) {
+  IOLockLock(log_gate);
+  uint64_t head = coachz_log_head;
+  if (head - log_taken > kCaptureBytes) {
+    log_dropped += head - log_taken - kCaptureBytes;
+    log_taken = head - kCaptureBytes;
+  }
+  const uint64_t capacity = (log_window.blocks - 1) * 512;
+  bool ok = true;
+  while (ok && log_taken < head && log_stored < capacity) {
+    // Rewrite from the block holding the current end: its earlier bytes come from log_tail.
+    uint64_t block = log_stored / 512, offset = log_stored % 512;
+    uint64_t room = 127 * 512 - offset, take = head - log_taken;
+    if (take > room) take = room;
+    if (take > capacity - log_stored) take = capacity - log_stored;
+    uint8_t *out = log_buffer + 512;
+    memcpy(out, log_tail, offset);
+    for (uint64_t i = 0; i < take; i++) out[offset + i] = (uint8_t)coachz_log_capture[(log_taken + i) & (kCaptureBytes - 1)];
+    uint64_t end = offset + take, blocks = (end + 511) / 512;
+    memset(out + end, 0, blocks * 512 - end);
+    ok = coachz_usb_write(log_window.first + 1 + block, (uint32_t)blocks, out);
+    if (ok) {
+      log_taken += take;
+      log_stored += take;
+      memcpy(log_tail, out + (end / 512) * 512, end % 512);
+    }
+  }
+  if (log_taken < head && log_stored >= capacity) {
+    log_dropped += head - log_taken;
+    log_taken = head;
+  }
+  log_flushes++;
+  if (ok) ok = log_write_header() && coachz_usb_sync();
+  IOLockUnlock(log_gate);
+  uint64_t deadline;
+  clock_interval_to_deadline(1, NSEC_PER_SEC, &deadline);
+  thread_call_enter_delayed(log_call, deadline);
+}
+
+static void log_start(IOLock *gate, uint64_t capacity) {
+  if (!coachz_log_window(capacity, data_window, log_window)) {
+    kprintf("COACHZ log: no room for the log ring past the partitions\n");
+    return;
+  }
+  log_buffer = static_cast<uint8_t *>(IOMalloc(128 * 512));
+  log_call = thread_call_allocate(log_flush, nullptr);
+  if (!log_buffer || !log_call) return;
+  memset(log_buffer, 0, 128 * 512);
+  log_gate = gate;
+  kprintf("COACHZ log: kernel log ring at block %llu, %llu MiB\n", log_window.first, log_window.blocks / 2048);
+  thread_call_enter(log_call);
+}
 
 class NativeRamBlock : public IOBlockStorageDevice {
   OSDeclareDefaultStructors(NativeRamBlock)
@@ -105,6 +193,7 @@ bool NativeRamBlock::start(IOService *provider)
     if (!write_buffer || !coachz_usb_sync()) panic("Coachz external Data cache synchronization unavailable");
     persistent_data = true;
     kprintf("COACHZ Data: external partition validated, %llu MiB, protected outside window\n", data_window.blocks / 2048);
+    log_start(gate, capacity);
   }
   native_ram_block_bytes = capacity * 512;
   online = true;

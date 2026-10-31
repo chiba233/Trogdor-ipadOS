@@ -1,0 +1,593 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -107,6 +107,7 @@
+ 
+ bsd/dev/memdev.c			standard
+ bsd/dev/coachz_sample.c		standard
++bsd/dev/coachz_touch.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/coachz_touch.c
++++ b/bsd/dev/coachz_touch.c
+@@ -0,0 +1,580 @@
++/*
++ * Coachz touchscreen (coachz-touch=1): the Goodix GT7375P on QUPv3 wrap0 SE4 as HID over I2C.
++ * Reads the HID descriptor and report descriptor, powers the device on, starts ShengHidInput's touch digitizer
++ * (platform/coachz-prelink/package/CoachzHid.cpp), then polls the interrupt line and hands each report's fingers to
++ * that digitizer through its seqlock interface (native_touch_*). The FIFO-mode GENI I2C engine is adapted from ios-sweet's
++ * bsd/dev/sweet_touch.c (MIT, Copyright (c) 2026 dipa-studio), which drove a Goodix controller on another
++ * Qualcomm SoC's GENI I2C on hardware.
++ *
++ * Board facts, from Linux mainline sc7180-trogdor(-coachz).dtsi and Coreboot's sc7180 sources:
++ *   i2c4 = SE4 at 0x890000, 400 kHz, SDA/SCL on GPIO115/116 (WEST tile, function 1, external pull-ups, 2 mA);
++ *   touchscreen@5d: interrupt GPIO9 level low with pull-up, reset GPIO8 active low (8 mA), both on the NORTH tile;
++ *   vdd is pp3300_ts, the eDP panel rail (GPIO67 on Coachz), already on while the panel shows a picture;
++ *   GCC: QUP votes in 0x52008 (wrap0 m_ahb 6, s_ahb 7, core 8, core_2x 9, S4 14); S4 branch 0x174f0, its DFS
++ *   command 0x17508 and performance level 0 at 0x17510. Coreboot loads the SE's I2C firmware and enables DFS.
++ * The HID descriptor address 0x0001 and the reset timing are those Linux's i2c-hid-of-goodix uses for this part.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern void coachz_hid_touch_start(void);
++void coachz_touch_start(void);
++void native_touch_set_sink(void (*)(void *), void *);
++
++#define GCC_PA          0x00100000u
++#define GCC_VOTE        0x52008u
++#define GCC_VOTE_BITS   ((1u << 6) | (1u << 7) | (1u << 8) | (1u << 9) | (1u << 14))
++#define GCC_S4_CBCR     0x174f0u
++#define GCC_S4_DFS_CMD  0x17508u
++#define GCC_S4_DFS_L0   0x17510u
++#define TLMM_NORTH_PA   0x03900000u
++#define TLMM_WEST_PA    0x03500000u
++#define GPIO_CFG(n)     ((uint32_t)(n) * 0x1000u)
++#define GPIO_IO(n)      (GPIO_CFG(n) + 4u)
++#define SE4_PA          0x00890000u
++#define TOUCH_ADDR      0x5d
++#define HID_DESC_REG    0x0001u
++
++#define SE_FORCE_DEFAULT 0x020u
++#define SE_OUTPUT_CTRL  0x024u
++#define SE_CGC_CTRL     0x028u
++#define SE_STATUS       0x040u
++#define SE_MCLK         0x048u
++#define SE_IF_DISABLE   0x064u
++#define SE_FW           0x068u
++#define SE_CLK_SEL      0x07cu
++#define SE_SCL          0x278u
++#define SE_BYTE_GRAN    0x254u
++#define SE_DMA          0x258u
++#define SE_TX_PACK0     0x260u
++#define SE_TX_PACK1     0x264u
++#define SE_TX_LEN       0x26cu
++#define SE_RX_LEN       0x270u
++#define SE_RX_PACK0     0x284u
++#define SE_RX_PACK1     0x288u
++#define SE_CMD          0x600u
++#define SE_CTRL         0x604u
++#define SE_IRQ          0x610u
++#define SE_IRQ_EN       0x614u
++#define SE_IRQ_CLR      0x618u
++#define SE_S_IRQ_EN     0x644u
++#define SE_S_IRQ_CLR    0x648u
++#define SE_TX           0x700u
++#define SE_RX           0x780u
++#define SE_TX_COUNT     0x800u
++#define SE_RX_COUNT     0x804u
++#define SE_TX_WM        0x80cu
++#define SE_RX_WM        0x810u
++#define SE_RX_RFR       0x814u
++#define SE_GSI_EVENT_EN 0xe18u
++#define SE_IRQ_ROUTE    0xe1cu
++#define SE_HW_TX        0xe24u
++#define SE_HW_RX        0xe28u
++#define SE_DMA_CFG      0xe30u
++
++#define SE_DONE         (1u << 0)
++#define SE_ABORT_DONE   (1u << 5)
++#define SE_NACK         (1u << 10)
++#define SE_ERRORS       (0x3eu | (1u << 9) | (1u << 10) | (1u << 12) | (1u << 13) | (3u << 24) | (3u << 28))
++#define SE_RX_WM_IRQ    (1u << 26)
++#define SE_RX_LAST      (1u << 27)
++#define SE_TX_WM_IRQ    (1u << 30)
++#define SE_EVENTS       (SE_DONE | SE_ERRORS | SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ)
++/* Linux geni_se_config_packing(8, 4, true): MSB first on the wire, the first byte in the FIFO word's low bits. */
++#define SE_PACK0        0x0007f8feu
++#define SE_PACK1        0x000ffefeu
++
++#define MAX_TX          8u
++#define MAX_RX          4096u
++
++static uint16_t
++le16_at(const uint8_t *p)
++{
++	return (uint16_t)(p[0] | (p[1] << 8));
++}
++
++/* For the periodic report (osfmk/arm64/coachz_thread.c). */
++char coachz_touch_status[3][160];
++volatile uint32_t coachz_touch_reports;
++
++/*
++ * ShengHidInput's producer interface: the current finger set, odd sequence while it is written, in its units (x 0..30480 along
++ * the 2160-pixel side, y 0..20320). The digitizer calls native_touch_set_sink once started and is notified after each frame.
++ */
++volatile uint32_t native_touch_seq, native_touch_count, native_touch_hid_reports;
++volatile int native_touch_xs[12], native_touch_ys[12], native_touch_ids[12];
++static void (*volatile touch_sink)(void *);
++static void *volatile touch_sink_context;
++
++void
++native_touch_set_sink(void (*sink)(void *), void *context)
++{
++	touch_sink_context = context;
++	__atomic_store_n(&touch_sink, sink, __ATOMIC_RELEASE);
++}
++
++/*
++ * Report 1 of this controller's descriptor (read from the part): five fingers of eight bytes, each tip switch in bit 0 of its first
++ * byte, contact identifier in bits 7:1 of the second, X (0..12960) and Y (0..8640) little endian, then width and height, and a
++ * contact count. 12960 x 8640 is six times the 2160 x 1440 panel.
++ */
++#define REPORT_FINGERS 5
++/*
++ * coachz-touch-flip: bit 0 mirrors x, bit 1 mirrors y, bit 2 swaps the axes (applied after mirroring), so the panel orientation
++ * can be matched from a boot argument alone. The stroke record keeps raw controller coordinates for that decision.
++ */
++static unsigned touch_flip;
++static uint32_t stroke_count, stroke_frames;
++static int stroke_first[2] = { -1, -1 }, stroke_last[2] = { -1, -1 };
++char coachz_touch_stroke[160];
++
++static void
++publish_fingers(const uint8_t *input)
++{
++	if (le16_at(input) < 3 + REPORT_FINGERS * 8 || input[2] != 1) {
++		return;
++	}
++	unsigned count = 0;
++	int xs[REPORT_FINGERS], ys[REPORT_FINGERS], ids[REPORT_FINGERS];
++	for (unsigned finger = 0; finger < REPORT_FINGERS; finger++) {
++		const uint8_t *f = input + 3 + finger * 8;
++		if (!(f[0] & 1)) {
++			continue;
++		}
++		unsigned rx = le16_at(f + 2), ry = le16_at(f + 4);
++		if (rx > 12960) {
++			rx = 12960;
++		}
++		if (ry > 8640) {
++			ry = 8640;
++		}
++		if (!count) {
++			if (stroke_first[0] < 0) {
++				stroke_first[0] = (int)rx;
++				stroke_first[1] = (int)ry;
++				stroke_frames = 0;
++			}
++			stroke_last[0] = (int)rx;
++			stroke_last[1] = (int)ry;
++			stroke_frames++;
++		}
++		unsigned ux = (touch_flip & 1) ? 12960 - rx : rx, uy = (touch_flip & 2) ? 8640 - ry : ry;
++		ids[count] = f[1] >> 1;
++		if (touch_flip & 4) {
++			xs[count] = (int)(uy * 30480u / 8640u);
++			ys[count] = (int)(ux * 20320u / 12960u);
++		} else {
++			xs[count] = (int)(ux * 30480u / 12960u);
++			ys[count] = (int)(uy * 20320u / 8640u);
++		}
++		count++;
++	}
++	if (!count && stroke_first[0] >= 0) {
++		stroke_count++;
++		snprintf(coachz_touch_stroke, sizeof(coachz_touch_stroke),
++		    "K43 stroke %u: raw first %d,%d last %d,%d over %u reports (x 0..12960 along 2160 px, y 0..8640), flip %u",
++		    stroke_count, stroke_first[0], stroke_first[1], stroke_last[0], stroke_last[1], stroke_frames, touch_flip);
++		stroke_first[0] = -1;
++	}
++	uint32_t seq = native_touch_seq;
++	native_touch_seq = seq + 1;
++	__asm__ volatile ("dmb ish" ::: "memory");
++	for (unsigned i = 0; i < count; i++) {
++		native_touch_xs[i] = xs[i];
++		native_touch_ys[i] = ys[i];
++		native_touch_ids[i] = ids[i];
++	}
++	native_touch_count = count;
++	__asm__ volatile ("dmb ish" ::: "memory");
++	native_touch_seq = seq + 2;
++	void (*sink)(void *) = __atomic_load_n(&touch_sink, __ATOMIC_ACQUIRE);
++	if (sink) {
++		sink(touch_sink_context);
++	}
++}
++
++static struct {
++	vm_offset_t gcc, north, west, se;
++	bool dead;
++	uint32_t irq_seen;
++	unsigned sent, got;
++	uint8_t desc[30];
++	uint16_t report_length, report_reg, input_reg, max_input, command_reg, data_reg;
++	uint8_t report[MAX_RX];
++	uint8_t input[512];
++} st;
++static int touch_chan;
++
++static uint32_t
++rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++/* A short delay spins on the counter: a blocking delay costs a timer interrupt and a wake here. */
++static void
++spin_us(unsigned us)
++{
++	uint64_t hz, start, now;
++	__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(hz));
++	__asm__ volatile ("isb\n\tmrs %0, cntpct_el0" : "=r"(start));
++	const uint64_t ticks = (hz ? hz : 19200000) * us / 1000000 + 1;
++	do {
++		__asm__ volatile ("isb\n\tmrs %0, cntpct_el0" : "=r"(now));
++	} while (now - start < ticks);
++}
++
++static void
++sleep_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&touch_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool
++wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
++{
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (!(rd(base, off) & mask)) {
++			return true;
++		}
++		spin_us(1);
++	}
++	return false;
++}
++
++/* TLMM config: pull 1:0 (0 none, 3 up), function 5:2, drive 8:6 ((mA / 2) - 1), output enable 9. */
++static void
++gpio_set(vm_offset_t tile, unsigned pin, unsigned func, unsigned pull, unsigned drive, bool out, bool high)
++{
++	if (out) {
++		/* Latch the level before enabling the output: reset is active low. */
++		wr(tile, GPIO_IO(pin), (rd(tile, GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
++	}
++	uint32_t cfg = rd(tile, GPIO_CFG(pin)) & ~0x3ffu;
++	cfg |= pull | (func << 2) | (drive << 6) | (out ? 0x200u : 0u);
++	wr(tile, GPIO_CFG(pin), cfg);
++}
++
++static bool
++clocks_on(void)
++{
++	wr(st.gcc, GCC_VOTE, rd(st.gcc, GCC_VOTE) | GCC_VOTE_BITS);
++	if (!wait_clear(st.gcc, GCC_S4_CBCR, 1u << 31)) {
++		return false;
++	}
++	/* With DFS on, SE_CLK_SEL 0 selects level 0; it must be the 19.2 MHz XO undivided (source 0, divider field 1). */
++	if ((rd(st.gcc, GCC_S4_DFS_CMD) & 1u) && (rd(st.gcc, GCC_S4_DFS_L0) & 0x371fu) != 1u) {
++		return false;
++	}
++	return true;
++}
++
++static void
++engine_abort(void)
++{
++	wr(st.se, SE_CTRL, 2);
++	bool done = false;
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (rd(st.se, SE_IRQ) & SE_ABORT_DONE) {
++			done = true;
++			break;
++		}
++		spin_us(1);
++	}
++	if (!done || !wait_clear(st.se, SE_STATUS, 1u)) {
++		st.dead = true;
++	}
++	for (unsigned i = 0; i < 1024 && (rd(st.se, SE_RX_COUNT) & 0x1ffffffu); ++i) {
++		(void)rd(st.se, SE_RX);
++	}
++	wr(st.se, SE_IRQ_CLR, 0xffffffffu);
++	if (rd(st.se, SE_TX_COUNT) & 0xfffffffu) {
++		st.dead = true;
++	}
++}
++
++static uint32_t
++engine_irq(void)
++{
++	uint32_t irq = rd(st.se, SE_IRQ);
++	st.irq_seen |= irq;
++	return irq;
++}
++
++/* One FIFO message: a write of up to MAX_TX bytes, or a read of up to MAX_RX. stretch keeps the bus for a repeated start. */
++static int
++engine_msg(const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, bool stretch)
++{
++	if (st.dead || nt > MAX_TX || nr > MAX_RX || (nt && nr) || (!nt && !nr)) {
++		return EIO;
++	}
++	if (!wait_clear(st.se, SE_STATUS, 1u)) {
++		st.dead = true;
++		return EBUSY;
++	}
++	st.sent = st.got = 0;
++	wr(st.se, SE_IRQ_CLR, 0xffffffffu);
++	wr(st.se, SE_TX_WM, nt ? 1u : 0u);
++	wr(st.se, nr ? SE_RX_LEN : SE_TX_LEN, nr ? nr : nt);
++	wr(st.se, SE_CMD, ((nr ? 2u : 1u) << 27) | ((uint32_t)TOUCH_ADDR << 9) | (stretch ? 4u : 0u));
++	uint64_t start = mach_absolute_time(), limit;
++	nanoseconds_to_absolutetime(500 * NSEC_PER_MSEC, &limit);
++	int err = ETIMEDOUT;
++	while (mach_absolute_time() - start < limit) {
++		uint32_t irq = engine_irq();
++		if (irq & SE_ERRORS) {
++			err = (irq & SE_NACK) ? ENXIO : EIO;
++			for (unsigned j = 0; j < 5000 && !(irq & SE_DONE); ++j) {
++				spin_us(1);
++				irq = engine_irq();
++			}
++			if ((irq & SE_DONE) && !(rd(st.se, SE_STATUS) & 1u) && !(rd(st.se, SE_TX_COUNT) & 0xfffffffu) &&
++			    !(rd(st.se, SE_RX_COUNT) & 0x1ffffffu)) {
++				wr(st.se, SE_IRQ_CLR, irq);
++				return err;
++			}
++			break;
++		}
++		if (nt && !st.sent && (irq & SE_TX_WM_IRQ)) {
++			/* At most two words: the FIFO holds them (its depth is checked at init). */
++			for (unsigned at = 0; at < nt; at += 4) {
++				uint32_t word = 0;
++				for (unsigned j = 0; j < 4 && at + j < nt; ++j) {
++					word |= (uint32_t)tx[at + j] << (8u * j);
++				}
++				wr(st.se, SE_TX, word);
++			}
++			st.sent = nt;
++			wr(st.se, SE_TX_WM, 0);
++		}
++		uint32_t count = rd(st.se, SE_RX_COUNT) & 0x1ffffffu;
++		if (count > 64 || count > (nr - st.got + 3u) / 4u) {
++			err = EIO;
++			break;
++		}
++		bool drained = count != 0;
++		while (count--) {
++			uint32_t word = rd(st.se, SE_RX);
++			for (unsigned j = 0; j < 4 && st.got < nr; ++j) {
++				rx[st.got++] = (uint8_t)(word >> (8u * j));
++			}
++		}
++		/* DONE is checked after draining, so the last short word is not lost; a late error still wins. */
++		if (irq & SE_DONE) {
++			irq = engine_irq();
++			if (irq & SE_ERRORS) {
++				continue;
++			}
++			wr(st.se, SE_IRQ_CLR, irq);
++			return st.got == nr && st.sent == nt ? 0 : EIO;
++		}
++		wr(st.se, SE_IRQ_CLR, irq & (SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ));
++		if (!drained) {
++			spin_us(2);
++		}
++	}
++	engine_abort();
++	return err;
++}
++
++/* An HID-over-I2C register read: the 16-bit register little endian, then a repeated-start read. */
++static int
++reg_read(uint16_t reg, uint8_t *buf, unsigned len)
++{
++	const uint8_t ptr[2] = { (uint8_t)reg, (uint8_t)(reg >> 8) };
++	int err = engine_msg(ptr, 2, NULL, 0, true);
++	return err ? err : engine_msg(NULL, 0, buf, len, false);
++}
++
++/* An HID-over-I2C command: command register, then the command's two bytes. */
++static int
++hid_command(uint8_t opcode, uint8_t low)
++{
++	const uint8_t cmd[4] = { (uint8_t)st.command_reg, (uint8_t)(st.command_reg >> 8), low, opcode };
++	return engine_msg(cmd, 4, NULL, 0, false);
++}
++
++static bool
++engine_init(void)
++{
++	uint32_t fw = rd(st.se, SE_FW), tx = rd(st.se, SE_HW_TX), rx = rd(st.se, SE_HW_RX);
++	/* Protocol 3 is I2C; the FIFOs must be 32 bits wide and at least two words deep. */
++	if (((fw >> 8) & 0xffu) != 3u || (rd(st.se, SE_IF_DISABLE) & 1u) || ((tx >> 24) & 0x3fu) != 32u ||
++	    ((rx >> 24) & 0x3fu) != 32u || ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u ||
++	    (rd(st.se, SE_STATUS) & 0x1001u)) {
++		return false;
++	}
++	wr(st.se, SE_GSI_EVENT_EN, 0);
++	wr(st.se, SE_IRQ_ROUTE, 0);           /* polled: no interrupt to the GIC */
++	wr(st.se, SE_S_IRQ_EN, 0);
++	wr(st.se, SE_IRQ_CLR, 0xffffffffu);
++	wr(st.se, SE_S_IRQ_CLR, 0xffffffffu);
++	wr(st.se, SE_DMA, 0);                 /* FIFO mode */
++	wr(st.se, SE_CGC_CTRL, rd(st.se, SE_CGC_CTRL) | 0x7fu);
++	wr(st.se, SE_DMA_CFG, rd(st.se, SE_DMA_CFG) | 0x0fu);
++	wr(st.se, SE_OUTPUT_CTRL, 0x7f);
++	wr(st.se, SE_FORCE_DEFAULT, 1);
++	wr(st.se, SE_CLK_SEL, 0);
++	/* 400 kHz from 19.2 MHz: divider 2, t_high 5, t_low 12, t_cycle 24 (Linux's geni_i2c_clk_map_19p2mhz). */
++	wr(st.se, SE_MCLK, (2u << 4) | 1u);
++	wr(st.se, SE_SCL, (5u << 20) | (12u << 10) | 24u);
++	wr(st.se, SE_BYTE_GRAN, 0);
++	wr(st.se, SE_TX_PACK0, SE_PACK0);
++	wr(st.se, SE_TX_PACK1, SE_PACK1);
++	wr(st.se, SE_RX_PACK0, SE_PACK0);
++	wr(st.se, SE_RX_PACK1, SE_PACK1);
++	wr(st.se, SE_TX_WM, 0);
++	wr(st.se, SE_RX_WM, 0);
++	wr(st.se, SE_RX_RFR, ((rx >> 16) & 0x3fu) - 1u);
++	wr(st.se, SE_IRQ_EN, SE_EVENTS);
++	return rd(st.se, SE_TX_PACK0) == SE_PACK0 && rd(st.se, SE_RX_PACK1) == SE_PACK1 &&
++	       !(rd(st.se, SE_TX_COUNT) & 0xfffffffu) && !(rd(st.se, SE_RX_COUNT) & 0x1ffffffu);
++}
++
++
++static void
++touch_thread(__unused void *arg, __unused wait_result_t result)
++{
++	char *s0 = coachz_touch_status[0], *s1 = coachz_touch_status[1], *s2 = coachz_touch_status[2];
++	int err = 0;
++
++	snprintf(s0, 160, "K42 touch: mapping");
++	st.gcc = ml_io_map(GCC_PA, 0x60000);
++	st.north = ml_io_map(TLMM_NORTH_PA, 0x10000);
++	st.west = ml_io_map(TLMM_WEST_PA + GPIO_CFG(115), 0x2000) - GPIO_CFG(115);
++	st.se = ml_io_map(SE4_PA, 0x4000);
++	if (!st.gcc || !st.north || st.west == (vm_offset_t)-GPIO_CFG(115) || !st.se) {
++		snprintf(s0, 160, "K42 touch: MMIO mapping failed");
++		goto out;
++	}
++	/* What firmware left: votes, S4 branch, DFS, SE firmware and FIFOs, the four pins and the interrupt level. */
++	snprintf(s0, 160, "K42 touch: fw vote %x cbcr %x dfs %x/%x se fw %x status %x hw %x/%x pins 115 %x 116 %x 8 %x/%x 9 %x/%x",
++	    rd(st.gcc, GCC_VOTE), rd(st.gcc, GCC_S4_CBCR), rd(st.gcc, GCC_S4_DFS_CMD), rd(st.gcc, GCC_S4_DFS_L0),
++	    rd(st.se, SE_FW), rd(st.se, SE_STATUS), rd(st.se, SE_HW_TX), rd(st.se, SE_HW_RX),
++	    rd(st.west, GPIO_CFG(115)), rd(st.west, GPIO_CFG(116)), rd(st.north, GPIO_CFG(8)), rd(st.north, GPIO_IO(8)),
++	    rd(st.north, GPIO_CFG(9)), rd(st.north, GPIO_IO(9)));
++	if (!clocks_on()) {
++		snprintf(s1, 160, "K42 touch: clocks: cbcr %x dfs %x/%x", rd(st.gcc, GCC_S4_CBCR),
++		    rd(st.gcc, GCC_S4_DFS_CMD), rd(st.gcc, GCC_S4_DFS_L0));
++		goto out;
++	}
++	if (!engine_init()) {
++		snprintf(s1, 160, "K42 touch: SE4 not an idle I2C engine with 32-bit FIFOs: fw %x status %x hw %x/%x",
++		    rd(st.se, SE_FW), rd(st.se, SE_STATUS), rd(st.se, SE_HW_TX), rd(st.se, SE_HW_RX));
++		goto out;
++	}
++	/* Pins as in the device tree, the controller held in reset meanwhile; then out of reset as i2c-hid-of-goodix does. */
++	gpio_set(st.north, 9, 0, 3, 0, false, false);
++	gpio_set(st.north, 8, 0, 0, 3, true, false);
++	gpio_set(st.west, 115, 1, 0, 0, false, false);
++	gpio_set(st.west, 116, 1, 0, 0, false, false);
++	sleep_ms(20);
++	gpio_set(st.north, 8, 0, 0, 3, true, true);
++	sleep_ms(200);
++	err = reg_read(HID_DESC_REG, st.desc, sizeof(st.desc));
++	if (err) {
++		snprintf(s1, 160, "K42 touch: HID descriptor read %d irq %x status %x int %x", err, st.irq_seen,
++		    rd(st.se, SE_STATUS), rd(st.north, GPIO_IO(9)));
++		goto out;
++	}
++	st.report_length = le16_at(st.desc + 4);
++	st.report_reg = le16_at(st.desc + 6);
++	st.input_reg = le16_at(st.desc + 8);
++	st.max_input = le16_at(st.desc + 10);
++	st.command_reg = le16_at(st.desc + 16);
++	st.data_reg = le16_at(st.desc + 18);
++	snprintf(s1, 160, "K42 touch: desc len %u bcd %x vid %04x pid %04x ver %x | report %u at %x, input %x max %u, cmd %x data %x",
++	    le16_at(st.desc), le16_at(st.desc + 2), le16_at(st.desc + 20), le16_at(st.desc + 22), le16_at(st.desc + 24),
++	    st.report_length, st.report_reg, st.input_reg, st.max_input, st.command_reg, st.data_reg);
++	if (le16_at(st.desc) != 30 || !st.report_length || st.report_length > MAX_RX || !st.max_input ||
++	    st.max_input > sizeof(st.input)) {
++		goto out;
++	}
++	err = reg_read(st.report_reg, st.report, st.report_length);
++	if (!err) {
++		err = hid_command(0x08, 0x00);          /* SET_POWER ON */
++	}
++	if (!err) {
++		err = hid_command(0x01, 0x00);          /* RESET */
++	}
++	if (err) {
++		snprintf(s2, 160, "K42 touch: report descriptor / power / reset %d irq %x", err, st.irq_seen);
++		goto out;
++	}
++	/* The controller answers: publish the digitizer now (it waits for IOHIDResource; reports queue in the controller meanwhile). */
++	coachz_hid_touch_start();
++	unsigned errors = 0, empty = 0;
++	uint64_t heartbeat = mach_absolute_time(), interval;
++	nanoseconds_to_absolutetime(10 * NSEC_PER_SEC, &interval);
++	for (;;) {
++		/* Printed by this thread itself, not by the periodic report: tells a stopped report from a stopped system. */
++		if (mach_absolute_time() - heartbeat >= interval) {
++			heartbeat = mach_absolute_time();
++			uint64_t ns;
++			absolutetime_to_nanoseconds(heartbeat, &ns);
++			printf("K44 alive %llu s, touch reports %u\n", ns / NSEC_PER_SEC, coachz_touch_reports);
++		}
++		/* The interrupt line is low while the controller has a report (or the reset response) waiting. */
++		if (!(rd(st.north, GPIO_IO(9)) & 1u)) {
++			err = engine_msg(NULL, 0, st.input, st.max_input, false);
++			if (err) {
++				errors++;
++			} else if (le16_at(st.input) <= 2) {
++				empty++;                     /* the reset response, or nothing to say */
++			} else {
++				coachz_touch_reports++;
++				publish_fingers(st.input);
++			}
++			const uint8_t *p = st.input;
++			snprintf(s2, 160, "K42 touch: reports %u empty %u errors %u err %d, to HID %u fingers %u: %02x%02x %02x %02x%02x%02x%02x%02x%02x%02x%02x "
++			    "| rd %02x%02x%02x%02x", coachz_touch_reports, empty, errors, err, native_touch_hid_reports, native_touch_count,
++			    p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], st.report[0], st.report[1], st.report[2],
++			    st.report[3]);
++			if (st.dead) {
++				break;
++			}
++		}
++		sleep_ms(5);
++	}
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++coachz_touch_start(void)
++{
++	static bool started;
++	int enabled = 0;
++	thread_t thread;
++
++	if (started || !PE_parse_boot_argn("coachz-touch", &enabled, sizeof(enabled)) || enabled != 1) {
++		return;
++	}
++	started = true;
++	(void)PE_parse_boot_argn("coachz-touch-flip", &touch_flip, sizeof(touch_flip));
++	if (kernel_thread_start(touch_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
