@@ -1,0 +1,38 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8445,7 +8445,27 @@
+ {
+ 	return coachz_watchdog_policy_check(path, bytes, length, true);
+ }
++
++/* Temporary: the MobileGestalt cache on the persistent Data volume was written by boots without a
++ * display service and holds no main-screen answers. Remove it before launchd so it is rebuilt.
++ */
++int unlink1(vfs_context_t, vnode_t, user_addr_t, enum uio_seg, int);
+ 
++static void
++coachz_mobilegestalt_cache_reset(void)
++{
++	static const char path[] = "/private/var/containers/Shared/SystemGroup/"
++	    "systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist";
++	int reset = 0;
++	int error;
++
++	if (!PE_parse_boot_argn("coachz-reset-mgcache", &reset, sizeof(reset)) || reset != 1) {
++		return;
++	}
++	error = unlink1(vfs_context_kernel(), NULLVP, CAST_USER_ADDR_T(path), UIO_SYSSPACE, 0);
++	printf("COACHZ MobileGestalt cache removed: %d\n", error);
++}
++
+ static int
+ coachz_watchdog_policy_prepare(void)
+ {
+@@ -8590,6 +8610,7 @@
+ 		if (error) {
+ 			panic("Coachz temporary watchdog launch policy failed: %d", error);
+ 		}
++		coachz_mobilegestalt_cache_reset();
+ 	}
+ }
+ 

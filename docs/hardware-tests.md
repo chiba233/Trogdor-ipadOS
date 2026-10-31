@@ -904,3 +904,89 @@ Data 的 GPT、cache sync、卷选择、挂载或目录／策略准备失败时�
 下一步是向原版显示框架发布实际固件 framebuffer。现有内核文本控制台不等于存在
 IOMobileFramebuffer/CADisplay 服务；此轮没有可见用户界面，也没有 GPU 渲染或触摸支持
 的验收。保持原版系统文件、崩溃策略、四分区布局及外接 Data，不再重写整盘来做纯内核迭代。
+
+
+## 2026-10-31：原版 Legacy framebuffer 后端，待真机启动
+
+根据上述主 CADisplay 断言，下一轮内核加入显式 `--display` 路线：在原版 launchd
+之前发布实际固件 framebuffer，调用原版 IOMobileFramebufferLegacy 生命周期，保留
+真实 IOSurface 接口。CPU 后端只接受其已限定的 BGRA 帧；刷新通知暂由 60 Hz 软件
+计时器提供，没有实现 GPU 或硬件 vblank。启动步骤、客户端、映射和最初帧有屏幕日志，
+未知抽象后端调用保留带 slot/caller 的停止诊断，详见 [显示实验](native-display.md)。
+
+完整编译及 prelink 已通过，原版 IOSurface/MobileGraphics 布局和 MobileGraphics
+完整可执行段哈希与已验收参考一致；358 项 vtable、原版方法入口及自有延后构造器
+执行指令不变检查通过。四种基线探针构建通过。164 项主机回归中 163 项首次通过，
+一项 boot_args ABI 编译在沙箱下失败，在正常主机权限下单独重跑通过；共享 CPU
+像素复制和边界测试另行编译运行通过。这些结果不代表真机显示服务或 UI 验收。
+
+本轮只打包 225 MiB 内核前缀，主分区表与上一轮整盘镜像逐字节相同，写入边界恰好
+停在 OS 分区之前；不重写 OS、SystemOS 或 8 GiB Data。镜像参数选择同一 Data 卷，
+不带 RAM Data，包装器标量指令审计通过。既有目标端写盘器已更新此前核验的外接测试盘，
+完整 225 MiB 回读摘要匹配，未自动重启。测试仍需操作者手动启动并拍照确认。
+
+
+## 2026-10-31：持久化 Data 的第二次启动在策略文件重复创建处停止
+
+显示实验首轮照片确认 SystemOS union 与外接 Data 的挂载返回 0，keybags 目录准备也
+返回 0；随后 watchdogd 禁用策略返回 17 并触发显式 panic。该错误来自 launchd 前的
+文件准备步骤，尚未运行新显示后端，不能据此判断显示驱动成败。
+
+原函数始终以 `O_CREAT | O_EXCL` 创建 disabled.plist 和迁移标记；原先每次重建的
+内存 Data 不会保留它们，持久化 Data 在后续启动已有文件时则返回 EEXIST（17）。
+主机对原始函数的文件操作重放已复现第二次创建返回 17。下一轮只修正此生命周期问题：
+已存在文件以不跟随链接的只读方式打开，验证普通文件、root 所有、非组／其他可写、
+长度和预期字节；匹配则复用，缺失才创建。不同内容明确报错，不覆盖已有用户数据。
+
+相同函数的主机重放确认策略和空迁移标记都可连续准备两次，原文件 inode 和内容不变，
+不同内容或不安全权限仍被拒绝。这是主机验证；真机尚待下一轮验证。保持显示后端和
+四分区布局，只更新内核前缀；此轮没有达到显示服务或 UI 的实机提交条件。
+
+修订内核完整编译及 prelink 检查通过，原版显示组件布局／代码哈希保持一致；33 项相关
+回归通过。新 225 MiB 前缀已核对当前内核、重复启动修订日志、原有显示参数和与已验收
+整盘镜像相同的 GPT；既有目标端写盘器完成更新，全部前缀回读 SHA-256 匹配，未自动
+重启，未重写任何 APFS 容器。没有新的实机通过记录。
+
+
+## 2026-10-31：显示后端越过主 CADisplay 断言，停在显示模式校验
+
+k20 照片显示 SpringBoard 首个异常退出仍为 `status 0x5`／SIGTRAP，但 PC 已不在
+`failed to find the main CADisplay`。用同版缓存和 UUID 匹配的本地符号符号化，调用链为
+`FBSDisplayMonitor` → `FBSDisplaySource` → `FBSDisplayConfiguration` →
+`-[FBSDisplayMode _initWithCADisplayMode:scale:rotation:]` →
+`_initWithWidth:...:validityCheck:` 中的 BRK，断言字符串为
+`FBSDisplayMode cannot be configured as requested : %@`。主显示器传入的 scale 为 0，
+校验改用模式自带的 preferredScale；该 PC 与 UniXNU 早先记录的缺 scale 失败相同。
+
+k21 在 SpringBoard 诊断中加入断言现场 x19／x24／x25／x26 与 x19 所指模式对象的
+80 字节。k21 上机前，Data 卷曾在 Mac 上被自动以读写方式挂载；随后的启动在 launchd 前
+校验已有 `disabled.plist` 时返回 13（EACCES）并 panic。k22 在已有策略文件不一致时
+打印属主、权限、长度与开头内容，原样另存为 `<path>.coachz-prev`，再写回预期字节并
+恢复 root／0644；主机重放测试覆盖另存、写回、权限恢复和一致时不重写。k22 未再出现
+该 panic，k23 照片中两个策略文件校验均返回 0。
+
+k22 照片取得模式对象：2160×1440、scaleOverride 0、**preferredScale 0.0**、刷新率
+60.0、gamut 1、hdr／rotation／virtual 为 0，确认失败项是 preferredScale。只读挂载
+Data 复制出的 MobileGestalt 缓存中，`main-screen-scale`、`main-screen-pitch`、
+`main-screen-class` 都属于存放在 CacheExtra 的键，却都不存在；该缓存由没有显示服务的
+早先启动生成。libMobileGestalt 的屏幕参数路径读取 `/chosen` 的 `display-scale`，
+读不到时默认 0。
+
+k23 的 `coachz-prelink-mgcache-reset.patch` 仅在显示路线（`coachz-reset-mgcache=1`）
+于 launchd 前删除这一个缓存文件。照片显示删除返回 0，显示后端报告
+`original Legacy active, mode 2160x1440 scale 2`，原版 launchd 正常启动；随后屏幕出现
+`COACHZ display: CPU transfer 1 status 0x0 bytes 12441600`（正好一帧 2160×1440×4）、
+`frame 2 kind 0 nonzero 41605`，中央显示原版白色苹果标志。这是原版 iPadOS 图形首次经
+原版 IOMobileFramebuffer 和 CPU 后端显示在本机屏幕上；不代表 GPU、Metal、触摸或可用
+界面。同屏还有 `IOMFB: default_fb_surface: No Default FB Surface found` 提示。
+
+同次启动中 SpringBoard 的首个异常退出变为 `status 0x9`（SIGKILL，自身上下文）。
+符号化显示主线程在 LaunchServices 初始化（`_LSContextInitCommon` →
+`_LSCopyServerStore`）中经 NSXPCConnection 同步等待 lsd 回复。谁发出 SIGKILL、lsd
+是否运行或卡住尚未确认。
+
+同次启动稍后的照片中，屏幕变为原版白色界面，下方显示 `Press home to upgrade`，
+`CPU transfer 5 status 0x0 bytes 12441600`。屏幕文字控制台叠在帧缓冲上方，诊断仍保留
+首个 SIGKILL 现场；这表明后续重启的 SpringBoard 已绘制原版系统界面。这是等待用户按
+Home 继续升级／迁移的画面，与从未完成设置或迁移的 Data 卷相符；尚无触摸或按键输入，
+不能继续操作，也不代表可用桌面。

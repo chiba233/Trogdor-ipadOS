@@ -27,3 +27,15 @@ coachz-prelink-systemos-union.patch
 
 # Selected external 8 GiB Data, with the previous RAM Data as an explicit fallback route.
 coachz-prelink-usb-data.patch
+
+# Reuse verified policy files across persistent Data boots.
+coachz-prelink-watchdog-persistent.patch
+
+# Explicit main-OS native firmware framebuffer, before original launchd.
+coachz-prelink-display.patch
+
+# A differing existing policy file on persistent Data: print it, keep a copy, reinstall the override.
+coachz-prelink-watchdog-replace.patch
+
+# The display route rebuilds the MobileGestalt cache that boots without a display wrote.
+coachz-prelink-mgcache-reset.patch

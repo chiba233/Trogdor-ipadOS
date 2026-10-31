@@ -81,8 +81,34 @@ def main():
         p.error('positive job count, ordinary output directory and --build with --ipsw required')
     base, xnu = verify('unixnu'), verify('apple-xnu')
     xnu = materialize_xnu(xnu, out / 'reference/xnu')
+    selected = list(COMPONENTS)
+    display_options = []
+    if (ROOT / 'platform' / a.platform / 'scripts/build-coachz-display.py').is_file():
+        selected.append('drivers/GopFramebuffer')
     subprocess.run(['git', '-C', str(base), 'submodule', 'update', '--init', '--depth=1',
-                    *COMPONENTS], check=True)
+                    *selected], check=True)
+    if 'drivers/GopFramebuffer' in selected:
+        # The newer shared driver includes another SoC's direct-scanout registers. Use the
+        # previously qualified generic CPU backend, on its own immutable reference checkout.
+        display_revision = 'cf3b42979a9c44219e7bb149543e6fc3388b58ed'
+        display_source = out / 'reference/GopFramebuffer'
+        if not display_source.exists():
+            preparing = display_source.with_name('GopFramebuffer.preparing')
+            preparing.mkdir()
+            try:
+                subprocess.run(['git', 'init', '--quiet', str(preparing)], check=True)
+                subprocess.run(['git', '-C', str(preparing), 'fetch', '--quiet', '--no-tags',
+                                '--depth=1', 'https://github.com/UniXNU/GopFramebuffer.git',
+                                display_revision], check=True)
+                subprocess.run(['git', '-C', str(preparing), 'checkout', '--quiet', '--detach', display_revision], check=True)
+                preparing.rename(display_source)
+            finally:
+                shutil.rmtree(preparing, ignore_errors=True)
+        if subprocess.check_output(['git', '-C', str(display_source), 'rev-parse', 'HEAD'], text=True).strip() != display_revision:
+            raise ValueError('unexpected generic framebuffer source revision')
+        if subprocess.check_output(['git', '-C', str(display_source), 'status', '--porcelain'], text=True):
+            raise ValueError('generic framebuffer source reference must remain clean')
+        display_options = ['--local-module', 'driver:GopFramebuffer=' + str(display_source)]
     # Use only the selected source components. The normal CLI also initializes all
     # unrelated module submodules and prelinks/downloads IPSW input after a build.
     sys.path.insert(0, str(base / 'scripts'))
@@ -90,7 +116,7 @@ def main():
     from unixnu.config import Context
     arguments = cli.parser().parse_args(['defconfig', 'coachz_defconfig', '-D',
         str(ROOT / 'platform' / a.platform), '--out', str(out), '-j', str(a.jobs),
-        '--local-module', 'refer:xnu=' + str(xnu), *patched_drivers(base, a.platform, out)])
+        '--local-module', 'refer:xnu=' + str(xnu), *patched_drivers(base, a.platform, out), *display_options])
     ctx = Context(arguments)
     cli.cmd_defconfig(ctx)
     # cmd_defconfig writes .config; Context keeps the original in-memory snapshot.
@@ -119,6 +145,13 @@ def main():
         os.environ['PATH'] = os.pathsep.join([*(str(b) for b in bins if b.is_dir()), os.environ.get('PATH', '')])
         if (ROOT / 'platform' / a.platform / 'drivers/RamBlock/coachz_usb.c').is_file():
             os.environ['XNU_EXTRA_LD_ARCHIVES'] = '-Wl,-force_load,' + str(ctx.tree / 'build/coachz-usb/libCoachzUsb.a')
+        display_builder = ROOT / 'platform' / a.platform / 'scripts/build-coachz-display.py'
+        if display_builder.is_file():
+            reference = ROOT / 'build/coachz-display-reference/kernel.macho'
+            if not reference.is_file():
+                raise ValueError('display needs the accepted prelinked ABI reference in build/coachz-display-reference')
+            os.environ['COACHZ_DISPLAY_REFERENCE'] = str(reference)
+            os.environ['XNU_EXTRA_LD_ARCHIVES'] += ' -Wl,-force_load,' + str(ctx.tree / 'build/native-legacy-display/libCoachzDisplay.a')
         kernel.build(ctx, modules)
         candidate = ctx.tree / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf'
         if not candidate.is_file():
@@ -129,6 +162,24 @@ def main():
     if a.ipsw:
         os.environ['UNIXNU_IPSW'] = str(a.ipsw.resolve())
         report['prelinked_sha256'] = hashlib.sha256(kernel.prelink(ctx).read_bytes()).hexdigest()
+        if (ROOT / 'platform' / a.platform / 'scripts/build-coachz-display.py').is_file():
+            # Absolute original-family bindings must retain their qualified layout after prelink.
+            proof = json.loads((ctx.tree / 'build/native-legacy-display/coachz-report.json').read_text())
+            sys.path.insert(0, str(base / 'kits/XnuPrelink'))
+            from native_prelink import macho as parse_macho, backed_offset
+            final = (ctx.work / 'kernel/kernel.macho').read_bytes()
+            image = parse_macho(final)
+            linked = json.loads((ctx.work / 'kernel/kernel.json').read_text())
+            reference_plan = json.loads((reference.with_suffix('.json')).read_text())
+            for name in ('com.apple.iokit.IOMobileGraphicsFamily', 'com.apple.iokit.IOSurface'):
+                before = [e for e in reference_plan['extents'] if e['module'] == name]
+                after = [e for e in linked['extents'] if e['module'] == name]
+                if before != after:
+                    raise ValueError('display original-component ABI layout changed: ' + name)
+            extent = next(e for e in linked['extents'] if e['module'] == 'com.apple.iokit.IOMobileGraphicsFamily' and e['segment'] == '__TEXT_EXEC')
+            at = backed_offset(image['segments'], extent['va'], extent['size'], len(final))
+            if hashlib.sha256(final[at:at + extent['size']]).hexdigest() != proof['family_sha256']:
+                raise ValueError('display original-component executable changed')
         report['prelinked'] = True
         report_path.write_text(json.dumps(report, indent=2) + '\n')
     print('Source preparation complete; report:', report_path)

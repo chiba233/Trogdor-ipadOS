@@ -1,0 +1,13 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8512,6 +8512,10 @@
+ #endif
+ 	coachz_systemos_prepare(p, (user_addr_t)scratch_addr, &init_envp);
+ 	coachz_data_prepare(p, (user_addr_t)scratch_addr);
++	/* Called only after the original storage initialization; the opt-in lives in the backend. */
++	extern int coachz_display_start(void);
++	int display_error = coachz_display_start();
++	if (display_error) panic("Coachz original framebuffer startup failed: %d", display_error);
+ #if CONFIG_MEMORYSTATUS
+ 	(void) memorystatus_init_at_boot_snapshot();
+ #endif /* CONFIG_MEMORYSTATUS */

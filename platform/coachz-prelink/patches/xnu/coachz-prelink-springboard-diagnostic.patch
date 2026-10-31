@@ -1,6 +1,6 @@
 --- a/osfmk/arm64/coachz_thread.c
 +++ b/osfmk/arm64/coachz_thread.c
-@@ -199,3 +199,117 @@
+@@ -199,3 +199,133 @@
  	    coachz_um_output + start, coachz_um_failure);
  	return 1;
  }
@@ -85,6 +85,22 @@
 +	    "COACHZ SB state: pc 0x%llx lr 0x%llx x16 0x%llx\n",
 +	    (unsigned long long)get_saved_state_pc(state), (unsigned long long)get_saved_state_lr(state),
 +	    (unsigned long long)get_saved_state_reg(state, 16));
++	/* FBSDisplayMode validation keeps the object in x19 and width/height/scale override in x25/x26/x24. */
++	used += snprintf(coachz_sb_failure + used, sizeof(coachz_sb_failure) - used,
++	    "COACHZ SB regs: x19 0x%llx x24 0x%llx x25 0x%llx x26 0x%llx\n",
++	    (unsigned long long)get_saved_state_reg(state, 19), (unsigned long long)get_saved_state_reg(state, 24),
++	    (unsigned long long)get_saved_state_reg(state, 25), (unsigned long long)get_saved_state_reg(state, 26));
++	{
++		uint64_t object[10];
++		if (!copyin(get_saved_state_reg(state, 19), object, sizeof(object))) {
++			for (unsigned index = 1; index < 10; index += 3) {
++				used += snprintf(coachz_sb_failure + used, sizeof(coachz_sb_failure) - used,
++				    "COACHZ SB x19+%02x: %016llx %016llx %016llx\n", index * 8,
++				    (unsigned long long)object[index], (unsigned long long)object[index + 1],
++				    index + 2 < 10 ? (unsigned long long)object[index + 2] : 0ULL);
++			}
++		}
++	}
 +	sp = get_saved_state_sp(state);
 +	fp = get_saved_state_fp(state);
 +	for (unsigned index = 0; index < 12 && used < sizeof(coachz_sb_failure) - 100; index++) {

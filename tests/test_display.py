@@ -420,6 +420,27 @@ class DisplayTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             pack(bytes(fixture()), adt(), 0x40000000, 1 << 30, data_uuid=uuid, data_seed=bytes(4096), **options)
 
+    def test_original_display_is_explicit_and_keeps_external_data_without_ramdisk(self):
+        from test_xnu_checkpoint import fixture, adt
+        from xnu_checkpoint import HEADER
+        from xnu_screen import pack, read_tree
+        options = dict(prelinked=True, root_cache=[struct.pack('<I16sI', 2, bytes(16), 0)],
+                       root_uuid='04769D26-2CA0-4825-B443-E2E5F88300F2',
+                       data_uuid='00000000-1111-2222-3333-444444444444')
+        for enabled in (False, True):
+            payload = pack(bytes(fixture()), adt(), 0x40000000, 1 << 30, display=enabled, **options)
+            header = HEADER.unpack_from(payload)
+            command = header[-1].split(b'\0', 1)[0].split()
+            for flag in (b'coachz-display=1', b'offline-legacy-phase=4', b'offline-legacy-cpu-present=1', b'sheng-vsync=60'):
+                self.assertEqual(command.count(flag), int(enabled))
+            self.assertIn(b'coachz-systemos-union=1', command)
+            self.assertIn(b'coachz-disable-watchdogd=1', command)
+            tree = read_tree(payload[header[9]:header[9] + header[10]])
+            keys = [key for key, _, _ in tree.child('chosen').child('memory-map').props]
+            self.assertNotIn('RAMDisk', keys)
+        with self.assertRaises(ValueError):
+            pack(bytes(fixture()), adt(), 0x40000000, 1 << 30, display=True)
+
     def test_hardware_verified_scanout_restart_order_is_unchanged(self):
         source=(ROOT/'boot/display.c').read_text()
         self.assertEqual(re.findall(r'pattern_write\(DISPLAY_(\w+),',source),['COUNT_EN','DSI','SCANOUT','TE','TE','DSI','COUNT_EN'])

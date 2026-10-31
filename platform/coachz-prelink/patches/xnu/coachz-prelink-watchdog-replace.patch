@@ -1,0 +1,128 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8312,16 +8312,85 @@
+  * The only job disabled is watchdogd: its native missing-IOWatchdog path BRKs on this
+  * board. Both files live on the selected Data volume; validate and reuse them on later boots.
+  * No system-volume bytes, daemon binary, VM identity or global panic policy change.
++ */
++/* An existing policy file can differ on a later persistent Data boot (launchd also writes it). Print it,
++ * keep a copy beside it as <path>.coachz-prev, and install the expected bytes as root 0644.
+  */
+ static int
+-coachz_watchdog_policy_file(const char *path, const char *bytes, int length)
++coachz_watchdog_policy_replace(const char *path, vnode_t vnode, const struct vnode_attr *found,
++    const char *bytes, int length, vfs_context_t context)
+ {
++	struct vnode_attr attributes;
++	vnode_t target = NULLVP;
++	uint64_t size = found->va_data_size;
++	size_t allocated = size ? (size_t)size : 1;
++	char saved[MAXPATHLEN];
++	char head[97];
++	char *data;
++	int error, close_error, residual = 0;
++
++	if (vnode_vtype(vnode) != VREG || size > (1 << 20)) {
++		return EACCES;
++	}
++	data = kalloc_data(allocated, Z_WAITOK | Z_NOFAIL);
++	error = size ? vn_rdwr(UIO_READ, vnode, data, (int)size, 0, UIO_SYSSPACE, 0,
++	    vfs_context_ucred(context), &residual, vfs_context_proc(context)) : 0;
++	if (!error && residual) {
++		error = EIO;
++	}
++	if (!error) {
++		unsigned count = size < 96 ? (unsigned)size : 96;
++		for (unsigned index = 0; index < count; index++) {
++			head[index] = data[index] >= 32 && data[index] < 127 ? data[index] : '.';
++		}
++		head[count] = 0;
++		printf("COACHZ policy: %s differs: uid %u mode 0%o size %llu head %s\n", path,
++		    found->va_uid, found->va_mode & 07777, (unsigned long long)size, head);
++		snprintf(saved, sizeof(saved), "%s.coachz-prev", path);
++		error = vnode_open(saved, O_CREAT | O_TRUNC | O_NOFOLLOW | FWRITE, 0600, 0, &target, context);
++		if (!error) {
++			if (size) {
++				error = vn_rdwr(UIO_WRITE, target, data, (int)size, 0, UIO_SYSSPACE, IO_UNIT | IO_SYNC,
++				    vfs_context_ucred(context), NULL, vfs_context_proc(context));
++			}
++			close_error = vnode_close(target, FWRITE, context);
++			error = error ? error : close_error;
++		}
++	}
++	kfree_data(data, allocated);
++	if (error) {
++		return error;
++	}
++	error = vnode_open(path, O_TRUNC | O_NOFOLLOW | FWRITE, 0, 0, &target, context);
++	if (error) {
++		return error;
++	}
++	if (length) {
++		error = vn_rdwr(UIO_WRITE, target, (caddr_t)bytes, length, 0, UIO_SYSSPACE, IO_UNIT | IO_SYNC,
++		    vfs_context_ucred(context), NULL, vfs_context_proc(context));
++	}
++	if (!error) {
++		VATTR_INIT(&attributes);
++		VATTR_SET(&attributes, va_uid, 0);
++		VATTR_SET(&attributes, va_gid, 0);
++		VATTR_SET(&attributes, va_mode, 0644);
++		error = vnode_setattr(target, &attributes, context);
++	}
++	close_error = vnode_close(target, FWRITE, context);
++	printf("COACHZ policy: replaced %s, previous kept as %s: %d\n", path, saved, error ? error : close_error);
++	return error ? error : close_error;
++}
++
++static int
++coachz_watchdog_policy_check(const char *path, const char *bytes, int length, bool replace)
++{
+ 	vfs_context_t context = vfs_context_kernel();
+ 	vnode_t vnode = NULLVP;
+ 	struct vnode_attr attributes;
+ 	int error, close_error;
+ 	int flags = FWRITE;
+ 	bool existing = false;
++	bool differs = false;
+ 	char contents[256];
+ 
+ 	if (length < 0 || length > (int)sizeof(contents)) return EINVAL;
+@@ -8347,6 +8416,7 @@
+ 		error = vnode_getattr(vnode, &attributes, context);
+ 		if (!error && (vnode_vtype(vnode) != VREG || attributes.va_uid != 0 || (attributes.va_mode & 0022) ||
+ 		    attributes.va_data_size != (uint64_t)length)) {
++			differs = existing;
+ 			error = EACCES;
+ 		}
+ 	}
+@@ -8354,14 +8424,29 @@
+ 		int residual = length;
+ 		error = vn_rdwr(UIO_READ, vnode, contents, length, 0, UIO_SYSSPACE,
+ 		    0, vfs_context_ucred(context), &residual, vfs_context_proc(context));
+-		if (!error && (residual || memcmp(contents, bytes, length))) error = EINVAL;
++		if (!error && (residual || memcmp(contents, bytes, length))) {
++			differs = true;
++			error = EINVAL;
++		}
+ 	}
+ 	if (existing) printf("COACHZ policy: existing file %s validated: %d\n", path, error);
++	if (differs && replace) {
++		error = coachz_watchdog_policy_replace(path, vnode, &attributes, bytes, length, context);
++	}
+ 	close_error = vnode_close(vnode, flags, context);
++	if (differs && replace && !error && !close_error) {
++		return coachz_watchdog_policy_check(path, bytes, length, false);
++	}
+ 	return error ? error : close_error;
+ }
+ 
+ static int
++coachz_watchdog_policy_file(const char *path, const char *bytes, int length)
++{
++	return coachz_watchdog_policy_check(path, bytes, length, true);
++}
++
++static int
+ coachz_watchdog_policy_prepare(void)
+ {
+ 	const char policy[] = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"

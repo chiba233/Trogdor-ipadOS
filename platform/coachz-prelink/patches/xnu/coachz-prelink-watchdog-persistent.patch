@@ -1,0 +1,59 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8313,35 +8313,52 @@
+ /* Temporary bring-up policy, using launchd's original root-owned disabled.plist loader.
+  * The only job disabled is watchdogd: its native missing-IOWatchdog path BRKs on this
+- * board. Both files live in the newly mounted memory Data and vanish at reboot.
++ * board. Both files live on the selected Data volume; validate and reuse them on later boots.
+  * No system-volume bytes, daemon binary, VM identity or global panic policy change.
+  */
+ static int
+ coachz_watchdog_policy_file(const char *path, const char *bytes, int length)
+ {
+ 	vfs_context_t context = vfs_context_kernel();
+ 	vnode_t vnode = NULLVP;
+ 	struct vnode_attr attributes;
+ 	int error, close_error;
++	int flags = FWRITE;
++	bool existing = false;
++	char contents[256];
++
++	if (length < 0 || length > (int)sizeof(contents)) return EINVAL;
+ 
+ 	error = vnode_open(path, O_CREAT | O_EXCL | O_NOFOLLOW | FWRITE, 0644, 0, &vnode, context);
++	if (error == EEXIST) {
++		flags = FREAD;
++		error = vnode_open(path, O_NOFOLLOW | FREAD, 0, 0, &vnode, context);
++		existing = true;
++	}
+ 	if (error) {
+ 		return error;
+ 	}
+-	if (length) {
++	if (!existing && length) {
+ 		error = vn_rdwr(UIO_WRITE, vnode, (caddr_t)bytes, length, 0, UIO_SYSSPACE,
+ 		    IO_UNIT | IO_SYNC, vfs_context_ucred(context), NULL, vfs_context_proc(context));
+ 	}
+ 	if (!error) {
+ 		VATTR_INIT(&attributes);
+ 		VATTR_WANTED(&attributes, va_uid);
+ 		VATTR_WANTED(&attributes, va_mode);
+ 		VATTR_WANTED(&attributes, va_data_size);
+ 		error = vnode_getattr(vnode, &attributes, context);
+-		if (!error && (attributes.va_uid != 0 || (attributes.va_mode & 0022) ||
++		if (!error && (vnode_vtype(vnode) != VREG || attributes.va_uid != 0 || (attributes.va_mode & 0022) ||
+ 		    attributes.va_data_size != (uint64_t)length)) {
+ 			error = EACCES;
+ 		}
+ 	}
+-	close_error = vnode_close(vnode, FWRITE, context);
++	if (!error && existing && length) {
++		int residual = length;
++		error = vn_rdwr(UIO_READ, vnode, contents, length, 0, UIO_SYSSPACE,
++		    0, vfs_context_ucred(context), &residual, vfs_context_proc(context));
++		if (!error && (residual || memcmp(contents, bytes, length))) error = EINVAL;
++	}
++	if (existing) printf("COACHZ policy: existing file %s validated: %d\n", path, error);
++	close_error = vnode_close(vnode, flags, context);
+ 	return error ? error : close_error;
+ }
