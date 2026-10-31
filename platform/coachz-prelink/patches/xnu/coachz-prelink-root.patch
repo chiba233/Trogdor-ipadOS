@@ -35,3 +35,29 @@
  	KERNEL_DEBUG_CONSTANT_IST(KDEBUG_COMMON,
  	    BSDDBG_CODE(DBG_BSD_PROC, BSD_PROC_EXIT) | DBG_FUNC_START,
  	    pid, exitval, 0, 0, 0);
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1088,6 +1088,23 @@
+ 				native_owner_root_checkpoint(autherr, owner, device);
+ 			}
+ #endif
++			/*
++			 * Coachz has no chain of trust to extend, and its USB root is not a sealed volume.
++			 * Accept it only read-only and only on the Coachz USB disk, and say so on the
++			 * screen. This is not a verification.
++			 */
++			if (autherr && !owner_authorized) {
++				extern int coachz_usb_root_device(dev_t);
++				mount_t root_mount = vnode_mount(rootvnode);
++				vnode_t device_vnode = vfs_devvp(root_mount);
++				dev_t device = device_vnode ? vnode_specrdev(device_vnode) : NODEV;
++				if (device_vnode) {
++					vnode_put(device_vnode);
++				}
++				owner_authorized = (vfs_flags(root_mount) & MNT_RDONLY) && device != NODEV && coachz_usb_root_device(device);
++				printf("COACHZ root: authentication error %d, unsealed read-only USB root %s\n", autherr,
++				    owner_authorized ? "accepted" : "refused");
++			}
+ 			if (autherr && !owner_authorized) {
+ 				panic("rootvp not authenticated after mounting");
+ 			}

@@ -709,3 +709,18 @@ panic 的调用栈为 `PE_init_iokit → InitIOKit → OSlibkernInit → OSRunti
 只有屏幕证据。照片里没有出现每分钟一次的 `COACHZ media:` 行，IOKit 块设备、GPT 分区和 IOMedia 是否发布还没有确认。没有写外接盘、固件或内置盘。
 
 未解决：根文件系统仍是内存盘。随机 zone panic 原因未查明。外接盘此前那次自行断开的原因也未查明。
+
+
+## 2026-10-31：恢复环境从外接盘挂根
+
+运行时与配置见随本节提交。镜像在内核分区后多了一个 GPT APFS 分区，里面是此前作为内存盘验证过的同一个 IPSW 恢复卷；内存里不再放 `RAMDisk`，只放它的 trust cache，启动参数是 `rd=disk1s1`。外接盘由随本节提交的免密写盘器写入并完整回读，写盘器只写核对过型号和容量的那块外接盘。
+
+第一轮（镜像 SHA-256 `39ece1b8088b91432841c4da628fe2fd17836661e75c6d6f89823967c85c5064`）：屏幕显示 `Got boot device = .../NativeRamBlock/IOBlockStorageDriver/Coachz USB mass storage Media/IOGUIDPartitionScheme/Coachz root@2/AppleAPFSContainerScheme/AppleAPFSMedia/AppleAPFSContainer/ramdisk@1`，`BSD root: disk1s1`，APFS 打印 `mount-complete volume ramdisk`。随后 APFS 判定这是需要根哈希认证的根卷（`could not retrieve system-volume-auth-blob from device tree`），内核 panic：`rootvp not authenticated after mounting`。内存盘根不经过这项检查。
+
+修正：`coachz-prelink-root.patch` 在这个 panic 之前加一道判断，只有 Apple 的认证失败、根卷只读挂载、且它的 IOMedia 沿 provider 链能追到 `NativeRamBlock` 时才放行，并在屏幕打印 `COACHZ root: ... accepted` 或 `refused`。这不是验证：这台机器本来就没有可以延伸的信任链，根卷也不是封存卷。UniXNU 的 owner root 签名清单路线没有接入。
+
+第二轮（镜像 SHA-256 `dcae41b0b501f20be8c40e92032b49db8ee4f2e3d57f81fa1132d7eec666f1fc`）：没有 panic。`restored_update` 从外接盘根运行，行为与内存盘时相同：`disable_watchdog failed`，`exit: pid 5 restored_update status 0x100`，`restored exited normally with status 1 - rebooting`，之后循环等待 `IONVRAM`，并开始反复打印 `Waiting for NAND service to publish`。内核在 140 秒时仍存活，挂根前和心跳时的 IOMedia 列表为：`disk0`（GUID_partition_scheme，128035676160 字节）、`disk0s1`（ChromeOS 内核分区）、`disk0s2`（APFS 分区）、`disk1`（APFS 容器）、`disk1s1`（APFS 卷）。
+
+只有屏幕证据。照片里没有拍到 `COACHZ root:` 那一行；没有 panic 且根上的程序开始运行，说明放行生效，这是推断。根是只读的，没有写外接盘、固件或内置盘。这仍是恢复环境，不是主系统。
+
+未解决：外接盘有两次在热重启后开机即识别为 `JMICRON JMS580`、容量 0，重新插拔后恢复，两次之前都运行过我们的 USB 栈；但这一轮热重启后它正常识别为 `Lenovo L7C 128GB`，所以和我们的 USB 栈有没有关系还不能下结论。随机 zone panic 未解释。

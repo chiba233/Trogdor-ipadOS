@@ -34,7 +34,7 @@ diff --git a/bsd/dev/coachz_sample.c b/bsd/dev/coachz_sample.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/coachz_sample.c
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,64 @@
 +/*
 + * Bring-up diagnostics, adapted from the process sampler of ios-sweet (MIT, Copyright
 + * (c) 2026 dipa-studio). The screen is the only output: a kernel thread prints a line
@@ -93,6 +93,8 @@ new file mode 100644
 +
 +	/* tmpfs has no personality to load it, and iOS has no /sbin/kextload for mount_tmpfs. */
 +	printf("COACHZ: tmpfs load: 0x%x\n", OSKextLoadKextWithIdentifier("com.apple.filesystems.tmpfs"));
++	/* The storage stack as the root lookup starts: names for rd= on a disk root. */
++	coachz_usb_report();
 +	if (kernel_thread_start(coachz_sample_thread, NULL, &thread) == KERN_SUCCESS) {
 +		thread_deallocate(thread);
 +	}

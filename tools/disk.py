@@ -14,6 +14,7 @@ ENTRY_SIZE = 128
 FIRST = 2048
 LENGTH = 32768  # 16 MiB kernel partition
 KERNEL_TYPE = uuid.UUID("fe3a2a5d-4f32-41a7-b725-accc3285a309")
+APFS_TYPE = uuid.UUID("7c3457ef-0000-11aa-aa11-00306543ecac")
 
 
 def layout(disk_mib, kernel_mib):
@@ -23,7 +24,7 @@ def layout(disk_mib, kernel_mib):
     return disk_mib * 2048, kernel_mib * 2048
 
 
-def fragments(payload, label="Coachz probe", disk_mib=64, kernel_mib=16, tries=1):
+def fragments(payload, label="Coachz probe", disk_mib=64, kernel_mib=16, tries=1, root=None):
     sectors, length = layout(disk_mib, kernel_mib)
     if type(tries) is not int or not 1 <= tries <= 15:
         raise ValueError("GPT tries must be 1..15")
@@ -40,6 +41,15 @@ def fragments(payload, label="Coachz probe", disk_mib=64, kernel_mib=16, tries=1
     attrs = (1 << 48) | (tries << 52)
     struct.pack_into("<16s16sQQQ72s", entries, 0, KERNEL_TYPE.bytes_le,
                      part_guid.bytes_le, FIRST, FIRST + length - 1, attrs, name)
+    # An optional APFS container right after the kernel partition, for a disk root. Not bootable.
+    root_first = FIRST + length
+    if root is not None:
+        root_length = -(-len(root) // (1 << 20)) * 2048
+        if not root or root_first + root_length > sectors - 34:
+            raise ValueError("root container does not fit the disk")
+        struct.pack_into("<16s16sQQQ72s", entries, ENTRY_SIZE, APFS_TYPE.bytes_le,
+                         uuid.uuid5(disk_guid, "root").bytes_le, root_first, root_first + root_length - 1, 0,
+                         "Coachz root".encode("utf-16-le"))
     array_crc = zlib.crc32(entries)
     def header(current, alternate, array_lba):
         h = bytearray(SECTOR)
@@ -52,12 +62,15 @@ def fragments(payload, label="Coachz probe", disk_mib=64, kernel_mib=16, tries=1
     struct.pack_into("<B3sB3sII", mbr, 446, 0, b"\0\2\0", 0xee,
                      b"\xff\xff\xff", 1, sectors - 1)
     mbr[510:512] = b"\x55\xaa"
-    return [(0, mbr), (SECTOR, header(1, sectors - 1, 2)), (2 * SECTOR, entries),
-            (FIRST * SECTOR, payload), ((sectors - 33) * SECTOR, entries),
-            ((sectors - 1) * SECTOR, header(sectors - 1, 1, sectors - 33))]
+    parts = [(0, mbr), (SECTOR, header(1, sectors - 1, 2)), (2 * SECTOR, entries),
+             (FIRST * SECTOR, payload), ((sectors - 33) * SECTOR, entries),
+             ((sectors - 1) * SECTOR, header(sectors - 1, 1, sectors - 33))]
+    if root is not None:
+        parts.insert(4, (root_first * SECTOR, root))
+    return parts
 
 
-def create_image(source, output, label="Coachz probe", disk_mib=64, kernel_mib=16, tries=1):
+def create_image(source, output, label="Coachz probe", disk_mib=64, kernel_mib=16, tries=1, root=None):
     sectors, length = layout(disk_mib, kernel_mib)
     source, output = Path(source).resolve(), Path(output).resolve()
     if not source.is_file():
@@ -66,7 +79,8 @@ def create_image(source, output, label="Coachz probe", disk_mib=64, kernel_mib=1
         raise ValueError("kernel container exceeds partition")
     if output == source or output.suffix != ".img" or output.is_relative_to(Path("/dev")):
         raise ValueError("output must be a separate .img file outside /dev")
-    parts = fragments(source.read_bytes(), label, disk_mib, kernel_mib, tries)
+    parts = fragments(source.read_bytes(), label, disk_mib, kernel_mib, tries,
+                      None if root is None else Path(root).read_bytes())
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("xb") as dest:
         dest.truncate(sectors * SECTOR)

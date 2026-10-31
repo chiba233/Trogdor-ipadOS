@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 from pathlib import Path
+import re
 import struct
 import tomllib
 
@@ -121,7 +122,7 @@ def wrap_trust_cache(module):
     return struct.pack('<II', 1, 8) + module
 
 
-def prelink_tree(adt, window, tree, ramdisk, cache, environment=None):
+def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=True):
     root = read_tree(adt)
     table = tomllib.loads(OS_PROFILE.read_text())['adt']
     apply_identity(root, table['root'])
@@ -130,19 +131,29 @@ def prelink_tree(adt, window, tree, ramdisk, cache, environment=None):
     if environment:
         root.child('chosen').set('osenvironment', environment.encode() + b'\0')
     memory_map = root.child('chosen').child('memory-map')
-    memory_map.set('RAMDisk', bytes(16))
+    # Without a RAMDisk entry IOFindBSDRoot makes no md0, and rd= names a disk partition.
+    if ram_root:
+        memory_map.set('RAMDisk', bytes(16))
     memory_map.set('TrustCache', bytes(16))
     disk = window + up(tree + len(root.write()))
-    memory_map.set('RAMDisk', struct.pack('<QQ', disk, len(ramdisk)))
+    if ram_root:
+        memory_map.set('RAMDisk', struct.pack('<QQ', disk, len(ramdisk)))
     memory_map.set('TrustCache', struct.pack('<QQ', disk + len(ramdisk), len(cache)))
     return root.write()
 
 
-def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=False, root_cache=None):
+def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=False, root_cache=None, root_device=None):
     if window & 0x1fffff or memory & 0x1fffff:
         raise ValueError('window base and size must be 2 MiB aligned')
     kernel = macho(data)
+    if root_device and (not prelinked or not root_cache or ramdisk is not None or command_line):
+        raise ValueError('a disk root needs the prelinked kernel, its trust cache and no RAM disk')
     command_line = command_line or (PRELINK_COMMAND_LINE if prelinked else COMMAND_LINE)
+    if root_device:
+        if not re.fullmatch(r'disk[0-9]+(s[0-9]+)*', root_device):
+            raise ValueError('invalid root device name')
+        command_line = command_line.replace('rd=md0', 'rd=' + root_device)
+        ramdisk = b''
     ramdisk = init_ramdisk() if ramdisk is None else ramdisk
     span = kernel.end - kernel.base
     bias = kernel.base & 0x1fffff
@@ -151,7 +162,7 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
     if prelinked:
         cache = wrap_trust_cache(root_cache) if root_cache else trust_cache(ramdisk)
         ramdisk += bytes(-len(ramdisk) % 4096)
-        adt = prelink_tree(adt, window, tree, ramdisk, cache, 'restore' if root_cache else None)
+        adt = prelink_tree(adt, window, tree, ramdisk, cache, 'restore' if root_cache else None, ram_root=not root_device)
         ramdisk = ramdisk + cache + bytes(-len(cache) % 4096)
     else:
         adt = add_ramdisk_property(adt, window + up(tree + len(adt) + 52), len(ramdisk))
@@ -184,15 +195,19 @@ def main():
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--prelinked', action='store_true', help='kernel carries the original components: trust the init program through a trust cache')
     p.add_argument('--root-image', type=Path, help='with --prelinked: RAM disk root instead of the init program; from tools/xnu_ipsw.py')
-    p.add_argument('--root-trust-cache', type=Path, help='the original trust cache module of --root-image')
+    p.add_argument('--root-trust-cache', type=Path, help='the original trust cache module of --root-image or --root-device')
+    p.add_argument('--root-device', help='with --prelinked: root on this BSD disk instead of a RAM disk, such as disk1s1')
     a = p.parse_args()
     if a.output.exists() or a.output.resolve().is_relative_to(Path('/dev')):
         p.error('output must be a new ordinary file')
-    if bool(a.root_image) != bool(a.root_trust_cache) or (a.root_image and not a.prelinked):
+    if a.root_device:
+        if a.root_image or not a.root_trust_cache or not a.prelinked:
+            p.error('--root-device takes --root-trust-cache and --prelinked, and no --root-image')
+    elif bool(a.root_image) != bool(a.root_trust_cache) or (a.root_image and not a.prelinked):
         p.error('--root-image and --root-trust-cache go together and need --prelinked')
     payload = pack(a.kernel.read_bytes(), a.adt.read_bytes(), a.window, a.memory, prelinked=a.prelinked,
                    ramdisk=a.root_image.read_bytes() if a.root_image else None,
-                   root_cache=a.root_trust_cache.read_bytes() if a.root_trust_cache else None)
+                   root_cache=a.root_trust_cache.read_bytes() if a.root_trust_cache else None, root_device=a.root_device)
     a.output.parent.mkdir(parents=True, exist_ok=True)
     a.output.write_bytes(payload)
     print('Built screen-output XNU payload', hashlib.sha256(payload).hexdigest())

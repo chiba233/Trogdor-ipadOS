@@ -20,4 +20,4 @@ Coachz 上的事实：控制器在 `0x0a600000`，中断是 GIC INTID 165（SPI 
 
 这个实验没有用到中断，也没有开 MMU 和缓存。XNU 里的驱动要自己解决 Device 映射、非缓存 DMA 内存和块设备接口。
 
-XNU 里的驱动在 `platform/coachz-prelink/drivers/RamBlock`。控制器用 `ml_io_map` 映射成 Device 内存，DMA 池是 XNU 物理窗口外的一段固定物理内存，用 `ml_io_map_wcomb` 映射成非缓存内存。两者都从 ARM 固定 8 MiB 的 `io_submap` 分配，所以 DMA 池只有 1 MiB；16 MiB 的第一版在映射时就 panic 了。2026-10-31 真机屏幕确认内核读到了同样三个扇区。
+XNU 里的驱动在 `platform/coachz-prelink/drivers/RamBlock`。控制器用 `ml_io_map` 映射成 Device 内存，DMA 池是 XNU 物理窗口外的一段固定物理内存，用 `ml_io_map_wcomb` 映射成非缓存内存。两者都从 ARM 固定 8 MiB 的 `io_submap` 分配，所以 DMA 池只有 1 MiB；16 MiB 的第一版在映射时就 panic 了。2026-10-31 真机屏幕确认内核读到了同样三个扇区，随后 IOKit 存储栈在它上面发布了 GPT 分区和 APFS 卷，恢复卷从外接盘挂成只读根。驱动报告写保护并拒绝写请求。

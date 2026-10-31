@@ -321,6 +321,10 @@ class DisplayTests(unittest.TestCase):
         self.assertIn('allocClassWithName("ApplePMGRNub")',(platform/'patches/xnu/coachz-prelink-pmgr.patch').read_text())
         self.assertIn('"--root", "com.apple.filesystems.tmpfs"',(platform/'board.toml').read_text())
         self.assertIn('xcf\\xfa\\xed\\xfe',(platform/'patches/xnu/coachz-prelink-root.patch').read_text())
+        root_patch=(platform/'patches/xnu/coachz-prelink-root.patch').read_text()
+        self.assertIn('owner_authorized = (vfs_flags(root_mount) & MNT_RDONLY) && device != NODEV && coachz_usb_root_device(device);',root_patch)
+        self.assertIn('OSDynamicCast(NativeRamBlock, provider)',(platform/'drivers/RamBlock/NativeRamBlock.cpp').read_text())
+        self.assertIn('#define POOL_BYTES (1ul * 1024 * 1024)',(platform/'drivers/RamBlock/coachz_usb.c').read_text())
         self.assertIn('OSKextLoadKextWithIdentifier("com.apple.filesystems.tmpfs")',(platform/'patches/xnu/coachz-prelink-diagnostics.patch').read_text())
         self.assertIn('((adt+adtsize+15)&~15ull)!=ramdisk',(ROOT/'boot/xnu_screen.c').read_text())
         self.assertIn('ramdisk_at = (adt_at + len(adt) + 15) & ~15',(ROOT/'tools/xnu_screen.py').read_text())
@@ -349,6 +353,10 @@ class DisplayTests(unittest.TestCase):
         disk=0x40000000+((0x4000+len(out)+0x3fff)&~0x3fff)
         self.assertEqual(props['RAMDisk'],struct.pack('<QQ',disk,4096))
         self.assertEqual(props['TrustCache'],struct.pack('<QQ',disk+4096,56))
+        disk_root=read_tree(prelink_tree(tree,0x40000000,0x4000,b'',cache,'restore',ram_root=False))
+        props={key:value for key,_,value in disk_root.child('chosen').child('memory-map').props}
+        self.assertNotIn('RAMDisk',props)
+        self.assertEqual(struct.unpack_from('<QQ',props['TrustCache'])[1],56)
 
     def test_hardware_verified_scanout_restart_order_is_unchanged(self):
         source=(ROOT/'boot/display.c').read_text()

@@ -18,6 +18,7 @@ int coachz_usb_open(uint64_t *blocks);
 int coachz_usb_read(uint64_t block, uint32_t count, void **data);
 uint32_t coachz_usb_max_blocks(void);
 void coachz_usb_report(void);
+int coachz_usb_root_device(dev_t device);
 // RamBlock's interface to the kernel patches; nothing here is a RAM disk or carries a seed.
 volatile uint32_t native_ram_block_ready = 0;
 volatile uint64_t native_ram_block_bytes = 0;
@@ -136,6 +137,34 @@ extern "C" void coachz_usb_report(void)
         size ? size->unsigned64BitValue() : 0ull, content ? content->getCStringNoCopy() : "-");
   }
   iterator->release();
+}
+
+// Whether a BSD device is media stacked on this driver, as the unsealed root patch asks. One media
+// must carry that major and minor, and its provider chain must reach us. This is not a verification.
+extern "C" int coachz_usb_root_device(dev_t device)
+{
+  OSDictionary *matching = IOService::serviceMatching("IOMedia");
+  OSDictionary *properties = OSDictionary::withCapacity(2);
+  OSNumber *mjr = OSNumber::withNumber(static_cast<unsigned>(major(device)), 32);
+  OSNumber *mnr = OSNumber::withNumber(static_cast<unsigned>(minor(device)), 32);
+  bool ready = matching && properties && mjr && mnr && properties->setObject(kIOBSDMajorKey, mjr) &&
+               properties->setObject(kIOBSDMinorKey, mnr) && matching->setObject("IOPropertyMatch", properties);
+  OSSafeReleaseNULL(mnr); OSSafeReleaseNULL(mjr); OSSafeReleaseNULL(properties);
+  OSIterator *iterator = ready ? IOService::getMatchingServices(matching) : nullptr;
+  OSSafeReleaseNULL(matching);
+  if (!iterator) return 0;
+  unsigned matches = 0;
+  bool ours = false;
+  while (OSObject *object = iterator->getNextObject()) {
+    IOService *media = OSDynamicCast(IOService, object);
+    if (!media || ++matches != 1) { ours = false; continue; }
+    unsigned depth = 0;
+    for (IOService *provider = media; provider && depth < 64; provider = provider->getProvider(), depth++) {
+      if (OSDynamicCast(NativeRamBlock, provider)) { ours = true; break; }
+    }
+  }
+  iterator->release();
+  return matches == 1 && ours;
 }
 
 extern "C" int native_ram_block_volume_device(const char *, dev_t *, char *, size_t) { return 0; }

@@ -8,7 +8,7 @@ import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
-from disk import create_image, fragments, FIRST, LENGTH, SECTOR, SECTORS, KERNEL_TYPE
+from disk import create_image, fragments, APFS_TYPE, FIRST, LENGTH, SECTOR, SECTORS, KERNEL_TYPE
 
 
 class DiskTests(unittest.TestCase):
@@ -64,6 +64,20 @@ class DiskTests(unittest.TestCase):
         for label in ("x" * 37, "bad\0name"):
             with self.assertRaises(ValueError):
                 fragments(self.payload(), label)
+
+    def test_optional_root_container_follows_the_kernel_partition(self):
+        root = b"NXSB" + bytes(3 << 20)
+        parts = fragments(self.payload(), disk_mib=64, kernel_mib=16, root=root)
+        entries = parts[2][1]
+        self.assertEqual(uuid.UUID(bytes_le=bytes(entries[128:144])), APFS_TYPE)
+        first, last, attrs = struct.unpack_from("<QQQ", entries, 128 + 32)
+        self.assertEqual((first, last - first + 1, attrs), (FIRST + LENGTH, 4 * 2048, 0))
+        self.assertIn((first * SECTOR, root), parts)
+        self.assertFalse(any(entries[256:]))
+        self.assertEqual(fragments(self.payload())[2][1][128:], bytes(127 * 128))
+        for oversized in (b"", bytes((64 - 16) << 20)):
+            with self.assertRaises(ValueError):
+                fragments(self.payload(), root=oversized)
 
     def test_existing_file_and_device_output_are_refused(self):
         with tempfile.TemporaryDirectory() as d:

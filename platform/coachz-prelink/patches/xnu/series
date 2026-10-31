@@ -6,7 +6,7 @@ component:XnuPrelink/patches/xnu-10063.141.1-sparse-index.patch
 ../../../coachz-screen/patches/xnu/coachz-screen-console.patch
 # The ApplePMGRNub that the original AMFI waits for.
 coachz-prelink-pmgr.patch
-# APFS RAM disk root, and process start and exit lines on the screen console.
+# APFS RAM disk root, the unsealed read-only USB root, and process start and exit lines on the screen console.
 coachz-prelink-root.patch
 # Load tmpfs, and report thread states on the screen console every minute.
 coachz-prelink-diagnostics.patch
