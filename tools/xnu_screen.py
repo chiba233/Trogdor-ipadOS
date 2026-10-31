@@ -253,6 +253,8 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         command_line += ' coachz-null-call=1'
         # The drivers under test: Chrome EC battery, a speaker tone and the volume buttons (docs/plans/battery-speaker.md, input.md).
         command_line += ' coachz-battery=1 coachz-speaker=1 coachz-buttons=1'
+        # The panel backlight behind the system's brightness control, and the Zed keyboard (docs/plans/backlight.md, input.md).
+        command_line += ' coachz-backlight=1 coachz-usb-keyboard=1'
     if cpus != 1:
         # coachz-prelink-smp.patch raises BCM2837's board configuration to eight CPUs in two clusters.
         if not root_uuid or not prelinked or not 2 <= cpus <= 8:

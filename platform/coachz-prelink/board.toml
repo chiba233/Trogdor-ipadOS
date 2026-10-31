@@ -18,7 +18,7 @@ patch_series = ["arch:patches/xnu/series", "device:patches/xnu/series"]
 # The profile's list, with the USB stack and the driver that uses it.
 archives = ["build-corecrypto-14.py", "build-corecrypto-14.py --namespace", "component:ArmDTPlatform", "component:ArmCpu",
   "component:SoftwareAES", "build-software-aes-bindings.py", "build-mockfs-fixture.py", "build-libpthread-kernel.py",
-  "component:RamBlock", "../drivers/RamBlock/build-usb-stack.py", "build-coachz-display.py", "component:AppleKeyStoreState", "component:ShengHidInput"]
+  "component:RamBlock", "../drivers/RamBlock/build-usb-stack.py", "build-coachz-display.py", "component:AppleKeyStoreState", "component:ShengHidInput", "build-coachz-backlight.py"]
 
 [kernel.prelink]
 # The restore RAM disk mounts tmpfs: the OS profile's list does not include it.

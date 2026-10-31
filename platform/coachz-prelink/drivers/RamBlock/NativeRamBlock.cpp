@@ -147,6 +147,22 @@ extern "C" void coachz_log_panic_flush(void) {
   running = 0;
 }
 
+// The Zed keyboard (coachz_usb_hid.c): its interrupt queue every 8 ms, under the same gate as block I/O.
+extern "C" {
+void coachz_usb_hid_poll(void);
+int coachz_usb_keyboard_enabled(void);
+}
+static thread_call_t keyboard_call;
+
+static void keyboard_poll(thread_call_param_t, thread_call_param_t) {
+  IOLockLock(log_gate);
+  coachz_usb_hid_poll();
+  IOLockUnlock(log_gate);
+  uint64_t deadline;
+  clock_interval_to_deadline(8, NSEC_PER_MSEC, &deadline);
+  thread_call_enter_delayed(keyboard_call, deadline);
+}
+
 static void log_start(IOLock *gate, uint64_t capacity) {
   if (!coachz_log_window(capacity, data_window, log_window)) {
     kprintf("COACHZ log: no room for the log ring past the partitions\n");
@@ -159,6 +175,9 @@ static void log_start(IOLock *gate, uint64_t capacity) {
   log_gate = gate;
   kprintf("COACHZ log: kernel log ring at block %llu, %llu MiB\n", log_window.first, log_window.blocks / 2048);
   thread_call_enter(log_call);
+  if (coachz_usb_keyboard_enabled() && (keyboard_call = thread_call_allocate(keyboard_poll, nullptr))) {
+    thread_call_enter(keyboard_call);
+  }
 }
 
 class NativeRamBlock : public IOBlockStorageDevice {

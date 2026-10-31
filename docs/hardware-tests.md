@@ -1249,3 +1249,11 @@ XNU 只用它们生成 IOPlatformUUID，没有它，CurrentHost 偏好写不进�
   屏幕上没有出现音量条，可能因为系统还没有音频设备，未验证。
 
 k54 起第一帧之后屏幕不再显示诊断文字（`coachz-console-band=0`），输出只进日志区，panic 时恢复显示。
+
+## 背光和键盘（k55）
+
+- 背光（`coachz-backlight=1`，说明在 `docs/plans/backlight.md`）：`initial duty 52428`、`service conforms 1 attached 1 started 1`，
+  随后 269 行 `target … applied … readback …`，读回值和设定值只差量化误差，错误数 0。**机主确认控制中心的亮度滑块能调屏幕亮度。**
+- 键盘（`coachz-usb-keyboard=1`，`coachz_usb_hid.c`）：`keyboard at 2, vendor 18d1 product 504c, interface 0 ... protocol 0 idle -6 queue 1`。
+  SET_IDLE 失败（-6），打字不受影响。**机主确认键盘能用。** 开机早期有一行 `the keyboard device is not ready for report 0`，因为报告先于 HID 设备到达。
+- 这次开机全程没有 panic 和 `@crash`，系统盘正常。

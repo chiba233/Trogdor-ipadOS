@@ -1,13 +1,13 @@
 # 机身按键与键盘
 
-依据是 `Trogdor-Input-Research` 调研的顺序：机身按键 → 基本键盘 → 触控板光标与点击 → 滚动与多指 → 拔插与休眠。这里完成了前两步的代码。机身按键已接入构建，真机结果在 `docs/hardware-tests.md`；USB 键盘在 `pending/`，还没有接入。主机测试 `tests/test_input.py` 通过。
+依据是 `Trogdor-Input-Research` 调研的顺序：机身按键 → 基本键盘 → 触控板光标与点击 → 滚动与多指 → 拔插与休眠。这里完成了前两步的代码。机身按键已接入构建，真机结果在 `docs/hardware-tests.md`；USB 键盘（`drivers/RamBlock/coachz_usb_hid.c`）已接入，由 `coachz-usb-keyboard=1` 打开。主机测试 `tests/test_input.py` 通过。
 
 ## 补丁和文件
 
 | 位置 | 内容 | 启用方式 |
 |---|---|---|
 | `patches/xnu/coachz-prelink-input.patch` | `iokit/Kernel/CoachzInput.cpp`：在 `IOHIDResource` 下、触摸数字化仪旁边发布 ShengHidInput 的键盘/Consumer 设备（`native_hid_input_allocate`，报告 1 为 boot 键盘，报告 2 的第 1～3 位为 Power、音量加、音量减），并为它加一个内核 IOHIDEventDriver personality（与 CoachzHid.cpp 给数字化仪的做法相同）；每 20 ms 用 `EC_CMD_MKBP_INFO` 读 EC 按键的**当前状态**，变化时发报告 2；导出 `coachz_input_keyboard_report()` 给 USB 键盘发报告 1 | `series` 中放在电池补丁之后；`coachz-buttons=1`（只有音量）或 `=3`（加上电源键） |
-| `pending/usb-keyboard/coachz_usb_hid.c` | Zed 底座键盘（USB `18d1:504c` 的接口 0，boot keyboard）：`usb_hid_init()` 切到 boot protocol、SET_IDLE 0、开一个 interrupt-IN 队列；`coachz_usb_hid_poll()` 取报告转给上面的函数；`coachz_usb_enumerate_hubs()` 开机时只轮询 hub 一秒 | 见同目录 `README.md` 的五步接线 |
+| `drivers/RamBlock/coachz_usb_hid.c` | Zed 底座键盘（USB `18d1:504c` 的接口 0，boot keyboard）：`usb_hid_init()` 切到 boot protocol、SET_IDLE 0、开一个 interrupt-IN 队列；`coachz_usb_hid_poll()` 取报告转给上面的函数；`coachz_usb_enumerate_hubs()` 开机时只轮询 hub 一秒 | 见同目录 `README.md` 的五步接线 |
 
 `input.patch` 与 `speaker.patch` 互不依赖，都以 `battery.patch` 为前提；电池→扬声器→输入、电池→输入→扬声器两种顺序都已验证能打上。
 

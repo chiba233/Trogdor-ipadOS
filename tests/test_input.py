@@ -27,7 +27,7 @@ class InputTests(unittest.TestCase):
         self.assertIn('methods[181]==0xfffffff004add0c4', script)
 
     def test_usb_keyboard_never_polls_the_disk(self):
-        source = (ROOT / 'platform/coachz-prelink/pending/usb-keyboard/coachz_usb_hid.c').read_text()
+        source = (ROOT / 'platform/coachz-prelink/drivers/RamBlock/coachz_usb_hid.c').read_text()
         code = re.sub(r'/\*.*?\*/', '', source, flags=re.S)
         self.assertNotIn('usb_poll(', code)
         self.assertIn('dev != disk', code)

@@ -117,6 +117,18 @@ int coachz_usb_read(uint64_t block, uint32_t count, void **data) {
     return 1;
 }
 
+/* coachz-usb-keyboard=1: the Zed keyboard behind the hub (coachz_usb_hid.c). */
+extern void coachz_usb_enumerate_hubs(unsigned ms, usbdev_t *disk);
+extern int PE_parse_boot_argn(const char *, void *, int);
+int coachz_usb_keyboard_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        unsigned value = 0;
+        enabled = PE_parse_boot_argn("coachz-usb-keyboard", &value, sizeof(value)) && value == 1;
+    }
+    return enabled;
+}
+
 int coachz_usb_open(uint64_t *blocks) {
     xhci_va = ml_io_map(XHCI_BASE, XHCI_BYTES);
     pool_va = ml_io_map_wcomb(POOL_BASE, POOL_BYTES);
@@ -145,5 +157,7 @@ int coachz_usb_open(uint64_t *blocks) {
         kprintf("COACHZ USB: lba %d ok %d value 0x%llx\n", probes[i].lba, ok, ok ? (unsigned long long)le64_at((uint8_t *)data + probes[i].at) : 0ull);
         if (!ok) return 0;
     }
+    /* A keyboard can enumerate after the disk. Later polls stay away from usb_poll(), which would test the disk too. */
+    if (coachz_usb_keyboard_enabled()) coachz_usb_enumerate_hubs(1000, disk);
     return 1;
 }

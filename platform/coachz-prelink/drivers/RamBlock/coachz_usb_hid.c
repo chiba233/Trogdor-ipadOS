@@ -68,8 +68,12 @@ static const interface_descriptor_t *first_interface(usbdev_t *dev) {
 }
 
 void usb_hid_init(usbdev_t *dev) {
+	extern int coachz_usb_keyboard_enabled(void);
 	dev->poll = hid_nop_poll;
 	dev->destroy = hid_destroy;
+	if (!coachz_usb_keyboard_enabled()) {
+		return;
+	}
 	const interface_descriptor_t *intf = first_interface(dev);
 	if (!intf || intf->bInterfaceClass != 3 || intf->bInterfaceSubClass != 1 || intf->bInterfaceProtocol != 1) {
 		kprintf("COACHZ USB HID: address %d is not a boot keyboard (%d/%d/%d), left alone\n", dev->address,

@@ -7,7 +7,12 @@
 #define CONFIG_LP_USB_HUB 1
 #define CONFIG_LP_USB_MSC 1
 #define CONFIG_LP_USB_GEN_HUB 1
+/* The kernel's USB stack carries the Zed keyboard (coachz_usb_hid.c); the probe's reader does not. */
+#ifdef COACHZ_USB_KERNEL
+#define CONFIG_LP_USB_HID 1
+#else
 #define CONFIG_LP_USB_HID 0
+#endif
 #define CONFIG_LP_USB_EHCI 0
 #define CONFIG_LP_USB_OHCI 0
 #define CONFIG_LP_USB_UHCI 0

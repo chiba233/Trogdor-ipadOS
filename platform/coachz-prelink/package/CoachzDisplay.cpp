@@ -137,6 +137,7 @@ static void cpu_probe() {
         midr,mpidr,counter_hz(),us,us?20000000/us:0);
 }
 extern "C" void coachz_keystore_start(void);
+extern "C" int coachz_backlight_start(IOService *display);
 int coachz_display_start(void) {
     int enabled=0;
     if(!PE_parse_boot_argn("coachz-display",&enabled,sizeof(enabled)) || enabled!=1)return 0;
@@ -194,6 +195,8 @@ int coachz_display_start(void) {
     if(!display->start(nub))return EIO;
     stage=10;
     kprintf("COACHZ display: original Legacy active, mode %lux%lu scale 2 registered %u\n",video.v_width,video.v_height,registrations);
+    // The panel backlight service below the display (CoachzBacklightStart.cpp, coachz-backlight=1 or 2): a failure leaves the display as it is.
+    if(int backlight=coachz_backlight_start(display))kprintf("COACHZ display: backlight start-up failed: %d\n",backlight);
     return registrations?0:EIO;
 }
 }

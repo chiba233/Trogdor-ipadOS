@@ -11,7 +11,7 @@ out = ROOT / 'build/coachz-usb'
 out.mkdir(parents=True, exist_ok=True)
 objects = []
 stack = HERE / 'usb'
-for source in sorted(stack.glob('*.c')) + [HERE / 'coachz_usb.c']:
+for source in sorted(stack.glob('*.c')) + [HERE / 'coachz_usb.c', HERE / 'coachz_usb_hid.c']:
     destination = out / (source.stem + '.o')
     command, index, arguments = [], 0, record['arguments']
     while index < len(arguments):
