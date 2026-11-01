@@ -12,8 +12,8 @@
 |---|---|---|
 | SMEM平台清点 | 已写：确认ADT范围与XNU内存窗口不重叠，解析公开partition table，仅读global/APPS-MODEM，读取incoming SMP2P及已有GLINK描述符 | 真机：global 和 apps-modem 分区读到，modem 启动后能看到它新建的条目 |
 | WLFW控制报文 | 已写：QMI/TLV、indication registration、CAP、SC7180 MSA-info请求、严格响应匹配、能力字段、QRTR服务增删 | 主机固定报文通过；没有实际发送或收到固件响应 |
-| MPSS 启动 | 已写（`coachz-wifi=4`，`coachz-prelink-wifi.patch`）：照主线 `qcom_q6v5_mss` 的 MBA 和 MPSS 加载、内存归属、IPA 供电和 rmtfs 共享 | 真机：MBA 就绪、MPSS 认证通过、modem 运行；还没有 ready 位 |
-| 传输 | 待做：AP 侧 SMEM 分配（硬件锁）、SMP2P 出站条目、GLINK 握手、QRTR/QMI 事务与超时，rmtfs 服务 | 真实WLFW服务与有效响应 |
+| MPSS 启动 | 已写（`coachz-wifi=4`，`coachz-prelink-wifi.patch`）：照主线 `qcom_q6v5_mss` 的 MBA 和 MPSS 加载、内存归属、IPA 供电和 rmtfs 共享；AP 侧 SMEM 分配（TCSR 互斥锁 3）和 SMP2P 条目 428 | 真机：modem 报告 ready 和 handover；约 40 s 后因初始化卡住报 fatal |
+| 传输 | 待做：GLINK（AP 的 FIFO 479、版本和通道握手）、QRTR 名字服务、rmtfs 服务（EFS），QMI 事务与超时 | 真实WLFW服务与有效响应 |
 | 无线扫描 | 待做：正确BDF、firmware/host SMMU、CE、HTC/WMI/HTT、真实BSS | 重复扫描与错误回收 |
 | 联网与系统接入 | 待做：station/WPA2、ifnet/Apple80211、wifid/configd、DHCP和DNS | 系统网络栈联网，再验证设置操作和生命周期 |
 
@@ -31,7 +31,7 @@
 - MSA报文只接受当前参考DTS的`0x94100000/2MiB`；调用前仍需确认实际FDT及内存所有权。这里只构造报文，未作权限分配或发送。
 - 主机SID为`0xc0`、firmware SID为`0xc2`，不能套Pixel `0x640`。本轮未配置任何SMMU。
 - Linux目标使用MSS PIL，并非只换Pixel PAS函数的地址；本轮不提供未经目标验证的启动序列。
-- SMP2P incoming为item 428、MODEM→APPS（1→0）；GLINK为478/479/480。只读已有内容，不创建/消费/确认任何item。
+- SMP2P：modem 写 item 435（MODEM→APPS，1→0），AP 写 428（主线 `smp2p.c` 把 `qcom,smem = <435>, <428>` 依次当作入站、出站）；GLINK为478/479/480。只读已有内容，不创建/消费/确认任何item。
 - `SMEM v12 inventory status 0`只说明布局解析成功。状态位和旧item可能是残留，不能写成“固件ready”或“Wi-Fi启动成功”。
 
 ## 未启用状态与主机检查

@@ -10,7 +10,9 @@
 #define CW_SMEM_APPS 0u
 #define CW_SMEM_MODEM 1u
 #define CW_SMEM_GLOBAL 0xfffeu
-#define CW_SMP2P_IN 428u
+/* smp2p.c reads qcom,smem = <435>, <428> as inbound, outbound: the modem writes 435, the AP 428. */
+#define CW_SMP2P_IN 435u
+#define CW_SMP2P_OUT 428u
 #define CW_GLINK_DESC 478u
 #define CW_GLINK_TX 479u
 #define CW_GLINK_RX 480u

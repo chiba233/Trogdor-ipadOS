@@ -1463,3 +1463,11 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 - k95，每次查找都重新读分区头之后：apps-modem 分区的已分配末尾从 `0x20` 涨到 `0x5208`，modem 运行并建了约 20 KiB 的条目。它没有置 ready 位；AP 这边自己的 SMP2P 条目（435）和 GLINK 都还没有，15 s 后照 Linux 的失败流程回收了 modem。
 - 送显拷贝：GPU 把每一帧拷进固件帧缓冲（UniXNU 的 hand-off）。k94 时这一拷平均 24 ms（71 帧），从一帧渲染完到拷贝结束约 31 ms，而每个渲染 pass 的 GPU 时间平均约 2 ms；提交到送进 GPU 之前还在编码线程上等约 12.7 ms。k95 的拷贝核每个线程搬 4 个像素（16 字节读写），406 帧平均 11 ms、最近一次 9 ms，前 4 帧逐行比对无差异；等待拷贝完成的平均时间从 23.3 ms 降到 10.6 ms。
 - 触摸：k94 的 48 份、k95 的 219 份报告全部送进 HID，0 错误。
+
+## modem 报告 ready 和 handover、GPU 提交时间戳（k96、k97）
+
+- k96 由 AP 先建了 SMP2P 条目 435。modem 照样跑起来，在 apps-modem 分区里建了 605（32 字节）、478（GLINK 描述符）、480（16 KiB 的 GLINK FIFO）和 611（4 KiB），但没有出现 428。主线 `smp2p.c` 把 `qcom,smem = <435>, <428>` 依次当作入站、出站：435 是 modem 写的，428 才是 AP 的。k95 没建任何条目时分区末尾同样是 `0x5208`，多出的 360 字节就是 modem 自己的 435；k96 占了它的位置。
+- k97 由 AP 建 428（TCSR 互斥锁 3 号下分配，`master-kernel` 和 `ipa` 两项）。modem 把版本降到 1、带 SSR_ACK 协商成功，MPSS 认证完成后 30 ms 在 `slave-kernel` 里置了 ready 和 handover（`0x6`），照 Linux 在 handover 时撤回了代投的电压票。它运行约 40 s 后置 fatal，SMEM 里的原因是 `dog_hal_common.c:173:DOG detects stalled initialization, triage with IMAGE OWNER`。这时它已经建了 GLINK 的 478 和 480，在等 AP 的 479；AP 这边还没有 GLINK、QRTR 和 rmtfs。系统本身没有 panic。
+- Debian 上 `qrtr-ns` 和 `rmtfs -r -s -v -o /lib/firmware/rmtfs` 在跑，EFS 是那个目录里的 `modem_fs1`、`modem_fs2`、`modem_fsc`、`modem_fsg`（各 2 MiB）。
+- GPU 提交时间戳（`COACHZ gpu stamps`，CP_ALWAYS_ON_COUNTER，结束前先 CP_WAIT_FOR_IDLE）：GPU 执行一次提交约 2–6 ms，排队平时几十微秒、忙时平均约 3–4 ms，完成后约 0.1 ms 被看到。同时段渲染一帧“提交到完成”平均 13–19 ms，大部分不在 GPU 上。送显拷贝平均 8–10 ms，其中 GPU 执行约 1.5–2 ms。
+- 触摸：k97 的 764 份报告全部送进 HID，0 错误；杂散 SGI 一直是 0。

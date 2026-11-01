@@ -125,9 +125,9 @@ flowchart LR
 | 内存带宽 | 通过 | 按主线公式给 DDR 和内存总线投票后，内存延迟从约 195 ns 降到 135–140 ns，带宽和 Debian 一致 |
 | 温度、加速度计、合盖 | 只读 | 能读到值；没有接温控和 CoreMotion，屏幕不会自动旋转 |
 | GPU 启动和命令执行 | 通过 | CP 经 SMMU 从 ring 和 IB 写内存，fence 到达，所有故障寄存器为 0 |
-| GPU 合成界面（Metal、Turnip） | 通过，还不够流畅 | 提交到完成平均约 18–23 ms，每次提交都完成、无故障；送显时 GPU 把一帧拷进帧缓冲平均约 11 ms（每个线程搬 4 个像素，原来 24 ms），还没有直接扫描输出；GPU 进程崩溃时释放缓冲区的 panic 已修；App 自己用 Metal 还没确认，没有 GPU 中断和电源管理 |
+| GPU 合成界面（Metal、Turnip） | 通过，还不够流畅 | 提交到完成平均约 18–23 ms，每次提交都完成、无故障；送显时 GPU 把一帧拷进帧缓冲平均约 8–10 ms（每个线程搬 4 个像素，原来 24 ms），其中 GPU 执行只有约 2 ms，其余在用户态的编码和提交上；还没有直接扫描输出；GPU 进程崩溃时释放缓冲区的 panic 已修；App 自己用 Metal 还没确认，没有 GPU 中断和电源管理 |
 | GPU 调频 | 通过 | 档位切换实测应答 18–60 µs、测得 179–800 MHz；按 UniXNU 的规则让 GPU 约一半时间忙碌，触摸后用最高档 |
-| Wi-Fi、蜂窝网络 | 部分 | 照主线 `qcom_q6v5_mss` 启动 modem：MBA 就绪，`qdsp6sw.mbn` 认证通过，modem 跑起来并在共享内存里建了自己的条目；AP 这边的 SMP2P、GLINK、QMI 还没做，modem 没报告就绪；没有网络 |
+| Wi-Fi、蜂窝网络 | 部分 | 照主线 `qcom_q6v5_mss` 启动 modem：MBA 就绪，`qdsp6sw.mbn` 认证通过，经 SMP2P 报告 ready 和 handover；AP 这边还没有 GLINK、QRTR 和 rmtfs，modem 约 40 s 后因初始化卡住自己报错；没有网络 |
 
 屏幕照片阶段没有逐字段核对。有一个原因不明的随机 zone panic，没有解决；长时间稳定性没有验证。详情见 [状态](docs/status.md) 和 [硬件记录](docs/hardware-tests.md)。
 

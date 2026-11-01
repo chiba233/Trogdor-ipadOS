@@ -105,6 +105,54 @@ void cpState(const char *when) {
         *reinterpret_cast<volatile uint32_t *>(gSmmu + SmmuSgfsr));
 }
 
+extern "C" {
+extern volatile uint32_t native_adreno_stamp_seqno[64];
+extern volatile uint64_t native_adreno_stamp_cpu[64][2];
+}
+
+// The last 64 framed submissions as the ring stamps them (NativeAdrenoRing.cpp, a6xx_submit's CP_ALWAYS_ON_COUNTER reads): queue is
+// submission to the CP starting it, gpu the CP start to the GPU idle after its buffers, seen that idle to a fence poll noticing it. The
+// GPU counter and mach_absolute_time both count 19.2 MHz; their offset is read here. Only submissions completed since the last line.
+void stampReport() {
+    static uint32_t reported;
+    if (!gMaps[2]) return;
+    const volatile uint32_t *page = reinterpret_cast<const volatile uint32_t *>(gMaps[2]->getVirtualAddress()) + 0x800 / 4;
+    const uint64_t before = mach_absolute_time();
+    uint32_t lo = coreRead(0x980), hi = coreRead(0x981);
+    const uint32_t again = coreRead(0x980);
+    if (again < lo) {lo = again; hi = coreRead(0x981);}
+    const uint64_t after = mach_absolute_time();
+    const int64_t offset = static_cast<int64_t>((before + after) / 2) - static_cast<int64_t>(static_cast<uint64_t>(hi) << 32 | lo);
+    uint64_t queue = 0, gpu = 0, seen = 0, queueMax = 0, gpuMax = 0, seenMax = 0;
+    unsigned n = 0, bins[7] = {};
+    uint32_t newest = reported;
+    for (unsigned slot = 0; slot < 64; ++slot) {
+        const uint32_t seq = native_adreno_stamp_seqno[slot];
+        const uint64_t submitted = native_adreno_stamp_cpu[slot][0], noticed = native_adreno_stamp_cpu[slot][1];
+        if (!seq || seq <= reported || !noticed) continue;
+        const uint64_t start = page[slot * 4] | static_cast<uint64_t>(page[slot * 4 + 1]) << 32;
+        const uint64_t end = page[slot * 4 + 2] | static_cast<uint64_t>(page[slot * 4 + 3]) << 32;
+        if (!start || end < start) continue;
+        const int64_t startCpu = static_cast<int64_t>(start) + offset, endCpu = static_cast<int64_t>(end) + offset;
+        const uint64_t q = startCpu > static_cast<int64_t>(submitted) ? (static_cast<uint64_t>(startCpu) - submitted) * 10 / 192 : 0;
+        const uint64_t g = (end - start) * 10 / 192;
+        const uint64_t d = static_cast<int64_t>(noticed) > endCpu ? (noticed - static_cast<uint64_t>(endCpu)) * 10 / 192 : 0;
+        queue += q; gpu += g; seen += d; ++n;
+        if (q > queueMax) queueMax = q;
+        if (g > gpuMax) gpuMax = g;
+        if (d > seenMax) seenMax = d;
+        unsigned bin = 0;
+        while (bin < 6 && g >= (1000ull << bin)) ++bin;
+        ++bins[bin];
+        if (seq > newest) newest = seq;
+    }
+    reported = newest;
+    if (!n) return;
+    printf("COACHZ gpu stamps: %u submissions, queue mean %llu max %llu us, gpu mean %llu max %llu us, seen mean %llu max %llu us; "
+        "gpu <1 %u <2 %u <4 %u <8 %u <16 %u <32 %u more %u ms\n", n, queue / n, queueMax, gpu / n, gpuMax, seen / n, seenMax,
+        bins[0], bins[1], bins[2], bins[3], bins[4], bins[5], bins[6]);
+}
+
 // Every ten seconds, what reached the driver: whether the plug-in opened it, what it reports, what the CP has run and what reached the screen.
 void reportThread(void *, wait_result_t) {
     for (;;) {
@@ -114,6 +162,7 @@ void reportThread(void *, wait_result_t) {
             gRing.lastSubmitted(), static_cast<unsigned long long>(native_gop_gpu_offers), static_cast<unsigned long long>(native_gop_gpu_completions),
             static_cast<unsigned long long>(native_gop_gpu_failures), static_cast<unsigned long long>(native_gop_gpu_abandoned));
         cpState("now");
+        stampReport();
         // Imported BOs the submit path left alone under IO coherence: [2] before submissions, [3] after completions.
         printf("COACHZ gpu9: coherent %u, maintenance skipped before submit %u after completion %u\n", native_adreno_io_coherent,
             native_adreno_coherent_skips[2], native_adreno_coherent_skips[3]);

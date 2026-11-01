@@ -13,7 +13,7 @@
  	extern void coachz_battery_start(void);
 --- /dev/null
 +++ b/bsd/dev/coachz_wifi.c
-@@ -0,0 +1,1443 @@
+@@ -0,0 +1,1659 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/* WCN3990 / SC7180: the modem that hosts the WLAN firmware, started as mainline's qcom_q6v5_mss does (coachz-wifi=4), and the SMEM
 + * inventory (coachz-wifi=1 plus an explicit /arm-io/coachz-wifi ADT node): the public table, the global partition and APPS<->MODEM.
@@ -816,21 +816,233 @@
 +}
 +
 +/*
-+ * The modem's side of SMP2P: item 428 (modem to apps, looked up in the apps-modem partition, then the global one, as qcom_smem_get does
-+ * for a remote) and its "slave-kernel" entry, whose bits qcom_q6v5.c takes as 0 fatal, 1 ready, 2 handover, 3 stop-ack. Returns the
-+ * entry's value, or -1 while the modem has not created it.
++ * The AP's side of SMEM and SMP2P, as Linux sets it up long before the modem starts. Allocation is qcom_smem_alloc_private in the
++ * apps-modem partition under the TCSR mutex SMEM uses (sc7180.dtsi: hwlocks = <&tcsr_mutex 3>; qcom,tcsr-mutex at 0x01f40000, one lock
++ * every 0x1000 bytes; the AP takes a lock by writing 1, QCOM_MUTEX_APPS_PROC_ID, and reading it back). SMEM is mapped as device memory,
++ * so every access is an aligned word.
 + */
++static volatile uint32_t *wifi_smem_lock;
++
++static int
++wifi_smem_lock_take(void)
++{
++    if (!wifi_smem_lock) {
++        const vm_offset_t page = ml_io_map(0x01f40000 + 3 * 0x1000, 0x1000);
++        if (!page) return 0;
++        wifi_smem_lock = (volatile uint32_t *)page;
++    }
++    for (unsigned tries = 0; tries < 100000; tries++) {   /* HWSPINLOCK_TIMEOUT: 1 s */
++        *wifi_smem_lock = 1;
++        __asm__ volatile ("dsb sy" ::: "memory");
++        if (*wifi_smem_lock == 1) return 1;
++        delay(10);
++    }
++    return 0;
++}
++
++static void
++wifi_smem_lock_drop(void)
++{
++    if (*wifi_smem_lock == 1) *wifi_smem_lock = 0;
++    __asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static volatile uint32_t *
++wifi_smem_word(uint32_t offset)
++{
++    return (volatile uint32_t *)(((const struct wifi_mapping *)wifi_smem_reader.context)->base + offset);
++}
++
++/* Lists the apps-modem partition's uncached items (id and size), at most 48, as one line. */
++static void
++wifi_smem_list(const char *label)
++{
++    struct cw_smem layout;
++    char line[400];
++    size_t used = 0;
++    unsigned count = 0;
++    if (!wifi_smem_now(&layout) || !layout.has_modem) return;
++    const uint32_t base = layout.modem.offset, end = layout.modem.uncached;
++    for (uint32_t off = 32; off + 16 <= end && count < 48 && used < sizeof(line) - 24; count++) {
++        const uint32_t w0 = *wifi_smem_word(base + off), size = *wifi_smem_word(base + off + 4), w2 = *wifi_smem_word(base + off + 8);
++        if ((w0 & 0xffff) != 0xa5a5) {
++            used += snprintf(line + used, sizeof(line) - used, " bad canary at 0x%x", off);
++            break;
++        }
++        used += snprintf(line + used, sizeof(line) - used, " %u:%u", w0 >> 16, size);
++        off += 16 + (w2 >> 16) + size;
++    }
++    printf("COACHZ smem %s: %u items, end 0x%x:%s\n", label, count, end, line);
++}
++
++/* qcom_smem_alloc_private: a new uncached item of size bytes at the partition's end of allocations, its header written before the end
++ * moves. Returns the SMEM offset of the item's data (also when it already exists), or a negative errno. */
++static int64_t
++wifi_smem_alloc(uint16_t item, uint32_t size)
++{
++    struct cw_smem layout;
++    if (!wifi_smem_now(&layout) || !layout.has_modem) return -2;
++    const uint32_t base = layout.modem.offset, limit = layout.modem.bytes, aligned = (size + 7) & ~7u;
++    if (!wifi_smem_lock_take()) return -16;
++    int64_t result = -28;
++    const uint32_t uncached = *wifi_smem_word(base + 12), cached = *wifi_smem_word(base + 16);
++    uint32_t off = 32;
++    while (off + 16 <= uncached && off < limit) {
++        const uint32_t w0 = *wifi_smem_word(base + off), bytes = *wifi_smem_word(base + off + 4), w2 = *wifi_smem_word(base + off + 8);
++        if ((w0 & 0xffff) != 0xa5a5) { result = -5; goto out; }
++        if ((w0 >> 16) == item) { result = (int64_t)(base + off + 16 + (w2 >> 16)); goto out; }
++        off += 16 + (w2 >> 16) + bytes;
++    }
++    if (off != uncached || cached > limit || off + 16 + aligned > cached) goto out;
++    *wifi_smem_word(base + off) = 0xa5a5u | (uint32_t)item << 16;
++    *wifi_smem_word(base + off + 4) = aligned;
++    *wifi_smem_word(base + off + 8) = aligned - size;   /* padding_data; padding_hdr 0 */
++    *wifi_smem_word(base + off + 12) = 0;
++    for (uint32_t i = 0; i < aligned; i += 4) *wifi_smem_word(base + off + 16 + i) = 0;
++    __asm__ volatile ("dsb sy" ::: "memory");
++    *wifi_smem_word(base + 12) = uncached + 16 + aligned;
++    __asm__ volatile ("dsb sy" ::: "memory");
++    result = (int64_t)(base + off + 16);
++out:
++    wifi_smem_lock_drop();
++    return result;
++}
++
++/*
++ * SMP2P with the modem (smp2p.c; sc7180.dtsi smp2p-mpss: qcom,smem = <435>, <428>, which smp2p.c reads as inbound then outbound, so
++ * the modem writes 435 and the AP 428 (k96 made 435 and took the modem's own item); local pid 0, remote pid 1, kicks through the APSS
++ * IPC register bit 14). The AP's item: magic, pids, 16 entries, SSR_ACK as its feature, the version written last (2 unless the modem's
++ * item says otherwise), then its two outbound entries in the device tree's order, "master-kernel" (the q6v5 stop request) and "ipa"
++ * (the IPA clock answer). On every poll the modem's item is handled as qcom_smp2p_intr does: the version negotiated, a restart
++ * acknowledged when its RESTART_DONE flag differs from our RESTART_ACK, and its "ipa" entry's clock query (bit 0) answered, as
++ * ipa_smp2p_notify does, with valid (bit 0) and enabled (bit 1): the IPA is voted on.
++ */
++#define WIFI_SMP2P_MAGIC 0x504d5324u
++static uint32_t wifi_smp2p_out;   /* SMEM offset of item 428, 0 until made */
++static int wifi_smp2p_negotiated, wifi_smp2p_ssr, wifi_smp2p_ack, wifi_smp2p_ipa_answered;
++
++static void
++wifi_smp2p_kick(void)
++{
++    if (!wifi_qmp_kick) return;
++    __asm__ volatile ("dsb sy" ::: "memory");
++    *wifi_qmp_kick = 1u << 14;
++}
++
++/* The modem's item 435 when it exists: its SMEM offset, else 0. */
++static uint32_t
++wifi_smp2p_in(void)
++{
++    struct cw_item item;
++    struct cw_smem layout;
++    if (!wifi_smem_now(&layout)) return 0;
++    int status = layout.has_modem ? cw_smem_find(&wifi_smem_reader, &layout.modem, CW_SMP2P_IN, &item) : CW_ABSENT;
++    if (status && layout.has_global) status = cw_smem_find(&wifi_smem_reader, &layout.global, CW_SMP2P_IN, &item);
++    return !status && item.bytes >= 20 && *wifi_smem_word(item.offset) == WIFI_SMP2P_MAGIC ? item.offset : 0;
++}
++
++static int64_t
++wifi_smp2p_create(void)
++{
++    const int64_t at = wifi_smem_alloc(CW_SMP2P_OUT, 20 + 16 * 20);
++    if (at < 0) return at;
++    const uint32_t out = (uint32_t)at, in = wifi_smp2p_in();
++    const uint32_t in_version = in ? *wifi_smem_word(in + 4) & 0xff : 0;
++    for (uint32_t i = 0; i < 20 + 16 * 20; i += 4) *wifi_smem_word(out + i) = 0;
++    *wifi_smem_word(out) = WIFI_SMP2P_MAGIC;
++    *wifi_smem_word(out + 4) = 1u << 8;              /* features SSR_ACK, version 0 until the header is complete */
++    *wifi_smem_word(out + 8) = 0 | 1u << 16;          /* local pid 0 (apps), remote pid 1 (modem) */
++    *wifi_smem_word(out + 12) = 16;                   /* total entries 16, valid 0 */
++    __asm__ volatile ("dsb sy" ::: "memory");
++    *wifi_smem_word(out + 4) = (in_version && in_version <= 2 ? in_version : 2) | 1u << 8;
++    wifi_smp2p_kick();
++    static const char names[2][16] = {"master-kernel", "ipa"};
++    for (unsigned e = 0; e < 2; e++) {
++        uint32_t words[4];
++        memcpy(words, names[e], 16);
++        for (unsigned i = 0; i < 4; i++) *wifi_smem_word(out + 20 + 20 * e + 4 * i) = words[i];
++        *wifi_smem_word(out + 36 + 20 * e) = 0;
++        __asm__ volatile ("dsb sy" ::: "memory");
++        *wifi_smem_word(out + 12) = 16 | (e + 1) << 16;
++    }
++    wifi_smp2p_kick();
++    wifi_smp2p_out = out;
++    return 0;
++}
++
++/* One pass of qcom_smp2p_intr. Returns the modem's "slave-kernel" bits (0 fatal, 1 ready, 2 handover, 3 stop-ack), -1 while the modem
++ * has no such entry, -2 without SMEM. */
 +static int64_t
 +wifi_modem_bits(void)
 +{
-+    struct cw_item item;
-+    struct cw_smp2p state;
-+    struct cw_smem layout;
-+    if (!wifi_smem_now(&layout)) return -2;
-+    int status = layout.has_modem ? cw_smem_find(&wifi_smem_reader, &layout.modem, CW_SMP2P_IN, &item) : CW_ABSENT;
-+    if (status && layout.has_global) status = cw_smem_find(&wifi_smem_reader, &layout.global, CW_SMP2P_IN, &item);
-+    if (!status) status = cw_smp2p_read(&wifi_smem_reader, &item, &state);
-+    return !status && state.has_slave ? (int64_t)state.state : -1;
++    const uint32_t in = wifi_smp2p_in(), out = wifi_smp2p_out;
++    if (!wifi_smem_ready) return -2;
++    if (!in) return -1;
++    const uint32_t in_word = *wifi_smem_word(in + 4), in_version = in_word & 0xff, in_flags = *wifi_smem_word(in + 16);
++    const uint32_t valid = *wifi_smem_word(in + 12) >> 16;
++    if (out && !wifi_smp2p_negotiated) {
++        const uint32_t out_word = *wifi_smem_word(out + 4), out_version = out_word & 0xff;
++        if (in_version == out_version) {
++            const uint32_t features = (out_word >> 8) & (in_word >> 8);
++            *wifi_smem_word(out + 4) = out_version | features << 8;
++            wifi_smp2p_ssr = !!(features & 1);
++            wifi_smp2p_negotiated = 1;
++            printf("COACHZ smp2p: negotiated version %u features 0x%x\n", out_version, features);
++        } else if (in_version && in_version < out_version) {
++            *wifi_smem_word(out + 4) = in_version | (out_word & ~0xffu);
++            wifi_smp2p_kick();
++            printf("COACHZ smp2p: version lowered to %u\n", in_version);
++        }
++    }
++    int64_t bits = -1;
++    for (uint32_t e = 0; e < valid && e < 16; e++) {
++        char name[17] = {0};
++        for (unsigned i = 0; i < 4; i++) {
++            const uint32_t w = *wifi_smem_word(in + 20 + 20 * e + 4 * i);
++            memcpy(name + 4 * i, &w, 4);
++        }
++        const uint32_t value = *wifi_smem_word(in + 36 + 20 * e);
++        if (!strcmp(name, "slave-kernel")) bits = value;
++        if (out && !strcmp(name, "ipa") && (value & 1) && !wifi_smp2p_ipa_answered) {
++            *wifi_smem_word(out + 36 + 20 * 1) = 3;   /* our "ipa" entry: clock enabled-valid and enabled */
++            wifi_smp2p_kick();
++            wifi_smp2p_ipa_answered = 1;
++            printf("COACHZ smp2p: IPA clock query answered (modem ipa entry 0x%x)\n", value);
++        }
++    }
++    if (out && wifi_smp2p_negotiated && wifi_smp2p_ssr && (int)(in_flags & 1) != wifi_smp2p_ack) {
++        wifi_smp2p_ack = !wifi_smp2p_ack;
++        const uint32_t flags = *wifi_smem_word(out + 16) & ~2u;
++        *wifi_smem_word(out + 16) = flags | (wifi_smp2p_ack ? 2u : 0);
++        wifi_smp2p_kick();
++        printf("COACHZ smp2p: restart acknowledged (%d)\n", wifi_smp2p_ack);
++    }
++    return bits;
++}
++
++/* What the modem's item holds, as one line: version, features, flags, and every entry with its value. */
++static void
++wifi_smp2p_print(const char *label)
++{
++    const uint32_t in = wifi_smp2p_in();
++    char line[300];
++    size_t used = 0;
++    if (!in) {
++        printf("COACHZ smp2p %s: no modem item (ours %s)\n", label, wifi_smp2p_out ? "made" : "missing");
++        return;
++    }
++    const uint32_t word = *wifi_smem_word(in + 4), pids = *wifi_smem_word(in + 8), counts = *wifi_smem_word(in + 12);
++    for (uint32_t e = 0; e < (counts >> 16) && e < 16 && used < sizeof(line) - 32; e++) {
++        char name[17] = {0};
++        for (unsigned i = 0; i < 4; i++) {
++            const uint32_t w = *wifi_smem_word(in + 20 + 20 * e + 4 * i);
++            memcpy(name + 4 * i, &w, 4);
++        }
++        for (unsigned i = 0; i < 16; i++) if (name[i] && (name[i] < 32 || name[i] > 126)) name[i] = '.';
++        used += snprintf(line + used, sizeof(line) - used, " %s=0x%x", name, *wifi_smem_word(in + 36 + 20 * e));
++    }
++    printf("COACHZ smp2p %s: modem version %u features 0x%x pids 0x%x entries %u/%u flags 0x%x:%s\n", label, word & 0xff, word >> 8, pids,
++        counts >> 16, counts & 0xffff, *wifi_smem_word(in + 16), line);
 +}
 +
 +/* The modem's crash reason (SMEM item 421, as qcom_q6v5.c prints it on a fatal error), when there is one. */
@@ -1056,11 +1268,9 @@
 +        delay(10000);
 +    }
 +    if (seen >= 0 && (seen & 1)) wifi_modem_reason();
-+    {
-+        /* What the modem allocated in its partition by now (k94 saw none, through a stale bound). */
-+        struct cw_smem layout;
-+        if (wifi_smem_now(&layout)) wifi_partition("apps-modem after start", layout.has_modem, &layout.modem);
-+    }
++    /* What the modem allocated in its partition by now (k94 saw none, through a stale bound) and what its SMP2P item holds. */
++    wifi_smem_list("after start");
++    wifi_smp2p_print("after start");
 +out:
 +#undef WIFI_PH
 +    if (disk != NULLVP) vnode_close(disk, FREAD, context);
@@ -1336,6 +1546,12 @@
 +        printf("COACHZ mpss: rmtfs_mem shared with the modem %lld\n",
 +            (long long)wifi_assign_vms(wifi_rmtfs_base, wifi_rmtfs_size, &from, 1, to, rights, 2));
 +    }
++    /* The AP's SMP2P item, which Linux's smp2p driver makes at boot, long before the modem starts. */
++    if (mpss) {
++        wifi_smem_list("before start");
++        const int64_t made = wifi_smp2p_create();
++        printf("COACHZ smp2p: AP item %u %s (%lld)\n", CW_SMP2P_OUT, made ? "not made" : "made", (long long)made);
++    }
 +    /* IPA power before the start, as ipa_modem.c takes it on QCOM_SSR_BEFORE_POWERUP (the modem loads the IPA's GSI firmware). */
 +    const int ipa = wifi_ipa_power();
 +    printf("COACHZ mba attempt 1: IPA %s\n", ipa ? "vote failed" : "powered");
@@ -1353,16 +1569,16 @@
 +    int handed = 0;
 +    printf("COACHZ mpss: watching the modem, bits %lld\n", (long long)seen);
 +    struct cw_smem now_layout;
-+    if (wifi_smem_now(&now_layout)) {
-+        wifi_partition("apps-modem now", now_layout.has_modem, &now_layout.modem);
-+        wifi_glink_state(&wifi_smem_reader, &now_layout);
-+    }
++    wifi_smem_list("running");
++    wifi_smp2p_print("running");
++    if (wifi_smem_now(&now_layout)) wifi_glink_state(&wifi_smem_reader, &now_layout);
 +    for (unsigned second = 1;; second++) {
 +        delay(1000 * 1000);
 +        if (second > 60 && second % 10) continue;
 +        const int64_t bits = wifi_modem_bits();
 +        if (bits != seen || !(second % 60)) {
 +            printf("COACHZ mpss: bits %lld at %u s of running (rmb mba 0x%x)\n", (long long)bits, second, maps.rmb[0x0c / 4]);
++            if (bits != seen) wifi_smp2p_print("change");
 +            seen = bits;
 +        }
 +        if (bits >= 0 && (bits & 4) && !handed) {
@@ -1642,7 +1858,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/coachz_wifi_smem.h
-@@ -0,0 +1,128 @@
+@@ -0,0 +1,130 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/* Read-only SMEM v12 inventory for APPS<->MODEM and the global partition.
 + * Wire layout: Linux smem.c and smp2p.c; see SOURCES.md. No allocation,
@@ -1655,7 +1871,9 @@
 +#define CW_SMEM_APPS 0u
 +#define CW_SMEM_MODEM 1u
 +#define CW_SMEM_GLOBAL 0xfffeu
-+#define CW_SMP2P_IN 428u
++/* smp2p.c reads qcom,smem = <435>, <428> as inbound, outbound: the modem writes 435, the AP 428. */
++#define CW_SMP2P_IN 435u
++#define CW_SMP2P_OUT 428u
 +#define CW_GLINK_DESC 478u
 +#define CW_GLINK_TX 479u
 +#define CW_GLINK_RX 480u

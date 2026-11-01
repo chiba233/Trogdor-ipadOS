@@ -20,7 +20,7 @@ SC7180 SMEM is `0x80900000 + 0x200000`, unlike the Pixel reference. The probe re
 
 The public `$TOC` partition-table format (version 1, used by SMEM v12) is supported. There is no legacy global-heap fallback. A different format produces `CW_UNSUPPORTED` instead of speculative reads. Only the global and APPS/MODEM partitions are inspected; protected ADSP/SLPI partitions are never dereferenced.
 
-The incoming SMP2P item is 428, from MODEM host 1 to APPS host 0. `slave-kernel` is reported as raw state, with version/features/flags. These can be left over from firmware: the snapshot does not establish a live remote processor or ready WLFW endpoint. The existing GLINK items are 478 (descriptor), 479 (APPS TX) and 480 (APPS RX). Missing allocations are normal on a cold boot before MPSS starts.
+The incoming SMP2P item is 435, from MODEM host 1 to APPS host 0 (smp2p.c reads `qcom,smem = <435>, <428>` as inbound, outbound; 428 is the AP's). `slave-kernel` is reported as raw state, with version/features/flags. These can be left over from firmware: the snapshot does not establish a live remote processor or ready WLFW endpoint. The existing GLINK items are 478 (descriptor), 479 (APPS TX) and 480 (APPS RX). Missing allocations are normal on a cold boot before MPSS starts.
 
 No hardware lock, SMEM allocation, GLINK negotiation, FIFO pointer update, mailbox write, SCM call, reset, power vote, radio MMIO or DMA is performed. The mapped SMEM range stays mapped for the kernel lifetime. The inventory runs once on the existing sampler thread.
 
