@@ -1403,3 +1403,11 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 - k78 GPU 剖析（GPU 忙时每秒，按核心周期计）：SP 忙约 40～55%，ALU 只有 4～15%，其余在等 RB 和 UCHE；UCHE 平均延迟 180～370 周期，TP L1 未命中 30～40%；GBIF 读写合计每秒约 3000 万拍，不到 2 GB/s（按每拍 32 字节估计）。是访存延迟，不是算力或带宽。
 - k78 LLCC：切片 1、8、11、12 都是停用（status `0x2`），属性寄存器为 0；GPU 的 `SYSTEM_CACHE_CNTL_0/1` 也是 0。系统缓存在 XNU 下完全没配置。主线开机时会配置全部切片并激活 CPU 切片，GPU 启动时再激活 GPU 和 GPUHTW 切片。
 - k78 MPSS：SMC64 的 SIP 调用可用。TF-A 没有实现 PAS 系列（init-image、mem-setup、auth-and-reset、is-supported、mss-reset），实现了 `assign_mem`。所以 modem 只能按主线 trogdor 的 MBA 自认证路线（q6v5 MSS）启动。TCSR halt：Q6 和 NC 空闲，没有 halt 请求，modem 没在运行。SMEM 清点照常通过。
+
+## LLCC、前台优先、AOSS 和 RPMh（k79、k80）
+
+- k79，LLCC 照主线配置（`coachz-llcc=1`，版本 1.1.2，1 个 bank）：CPU 切片（1）、GPU 切片（12）和 GPUHTW 切片（11）都已激活，属性值与 `llcc-qcom.c` 的 sc7180 表一致；GPU 的 `SYSTEM_CACHE_CNTL_1` 为 `0x16c6318c`，`CNTL_0` 为 `0x3`。和 k78 比：UCHE 平均延迟 268 → 215 周期，提交到完成平均 68.9 → 51.9 ms（约 −25%），每帧 GPU 时间的众数从 64～128 ms 区间移到 32～64 ms。CPU 内存探针没有可见变化。
+- k80，GPU 提交按前台优先排队（backboardd 和报了高优先级的进程先走，其他进程在锁外最多等 16 ms）：整场只拦了 7 次、113 ms。插件统计里的“其他 GPU 作业”是渲染服务器每帧之后那个只有一次 blit 的小命令缓冲，从提交算到完成，主要是在 ring 里排在画面后面的时间，并不是别的进程的作业。提交到完成平均 57.7 ms，最长 142 ms（k79 是 273 ms）；两次操作内容不同，平均值的差别不能归因于这项改动。
+- k80，AOSS QMP 通道照 `qmp_open` 打开：链路、通道、应答都是 UP。
+- k80，AP 侧 RPMh：经 apps RSC 的第一个 active TCS 发出 `mss.lvl=0`，10 µs 内 issued 和 completed 都置位，IRQ 状态位置位。之后的电源轨投票和带宽投票走同一条路。
+- k80，locationd 读了 `gyro` 节点的 `gyro-interrupt-calibration`（CFData，至少 8 字节：偏移 0 的 u16 版本、偏移 4 的 u16 dt、偏移 8 的 u16 rate），之后没有别的内核查询。运动数据走 HID 事件系统的快速通道（`IOHIDServiceClientFastPath*`），需要一个能提供快速通道的加速度计 HID 服务。

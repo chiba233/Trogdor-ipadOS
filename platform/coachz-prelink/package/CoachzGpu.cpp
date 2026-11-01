@@ -84,7 +84,8 @@ uint64_t ringNow(void *) {
     clock_get_system_microtime(&sec, &usec);
     return uint64_t(sec) * 1000000 + usec;
 }
-int ringIdle(void *) {IODelay(20); return 0;}
+// Between two fence polls, which take the publisher's lock: 100 us, the most upstream's board pauses for a GPU interrupt (none here yet).
+int ringIdle(void *) {IODelay(100); return 0;}
 int timerRead(void *, uint32_t reg, uint32_t *value) {*value = coreRead(reg); return 0;}
 
 void cpState(const char *when) {
@@ -152,13 +153,56 @@ void profileSetup() {
     coreWrite(GbifEnable, coreRead(GbifEnable) | 0xf);
 }
 
+// Dynamic GPU frequency, tried once 150 s after the driver starts: the DCVS request the bring-up sends (a6xx_gmu_set_freq for a legacy
+// GMU: DCVS_PERF_SETTING, then OOB DCVS_SET on bit 23, acknowledged on bit 31 and cleared through bit 31), at perf levels 3, 1 and 6
+// (355, 180, 650 MHz), each held half a second while the CP cycle counter measures the clock that results. It ends at 650 MHz.
+enum : uint32_t {GmuDcvsAck = 0x8ff0, GmuDcvsPerf = 0x8ff4, GmuDcvsBw = 0x8ff8, GmuDcvsReturn = 0x8ffc, GmuHostSet = 0x14650,
+    GmuInfo = 0x14648, GmuClearIrq = 0x14644};
+uint32_t gmuRead(uint32_t at) {return *reinterpret_cast<volatile uint32_t *>(gGmu + at);}
+void gmuWrite(uint32_t at, uint32_t value) {
+    __asm__ volatile("dsb sy" ::: "memory");
+    *reinterpret_cast<volatile uint32_t *>(gGmu + at) = value;
+    __asm__ volatile("dsb sy" ::: "memory");
+}
+unsigned dcvsSet(unsigned level, uint32_t *result) {
+    gmuWrite(GmuDcvsAck, 0);
+    gmuWrite(GmuDcvsPerf, 3u << 28 | level);
+    gmuWrite(GmuDcvsBw, 0xff);
+    gmuWrite(GmuHostSet, 1u << 23);
+    unsigned polls = 0;
+    while (polls < 1000 && !(gmuRead(GmuInfo) & (1u << 31))) {
+        IODelay(10);
+        polls++;
+    }
+    gmuWrite(GmuClearIrq, 1u << 31);
+    gmuWrite(GmuHostSet, 1u << 31);
+    *result = gmuRead(GmuDcvsReturn);
+    return polls < 1000 ? polls + 1 : 0;
+}
+void dcvsTest() {
+    static const unsigned levels[] = {3, 1, 6};
+    for (unsigned level : levels) {
+        uint32_t result = 0;
+        const uint64_t began = mach_absolute_time();
+        const unsigned polls = dcvsSet(level, &result);
+        uint64_t ns = 0;
+        absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+        const uint64_t cycles = coreCounter(0x400), always = coreCounter(0x980);
+        IOSleep(500);
+        const uint64_t dCycles = coreCounter(0x400) - cycles, dAlways = coreCounter(0x980) - always;
+        printf("COACHZ gpu dcvs: level %u acknowledged after %u polls in %llu us, return %u, clock %llu MHz\n", level, polls,
+            static_cast<unsigned long long>(ns / 1000), result, static_cast<unsigned long long>(dAlways ? dCycles * 192 / dAlways / 10 : 0));
+    }
+}
+
 void rateThread(void *, wait_result_t) {
     uint64_t cycles = coreCounter(0x400), busy = gmuBusy(), always = coreCounter(0x980), last[ProfileCount], lastGbif[4];
     profileSetup();
     for (unsigned i = 0; i < ProfileCount; i++) last[i] = coreCounter(kProfile[i].counter);
     for (unsigned i = 0; i < 4; i++) lastGbif[i] = gbifCounter(i);
-    for (;;) {
+    for (unsigned seconds = 0;; seconds++) {
         IOSleep(1000);
+        if (seconds == 150) dcvsTest();
         const uint64_t newCycles = coreCounter(0x400), newBusy = gmuBusy(), newAlways = coreCounter(0x980);
         const uint64_t dCycles = newCycles - cycles, dBusy = newBusy - busy, dAlways = newAlways - always;
         uint64_t d[ProfileCount], g[4];
@@ -189,22 +233,74 @@ void rateThread(void *, wait_result_t) {
     }
 }
 
-// Whether the system cache serves the GPU, read only: mainline activates sc7180's GPU and GPUHTW LLCC slices (12 and 11; CPUSS 1, MDM 8) through
-// the broadcast ACT_CTRL and STATUS registers (llcc-qcom.c, n * 4 KiB and 4 + n * 4 KiB; ATTR0/1 at 0x21000 + 8n), then writes the slice IDs to
-// CX_MISC SYSTEM_CACHE_CNTL_1 (a6xx_llc_activate). Bank 0 holds the same registers.
+// The system cache as mainline configures it (llcc-qcom.c; sc7180_data with llcc_v1_reg_offset, so the version 1 path): read the
+// version and bank count from llcc0, write each slice's ATTR1 (priority, max capacity in cache lines per bank) and ATTR0 (bonus
+// ways) through the broadcast region, clear its capacity-allocation disable bit and set its retain-on-power-collapse bit, then
+// activate CPUSS (activate_on_init). The GPU then activates its GPU and GPUHTW slices and programs CX_MISC SYSTEM_CACHE_CNTL_1 and
+// CNTL_0 as a6xx_llc_activate does for a GPU without MMU-500. Each slice's state is printed before and after (coachz-llcc=1).
 extern "C" vm_offset_t ml_io_map(vm_offset_t physical, vm_size_t size);
-void cacheProbe() {
-    const vm_offset_t llcc = ml_io_map(0x09200000, 0x22000), misc = ml_io_map(0x0509e000, 0x1000);
+struct LlccSlice {uint32_t id, maxCapKiB, priority, bonusWays; bool retain, activateOnInit;};
+const LlccSlice kSc7180Slices[] = {{1, 256, 1, 0xf, true, true}, {8, 128, 1, 0xf, true, false}, {11, 128, 1, 0xf, true, false},
+    {12, 128, 1, 0xf, true, false}};
+enum : uint32_t {LlccActCtrl = 0x1000, LlccStatus = 4, LlccAttr0 = 0x21000, LlccAttr1 = 0x21004, LlccDisCapAlloc = 0x21f00,
+    LlccPcbAct = 0x21f04, LlccHwInfo = 0x30000, LlccStatus0 = 0x3000c, LlccDeactivate = 2};
+
+bool llccActivate(vm_offset_t broadcast, uint32_t id) {
+    auto reg = [broadcast](uint32_t at) {return reinterpret_cast<volatile uint32_t *>(broadcast + at);};
+    const uint32_t value = 1u << 1;   // ACT_CTRL_OPCODE_ACTIVATE << ACT_CTRL_OPCODE_SHIFT
+    *reg(id * LlccActCtrl) = value | 1u;   // with ACT_CTRL_ACT_TRIG
+    __asm__ volatile("dsb sy" ::: "memory");
+    *reg(id * LlccActCtrl) = value;
+    __asm__ volatile("dsb sy" ::: "memory");
+    for (unsigned polls = 0; polls < 100; polls++) {
+        if (!(*reg(LlccStatus + id * LlccActCtrl) & LlccDeactivate)) return true;
+        IODelay(1);
+    }
+    return false;
+}
+
+void cacheSetup() {
+    const vm_offset_t llcc = ml_io_map(0x09200000, 0x31000), broadcast = ml_io_map(0x09600000, 0x22000), misc = ml_io_map(0x0509e000, 0x1000);
     auto read = [](vm_offset_t at) {return *reinterpret_cast<volatile uint32_t *>(at);};
-    if (!llcc || !misc) {
+    auto write = [](vm_offset_t at, uint32_t value) {
+        *reinterpret_cast<volatile uint32_t *>(at) = value;
+        __asm__ volatile("dsb sy" ::: "memory");
+    };
+    if (!llcc || !broadcast || !misc) {
         printf("COACHZ llcc: map failed\n");
         return;
     }
-    static const unsigned slices[] = {1, 8, 11, 12};
-    for (unsigned id : slices)
-        printf("COACHZ llcc: slice %u act 0x%x status 0x%x attr0 0x%x attr1 0x%x\n", id, read(llcc + id * 0x1000), read(llcc + 4 + id * 0x1000),
-            read(llcc + 0x21000 + 8 * id), read(llcc + 0x21004 + 8 * id));
-    printf("COACHZ llcc: gpu system cache cntl0 0x%x cntl1 0x%x\n", read(misc + 4), read(misc + 8));
+    auto report = [&](const char *when) {
+        for (const LlccSlice &s : kSc7180Slices)
+            printf("COACHZ llcc: %s slice %u act 0x%x status 0x%x attr0 0x%x attr1 0x%x\n", when, s.id, read(llcc + s.id * LlccActCtrl),
+                read(llcc + LlccStatus + s.id * LlccActCtrl), read(llcc + LlccAttr0 + 8 * s.id), read(llcc + LlccAttr1 + 8 * s.id));
+        printf("COACHZ llcc: %s pcb 0x%x dis-cap 0x%x gpu system cache cntl0 0x%x cntl1 0x%x\n", when, read(llcc + LlccPcbAct),
+            read(llcc + LlccDisCapAlloc), read(misc + 4), read(misc + 8));
+    };
+    const uint32_t version = read(llcc + LlccHwInfo), banks = read(llcc + LlccStatus0) >> 28;
+    printf("COACHZ llcc: version 0x%x banks %u\n", version, banks);
+    report("before");
+    unsigned enabled = 0;
+    if (!PE_parse_boot_argn("coachz-llcc", &enabled, sizeof(enabled)) || enabled != 1) return;
+    if (version >= 0x02000000u || !banks) {
+        printf("COACHZ llcc: not the version 1 layout sc7180_data uses; left alone\n");
+        return;
+    }
+    for (const LlccSlice &s : kSc7180Slices) {
+        const uint32_t lines = (s.maxCapKiB * 1024 / banks) >> 6;
+        write(broadcast + LlccAttr1 + 8 * s.id, s.priority << 4 | lines << 16);
+        write(broadcast + LlccAttr0 + 8 * s.id, s.bonusWays << 16);
+        write(broadcast + LlccDisCapAlloc, read(broadcast + LlccDisCapAlloc) & ~(1u << s.id));
+        if (s.retain) write(broadcast + LlccPcbAct, read(broadcast + LlccPcbAct) | 1u << s.id);
+    }
+    bool cpu = llccActivate(broadcast, 1), gpu = llccActivate(broadcast, 12), htw = llccActivate(broadcast, 11);
+    printf("COACHZ llcc: activated cpu %d gpu %d gpuhtw %d\n", cpu, gpu, htw);
+    if (gpu && htw) {
+        const uint32_t scid = 12;
+        write(misc + 8, scid | scid << 5 | scid << 10 | scid << 15 | scid << 20 | 11u << 25);
+        write(misc + 4, (read(misc + 4) & ~0xfu) | 0x3u);   // no allocation on a write miss
+    }
+    report("after");
 }
 
 // Memory bandwidth and latency on an A55 and an A76, with loops the same as a Debian baseline's on this hardware: no XNU memory path votes for bandwidth,
@@ -374,7 +470,7 @@ extern "C" int coachz_gpu_driver_start(volatile uint8_t *core, volatile uint8_t 
     thread_t thread = THREAD_NULL;
     if (kernel_thread_start(reportThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
     if (kernel_thread_start(memoryProbeThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
-    cacheProbe();
+    cacheSetup();
     if (kernel_thread_start(rateThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
     return accelerator;
 }

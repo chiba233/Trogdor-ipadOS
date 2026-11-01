@@ -15,6 +15,8 @@
 | MPSS/传输 | 待做：SC7180 MBA/PIL、权限和资源、SMEM锁/分配、SMP2P/GLINK握手、QRTR/QMI事务与超时 | 真实WLFW服务与有效响应 |
 
 真机（k78，只读）：TF-A 的 SMC64 SIP 调用可用，PAS 系列一个都没实现，`assign_mem` 实现了，所以 MPSS 只能走主线 trogdor 的 MBA 自认证（`qcom_q6v5_mss.c`，`qcom,sc7180-mss-pil`）。TCSR 0x01f60000 的 Q6/NC halt 空闲、无请求。`qdsp6sw.mbn` 有 65.6 MB，进不了 payload，需要另找传送方式；`mba.mbn` 283 KB 可以。
+
+真机（k80）：AOSS QMP 通道已照 `qmp_open` 打开（链路、通道和应答都是 UP）；AP 侧 RPMh 写入通路可用（active TCS 发出 `mss.lvl=0`，10 µs 完成）。下一步：把 MPSS 固件送进内核，然后照 `qcom_q6v5_mss.c` 做 MBA 启动。
 | 无线扫描 | 待做：正确BDF、firmware/host SMMU、CE、HTC/WMI/HTT、真实BSS | 重复扫描与错误回收 |
 | 联网与系统接入 | 待做：station/WPA2、ifnet/Apple80211、wifid/configd、DHCP和DNS | 系统网络栈联网，再验证设置操作和生命周期 |
 

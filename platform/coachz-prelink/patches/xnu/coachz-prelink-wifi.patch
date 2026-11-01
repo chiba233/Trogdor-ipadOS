@@ -13,7 +13,7 @@
  	extern void coachz_battery_start(void);
 --- /dev/null
 +++ b/bsd/dev/coachz_wifi.c
-@@ -0,0 +1,171 @@
+@@ -0,0 +1,313 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/* WCN3990 / SC7180 first-stage SMEM inventory. Not in the kernel build.
 + * coachz-wifi=1 plus an explicit /arm-io/coachz-wifi ADT node enables it.
@@ -24,6 +24,7 @@
 +#include <sys/param.h>
 +#include <sys/systm.h>
 +#include <machine/machine_routines.h>
++#include <kern/clock.h>
 +#include <pexpert/pexpert.h>
 +#include <pexpert/device_tree.h>
 +#include <libkern/libkern.h>
@@ -141,15 +142,156 @@
 +    }
 +}
 +
++/*
++ * What an MBA start needs from the power side, read only (sc7180.dtsi, gcc-sc7180.c, qcom_aoss.c, rpmh-rsc.c, cmd-db.c): the five
++ * GCC MSS branches q6v5_mss enables (CBCR bit 31 is CLK_OFF, bit 0 the enable), the AOSS QMP descriptor at 0x0c300000 (magic "mail",
++ * version, link and channel states), the apps RSC's DRV2 (0x18220000; TCS block at 0xd00, 672 bytes a TCS) and the CMD DB entries of
++ * the rails its power domains vote (mss.lvl, cx.lvl, mx.lvl: RPMh address and level count).
++ */
++static uint32_t
++wifi_db_u16(vm_offset_t db, uint32_t at)
++{
++    return (*(volatile uint32_t *)(db + (at & ~3u)) >> ((at & 2u) * 8u)) & 0xffffu;
++}
++
++static void
++wifi_power_probe(void)
++{
++    static const struct { uint32_t offset; const char *name; } branches[] = {
++        {0x8a000, "mss-cfg-ahb"}, {0x8a154, "mss-q6-memnoc-axi"}, {0x8a00c, "mss-nav-axi"}, {0x8a150, "mss-snoc-axi"}, {0x8a004, "mss-mfab-axis"},
++    };
++    const vm_offset_t gcc = ml_io_map(0x00100000, 0x90000), qmp = ml_io_map(0x0c300000, 0x1000), rsc = ml_io_map(0x18220000, 0x10000),
++        db = ml_io_map(0x80820000, 0x20000);
++    if (!gcc || !qmp || !rsc || !db) { printf("COACHZ mpss: power map failed\n"); return; }
++    for (unsigned i = 0; i < 5; i++)
++        printf("COACHZ mpss: gcc %s cbcr 0x%x\n", branches[i].name, *(volatile uint32_t *)(gcc + branches[i].offset));
++    const volatile uint32_t *q = (const volatile uint32_t *)qmp;
++    printf("COACHZ mpss: qmp magic 0x%x version %u features 0x%x ucore link 0x%x/0x%x ch 0x%x/0x%x mbox %u@0x%x mcore link 0x%x/0x%x ch 0x%x/0x%x mbox %u@0x%x\n",
++        q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8], q[9], q[10], q[11], q[12], q[13], q[14]);
++    const volatile uint32_t *r = (const volatile uint32_t *)rsc;
++    printf("COACHZ mpss: rsc drv2 id 0x%x solver 0x%x config 0x%x irq enable 0x%x status 0x%x\n", r[0], r[1], r[3],
++        r[0xd00 / 4], r[(0xd00 + 4) / 4]);
++    for (unsigned n = 0; n < 9; n++) {
++        const volatile uint32_t *tcs = (const volatile uint32_t *)(rsc + 0xd00 + 672 * n);
++        printf("COACHZ mpss: tcs %u control 0x%x status 0x%x enable 0x%x\n", n, tcs[0x14 / 4], tcs[0x18 / 4], tcs[0x1c / 4]);
++    }
++    static const struct { uint32_t name0, name1; const char *label; } rails[] = {
++        {0x2e73736du, 0x006c766cu, "mss.lvl"}, {0x6c2e7863u, 0x00006c76u, "cx.lvl"}, {0x6c2e786du, 0x00006c76u, "mx.lvl"},
++    };
++    printf("COACHZ mpss: cmd-db magic 0x%x\n", *(volatile uint32_t *)db);
++    for (unsigned k = 0; k < 3; k++) {
++        uint32_t address = 0, count = 0, found = 0;
++        for (uint32_t i = 0; i < 8 && !found; i++) {
++            const uint32_t rec = 8u + 16u * i;
++            if (!wifi_db_u16(db, rec)) break;
++            const uint32_t headers = 0x90u + wifi_db_u16(db, rec + 2u), entries = wifi_db_u16(db, rec + 6u);
++            for (uint32_t j = 0; j < entries && headers + (j + 1) * 24u <= 0x20000u; j++) {
++                const vm_offset_t entry = db + headers + j * 24u;
++                if (*(volatile uint32_t *)entry != rails[k].name0 || *(volatile uint32_t *)(entry + 4) != rails[k].name1) continue;
++                address = *(volatile uint32_t *)(entry + 16);
++                count = wifi_db_u16(db, headers + j * 24u + 20u) / 2u;
++                found = 1;
++                break;
++            }
++        }
++        printf("COACHZ mpss: cmd-db %s found %u address 0x%x levels %u\n", rails[k].label, found, address, count);
++    }
++}
++
++/*
++ * coachz-wifi=2, the first writes toward an MBA start, both as mainline does them:
++ *  - qmp_open (qcom_aoss.c): acknowledge the AOP's link state, raise ours, then the channel, each followed by a kick of the APSS shared
++ *    mailbox (sc7180 apss_shared at 0x17c00000, IPC register +12, channel 0) and a wait for the AOP's acknowledgement (polled; Linux
++ *    waits on SPI 389). The AOP takes the modem's load state through this channel.
++ *  - one active-only RPMh vote through the apps RSC's first active TCS (rpmh-rsc.c tcs_write and __tcs_set_trigger, register layout
++ *    2.7): mss.lvl to level 0, waited for completion. RPMh keeps the highest vote of every master, so this changes no rail; it shows
++ *    that this kernel can vote (the modem's rails and the GPU's bandwidth go the same way).
++ */
++static int
++wifi_wait_word(volatile uint32_t *word, uint32_t value, unsigned budget_us)
++{
++    for (unsigned waited = 0; waited < budget_us; waited += 10) {
++        if (*word == value) return 1;
++        delay(10);
++    }
++    return *word == value;
++}
++
++static void
++wifi_qmp_open(void)
++{
++    const vm_offset_t qmp = ml_io_map(0x0c300000, 0x1000), mailbox = ml_io_map(0x17c00000, 0x1000);
++    if (!qmp || !mailbox) { printf("COACHZ mpss: qmp map failed\n"); return; }
++    volatile uint32_t *q = (volatile uint32_t *)qmp, *kick = (volatile uint32_t *)(mailbox + 12);
++    const uint32_t up = 0xffffu;
++    if (q[0] != 0x4d41494cu || q[1] != 1 || !q[13]) { printf("COACHZ mpss: qmp descriptor not usable\n"); return; }
++    q[0x10 / 4] = q[0x0c / 4];                    /* acknowledge the AOP's link state */
++    q[0x24 / 4] = up;                             /* our link up */
++    __asm__ volatile ("dsb sy" ::: "memory");
++    *kick = 1;
++    const int link = wifi_wait_word(&q[0x28 / 4], up, 1000000);
++    q[0x2c / 4] = up;                             /* our channel up */
++    __asm__ volatile ("dsb sy" ::: "memory");
++    *kick = 1;
++    const int channel = link && wifi_wait_word(&q[0x14 / 4], up, 1000000);
++    q[0x18 / 4] = up;                             /* acknowledge the AOP's channel */
++    __asm__ volatile ("dsb sy" ::: "memory");
++    *kick = 1;
++    const int acked = channel && wifi_wait_word(&q[0x30 / 4], up, 1000000);
++    printf("COACHZ mpss: qmp open link %d channel %d acked %d, ucore link 0x%x ch 0x%x, mcore link ack 0x%x ch ack 0x%x\n",
++        link, channel, acked, q[3], q[5], q[10], q[12]);
++}
++
++static void
++wifi_rpmh_vote_test(void)
++{
++    const vm_offset_t rsc = ml_io_map(0x18220000, 0x10000);
++    if (!rsc) { printf("COACHZ mpss: rsc map failed\n"); return; }
++    volatile uint32_t *base = (volatile uint32_t *)(rsc + 0xd00), *tcs = (volatile uint32_t *)(rsc + 0xd00);   /* TCS 0, active */
++    const uint32_t control = 0x14 / 4, status = 0x18 / 4, enable = 0x1c / 4, wait = 0x10 / 4, msgid = 0x30 / 4, addr = 0x34 / 4,
++        data = 0x38 / 4, cmd_status = 0x3c / 4;
++    if (!(tcs[status] & 1)) { printf("COACHZ mpss: rpmh tcs 0 busy (0x%x), no vote\n", tcs[status]); return; }
++    base[0] |= 1u;                                /* IRQ_ENABLE for TCS 0 (the status bit is what is polled) */
++    tcs[msgid] = 8u | (1u << 16) | (1u << 8);      /* CMD_MSGID_LEN, WRITE, RESP_REQ */
++    tcs[addr] = 0x30060;                          /* mss.lvl from CMD DB */
++    tcs[data] = 0;
++    tcs[wait] = 1u;
++    tcs[enable] = tcs[enable] | 1u;
++    __asm__ volatile ("dsb sy" ::: "memory");
++    uint32_t v = tcs[control] & ~(1u << 24);
++    tcs[control] = v;
++    v &= ~(1u << 16);
++    tcs[control] = v;
++    tcs[control] = 1u << 16;                      /* AMC mode */
++    __asm__ volatile ("dsb sy" ::: "memory");
++    tcs[control] = (1u << 16) | (1u << 24);       /* trigger */
++    unsigned waited = 0;
++    while (waited < 100000 && !(base[1] & 1u)) { delay(10); waited += 10; }
++    const uint32_t irq = base[1], cmd = tcs[cmd_status], st = tcs[status];
++    base[2] = 1u;                                 /* IRQ_CLEAR */
++    v = tcs[control] & ~(1u << 24);
++    tcs[control] = v;
++    tcs[control] = v & ~(1u << 16);
++    tcs[enable] = 0;
++    base[0] &= ~1u;
++    printf("COACHZ mpss: rpmh vote mss.lvl=0 irq 0x%x after %u us, cmd status 0x%x (issued %u completed %u), tcs status 0x%x\n",
++        irq, waited, cmd, (cmd >> 8) & 1, (cmd >> 16) & 1, st);
++}
++
 +/* Call from the existing sampler thread after IOKit has started, once. */
 +void
 +coachz_wifi_start(void)
 +{
 +    static int started;
 +    unsigned mode = 0;
-+    if (started || !PE_parse_boot_argn("coachz-wifi", &mode, sizeof(mode)) || mode != 1) return;
++    if (started || !PE_parse_boot_argn("coachz-wifi", &mode, sizeof(mode)) || mode < 1 || mode > 2) return;
 +    started = 1;
 +    wifi_mpss_probe();
++    wifi_power_probe();
++    if (mode >= 2) {
++        wifi_qmp_open();
++        wifi_rpmh_vote_test();
++    }
 +    DTEntry node;
 +    const void *property = NULL;
 +    unsigned size = 0;

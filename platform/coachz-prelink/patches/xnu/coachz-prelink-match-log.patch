@@ -1,9 +1,11 @@
 --- a/iokit/Kernel/IOUserClient.cpp
 +++ b/iokit/Kernel/IOUserClient.cpp
-@@ -2694,6 +2694,56 @@
+@@ -2692,6 +2692,71 @@
+ 	boolean_t *matches)
+ {
  	return internal_io_service_match_property_table(service, matching, matchingCnt, matches);
- }
- 
++}
++
 +/*
 + * Diagnostic (coachz-match-log=1): the IOKit matching dictionaries and the services that locationd, backboardd and SpringBoard ask for,
 + * each distinct one once, to the log ring. It shows what CoreMotion looks for before an orientation source is made for it. Read only.
@@ -54,10 +56,23 @@
 +	s->release();
 +}
 +
++/* The registry properties locationd reads (coachz-match-log=1), by entry name and key: what CoreMotion needs from a motion node. */
++static void
++coachz_prop_log(IORegistryEntry * entry, const char * key)
++{
++	char name[17] = {}, text[128];
++	proc_selfname(name, sizeof(name));
++	if (strcmp(name, "locationd")) {
++		return;
++	}
++	snprintf(text, sizeof(text), "%s %s", entry->getName(), key ? key : "*");
++	OSString * read = OSString::withCString(text);
++	coachz_match_log("prop", read);
++	OSSafeReleaseNULL(read);
+ }
+ 
  static kern_return_t
- internal_io_service_get_matching_services(
- 	mach_port_t main_port,
-@@ -2711,6 +2761,7 @@
+@@ -2711,6 +2776,7 @@
  
  	assert(matching_size);
  	obj = OSUnserializeXML(matching, matching_size);
@@ -65,7 +80,7 @@
  
  	if ((dict = OSDynamicCast( OSDictionary, obj))) {
  		IOTaskRegistryCompatibilityMatching(current_task(), dict);
-@@ -2794,6 +2845,7 @@
+@@ -2794,6 +2860,7 @@
  
  	assert(matching_size);
  	obj = OSUnserializeXML(matching, matching_size);
@@ -73,7 +88,7 @@
  
  	if ((dict = OSDynamicCast( OSDictionary, obj))) {
  		IOTaskRegistryCompatibilityMatching(current_task(), dict);
-@@ -2896,6 +2948,7 @@
+@@ -2896,6 +2963,7 @@
  
  		assert(matching_size);
  		obj = OSUnserializeXML(matching, matching_size);
@@ -81,11 +96,44 @@
  		dict = OSDynamicCast(OSDictionary, obj);
  		if (!dict) {
  			err = kIOReturnBadArgument;
-@@ -4377,6 +4430,14 @@
- 	bool           disallowAccess = false;
+@@ -3650,6 +3718,7 @@
+ 	IOReturn            ret = kIOReturnSuccess;
+ 
+ 	CHECK( IORegistryEntry, registry_entry, entry );
++	coachz_prop_log(entry, property_name);
+ 
+ #if CONFIG_MACF
+ 	if (0 != mac_iokit_check_get_property(kauth_cred_get(), entry, property_name)) {
+@@ -3718,6 +3787,7 @@
+ 	OSObject *          obj;
+ 
+ 	CHECK( IORegistryEntry, registry_entry, entry );
++	coachz_prop_log(entry, property_name);
+ 
+ #if CONFIG_MACF
+ 	if (0 != mac_iokit_check_get_property(kauth_cred_get(), entry, property_name)) {
+@@ -3765,6 +3835,7 @@
+ 	OSObject *          obj;
+ 
+ 	CHECK( IORegistryEntry, registry_entry, entry );
++	coachz_prop_log(entry, property_name);
+ 
+ #if CONFIG_MACF
+ 	if (0 != mac_iokit_check_get_property(kauth_cred_get(), entry, property_name)) {
+@@ -3955,6 +4026,9 @@
+ 	const OSSymbol *    sym;
+ 
+ 	CHECK( IORegistryEntry, registry_entry, entry );
++	coachz_prop_log(entry, NULL);
++	coachz_prop_log(entry, NULL);
++	coachz_prop_log(entry, property_name);
+ 
+ #if CONFIG_MACF
+ 	if (0 != mac_iokit_check_get_property(kauth_cred_get(), entry, property_name)) {
+@@ -4378,6 +4452,14 @@
  
  	CHECK( IOService, _service, service );
-+
+ 
 +	{
 +		char text[96];
 +		snprintf(text, sizeof(text), "%s type %u", service->getMetaClass()->getClassName(), connect_type);
@@ -93,6 +141,7 @@
 +		coachz_match_log("open", opened);
 +		OSSafeReleaseNULL(opened);
 +	}
- 
++
  	if (!owningTask) {
  		return kIOReturnBadArgument;
+ 	}

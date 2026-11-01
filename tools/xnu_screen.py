@@ -179,7 +179,7 @@ def smp_tree(root, count):
 
 
 def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=True, root_uuid=None, cpus=1,
-                 full_screen=False, gmu_firmware_size=0, sqe_firmware_size=0, gpu_addon_size=0):
+                 full_screen=False, gmu_firmware_size=0, sqe_firmware_size=0, gpu_addon_size=0, motion_probe=False):
     root = read_tree(adt)
     if cpus > 1:
         smp_tree(root, cpus)
@@ -219,6 +219,13 @@ def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=T
         wifi = root.child('arm-io').child('coachz-wifi')
         wifi.set('compatible', b'google,coachz-wcn3990\0')
         wifi.set('smem-region', struct.pack('<QQ', 0x80900000, 0x200000))
+    if motion_probe:
+        # locationd looks for a registry entry named gyro before it uses motion hardware (coachz-prelink-match-log.patch saw it on
+        # hardware). An otherwise empty node, matched by no driver, shows which properties it then reads.
+        root.child('arm-io').child('gyro').set('compatible', b'coachz,motion-probe\0')
+        # locationd (CLGyro) reads gyro-interrupt-calibration as CFData of at least 8 bytes: u16 version (nonzero) at 0, u16 dt at 4, u16 rate
+        # at 8 (it picks 800 or 200 itself when rate is 0). A version 1 value moves it past that check to whatever it needs next.
+        root.child('arm-io').child('gyro').set('gyro-interrupt-calibration', struct.pack('<6H', 1, 0, 1250, 0, 100, 0))
     disk = window + up(tree + len(root.write()))
     if ram_root:
         memory_map.set('RAMDisk', struct.pack('<QQ', disk, len(ramdisk)))
@@ -290,7 +297,8 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         # The panel backlight behind the system's brightness control, and the Zed keyboard (docs/plans/backlight.md, input.md).
         command_line += ' coachz-backlight=1 coachz-usb-keyboard=1'
         # Read-only probes: SoC temperatures and the SMEM inventory, with their nodes from prelink_tree (docs/plans/thermal.md, wifi.md).
-        command_line += ' coachz-thermal=1 coachz-wifi=1 coachz-motion=1 coachz-switches=1'
+        # coachz-wifi=2 adds the AOSS channel and one RPMh vote to the read-only MPSS inventory (coachz-prelink-wifi.patch).
+        command_line += ' coachz-thermal=1 coachz-wifi=2 coachz-motion=1 coachz-switches=1'
     if gpu:
         # Adreno 618 bring-up stages (docs/plans/gpu.md): 1 inventory, 2 CX + GMU clock window, 3 also the GMU firmware into TCM,
         # 4 the window with a read-only GPU SMMU inventory.
@@ -306,6 +314,8 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
             command_line += ' sheng-fb-gpu=1'
             # Every pass in system memory: A618's 512 KiB of GMEM splits this screen into about 30 bins (the plug-in sets TU_DEBUG from it).
             command_line += ' sheng-tu-debug=sysmem,nocb'
+            # The system cache as mainline sets it up: sc7180's slices configured, CPUSS active, and the GPU and GPUHTW slices for the GPU (CoachzGpu.cpp).
+            command_line += ' coachz-llcc=1'
     if cpus != 1:
         # coachz-prelink-smp.patch raises BCM2837's board configuration to eight CPUs in two clusters.
         if not root_uuid or not prelinked or not 2 <= cpus <= 8:
@@ -343,7 +353,7 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         environment = 'restore' if root_cache and not root_uuid else None
         adt = prelink_tree(adt, window, tree, ramdisk, cache, environment, ram_root=not disk_root or bool(data_seed),
                            root_uuid=root_uuid, cpus=cpus, full_screen=display,
-                           gmu_firmware_size=len(gmu_firmware) if gmu_firmware else 0, sqe_firmware_size=len(sqe_firmware) if sqe_firmware else 0, gpu_addon_size=len(gpu_addon) if gpu_addon else 0)
+                           gmu_firmware_size=len(gmu_firmware) if gmu_firmware else 0, sqe_firmware_size=len(sqe_firmware) if sqe_firmware else 0, gpu_addon_size=len(gpu_addon) if gpu_addon else 0, motion_probe=diagnostics)
         ramdisk = ramdisk + cache + bytes(-len(cache) % 4096)
         if gmu_firmware:
             ramdisk += gmu_firmware + bytes(-len(gmu_firmware) % 4096)

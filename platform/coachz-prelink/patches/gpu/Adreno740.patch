@@ -153,10 +153,12 @@
      const uint32_t writes[]={RingBase,base_lo,RingBase+1,base_hi,RingControl,control,
 --- a/NativeAdrenoPublish.cpp
 +++ b/NativeAdrenoPublish.cpp
-@@ -38,6 +38,19 @@
+@@ -38,6 +38,23 @@
  } native_adreno_metal_diag;
  /* BO CPU views (clientMemoryForType for a BO token): [0] calls, [1] new descriptors, [2] served from the view cache, [3] refused (not a BO / out of
   * resources), [4] last refusal's IOReturn, [5] threads inside now. int-115 showed a backboardd thread in IOConnectMapMemory64 ~650 times a second. */
++/* Coachz: the foreground's newest fence and the gate's waits, total and longest wait (us) and timeouts. */
++static volatile uint32_t gCoachzForegroundFence,gCoachzGate[4];
 +/* Coachz: this board has no diagnostic page, so what the processes did goes to the log. */
 +extern "C" void native_adreno_metal_report(void)
 +{
@@ -165,6 +167,8 @@
 +    printf("COACHZ gpu9: metal opens %u busy %u bad %u closes %u reports %u property reads %u name reads %u calls %u selector %u status 0x%x grants %u, opener %.16s reader %.16s starter %.16s\n",
 +        d.opens,d.busy,d.bad,d.closes,d.reports,d.property_reads,d.name_reads,d.calls,d.last_selector,d.last_status,d.grants,d.opener[0],d.reader[0],d.starter[0]);
 +    printf("COACHZ gpu9: plug-in report [%.63s] turnip [%.63s]\n",d.report,d.report2);
++    printf("COACHZ gpu gate: waits %u total %u ms max %u us timeouts %u foreground fence %u\n",gCoachzGate[0],gCoachzGate[1]/1000,gCoachzGate[2],
++        gCoachzGate[3],gCoachzForegroundFence);
 +    if(native_adreno_metal_rows_seq!=rows_seen) {
 +        rows_seen=native_adreno_metal_rows_seq;
 +        for(unsigned row=0;row<48;++row)if(native_adreno_metal_rows[row][0])printf("COACHZ gpu9: row %u [%.95s]\n",row,native_adreno_metal_rows[row]);
@@ -173,6 +177,55 @@
  extern "C" {volatile uint32_t native_adreno_view_diag[6],native_adreno_view_kept;}   /* kept: BoCpuUnmap calls that left the view for another lease */
  }
  
+@@ -134,6 +151,28 @@
+     uint32_t input_bits=0,output_bits=0;
+     uint32_t opened=0,closed=0;
+ } g;
++static void coachzWaitForForeground()
++{
++    const uint32_t target=gCoachzForegroundFence;
++    if(!target || !g.ring || !g.clock.now_us)return;
++    const uint64_t began=g.clock.now_us(g.clock.cookie);
++    bool timedOut=false,waited=false;
++    for(;;) {
++        uint32_t observed=0;
++        IOLockLock(g.lock);
++        const bool done=g.ring->observeFence(target,nullptr,0,&observed)!=NativeAdrenoRingFenceTimeout;
++        IOLockUnlock(g.lock);
++        if(done)break;
++        if(g.clock.now_us(g.clock.cookie)-began>=16000) {timedOut=true;break;}
++        waited=true;
++        IODelay(250);
++    }
++    if(!waited)return;
++    const uint32_t us=(uint32_t)(g.clock.now_us(g.clock.cookie)-began);
++    gCoachzGate[0]=gCoachzGate[0]+1;gCoachzGate[1]=gCoachzGate[1]+us;
++    if(us>gCoachzGate[2])gCoachzGate[2]=us;
++    if(timedOut)gCoachzGate[3]=gCoachzGate[3]+1;
++}
+ }
+ 
+ class NativeAdrenoGpuPublished : public IOService {
+@@ -443,8 +482,19 @@
+         native_adreno_wait_outer[0]=native_adreno_wait_outer[0]+1;native_adreno_wait_outer[1]=native_adreno_wait_outer[1]+waited;
+         if(waited>native_adreno_wait_outer[3])native_adreno_wait_outer[3]=waited;
+     } else {
++        /* Coachz: A618 has one ring and no preemption (mainline gives A6XX one ring), so the render server's work goes first by order. A
++         * submission from another process waits, outside the lock, while the newest job of backboardd or of a process that asked for a high
++         * GPU priority (0 high, 4 normal-high, 5 real-time) still runs, at most 16 ms, so background work is delayed but never starved. */
++        const bool foreground=connection->live_ && (!strncmp(connection->name_,"backboardd",sizeof connection->name_) ||
++            connection->core_->foregroundPriority()==0 || connection->core_->foregroundPriority()>=4);
++        if(method==NativeAdrenoMethodSubmit && !foreground)coachzWaitForForeground();
+         IOLockLock(g.lock);
+         status=connection->live_?connection->core_->dispatch(method,input,input_size,output,output_size,&g.clock):kIOReturnNotReady;
++        if(method==NativeAdrenoMethodSubmit && foreground && !status && output && output_size>=sizeof(NativeAdrenoAbiSubmitReply)) {
++            NativeAdrenoAbiSubmitReply reply{};
++            memcpy(&reply,output,sizeof(reply));
++            if(reply.fence)gCoachzForegroundFence=(uint32_t)reply.fence;
++        }
+         if(method==NativeAdrenoMethodBoMap && !status && connection->live_ && !connection->kernel_)
+             if(NativeAdrenoClientRecord *record=clientRecord(connection->name_))
+                 if(connection->core_->windowPeak()>>20>record->peak_mib)record->peak_mib=uint32_t(connection->core_->windowPeak()>>20);
 --- a/NativeAdrenoABI.h
 +++ b/NativeAdrenoABI.h
 @@ -30,6 +30,8 @@
@@ -223,19 +276,20 @@
      default:return SIZE_MAX;
      }
  }
-@@ -576,6 +580,26 @@
+@@ -576,8 +580,29 @@
          NativeAdrenoAbiMetadata reply{};
          status=getMetadata(&request,&reply);
          if(!status)memcpy(output,&reply,sizeof(reply));
 +        break;
 +    }
-+    /* Coachz: one ring without priorities, so a priority is only accepted (a refused foreground value, 3, or one above 5 is not). */
++    /* Coachz: the foreground value is kept for the publisher's ordering (NativeAdrenoPublish.cpp); a refused value, 3, or one above 5 is not. */
 +    case NativeAdrenoMethodSetPriority: {
 +        NativeAdrenoAbiPriority request{};
 +        memcpy(&request,input,sizeof(request));
 +        if(request.foreground>5 || request.foreground==3 || request.background>5)status=kIOReturnBadArgument;
-+        break;
-+    }
++        else foreground_priority_=request.foreground;
+         break;
+     }
 +    /* Coachz: a note goes to the log ring, its first words in hex, at most 400 of them a boot. */
 +    case NativeAdrenoMethodNote: {
 +        NativeAdrenoAbiNote request{};
@@ -247,6 +301,28 @@
 +            printf("COACHZ gpu note: kind %u count %u: %x %x %x %x %x %x %x %x %x %x %x %x\n",request.kind,request.count,
 +                w[0],w[1],w[2],w[3],w[4],w[5],w[6],w[7],w[8],w[9],w[10],w[11]);
 +        }
-         break;
-     }
++        break;
++    }
      case NativeAdrenoMethodGetStatus: {
+         NativeAdrenoAbiStatus reply{};
+         status=this->status(&reply);
+--- a/NativeAdrenoUserClient.h
++++ b/NativeAdrenoUserClient.h
+@@ -76,6 +76,9 @@
+     IOReturn setScope(uint32_t queue_base,uint64_t window_start,uint64_t window_bytes);
+     /* Highest end address (exclusive) any mapping of this client has reached, 0 before the first. */
+     uint64_t windowPeak() const {return window_peak_;}
++    /* Coachz: the foreground GPU priority the process last asked for (MTLGPUPriority numbering; 1, normal, until it asks). */
++    uint32_t foregroundPriority() const {return foreground_priority_;}
++    void setForegroundPriority(uint32_t value) {foreground_priority_=value;}
+     /* Whether any job is unobserved in the range this client owns (never, while it owns none). */
+     bool ownRangeOutstanding() const;
+     /* Refuses while any object is live or any of this client's jobs is unobserved. */
+@@ -120,6 +123,7 @@
+     /* Optional counters; absent means the status method stays unsupported. */
+     IOReturn attachStatus(const NativeAdrenoStatus *);
+     IOReturn status(NativeAdrenoAbiStatus *);
++    uint32_t foreground_priority_=1;
+     /* Optional constant device facts; absent means the method stays unsupported. */
+     IOReturn attachDeviceInfo(const NativeAdrenoAbiDeviceInfo *);
+     IOReturn deviceInfo(NativeAdrenoAbiDeviceInfo *);
