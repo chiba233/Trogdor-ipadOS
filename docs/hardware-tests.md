@@ -1477,3 +1477,10 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 - AP 这边按主线建了 GLINK（FIFO 479，交换版本，modem 的 features 是 `0x7`，协商为 `0x1`）。modem 依次打开 `glink_ssr`、`IPCRTR`、`SSM_RTR_MODEM_APPS`、`apr_voice_svc`、`apr_apps2`、`LOOPBACK_CTL_MPSS`、`DS` 等通道，只有 `IPCRTR` 由这边打开。
 - QRTR：这边是节点 1，modem 是节点 0。收到 modem 的 hello 后通告了 rmtfs（服务 14）。modem 随后打开 `/boot/modem_fs1`、`modem_fs2`、`modem_fsg`，要了 2 MiB 共享缓冲区，读写了 8194 个扇区；EFS 是 Debian 的那四个全零镜像，只留在内存里。
 - modem 通告了约 30 个 QMI 服务，其中有 69（WLFW，WLAN 固件服务）、3、5、9、10、11、12、15、17、21–24、34、36、43、47、49、51、66、74、76、4098。k97 那次 40 s 后的 “DOG detects stalled initialization” 没有再出现，120 s 时状态位仍是 ready 加 handover。
+
+## 触摸改为照 Linux 移植的中断驱动，WLFW 握手到固件就绪（k99～k101）
+
+- 触摸改照主线 `i2c-hid-core.c` 和 `i2c-hid-of-goodix.c`：Goodix 的上电复位时序，读 HID 描述符，GPIO 9 电平中断经 TLMM 汇总线（GIC SPI 208）进来，SET_POWER ON 后等 60 ms，RESET 后等复位响应，再 SET_POWER ON，然后才读报告描述符；之后每次中断读一份完整报告，绝不在控制器没拉中断时读。这是这台机器上第一次用 GIC 外设中断。
+- k99 中断能进来，但线程用计数器判断中断是否到来，复位响应那一次正好漏掉，中断停在屏蔽状态。k100 改成中断置待处理标志、线程取走。
+- k101：复位握手完成，约 2480 次中断全部读出报告送进 HID，重度触摸时每秒 100 份，读错、意外复位、杂散中断都是 0。机主仍感到触摸后来“挂了”：那几秒里报告照常进 `IOHIDEventDriver`，屏幕没有新帧，SpringBoard、backboardd、设置的主线程都在等事件，GPU 送显正常。问题在 HID 之上；那段时间很多笔画从屏幕上沿开始。
+- WLFW：指示注册、主机能力、MSA 信息（wlan_mem 里两段：0x94100000+0x10000 安全区、0x94110000+0x1f0000）、MSA 就绪、能力查询（芯片 0x320、族 0x4001、板 0x67、SoC 0x400c0000、固件 WLAN.HL.3.2.2.c10-00754），用 `board-2.bin` 里 `bus=snoc,qmi-board-id=67` 的 26328 字节分 5 段下发板级数据，空校准报告，然后收到 FW ready。

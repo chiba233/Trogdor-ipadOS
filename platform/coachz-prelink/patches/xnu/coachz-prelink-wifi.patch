@@ -13,7 +13,7 @@
  	extern void coachz_battery_start(void);
 --- /dev/null
 +++ b/bsd/dev/coachz_wifi.c
-@@ -0,0 +1,2243 @@
+@@ -0,0 +1,2556 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/* WCN3990 / SC7180: the modem that hosts the WLAN firmware, started as mainline's qcom_q6v5_mss does (coachz-wifi=4), and the SMEM
 + * inventory (coachz-wifi=1 plus an explicit /arm-io/coachz-wifi ADT node): the public table, the global partition and APPS<->MODEM.
@@ -556,6 +556,9 @@
 +/* qdsp6sw.mbn once its SHA-256 matched: the disk, its byte offset there and its size; read again in place to load the modem. */
 +static volatile int wifi_mpss_disk = -1;
 +static uint64_t wifi_mpss_at, wifi_mpss_bytes;
++/* The WLAN board data file (linux-firmware ath10k/WCN3990/hw1.0/board-2.bin) once its SHA-256 matched, for WLFW's BDF download. */
++static uint8_t *wifi_board;
++static size_t wifi_board_bytes;
 +/* The modem's EFS images (modem_fs1, fs2, fsc, fsg) once their SHA-256 matched, in memory for rmtfs. */
 +struct wifi_efs { char name[16]; uint8_t *data; uint32_t bytes; };
 +static struct wifi_efs wifi_efs[4];
@@ -636,6 +639,15 @@
 +                wifi_mba_image = copy;
 +            } else if (copy) {
 +                kfree_data(copy, rounded);
++            }
++        }
++        if (!error && !memcmp(digest, entry + 32, 32) && !strcmp(name, "board-2.bin") && size && size <= (2u << 20) && !wifi_board) {
++            uint8_t *copy = kalloc_data((size_t)((size + 511) & ~511ull), Z_WAITOK);
++            if (copy && !wifi_fw_read(disk, context, copy, (size_t)((size + 511) & ~511ull), WIFI_FW_BLOB + offset)) {
++                wifi_board_bytes = (size_t)size;
++                __atomic_store_n(&wifi_board, copy, __ATOMIC_RELEASE);
++            } else if (copy) {
++                kfree_data(copy, (size_t)((size + 511) & ~511ull));
 +            }
 +        }
 +        /* The modem's EFS images for rmtfs (wg), kept in memory. */
@@ -1688,8 +1700,8 @@
 +static void
 +wq_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_port, const void *payload, uint32_t len)
 +{
-+    uint8_t packet[32 + 1024];
-+    if (len > 1024) return;
++    static uint8_t packet[32 + 8192];
++    if (len > 8192) return;
 +    const uint32_t h[8] = {1, type, WQ_NODE, src_port, 0, len, dst_node, dst_port};
 +    memcpy(packet, h, 32);
 +    memcpy(packet + 32, payload, len);
@@ -1829,6 +1841,298 @@
 +    wq_send(1, WQ_RMTFS_PORT, node, port, out, at);
 +}
 +
++/*
++ * WLFW, the WLAN firmware service the modem announces (QMI service 69 version 1), as ath10k's qmi.c drives it on a WCN3990 over SNOC:
++ * on the server's arrival the indication registration (fw_ready, msa_ready, client id), the host capability (daemon_support 0), the MSA
++ * information (wlan_mem, 0x94100000 2 MiB; qcom,msa-fixed-perm, so no permission change), 20 ms, MSA ready and the capability query;
++ * once the MSA-ready indication came, the board data (board-2.bin's entry for "bus=snoc,qmi-board-id=<id>", as
++ * ath10k_core_create_board_name names it without a calibration variant, which this machine's device tree has none of) in 6144-byte
++ * segments, then an empty calibration report, then the FW-ready indication awaited. TLVs as qmi_wlfw_v01.c encodes them. WLAN mode and
++ * the copy engines are the next step: nothing here turns the radio on.
++ */
++#define WL_PORT 0x4001u
++#define WL_SEGMENT 6144u
++static uint8_t wl_message[7 + 64 + WL_SEGMENT];
++
++static struct {
++    uint32_t node, port;
++    int known, state, msa_ready, fw_ready, failed;
++    uint16_t txn, want_id, want_txn;
++    unsigned waited_ms;
++    uint8_t resp[1024];
++    uint32_t resp_len;
++    int resp_ready;
++    uint32_t chip_id, chip_family, board_id, soc_id, fw_version;
++    char build_id[96], timestamp[40];
++    const uint8_t *bdf;
++    uint32_t bdf_len, bdf_seg, bdf_at;
++} wl;
++
++static void
++wl_request(uint16_t id, const uint8_t *tlvs, uint32_t len)
++{
++    const uint16_t txn = ++wl.txn;
++    wl_message[0] = 0;
++    wl_message[1] = (uint8_t)txn;
++    wl_message[2] = (uint8_t)(txn >> 8);
++    wl_message[3] = (uint8_t)id;
++    wl_message[4] = (uint8_t)(id >> 8);
++    wl_message[5] = (uint8_t)len;
++    wl_message[6] = (uint8_t)(len >> 8);
++    if (len) memmove(wl_message + 7, tlvs, len);
++    wl.want_id = id;
++    wl.want_txn = txn;
++    wl.resp_ready = 0;
++    wl.waited_ms = 0;
++    wq_send(1, WL_PORT, wl.node, wl.port, wl_message, 7 + len);
++}
++
++/* A response's result TLV (type 2: result, error); 0 when it succeeded. */
++static int
++wl_result(uint16_t *error)
++{
++    const uint8_t *v = NULL;
++    uint16_t l = 0;
++    *error = 0xffff;
++    if (!wr_tlv(wl.resp + 7, wl.resp_len - 7, 2, &v, &l) || l < 4) return -1;
++    *error = (uint16_t)(v[2] | v[3] << 8);
++    return v[0] | v[1] << 8;
++}
++
++/* A QMI message from WLFW to our port: the awaited response, or an indication. */
++static void
++wl_rx(const uint8_t *m, uint32_t n)
++{
++    if (n < 7) return;
++    const uint8_t type = m[0];
++    const uint16_t txn = (uint16_t)(m[1] | m[2] << 8), id = (uint16_t)(m[3] | m[4] << 8);
++    if (type == 2 && id == wl.want_id && txn == wl.want_txn && n <= sizeof(wl.resp)) {
++        memcpy(wl.resp, m, n);
++        wl.resp_len = n;
++        wl.resp_ready = 1;
++    } else if (type == 4 && id == 0x2b) {
++        wl.msa_ready = 1;
++        printf("COACHZ wlfw: MSA ready indication\n");
++    } else if (type == 4 && id == 0x21) {
++        wl.fw_ready = 1;
++        printf("COACHZ wlfw: FW ready indication\n");
++    } else {
++        printf("COACHZ wlfw: message type %u id 0x%x txn %u (%u bytes) not awaited\n", type, id, txn, n);
++    }
++}
++
++/* board-2.bin (ath10k core.c): "QCA-ATH10K-BOARD" padded to 20 bytes, then IEs {id, length, data padded to 4}; a board IE (0) holds
++ * a name IE (0) and a data IE (1). */
++static int
++wl_board(const char *want, const uint8_t **data, uint32_t *len)
++{
++    if (!wifi_board || wifi_board_bytes < 28 || memcmp(wifi_board, "QCA-ATH10K-BOARD", 16)) return 0;
++    for (size_t at = 20; at + 8 <= wifi_board_bytes;) {
++        uint32_t h[2];
++        memcpy(h, wifi_board + at, 8);
++        if (h[1] > wifi_board_bytes - at - 8) return 0;
++        if (h[0] == 0) {
++            const uint8_t *body = wifi_board + at + 8;
++            const uint8_t *name = NULL, *blob = NULL;
++            uint32_t name_len = 0, blob_len = 0;
++            for (uint32_t s = 0; s + 8 <= h[1];) {
++                uint32_t sh[2];
++                memcpy(sh, body + s, 8);
++                if (sh[1] > h[1] - s - 8) break;
++                if (sh[0] == 0) { name = body + s + 8; name_len = sh[1]; }
++                if (sh[0] == 1) { blob = body + s + 8; blob_len = sh[1]; }
++                s += 8 + ((sh[1] + 3) & ~3u);
++            }
++            if (name && blob && name_len == strlen(want) && !memcmp(name, want, name_len)) {
++                *data = blob;
++                *len = blob_len;
++                return 1;
++            }
++        }
++        at += 8 + ((h[1] + 3) & ~3u);
++    }
++    return 0;
++}
++
++static void
++wl_bdf_segment(void)
++{
++    static uint8_t t[64 + WL_SEGMENT];
++    uint32_t at = 0;
++    const uint32_t remaining = wl.bdf_len - wl.bdf_at, n = remaining > WL_SEGMENT ? WL_SEGMENT : remaining;
++    const uint8_t valid = 1, end = n == remaining;
++    const int32_t file_id = 0;
++    at = wr_put(t, at, 0x01, &valid, 1);
++    at = wr_put(t, at, 0x10, &file_id, 4);
++    at = wr_put(t, at, 0x11, &wl.bdf_len, 4);
++    at = wr_put(t, at, 0x12, &wl.bdf_seg, 4);
++    t[at] = 0x13;
++    t[at + 1] = (uint8_t)(n + 2);
++    t[at + 2] = (uint8_t)((n + 2) >> 8);
++    t[at + 3] = (uint8_t)n;
++    t[at + 4] = (uint8_t)(n >> 8);
++    memcpy(t + at + 5, wl.bdf + wl.bdf_at, n);
++    at += 5 + n;
++    at = wr_put(t, at, 0x14, &end, 1);
++    wl_request(0x25, t, at);
++    wl.bdf_at += n;
++    wl.bdf_seg++;
++}
++
++/* One step of the sequence, every millisecond from the watch loop. */
++static void
++wl_step(void)
++{
++    uint8_t t[64];
++    uint32_t at = 0;
++    uint16_t error = 0;
++    int result = 0;
++    if (wl.failed || !wl.known || !wg.open_acked || wl.state >= 10) return;
++    if (wl.state && wl.state != 6 && wl.state != 9 && !wl.resp_ready) {
++        if (++wl.waited_ms >= 30000) {
++            printf("COACHZ wlfw: no response to 0x%x in 30 s (state %d)\n", wl.want_id, wl.state);
++            wl.failed = 1;
++        }
++        return;
++    }
++    if (wl.resp_ready) result = wl_result(&error);
++    switch (wl.state) {
++    case 0: {
++        const uint8_t on = 1;
++        const uint32_t client = 0x4b4e454cu;   /* ATH10K_QMI_CLIENT_ID */
++        at = wr_put(t, at, 0x10, &on, 1);
++        at = wr_put(t, at, 0x13, &on, 1);
++        at = wr_put(t, at, 0x15, &client, 4);
++        wl_request(0x20, t, at);
++        wl.state = 1;
++        break;
++    }
++    case 1: {
++        const uint8_t *v = NULL;
++        uint16_t l = 0;
++        uint64_t status = 0;
++        if (wr_tlv(wl.resp + 7, wl.resp_len - 7, 0x10, &v, &l) && l >= 8) memcpy(&status, v, 8);
++        printf("COACHZ wlfw: indication registration %d/%u, fw status 0x%llx\n", result, error, (unsigned long long)status);
++        if (result) { wl.failed = 1; break; }
++        const uint32_t daemon = 0;
++        at = wr_put(t, at, 0x10, &daemon, 4);
++        wl_request(0x34, t, at);
++        wl.state = 2;
++        break;
++    }
++    case 2: {
++        printf("COACHZ wlfw: host capability %d/%u\n", result, error);
++        if (result && error != 0x5e) { wl.failed = 1; break; }   /* QMI_ERR_NOT_SUPPORTED_V01: older firmware, not fatal */
++        const uint64_t base = CW_MSA_BASE;
++        const uint32_t size = CW_MSA_SIZE;
++        at = wr_put(t, at, 0x01, &base, 8);
++        at = wr_put(t, at, 0x02, &size, 4);
++        wl_request(0x2d, t, at);
++        wl.state = 3;
++        break;
++    }
++    case 3: {
++        const uint8_t *v = NULL;
++        uint16_t l = 0;
++        char regions[160] = {0};
++        size_t used = 0;
++        if (wr_tlv(wl.resp + 7, wl.resp_len - 7, 0x03, &v, &l) && l >= 1)
++            for (unsigned i = 0; i < v[0] && 1u + 13u * (i + 1) <= l && used < sizeof(regions) - 40; i++) {
++                uint64_t address;
++                uint32_t size;
++                memcpy(&address, v + 1 + 13 * i, 8);
++                memcpy(&size, v + 9 + 13 * i, 4);
++                used += snprintf(regions + used, sizeof(regions) - used, " 0x%llx+0x%x%s", (unsigned long long)address, size,
++                    v[13 + 13 * i] ? " secure" : "");
++            }
++        printf("COACHZ wlfw: MSA info %d/%u, regions%s\n", result, error, regions[0] ? regions : " none");
++        if (result) { wl.failed = 1; break; }
++        delay(20000);   /* the 20 ms ath10k waits after the MSA info (SDM845 XPU crash) */
++        wl_request(0x2e, NULL, 0);
++        wl.state = 4;
++        break;
++    }
++    case 4:
++        printf("COACHZ wlfw: MSA ready %d/%u\n", result, error);
++        if (result) { wl.failed = 1; break; }
++        wl_request(0x24, NULL, 0);
++        wl.state = 5;
++        break;
++    case 5: {
++        const uint8_t *v = NULL;
++        uint16_t l = 0;
++        wl.board_id = 0xff;
++        if (wr_tlv(wl.resp + 7, wl.resp_len - 7, 0x10, &v, &l) && l >= 8) { memcpy(&wl.chip_id, v, 4); memcpy(&wl.chip_family, v + 4, 4); }
++        if (wr_tlv(wl.resp + 7, wl.resp_len - 7, 0x11, &v, &l) && l >= 4) memcpy(&wl.board_id, v, 4);
++        if (wr_tlv(wl.resp + 7, wl.resp_len - 7, 0x12, &v, &l) && l >= 4) memcpy(&wl.soc_id, v, 4);
++        if (wr_tlv(wl.resp + 7, wl.resp_len - 7, 0x13, &v, &l) && l >= 5) {
++            memcpy(&wl.fw_version, v, 4);
++            const uint32_t n = v[4] < l - 5 ? v[4] : l - 5;
++            memcpy(wl.timestamp, v + 5, n < sizeof(wl.timestamp) - 1 ? n : sizeof(wl.timestamp) - 1);
++        }
++        if (wr_tlv(wl.resp + 7, wl.resp_len - 7, 0x14, &v, &l)) memcpy(wl.build_id, v, l < sizeof(wl.build_id) - 1 ? l : sizeof(wl.build_id) - 1);
++        printf("COACHZ wlfw: capability %d/%u: chip 0x%x family 0x%x board 0x%x soc 0x%x fw 0x%x \"%s\" build \"%s\"\n", result, error,
++            wl.chip_id, wl.chip_family, wl.board_id, wl.soc_id, wl.fw_version, wl.timestamp, wl.build_id);
++        if (result) { wl.failed = 1; break; }
++        wl.state = 6;
++        break;
++    }
++    case 6: {
++        if (!wl.msa_ready) {
++            if (++wl.waited_ms >= 30000) { printf("COACHZ wlfw: no MSA ready indication in 30 s\n"); wl.failed = 1; }
++            return;
++        }
++        char name[80];
++        snprintf(name, sizeof(name), "bus=snoc,qmi-board-id=%x,qmi-chip-id=%x", wl.board_id, wl.chip_id);
++        int found = wl_board(name, &wl.bdf, &wl.bdf_len);
++        if (!found) {
++            snprintf(name, sizeof(name), "bus=snoc,qmi-board-id=%x", wl.board_id);
++            found = wl_board(name, &wl.bdf, &wl.bdf_len);
++        }
++        printf("COACHZ wlfw: board data \"%s\" %s (%u bytes, board file %zu bytes)\n", name, found ? "found" : "missing", wl.bdf_len,
++            wifi_board_bytes);
++        if (!found) { wl.failed = 1; break; }
++        wl.bdf_at = wl.bdf_seg = 0;
++        wl_bdf_segment();
++        wl.state = 7;
++        break;
++    }
++    case 7:
++        if (result) {
++            printf("COACHZ wlfw: board data segment %u refused %d/%u\n", wl.bdf_seg - 1, result, error);
++            wl.failed = 1;
++            break;
++        }
++        if (wl.bdf_at < wl.bdf_len) {
++            wl_bdf_segment();
++            break;
++        }
++        printf("COACHZ wlfw: board data sent in %u segments\n", wl.bdf_seg);
++        {
++            const uint8_t none = 0;   /* meta_data: no calibration entries */
++            at = wr_put(t, at, 0x01, &none, 1);
++            wl_request(0x26, t, at);
++        }
++        wl.state = 8;
++        break;
++    case 8:
++        printf("COACHZ wlfw: calibration report %d/%u\n", result, error);
++        if (result) { wl.failed = 1; break; }
++        wl.state = 9;
++        wl.waited_ms = 0;
++        break;
++    case 9:
++        if (wl.fw_ready) {
++            printf("COACHZ wlfw: WLAN firmware ready; WLAN mode and the copy engines are next\n");
++            wl.state = 10;
++        } else if (++wl.waited_ms >= 30000) {
++            printf("COACHZ wlfw: no FW ready indication in 30 s\n");
++            wl.failed = 1;
++        }
++        break;
++    }
++}
++
 +/* One complete QRTR packet from the modem. */
 +static void
 +wq_rx(const uint8_t *p, uint32_t n)
@@ -1856,6 +2160,7 @@
 +    switch (type) {
 +    case 1:
 +        if (dst_port == WQ_RMTFS_PORT) wr_request(src_node, src_port, body, size);
++        else if (dst_port == WL_PORT) wl_rx(body, size);
 +        else printf("COACHZ qrtr: data for port 0x%x from %u:0x%x\n", dst_port, src_node, src_port);
 +        if (confirm) wq_send(7, dst_port, src_node, src_port, (const uint32_t[]){7, WQ_NODE, dst_port, 0, 0}, 20);
 +        break;
@@ -1870,6 +2175,11 @@
 +        break;
 +    case 4:
 +        printf("COACHZ qrtr: new server %u version %u instance %u at %u:0x%x\n", ctrl[1], ctrl[2] & 0xff, ctrl[2] >> 8, ctrl[3], ctrl[4]);
++        if (ctrl[1] == 69 && !wl.known) {
++            wl.node = ctrl[3];
++            wl.port = ctrl[4];
++            wl.known = 1;
++        }
 +        break;
 +    case 5:
 +        printf("COACHZ qrtr: server %u gone at %u:0x%x\n", ctrl[1], ctrl[3], ctrl[4]);
@@ -2153,7 +2463,10 @@
 +    if (link) printf("COACHZ glink: not started (%d)\n", link);
 +    for (unsigned second = 1;; second++) {
 +        for (unsigned ms = 0; ms < 1000; ms++) {
-+            if (!link) wg_poll();
++            if (!link) {
++                wg_poll();
++                wl_step();
++            }
 +            delay(1000);
 +        }
 +        if (!link && (second <= 120 ? !(second % 10) : !(second % 60))) wg_report(second);

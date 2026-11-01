@@ -10,12 +10,18 @@
  bsd/dev/unix_startup.c			standard
 --- a/bsd/dev/coachz_touch.c
 +++ b/bsd/dev/coachz_touch.c
-@@ -0,0 +1,660 @@
+@@ -0,0 +1,762 @@
 +/*
 + * Coachz touchscreen (coachz-touch=1): the Goodix GT7375P on QUPv3 wrap0 SE4 as HID over I2C.
-+ * Reads the HID descriptor and report descriptor, powers the device on, starts ShengHidInput's touch digitizer
-+ * (platform/coachz-prelink/package/CoachzHid.cpp), then polls the interrupt line and hands each report's fingers to
-+ * that digitizer through its seqlock interface (native_touch_*). The FIFO-mode GENI I2C engine is adapted from ios-sweet's
++ * The device side is a port of Linux's drivers/hid/i2c-hid: i2c-hid-of-goodix.c's power-up for this part (reset asserted, 10 ms,
++ * reset released, 180 ms), then i2c-hid-core.c's probe: the address probed, the HID descriptor read, the interrupt set up, the
++ * reset handshake (SET_POWER ON and 60 ms, RESET, the device's empty reset response awaited for up to a second, SET_POWER ON
++ * and 60 ms again), the report descriptor read. After that every interrupt reads exactly one input report of wMaxInputLength
++ * bytes, as i2c_hid_get_input does, and nothing is ever read while the controller does not ask for it. The interrupt is the
++ * TLMM's level-low GPIO9 interrupt through its summary line (GIC SPI 208), handled as Linux's handle_level_irq with a threaded
++ * one-shot handler: masked and acknowledged in the interrupt (pinctrl-msm.c msm_gpio_irq_mask/ack), unmasked after the read.
++ * Fingers go to ShengHidInput's touch digitizer (platform/coachz-prelink/package/CoachzHid.cpp) through its seqlock
++ * interface (native_touch_*). The FIFO-mode GENI I2C engine is adapted from ios-sweet's
 + * bsd/dev/sweet_touch.c (MIT, Copyright (c) 2026 dipa-studio), which drove a Goodix controller on another
 + * Qualcomm SoC's GENI I2C on hardware.
 + *
@@ -53,6 +59,16 @@
 +#define TLMM_WEST_PA    0x03500000u
 +#define GPIO_CFG(n)     ((uint32_t)(n) * 0x1000u)
 +#define GPIO_IO(n)      (GPIO_CFG(n) + 4u)
++#define GPIO_INTR_CFG(n)    (GPIO_CFG(n) + 8u)
++#define GPIO_INTR_STATUS(n) (GPIO_CFG(n) + 0xcu)
++/* pinctrl-sc7180.c: enable bit 0, polarity 1, detection 3:2, raw status 4, target 7:5 (3 = the apps processor). */
++#define INTR_ENABLE     (1u << 0)
++#define INTR_RAW        (1u << 4)
++#define INTR_TARGET     (3u << 5)
++#define TLMM_SUMMARY_INTID (32u + 208u)
++#define GICD_PA         0x17a00000u
++#define GICD_ISPENDR(n) (0x200u + ((n) / 32u) * 4u)
++#define GICD_ICENABLER(n) (0x180u + ((n) / 32u) * 4u)
 +#define SE4_PA          0x00890000u
 +#define TOUCH_ADDR      0x5d
 +#define HID_DESC_REG    0x0001u
@@ -224,8 +240,11 @@
 +	uint16_t report_length, report_reg, input_reg, max_input, command_reg, data_reg;
 +	uint8_t report[MAX_RX];
 +	uint8_t input[512];
++	bool reset_pending, started;
++	volatile uint32_t irqs, spurious, spurious_run, storm, pending;
++	vm_offset_t gicd;
 +} st;
-+static int touch_chan;
++static int touch_chan, touch_irq_chan;
 +
 +static uint32_t
 +rd(vm_offset_t base, uint32_t off)
@@ -467,11 +486,105 @@
 +}
 +
 +
++/* The TLMM summary interrupt, as pinctrl-msm.c's msm_gpio_irq_handler and handle_level_irq: GPIO9's latched status, then
++ * mask (enable and raw status off, so the level cannot latch again while masked) and acknowledge, and the thread is woken. */
++static void
++touch_irq(__unused void *context)
++{
++	if (!(rd(st.north, GPIO_INTR_STATUS(9)) & 1u)) {
++		st.spurious++;
++		/* The summary line is shared by every TLMM GPIO: another one left enabled by firmware would hold it asserted. */
++		if (++st.spurious_run > 10000 && st.gicd && !st.storm) {
++			wr(st.gicd, GICD_ICENABLER(TLMM_SUMMARY_INTID), 1u << (TLMM_SUMMARY_INTID % 32u));
++			st.storm = 1;
++		}
++		return;
++	}
++	st.spurious_run = 0;
++	wr(st.north, GPIO_INTR_CFG(9), rd(st.north, GPIO_INTR_CFG(9)) & ~(INTR_ENABLE | INTR_RAW));
++	wr(st.north, GPIO_INTR_STATUS(9), 0);
++	st.irqs++;
++	__atomic_store_n(&st.pending, 1, __ATOMIC_RELEASE);
++	thread_wakeup(&touch_irq_chan);
++}
++
++/* msm_gpio_irq_unmask. */
++static void
++irq_unmask(void)
++{
++	wr(st.north, GPIO_INTR_CFG(9), rd(st.north, GPIO_INTR_CFG(9)) | INTR_RAW | INTR_ENABLE);
++}
++
++/* Waits for the interrupt for at most ms; true when one is to be handled. The interrupt leaves a flag that only this takes, so one
++ * that comes between two waits is handled by the next (k99 compared counters and lost the reset response that way, masked for good). */
++static bool
++irq_wait(unsigned ms)
++{
++	if (__atomic_exchange_n(&st.pending, 0, __ATOMIC_ACQ_REL)) {
++		return true;
++	}
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&touch_irq_chan, THREAD_UNINT, deadline);
++	if (__atomic_load_n(&st.pending, __ATOMIC_ACQUIRE)) {
++		thread_wakeup(&touch_irq_chan);   /* it came before the wait was asserted: the block returns at once */
++	}
++	thread_block(THREAD_CONTINUE_NULL);
++	return __atomic_exchange_n(&st.pending, 0, __ATOMIC_ACQ_REL) != 0;
++}
++
++/* i2c_hid_set_power: one retry after 400-500 us if the address is not acknowledged; 60 ms after PWR_ON. */
++static int
++set_power(bool on)
++{
++	int err = hid_command(0x08, on ? 0x00 : 0x01);
++	if (err && on) {
++		spin_us(500);
++		err = hid_command(0x08, 0x00);
++	}
++	if (!err && on) {
++		sleep_ms(60);
++	}
++	return err;
++}
++
++static unsigned resets_done, resets_unasked, input_errors, short_reads;
++
++/* i2c_hid_get_input: one read of wMaxInputLength bytes; length 0 is a (requested or not) reset completing. */
++static void
++get_input(void)
++{
++	const int err = engine_msg(NULL, 0, st.input, st.max_input, false);
++	if (err) {
++		input_errors++;
++		return;
++	}
++	const unsigned length = le16_at(st.input);
++	if (!length) {
++		if (st.reset_pending) {
++			st.reset_pending = false;
++			resets_done++;
++		} else {
++			resets_unasked++;
++		}
++		return;
++	}
++	if (length > st.max_input || length < 2) {
++		short_reads++;
++		return;
++	}
++	if (st.started && length > 2) {
++		coachz_touch_reports++;
++		publish_fingers(st.input);
++	}
++}
++
 +static void
 +touch_thread(__unused void *arg, __unused wait_result_t result)
 +{
 +	char *s0 = coachz_touch_status[0], *s1 = coachz_touch_status[1], *s2 = coachz_touch_status[2];
 +	int err = 0;
++	extern int armcpu_spi_attach(uint32_t, bool, void (*)(void *), void *, uint32_t *, uint64_t *);   /* ArmCpu.cpp, IOReturn */
 +
 +	snprintf(s0, 160, "K42 touch: mapping");
 +	st.gcc = ml_io_map(GCC_PA, 0x60000);
@@ -482,12 +595,12 @@
 +		snprintf(s0, 160, "K42 touch: MMIO mapping failed");
 +		goto out;
 +	}
-+	/* What firmware left: votes, S4 branch, DFS, SE firmware and FIFOs, the four pins and the interrupt level. */
-+	snprintf(s0, 160, "K42 touch: fw vote %x cbcr %x dfs %x/%x se fw %x status %x hw %x/%x pins 115 %x 116 %x 8 %x/%x 9 %x/%x",
++	/* What firmware left: votes, S4 branch, DFS, SE firmware and FIFOs, the pins, the interrupt level and its TLMM configuration. */
++	snprintf(s0, 160, "K42 touch: fw vote %x cbcr %x dfs %x/%x se fw %x status %x hw %x/%x pins 8 %x/%x 9 %x/%x intr %x/%x",
 +	    rd(st.gcc, GCC_VOTE), rd(st.gcc, GCC_S4_CBCR), rd(st.gcc, GCC_S4_DFS_CMD), rd(st.gcc, GCC_S4_DFS_L0),
-+	    rd(st.se, SE_FW), rd(st.se, SE_STATUS), rd(st.se, SE_HW_TX), rd(st.se, SE_HW_RX),
-+	    rd(st.west, GPIO_CFG(115)), rd(st.west, GPIO_CFG(116)), rd(st.north, GPIO_CFG(8)), rd(st.north, GPIO_IO(8)),
-+	    rd(st.north, GPIO_CFG(9)), rd(st.north, GPIO_IO(9)));
++	    rd(st.se, SE_FW), rd(st.se, SE_STATUS), rd(st.se, SE_HW_TX), rd(st.se, SE_HW_RX), rd(st.north, GPIO_CFG(8)),
++	    rd(st.north, GPIO_IO(8)), rd(st.north, GPIO_CFG(9)), rd(st.north, GPIO_IO(9)), rd(st.north, GPIO_INTR_CFG(9)),
++	    rd(st.north, GPIO_INTR_STATUS(9)));
 +	if (!clocks_on()) {
 +		snprintf(s1, 160, "K42 touch: clocks: cbcr %x dfs %x/%x", rd(st.gcc, GCC_S4_CBCR),
 +		    rd(st.gcc, GCC_S4_DFS_CMD), rd(st.gcc, GCC_S4_DFS_L0));
@@ -498,17 +611,28 @@
 +		    rd(st.se, SE_FW), rd(st.se, SE_STATUS), rd(st.se, SE_HW_TX), rd(st.se, SE_HW_RX));
 +		goto out;
 +	}
-+	/* Pins as in the device tree, the controller held in reset meanwhile; then out of reset as i2c-hid-of-goodix does. */
++	/* The pins as the device tree has them; the interrupt masked while the controller resets. */
++	wr(st.north, GPIO_INTR_CFG(9), rd(st.north, GPIO_INTR_CFG(9)) & ~(INTR_ENABLE | INTR_RAW));
 +	gpio_set(st.north, 9, 0, 3, 0, false, false);
-+	gpio_set(st.north, 8, 0, 0, 3, true, false);
 +	gpio_set(st.west, 115, 1, 0, 0, false, false);
 +	gpio_set(st.west, 116, 1, 0, 0, false, false);
-+	sleep_ms(20);
++	/* i2c-hid-of-goodix: probed with reset asserted; vdd (pp3300_dx_edp, the panel rail on GPIO67) is already on with the panel;
++	 * post_power_delay_ms 10, reset released, post_gpio_reset_delay_ms 180. */
++	gpio_set(st.north, 8, 0, 0, 3, true, false);
++	sleep_ms(10);
 +	gpio_set(st.north, 8, 0, 0, 3, true, true);
-+	sleep_ms(200);
-+	err = reg_read(HID_DESC_REG, st.desc, sizeof(st.desc));
++	sleep_ms(180);
++	/* i2c_hid_probe_address: a one-byte read, again after 400 us. */
++	err = engine_msg(NULL, 0, st.input, 1, false);
 +	if (err) {
-+		snprintf(s1, 160, "K42 touch: HID descriptor read %d irq %x status %x int %x", err, st.irq_seen,
++		spin_us(500);
++		err = engine_msg(NULL, 0, st.input, 1, false);
++	}
++	if (!err) {
++		err = reg_read(HID_DESC_REG, st.desc, sizeof(st.desc));
++	}
++	if (err) {
++		snprintf(s1, 160, "K42 touch: address probe / HID descriptor %d irq %x status %x int %x", err, st.irq_seen,
 +		    rd(st.se, SE_STATUS), rd(st.north, GPIO_IO(9)));
 +		goto out;
 +	}
@@ -521,134 +645,112 @@
 +	snprintf(s1, 160, "K42 touch: desc len %u bcd %x vid %04x pid %04x ver %x | report %u at %x, input %x max %u, cmd %x data %x",
 +	    le16_at(st.desc), le16_at(st.desc + 2), le16_at(st.desc + 20), le16_at(st.desc + 22), le16_at(st.desc + 24),
 +	    st.report_length, st.report_reg, st.input_reg, st.max_input, st.command_reg, st.data_reg);
-+	if (le16_at(st.desc) != 30 || !st.report_length || st.report_length > MAX_RX || !st.max_input ||
-+	    st.max_input > sizeof(st.input)) {
++	if (le16_at(st.desc) != 30 || le16_at(st.desc + 2) != 0x0100 || !st.report_length || st.report_length > MAX_RX ||
++	    st.max_input < 2 || st.max_input > sizeof(st.input)) {
 +		goto out;
 +	}
-+	err = reg_read(st.report_reg, st.report, st.report_length);
++	/* i2c_hid_init_irq: GPIO9 level low (msm_gpio_irq_set_type: target the apps processor, raw status on, level, active low,
++	 * stale status cleared), the summary interrupt attached level-triggered, then unmasked. */
++	wr(st.north, GPIO_INTR_CFG(9), (rd(st.north, GPIO_INTR_CFG(9)) & ~((7u << 5) | (3u << 2) | (1u << 1) | INTR_ENABLE)) | INTR_TARGET | INTR_RAW);
++	wr(st.north, GPIO_INTR_STATUS(9), 0);
++	uint32_t readback = 0;
++	uint64_t router = 0;
++	/* With GPIO9 masked nothing of ours drives the summary line: pending now means another GPIO does, and it would never clear. */
++	st.gicd = ml_io_map(GICD_PA, 0x1000);
++	const bool foreign = st.gicd && (rd(st.gicd, GICD_ISPENDR(TLMM_SUMMARY_INTID)) & (1u << (TLMM_SUMMARY_INTID % 32u)));
++	if (!st.gicd || foreign) {
++		printf("K42 touch: TLMM summary interrupt %s, not attached\n", st.gicd ? "already pending from another GPIO" : "unmapped GIC");
++		goto out;
++	}
++	const int attached = armcpu_spi_attach(TLMM_SUMMARY_INTID, false, touch_irq, NULL, &readback, &router);
++	printf("K42 touch: TLMM summary interrupt %u attached 0x%x (gic 0x%x router 0x%llx), GPIO9 intr cfg %x\n", TLMM_SUMMARY_INTID,
++	    (unsigned)attached, readback, router, rd(st.north, GPIO_INTR_CFG(9)));
++	if (attached) {
++		goto out;
++	}
++	irq_unmask();
++	/* i2c_hid_hwreset: power on, reset, the reset response, power on again; then the report descriptor (i2c_hid_parse). */
++	err = set_power(true);
 +	if (!err) {
-+		err = hid_command(0x08, 0x00);          /* SET_POWER ON */
++		st.reset_pending = true;
++		err = hid_command(0x01, 0x00);
 +	}
 +	if (!err) {
-+		err = hid_command(0x01, 0x00);          /* RESET */
++		for (unsigned waited = 0; st.reset_pending && waited < 1000; waited += 50) {
++			if (irq_wait(50)) {
++				get_input();
++				irq_unmask();
++			}
++		}
++		if (st.reset_pending) {
++			printf("K42 touch: device did not ack reset within 1000 ms\n");
++			st.reset_pending = false;
++		}
++		err = set_power(true);
++	}
++	if (!err) {
++		err = reg_read(st.report_reg, st.report, st.report_length);
 +	}
 +	if (err) {
-+		snprintf(s2, 160, "K42 touch: report descriptor / power / reset %d irq %x", err, st.irq_seen);
++		snprintf(s2, 160, "K42 touch: power / reset / report descriptor %d irq %x", err, st.irq_seen);
 +		goto out;
 +	}
-+	/* The controller answers: publish the digitizer now (it waits for IOHIDResource; reports queue in the controller meanwhile). */
++	printf("K42 touch: reset acknowledged %u, interrupts %u (spurious %u), report descriptor %u bytes\n", resets_done, st.irqs,
++	    st.spurious, st.report_length);
++	/* i2c_hid_start and open: reports go to the digitizer from now on. */
++	st.started = true;
 +	coachz_hid_touch_start();
-+	unsigned errors = 0, empty = 0;
-+	uint64_t heartbeat = mach_absolute_time(), interval;
-+	nanoseconds_to_absolutetime(10 * NSEC_PER_SEC, &interval);
-+	/*
-+	 * k86 and k87 lost the interrupt line after about 100 reports a second (one report read per poll, polls up to 10 ms apart): it
-+	 * stayed high for tens of seconds while reads still returned reports, then came back. Each second records how often the line was
-+	 * seen low and high, the longest gap between polls and the reports. While the line is low, reports are read back to back (up to 16)
-+	 * before the next 2 ms poll. And once the line has not been low for 500 ms the input register is read every 20 ms whatever it says:
-+	 * a report that differs from the last one passed on goes to HID like any other (counted as a probe report), one that repeats it is
-+	 * only counted (the controller answers its last report again, not an empty one, after the first touch).
-+	 */
-+	uint64_t second_start = heartbeat, last_low = heartbeat, last_poll = heartbeat, last_probe = 0, one_second, half_second, probe_period,
-+	    max_gap = 0;
-+	nanoseconds_to_absolutetime(NSEC_PER_SEC, &one_second);
-+	nanoseconds_to_absolutetime(500 * NSEC_PER_MSEC, &half_second);
-+	nanoseconds_to_absolutetime(20 * NSEC_PER_MSEC, &probe_period);
-+	unsigned low_polls = 0, high_polls = 0, second_reports = 0, probes = 0, probe_hits = 0, probe_empty = 0, probe_same = 0, drained = 0,
-+	    quiet = 0;
-+	static uint8_t passed[MAX_RX];
-+	unsigned passed_length = 0;
-+	/* Per second also what HID took and the frames the display showed, so a touch the screen ignored shows as reports without frames. */
++	/* Every interrupt: one report read, then unmasked (the line, still low, interrupts again). A line per second with input. */
 +	extern volatile uint64_t native_gop_gpu_completions __attribute__((weak));
-+	uint32_t hid_last = native_touch_hid_reports;
-+	uint64_t frames_last = &native_gop_gpu_completions ? native_gop_gpu_completions : 0;
++	uint32_t irqs_last = st.irqs, reports_last = coachz_touch_reports, hid_last = native_touch_hid_reports, spurious_last = st.spurious;
++	unsigned errors_last = 0, unasked_last = 0, short_last = 0, quiet = 0;
++	uint64_t frames_last = &native_gop_gpu_completions ? native_gop_gpu_completions : 0, second_start = mach_absolute_time(), one_second;
++	uint64_t heartbeat = second_start, interval;
++	nanoseconds_to_absolutetime(NSEC_PER_SEC, &one_second);
++	nanoseconds_to_absolutetime(10 * NSEC_PER_SEC, &interval);
 +	for (;;) {
++		if (irq_wait(100)) {
++			get_input();
++			irq_unmask();
++		}
 +		const uint64_t now = mach_absolute_time();
-+		if (now - last_poll > max_gap) {
-+			max_gap = now - last_poll;
-+		}
-+		last_poll = now;
 +		if (now - second_start >= one_second) {
-+			uint64_t gap_ns;
-+			absolutetime_to_nanoseconds(max_gap, &gap_ns);
-+			/* Every second with reports or probes, and the first quiet one after them. */
-+			if (second_reports || probes || !quiet) {
++			const uint32_t irqs = st.irqs - irqs_last, reports = coachz_touch_reports - reports_last;
++			const unsigned problems = (input_errors - errors_last) + (resets_unasked - unasked_last) + (short_reads - short_last) +
++			    (st.spurious - spurious_last);
++			if (irqs || problems || !quiet) {
 +				const uint64_t frames = &native_gop_gpu_completions ? native_gop_gpu_completions : 0;
-+				printf("K45 touch 1s: line low %u high %u, reports %u (%u drained) to HID %u, frames %llu, longest poll gap %llu us, probes %u "
-+				    "(new %u same %u empty %u), errors %u\n", low_polls, high_polls, second_reports, drained, native_touch_hid_reports - hid_last,
-+				    frames - frames_last, gap_ns / 1000, probes, probe_hits, probe_same, probe_empty, errors);
++				printf("K45 touch 1s: interrupts %u, reports %u to HID %u, frames %llu, read errors %u, unasked resets %u, bad lengths %u, "
++				    "spurious %u%s, line %s, intr cfg %x\n", irqs, reports, native_touch_hid_reports - hid_last, frames - frames_last,
++				    input_errors - errors_last, resets_unasked - unasked_last, short_reads - short_last, st.spurious - spurious_last,
++				    st.storm ? " (storm: interrupt disabled)" : "", (rd(st.north, GPIO_IO(9)) & 1u) ? "high" : "low", rd(st.north, GPIO_INTR_CFG(9)));
++				frames_last = frames;
 +			}
++			quiet = !irqs && !problems;
++			irqs_last = st.irqs;
++			reports_last = coachz_touch_reports;
 +			hid_last = native_touch_hid_reports;
-+			frames_last = &native_gop_gpu_completions ? native_gop_gpu_completions : 0;
-+			quiet = !second_reports && !probe_hits;
++			spurious_last = st.spurious;
++			errors_last = input_errors;
++			unasked_last = resets_unasked;
++			short_last = short_reads;
 +			second_start = now;
-+			max_gap = 0;
-+			low_polls = high_polls = second_reports = probes = probe_hits = probe_empty = probe_same = drained = 0;
 +		}
-+		/* Printed by this thread itself, not by the periodic report: tells a stopped report from a stopped system. */
-+		if (mach_absolute_time() - heartbeat >= interval) {
-+			heartbeat = mach_absolute_time();
++		if (now - heartbeat >= interval) {
++			heartbeat = now;
 +			uint64_t ns;
 +			absolutetime_to_nanoseconds(heartbeat, &ns);
-+			printf("K44 alive %llu s, touch reports %u, io_submap %llu KiB\n", ns / NSEC_PER_SEC, coachz_touch_reports,
-+			    coachz_io_submap_bytes / 1024);
++			printf("K44 alive %llu s, touch reports %u, interrupts %u, io_submap %llu KiB\n", ns / NSEC_PER_SEC, coachz_touch_reports,
++			    st.irqs, coachz_io_submap_bytes / 1024);
 +		}
-+		/* The interrupt line is low while the controller has a report (or the reset response) waiting. */
-+		bool low = !(rd(st.north, GPIO_IO(9)) & 1u);
-+		low ? low_polls++ : high_polls++;
-+		if (low) {
-+			last_low = now;
++		const uint8_t *p = st.input;
++		snprintf(s2, 160, "K42 touch: reports %u interrupts %u errors %u resets %u/%u, to HID %u fingers %u: %02x%02x %02x %02x%02x%02x%02x",
++		    coachz_touch_reports, st.irqs, input_errors, resets_done, resets_unasked, native_touch_hid_reports, native_touch_count, p[0], p[1],
++		    p[2], p[3], p[4], p[5], p[6]);
++		if (st.dead) {
++			printf("K42 touch: I2C engine stopped\n");
++			break;
 +		}
-+		const bool probe = !low && now - last_low > half_second && now - last_probe > probe_period;
-+		if (probe) {
-+			last_probe = now;
-+			probes++;
-+		}
-+		if (low || probe) {
-+		for (unsigned round = 0; round < 16; round++) {
-+			err = engine_msg(NULL, 0, st.input, st.max_input, false);
-+			const unsigned length = le16_at(st.input);
-+			if (err) {
-+				errors++;
-+			} else if (length <= 2) {
-+				if (probe) {
-+					probe_empty++;
-+				} else {
-+					empty++;                     /* the reset response, or nothing to say */
-+				}
-+			} else if (probe && length <= sizeof(passed) && length == passed_length && !memcmp(passed, st.input, length)) {
-+				probe_same++;
-+			} else {
-+				coachz_touch_reports++;
-+				second_reports++;
-+				drained += round > 0;
-+				if (probe) {
-+					probe_hits++;
-+				}
-+				if (length <= sizeof(passed)) {
-+					memcpy(passed, st.input, length);
-+					passed_length = length;
-+				}
-+				publish_fingers(st.input);
-+			}
-+			if (err || probe || st.dead) {
-+				break;
-+			}
-+			low = !(rd(st.north, GPIO_IO(9)) & 1u);
-+			if (!low) {
-+				break;
-+			}
-+		}
-+			const uint8_t *p = st.input;
-+			snprintf(s2, 160, "K42 touch: reports %u empty %u errors %u err %d, to HID %u fingers %u: %02x%02x %02x %02x%02x%02x%02x%02x%02x%02x%02x "
-+			    "| rd %02x%02x%02x%02x", coachz_touch_reports, empty, errors, err, native_touch_hid_reports, native_touch_count,
-+			    p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], st.report[0], st.report[1], st.report[2],
-+			    st.report[3]);
-+			if (st.dead) {
-+				break;
-+			}
-+		}
-+		sleep_ms(2);
 +	}
 +out:
 +	(void)thread_terminate(current_thread());

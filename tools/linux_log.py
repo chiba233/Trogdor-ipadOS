@@ -190,7 +190,9 @@ def modem_blob(image, kpart, directory, partition_end):
     # The modem's EFS images (rmtfs/modem_fs1, fs2, fsc, fsg; device data from the machine's own Linux, kept out of the repository) go
     # before qdsp6sw.mbn when they are there, so the kernel has them before the modem asks.
     efs = [directory / 'rmtfs' / name for name in ('modem_fs1', 'modem_fs2', 'modem_fsc', 'modem_fsg')]
-    files = [directory / 'mba.mbn', *(efs if all(path.is_file() for path in efs) else []), directory / 'qdsp6sw.mbn']
+    # WLFW's board data (linux-firmware ath10k/WCN3990/hw1.0/board-2.bin) likewise when it is there.
+    board = [directory / 'board-2.bin'] if (directory / 'board-2.bin').is_file() else []
+    files = [directory / 'mba.mbn', *(efs if all(path.is_file() for path in efs) else []), *board, directory / 'qdsp6sw.mbn']
     header = bytearray(4096)
     header[:16] = b'COACHZMODEMFW1\0\0'
     struct.pack_into('<I', header, 16, len(files))
