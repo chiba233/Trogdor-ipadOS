@@ -12,10 +12,22 @@ ROOT = Path(__file__).resolve().parents[1]
 UNIXNU = ROOT / 'upstream/unixnu'
 
 
+def build_plugin():
+    patch = ['patch', '--batch', '--silent', '-p1', '-d', str(UNIXNU / 'drivers/AdrenoMetal'), '-i', str(ROOT / 'platform/coachz-prelink/patches/gpu/AdrenoMetal.patch')]
+    subprocess.run(patch, check=True)
+    try:
+        subprocess.run(['python3', '-B', 'scripts/build-adreno-metal-plugin.py'], cwd=UNIXNU, check=True)
+    finally:
+        subprocess.run([*patch, '-R'], check=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, default=ROOT / 'build/coachz-gpu-userland')
+    parser.add_argument('--build', action='store_true', help='build the plug-in first, with patches/gpu/AdrenoMetal.patch applied around the build')
     args = parser.parse_args()
+    if args.build:
+        build_plugin()
     args.output.mkdir(parents=True, exist_ok=True)
     addon = args.output / 'NativeAdrenoMetal.addon'
     addon.unlink(missing_ok=True)

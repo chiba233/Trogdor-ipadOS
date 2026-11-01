@@ -190,6 +190,14 @@ GPU 核心寄存器不能用 64 位写。很多寄存器不是 8 字节对齐，
   - `cp state`：`RBBM_STATUS` 为 `1`（只有 CPU 自己在读），HW fault、CP 中断和 protect 都是 0，bank 0 的 fsr 只有 `0x400`。
 - 卡死或异常重启时，说明某个前提不成立，先退回上一个阶段看结果。
 
+## 性能（k73、k74）
+
+时钟、忙碌率和帧分解的原始数字记在 `docs/hardware-tests.md`。结论：
+
+- GPU 实际跑在 650 MHz，计数器每秒都一致，最高忙碌 56%。频率和 GPU 本身都不是瓶颈。
+- 每个 pass 都改成系统内存（`platform/coachz-prelink/patches/gpu/AdrenoMetal.patch`，由 `tools/xnu_gpu_userland.py --build` 在构建期间打上、构建完撤掉）后，GPU 段快了约 13%，但重帧间隔没变。A618 的 GMEM 只有 512 KiB，这个分辨率要分约 30 个 bin。
+- 重帧间隔约等于 CPU 编码加 GPU 执行：渲染服务器每帧要同步等完成，命令缓冲翻译和提交还另要 5～8 ms。UniXNU 在当前锁定版本之后，给渲染服务器加了独立的编码线程，提高了队列优先级，也改了导入和等待。下一步是同步这部分上游，再按同样的计数器对比。
+
 ## 还没做的
 
 表里的阶段都走通了，接下来是性能。另外：

@@ -36,7 +36,7 @@ class BatteryTests(unittest.TestCase):
         # The service reads; it never sends charger, PD or EC configuration commands.
         battery = new_file('coachz-prelink-battery.patch', 'iokit/Kernel/CoachzBattery.cpp')
         commands = set(re.findall(r'coachz_ec_command\((EC_CMD_\w+)', battery))
-        self.assertEqual(commands, {'EC_CMD_BATTERY_GET_DYNAMIC', 'EC_CMD_CHARGE_STATE'})
+        self.assertEqual(commands, {'EC_CMD_BATTERY_GET_DYNAMIC', 'EC_CMD_CHARGE_STATE', 'EC_CMD_USB_PD_POWER_INFO', 'EC_CMD_CONSOLE_SNAPSHOT', 'EC_CMD_CONSOLE_READ'})
         self.assertIn('uint8_t reply[EC_MAX_REPLY], index = 0, charge[10] = {0};', battery)   # GET_STATE is subcommand 0
         self.assertIn('if (!published) {', battery)
         transport = new_file('coachz-prelink-battery.patch', 'bsd/dev/coachz_ec.c')

@@ -30,7 +30,7 @@
 +#include "coachz_gpu_seq.h"
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
-+extern int coachz_gpu_driver_start(volatile uint8_t *core, volatile uint8_t *smmu, size_t smmu_bytes, const uint32_t *sqe, uint32_t sqe_bytes);
++extern int coachz_gpu_driver_start(volatile uint8_t *core, volatile uint8_t *gmu, volatile uint8_t *smmu, size_t smmu_bytes, const uint32_t *sqe, uint32_t sqe_bytes);
 +void coachz_gpu_start(void);
 +/* coachz-gpu=9: set once the driver has served or given up; launchd waits for it (coachz-prelink-gpu-addon.patch). */
 +volatile int coachz_gpu_ready;
@@ -227,7 +227,7 @@
 +	if (mode == 9) {
 +		printf("COACHZ gpu: dcvs polls %u return %u, registers done %u, left up %u\n", r.dcvs_polls, r.dcvs_return, r.core_registers_done, r.stage == 8);
 +		if (r.stage == 8) {
-+			coachz_gpu_driver_start((volatile uint8_t *)gpu_window[GPU_CORE], (volatile uint8_t *)gpu_window[GPU_SMMU], GPU_SMMU_SIZE, sqe, sqe_bytes);
++			coachz_gpu_driver_start((volatile uint8_t *)gpu_window[GPU_CORE], (volatile uint8_t *)gpu_window[GPU_GMU], (volatile uint8_t *)gpu_window[GPU_SMMU], GPU_SMMU_SIZE, sqe, sqe_bytes);
 +		}
 +		coachz_gpu_ready = 1;
 +	}
@@ -1476,7 +1476,7 @@
 +#define GMU_CGC_HYST_CNTL 0x24c2cu
 +#define GMU_CX_BUSY_MASK 0x24c38u
 +#define CORE_PERF_LOWEST 1u                             /* 180 MHz: index 0 is the "off" level */
-+#define CORE_PERF_RUN 3u                                /* 355 MHz for the driver, no thermal control yet */
++#define CORE_PERF_RUN 6u                                /* 650 MHz for the driver, no thermal control yet */
 +
 +/* PM4 (adreno_pm4.xml) */
 +#define PM4_NOP 0x10u

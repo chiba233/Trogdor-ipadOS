@@ -1359,3 +1359,23 @@ k72 的性能数据（插件自己的统计，355 MHz）：
 - 机主反馈帧率不高。没有给内存发带宽投票，也没有动态调频。
 - 还没有确认 App 自己能用 Metal。放行的进程只有 backboardd、iconservicesagent、WidgetRenderer_Default 和 PosterBoard。
 - GPU 没有电源管理（GPU_SET 一直保持）、没有中断、没有复位和每进程页表。长时间稳定性没有验证。
+
+## GPU 帧率和 EC 探针（k73、k74）
+
+k73：GPU 升到 650 MHz，GPU 路径接手时也静音屏幕控制台。k74：Turnip 每个 pass 都用系统内存渲染（`TU_DEBUG=sysmem`），另外加了 GPU 时钟/忙碌计数和 EC 的只读探针。两次都进桌面，没有 `@crash` 和 panic。
+
+- 跑码：机主确认已经消失。
+- k73：ring 提交 1165 次，全部 fence；571 帧上屏，失败 0。提交到完成平均 32.0 ms（k72 在 355 MHz 下是 40.0 ms），最长 180 ms。
+- k74：ring 提交 1943 次，全部 fence；945 帧上屏，失败 0。提交到完成平均 28.2 ms，最长 330 ms。
+- 时钟：CP 的 always-count 计数器对 always-on 计数器，每秒都是 649～650 MHz，和设定一致。
+- 忙碌率：GMU 的 busy 计数器（Linux `a6xx_gpu_busy` 用的那个）最高 56%，GPU 将近一半时间空闲。
+- 重帧（插件 FA3）：间隔 58.8 ms，其中 GPU 段 34.1 ms（k73 是 39.0 ms），CPU 编码 25.8 ms（k73 是 25.9 ms）。渲染服务器编码完一帧就同步等它完成，再编码下一帧，两段是串行的，所以间隔约等于两者之和。每个命令缓冲从提交到被调度（运行时翻译成 Vulkan 再提交）要 5～8 ms，只有一次 blit 的也一样。
+- 画面：机主看到电池、时钟这类小图标偶尔会花。两次日志都有同一条警告：一张约 95×29 的 A8Unorm 纹理建在 no-copy buffer 上，运行时没法为它建线性图像。花屏是不是 sysmem 引起的，还不知道。
+- 内存（k73，开机 40 秒后在 CPU0 和 CPU6 上各测 32 MiB，循环和 Debian 上的基准相同）：XNU 比 Debian 慢 10～30%，没有数量级差别。
+
+EC 探针（k74，`coachz-battery=1`）每 10 秒读一次两个 PD 端口的 `EC_CMD_USB_PD_POWER_INFO`，再按 Linux `cros_ec_debugfs` 的方式读 EC 自己的控制台（`CONSOLE_SNAPSHOT` 加 `CONSOLE_READ`），全部写进日志环，不改 EC 的任何状态。
+
+- k73 里机主重新插拔充电器后，充电停了，灯也灭了。EC 的 PD 日志（Debian dmesg）：谈到 5V 3A 后约 60 ms 断开，之后 EC 把这个端口记成供电方，输入限流 512 mA，没再升到 12V。
+- 同一个充电器在 Debian 下重新插拔，约 0.4 秒就到 12V 2.5A，开始充电，所以充电器和电池没有问题。
+- k74 里重新插拔一次，结果正常。EC 控制台依次是 `Attached.SNK`、5V 3A、请求 12V 2.5A、`PE_SNK_Ready`、`AC on`，前后约 0.2 秒，电池恢复充电。k73 那次的原因不明，没有复现。
+- EC 控制台还有 139 次 `MKBP not cleared within threshold, toggling`：XNU 只轮询按键状态，没有像 Linux 那样把 MKBP 事件取走。这次带着它照样正常充电。

@@ -9,6 +9,7 @@
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include <kern/clock.h>
 #include <kern/thread.h>
 #include <libkern/c++/OSMetaClass.h>
@@ -31,6 +32,9 @@ extern "C" unsigned native_adreno_accelerator_instance_size(void);
 extern "C" kern_return_t OSKextLoadKextWithIdentifier(const char *);
 extern "C" void native_adreno_metal_report(void);
 extern "C" volatile uint64_t native_gop_gpu_offers, native_gop_gpu_completions, native_gop_gpu_failures, native_gop_gpu_abandoned;
+extern "C" void *memprobe_cpu_to_processor(int) __asm__("_cpu_to_processor");
+extern "C" void *memprobe_thread_bind(void *) __asm__("_thread_bind");
+extern "C" int memprobe_thread_block(void *) __asm__("_thread_block");
 extern kmod_info_t g_kernel_kmod_info;
 
 // NativeAdrenoPublish's sink for the plug-in's cache export to the boot log disk, which this board does not have.
@@ -46,7 +50,7 @@ enum : uint32_t {
 // The original IOAcceleratorES as audited (UniXNU scripts/data/ioaccelerator-base-abi.json): the bindings in build-coachz-gpu.py use this address.
 const uint64_t kOriginalAcceleratorMetaclass = 0xfffffff006aeb688ull;
 
-volatile uint8_t *gCore, *gSmmu;
+volatile uint8_t *gCore, *gGmu, *gSmmu;
 NativeAdrenoRing gRing;
 NativeAdrenoSubmit gSubmit;
 NativeAdrenoTimer gTimer;
@@ -99,6 +103,80 @@ void reportThread(void *, wait_result_t) {
             static_cast<unsigned long long>(native_gop_gpu_failures), static_cast<unsigned long long>(native_gop_gpu_abandoned));
         cpState("now");
     }
+}
+
+// The GPU's load and clock each second it had work, from the counters hw_init starts as Linux does: the CP's always-count in core cycles (RBBM_PERFCTR_CP(0)),
+// the GMU's busy counter (a6xx_gpu_busy) and the always-on counter, both at 19.2 MHz. A clock below the requested one would show here.
+uint64_t coreCounter(uint32_t reg) {
+    uint32_t high, low;
+    do {
+        high = coreRead(reg + 1);
+        low = coreRead(reg);
+    } while (high != coreRead(reg + 1));
+    return uint64_t(high) << 32 | low;
+}
+uint64_t gmuBusy() {
+    volatile uint32_t *low = reinterpret_cast<volatile uint32_t *>(gGmu + 0x14110), *top = reinterpret_cast<volatile uint32_t *>(gGmu + 0x14114);
+    uint32_t high, value;
+    do {
+        high = *top;
+        value = *low;
+    } while (high != *top);
+    return uint64_t(high) << 32 | value;
+}
+void rateThread(void *, wait_result_t) {
+    uint64_t cycles = coreCounter(0x400), busy = gmuBusy(), always = coreCounter(0x980);
+    for (;;) {
+        IOSleep(1000);
+        const uint64_t newCycles = coreCounter(0x400), newBusy = gmuBusy(), newAlways = coreCounter(0x980);
+        const uint64_t dCycles = newCycles - cycles, dBusy = newBusy - busy, dAlways = newAlways - always;
+        cycles = newCycles;
+        busy = newBusy;
+        always = newAlways;
+        if (dAlways && dBusy * 20 >= dAlways)
+            printf("COACHZ gpu rate: busy %llu%%, %llu MHz over the second, %llu MHz while busy\n", static_cast<unsigned long long>(dBusy * 100 / dAlways),
+                static_cast<unsigned long long>(dCycles * 192 / dAlways / 10), static_cast<unsigned long long>(dBusy ? dCycles * 192 / dBusy / 10 : 0));
+    }
+}
+
+// Memory bandwidth and latency on an A55 and an A76, with loops the same as a Debian baseline's on this hardware: no XNU memory path votes for bandwidth,
+// so this says how much the DRAM gives here compared with Linux, which votes.
+void memoryProbeThread(void *, wait_result_t) {
+    enum : uint32_t {Bytes = 32u << 20, Line = 64, Passes = 8, Hops = 2000000};
+    IOSleep(40000);
+    IOBufferMemoryDescriptor *memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, static_cast<IOOptionBits>(kIODirectionInOut) | kIOMemoryPhysicallyContiguous, Bytes, 4096);
+    if (!memory) {
+        printf("COACHZ mem: no buffer\n");
+        return;
+    }
+    volatile uint64_t *b = static_cast<volatile uint64_t *>(memory->getBytesNoCopy());
+    static const int cpus[2] = {0, 6};
+    for (int c = 0; c < 2; ++c) {
+        memprobe_thread_bind(memprobe_cpu_to_processor(cpus[c]));
+        memprobe_thread_block(nullptr);
+        for (int round = 0; round < 3; ++round) {
+            uint64_t sum = 0;
+            uint64_t start = ringNow(nullptr);
+            for (uint32_t p = 0; p < Passes; ++p) for (uint32_t i = 0; i < Bytes / 8; i += 4) sum += b[i] + b[i + 1] + b[i + 2] + b[i + 3];
+            const uint64_t read = ringNow(nullptr) - start;
+            start = ringNow(nullptr);
+            for (uint32_t p = 0; p < Passes; ++p) for (uint32_t i = 0; i < Bytes / 8; i += 4) {b[i] = p; b[i + 1] = p; b[i + 2] = p; b[i + 3] = p;}
+            const uint64_t write = ringNow(nullptr) - start;
+            const uint32_t lines = Bytes / Line, step = (40503u % lines) | 1u;
+            volatile uint32_t *q = reinterpret_cast<volatile uint32_t *>(b);
+            for (uint32_t i = 0; i < lines; ++i) q[i * Line / 4] = ((i + step) % lines) * Line / 4;
+            start = ringNow(nullptr);
+            uint32_t at = 0;
+            for (uint32_t i = 0; i < Hops; ++i) at = q[at];
+            const uint64_t chase = ringNow(nullptr) - start;
+            printf("COACHZ mem: cpu %d read %llu MB/s write %llu MB/s chase %llu ns (%u %llu)\n", cpus[c],
+                static_cast<unsigned long long>(uint64_t(Bytes) * Passes / (read ? read : 1)), static_cast<unsigned long long>(uint64_t(Bytes) * Passes / (write ? write : 1)),
+                static_cast<unsigned long long>(chase * 1000 / Hops), at, static_cast<unsigned long long>(sum & 1));
+        }
+    }
+    memprobe_thread_bind(nullptr);
+    memprobe_thread_block(nullptr);
+    memory->release();
 }
 
 // The SQE firmware, the kit's GPU context and the CP's first packets.
@@ -207,8 +285,9 @@ bool publishAccelerator() {
 }  // namespace
 
 // Called once from coachz_gpu_start with the windows it mapped; the seq left the GMU up. Nonzero when the driver is serving.
-extern "C" int coachz_gpu_driver_start(volatile uint8_t *core, volatile uint8_t *smmu, size_t smmuBytes, const uint32_t *sqe, uint32_t sqeBytes) {
+extern "C" int coachz_gpu_driver_start(volatile uint8_t *core, volatile uint8_t *gmu, volatile uint8_t *smmu, size_t smmuBytes, const uint32_t *sqe, uint32_t sqeBytes) {
     gCore = core;
+    gGmu = gmu;
     gSmmu = smmu;
     if (!core || !smmu || !sqe || !startCp(smmu, smmuBytes, sqe, sqeBytes)) {
         printf("COACHZ gpu9: CP not started; rendering stays on the CPU\n");
@@ -226,5 +305,7 @@ extern "C" int coachz_gpu_driver_start(volatile uint8_t *core, volatile uint8_t 
     printf("COACHZ gpu9: accelerator %d\n", accelerator);
     thread_t thread = THREAD_NULL;
     if (kernel_thread_start(reportThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
+    if (kernel_thread_start(memoryProbeThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
+    if (kernel_thread_start(rateThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
     return accelerator;
 }

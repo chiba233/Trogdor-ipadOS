@@ -74,13 +74,16 @@ static uint64_t counter_hz() { uint64_t value;__asm__ volatile("mrs %0, cntfrq_e
 extern "C" { volatile uint64_t coachz_frame_stats[13]; }
 // The memory attribute the source of the coming copy is mapped with, as the MMU translates it: AT S1E1R leaves the MAIR value
 // in PAR_EL1[63:56] (0xff write-back, 0x44 non-cacheable, 0 device). 0x100 marks a failed translation.
-void native_legacy_copy_source_observed(const void *source,uint64_t scanTicks) {
-    // Before the first copy, so that this full frame overwrites what the console drew. The copies after it only touch what changed.
+// Once, before the first frame of either path reaches the scanout, so that it overwrites what the console drew.
+static void silenceConsole() {
     static bool silenced;
     if(!silenced) {
         silenced=true;unsigned band=~0u;
         if(PE_parse_boot_argn("coachz-console-band",&band,sizeof(band)) && !band)coachz_early_band(0);
     }
+}
+void native_legacy_copy_source_observed(const void *source,uint64_t scanTicks) {
+    silenceConsole();
     // Off unless coachz-diag bit 3 is set (see osfmk/arm64/coachz_thread.c).
     static int enabled=-1;
     if(enabled<0){unsigned diag=0;PE_parse_boot_argn("coachz-diag",&diag,sizeof(diag));enabled=(diag&8)!=0;}
@@ -114,7 +117,9 @@ void native_legacy_transfer_observed(IOReturn status,const void *,uint64_t bytes
 void native_legacy_retirement_observed(IOService *) { retirements++; }
 // sheng-fb-gpu=1: frames go to the GPU client when one is connected, and are copied by the CPU until then or if it goes away.
 bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *memory,uint64_t stride,uint32_t width,uint32_t height) {
-    return gpuHandoff && native_gop_gpu_offer(gpuHandoff,display,memory,stride,width,height);
+    if(!gpuHandoff || !native_gop_gpu_offer(gpuHandoff,display,memory,stride,width,height))return false;
+    silenceConsole();   // the GPU path has no CPU copy to do it
+    return true;
 }
 void native_legacy_gpu_fallback_observed(int status) { kprintf("COACHZ display: GPU offer unsupported %d\n",status); }
 __attribute__((noreturn)) void native_legacy_backend_guard(unsigned slot,void *,void *caller) {

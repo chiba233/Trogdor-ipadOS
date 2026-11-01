@@ -293,7 +293,7 @@
 +}
 --- a/bsd/dev/coachz_ec_proto.h
 +++ b/bsd/dev/coachz_ec_proto.h
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,135 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/*
 + * ChromeOS EC host command protocol 3: request framing, response checks and the battery replies Coachz reads.
@@ -307,11 +307,14 @@
 +
 +#define EC_CMD_HELLO 0x0001u
 +#define EC_CMD_GET_PROTOCOL_INFO 0x000bu
++#define EC_CMD_CONSOLE_SNAPSHOT 0x0097u
++#define EC_CMD_CONSOLE_READ 0x0098u
 +#define EC_CMD_CHARGE_STATE 0x00a0u
++#define EC_CMD_USB_PD_POWER_INFO 0x0103u
 +#define EC_CMD_BATTERY_GET_DYNAMIC 0x0601u
 +#define EC_HEADER 8u
 +#define EC_MAX_PARAMS 32u
-+#define EC_MAX_REPLY 64u
++#define EC_MAX_REPLY 544u
 +
 +/* Errors: low byte the stage, the EC result code above it for EC_ERR_RESULT. */
 +enum {
@@ -441,7 +444,7 @@
  		clock_usec_t usec;
 --- a/iokit/Kernel/CoachzBattery.cpp
 +++ b/iokit/Kernel/CoachzBattery.cpp
-@@ -0,0 +1,147 @@
+@@ -0,0 +1,213 @@
 +// SPDX-License-Identifier: BSD-2-Clause
 +// The Coachz battery as iPadOS reads it (coachz-battery=1): an IOPMPowerSource fed by the Chrome EC, which keeps its own charger,
 +// PD and battery management. Every ten seconds it reads BATTERY_GET_DYNAMIC and CHARGE_STATE through bsd/dev/coachz_ec.c; it only
@@ -472,6 +475,11 @@
 +	bool published = false;
 +	int lastPercent = -1, lastFlags = -1, lastError = -1;
 +	uint32_t reads = 0, failures = 0;
++	uint32_t lastPort[2][3] = {};
++	bool portError = false, consoleStopped = false;
++	uint8_t consoleReply[EC_MAX_REPLY];
++	char consoleLine[160];
++	uint32_t consoleUsed = 0;
 +
 +	void number(const char *key, int64_t value) {
 +		const OSSymbol *symbol = OSSymbol::withCString(key);
@@ -490,12 +498,73 @@
 +		OSSafeReleaseNULL(symbol);
 +	}
 +
++	// Both PD ports as the EC reports them (EC_CMD_USB_PD_POWER_INFO, read only), when they change. Role: 0 none, 1 source, 2 sink, 3 sink not charging.
++	// Type: 0 none, 1 PD, 2 Type-C, 3 proprietary, 4-6 BC1.2, 8 VBUS.
++	void readPorts() {
++		for (uint8_t port = 0; port < 2; port++) {
++			uint8_t r[16];
++			uint32_t length = 0;
++			int error = coachz_ec_command(EC_CMD_USB_PD_POWER_INFO, 0, &port, 1, r, sizeof(r), &length);
++			if (error || length < sizeof(r)) {
++				if (!portError) {
++					printf("COACHZ ec port %u: error 0x%x length %u\n", port, (unsigned)error, length);
++					portError = true;
++				}
++				continue;
++			}
++			uint32_t now[3] = {(uint32_t)r[0] | (uint32_t)r[1] << 8 | (uint32_t)r[2] << 16, coachz_ec_le16(r + 4), (uint32_t)coachz_ec_le16(r + 8) | (uint32_t)coachz_ec_le16(r + 10) << 16};
++			if (now[0] != lastPort[port][0] || now[1] != lastPort[port][1] || now[2] != lastPort[port][2] || reads == 1) {
++				printf("COACHZ ec port %u: role %u type %u dual %u, %u mV now, max %u mV %u mA, limit %u mA, max %u mW (read %u)\n", port, r[0], r[1], r[2], coachz_ec_le16(r + 6),
++				    coachz_ec_le16(r + 4), coachz_ec_le16(r + 8), coachz_ec_le16(r + 10), coachz_ec_le32(r + 12), reads);
++				lastPort[port][0] = now[0];
++				lastPort[port][1] = now[1];
++				lastPort[port][2] = now[2];
++			}
++		}
++	}
++
++	void consoleByte(uint8_t byte) {
++		if (byte != '\n' && byte != '\r') {
++			consoleLine[consoleUsed++] = byte >= 0x20 && byte < 0x7f ? (char)byte : '.';
++		}
++		if (consoleUsed && (byte == '\n' || consoleUsed == sizeof(consoleLine) - 1)) {
++			consoleLine[consoleUsed] = 0;
++			printf("COACHZ ec: %s\n", consoleLine);
++			consoleUsed = 0;
++		}
++	}
++
++	// The EC's own console, as Linux's cros_ec_debugfs reads it: a snapshot, then CONSOLE_READ_RECENT until an empty reply. Neither changes the EC's state.
++	void readConsole() {
++		uint32_t length = 0;
++		uint8_t recent = 1;
++		if (consoleStopped) {
++			return;
++		}
++		int error = coachz_ec_command(EC_CMD_CONSOLE_SNAPSHOT, 0, nullptr, 0, consoleReply, sizeof(consoleReply), &length);
++		for (unsigned i = 0; !error && i < 64; i++) {
++			error = coachz_ec_command(EC_CMD_CONSOLE_READ, 1, &recent, 1, consoleReply, sizeof(consoleReply), &length);
++			if (error || !length || !consoleReply[0]) {
++				break;
++			}
++			for (uint32_t at = 0; at < length && consoleReply[at]; at++) {
++				consoleByte(consoleReply[at]);
++			}
++		}
++		if (error) {
++			printf("COACHZ ec console: error 0x%x, stopped\n", (unsigned)error);
++			consoleStopped = true;
++		}
++	}
++
 +	void refresh() {
 +		uint8_t reply[EC_MAX_REPLY], index = 0, charge[10] = {0};   // CHARGE_STATE: cmd 0 = GET_STATE, the union and chgnum zero
 +		uint32_t length = 0;
 +		coachz_ec_battery b;
 +		coachz_ec_charge c;
 +		reads++;
++		readPorts();
++		readConsole();
 +		int error = coachz_ec_command(EC_CMD_BATTERY_GET_DYNAMIC, 0, &index, 1, reply, sizeof(reply), &length);
 +		if (!error && !coachz_ec_battery_decode(reply, length, &b)) {
 +			error = EC_ERR_SHORT;

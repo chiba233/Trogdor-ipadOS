@@ -25,7 +25,7 @@ int main(void){
     assert(coachz_ec_response(in,n-1,&len)==EC_ERR_SHORT);
     in[9]^=1;assert(coachz_ec_response(in,n,&len)==EC_ERR_CHECKSUM);in[9]^=1;
     n=reply(in,3,dyn,0);assert(coachz_ec_response(in,n,&len)==(EC_ERR_RESULT|3<<8));
-    n=reply(in,0,dyn,14);in[4]=200;assert(coachz_ec_response(in,n,&len)==EC_ERR_LENGTH);
+    n=reply(in,0,dyn,14);in[5]=3;assert(coachz_ec_response(in,n,&len)==EC_ERR_LENGTH);
     n=reply(in,0,dyn,14);in[0]=2;assert(coachz_ec_response(in,n,&len)==EC_ERR_VERSION);
     assert(!coachz_ec_battery_decode(dyn,13,&b));
     uint8_t cs[20]={1,0,0,0, 0x7c,0x21,0,0, 0x10,0,0,0, 0xdc,5,0,0, 100,0,0,0};
