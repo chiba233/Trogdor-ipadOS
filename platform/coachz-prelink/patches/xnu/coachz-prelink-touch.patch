@@ -10,7 +10,7 @@
  bsd/dev/unix_startup.c			standard
 --- a/bsd/dev/coachz_touch.c
 +++ b/bsd/dev/coachz_touch.c
-@@ -0,0 +1,582 @@
+@@ -0,0 +1,660 @@
 +/*
 + * Coachz touchscreen (coachz-touch=1): the Goodix GT7375P on QUPv3 wrap0 SE4 as HID over I2C.
 + * Reads the HID descriptor and report descriptor, powers the device on, starts ShengHidInput's touch digitizer
@@ -541,7 +541,50 @@
 +	unsigned errors = 0, empty = 0;
 +	uint64_t heartbeat = mach_absolute_time(), interval;
 +	nanoseconds_to_absolutetime(10 * NSEC_PER_SEC, &interval);
++	/*
++	 * k86 and k87 lost the interrupt line after about 100 reports a second (one report read per poll, polls up to 10 ms apart): it
++	 * stayed high for tens of seconds while reads still returned reports, then came back. Each second records how often the line was
++	 * seen low and high, the longest gap between polls and the reports. While the line is low, reports are read back to back (up to 16)
++	 * before the next 2 ms poll. And once the line has not been low for 500 ms the input register is read every 20 ms whatever it says:
++	 * a report that differs from the last one passed on goes to HID like any other (counted as a probe report), one that repeats it is
++	 * only counted (the controller answers its last report again, not an empty one, after the first touch).
++	 */
++	uint64_t second_start = heartbeat, last_low = heartbeat, last_poll = heartbeat, last_probe = 0, one_second, half_second, probe_period,
++	    max_gap = 0;
++	nanoseconds_to_absolutetime(NSEC_PER_SEC, &one_second);
++	nanoseconds_to_absolutetime(500 * NSEC_PER_MSEC, &half_second);
++	nanoseconds_to_absolutetime(20 * NSEC_PER_MSEC, &probe_period);
++	unsigned low_polls = 0, high_polls = 0, second_reports = 0, probes = 0, probe_hits = 0, probe_empty = 0, probe_same = 0, drained = 0,
++	    quiet = 0;
++	static uint8_t passed[MAX_RX];
++	unsigned passed_length = 0;
++	/* Per second also what HID took and the frames the display showed, so a touch the screen ignored shows as reports without frames. */
++	extern volatile uint64_t native_gop_gpu_completions __attribute__((weak));
++	uint32_t hid_last = native_touch_hid_reports;
++	uint64_t frames_last = &native_gop_gpu_completions ? native_gop_gpu_completions : 0;
 +	for (;;) {
++		const uint64_t now = mach_absolute_time();
++		if (now - last_poll > max_gap) {
++			max_gap = now - last_poll;
++		}
++		last_poll = now;
++		if (now - second_start >= one_second) {
++			uint64_t gap_ns;
++			absolutetime_to_nanoseconds(max_gap, &gap_ns);
++			/* Every second with reports or probes, and the first quiet one after them. */
++			if (second_reports || probes || !quiet) {
++				const uint64_t frames = &native_gop_gpu_completions ? native_gop_gpu_completions : 0;
++				printf("K45 touch 1s: line low %u high %u, reports %u (%u drained) to HID %u, frames %llu, longest poll gap %llu us, probes %u "
++				    "(new %u same %u empty %u), errors %u\n", low_polls, high_polls, second_reports, drained, native_touch_hid_reports - hid_last,
++				    frames - frames_last, gap_ns / 1000, probes, probe_hits, probe_same, probe_empty, errors);
++			}
++			hid_last = native_touch_hid_reports;
++			frames_last = &native_gop_gpu_completions ? native_gop_gpu_completions : 0;
++			quiet = !second_reports && !probe_hits;
++			second_start = now;
++			max_gap = 0;
++			low_polls = high_polls = second_reports = probes = probe_hits = probe_empty = probe_same = drained = 0;
++		}
 +		/* Printed by this thread itself, not by the periodic report: tells a stopped report from a stopped system. */
 +		if (mach_absolute_time() - heartbeat >= interval) {
 +			heartbeat = mach_absolute_time();
@@ -551,16 +594,51 @@
 +			    coachz_io_submap_bytes / 1024);
 +		}
 +		/* The interrupt line is low while the controller has a report (or the reset response) waiting. */
-+		if (!(rd(st.north, GPIO_IO(9)) & 1u)) {
++		bool low = !(rd(st.north, GPIO_IO(9)) & 1u);
++		low ? low_polls++ : high_polls++;
++		if (low) {
++			last_low = now;
++		}
++		const bool probe = !low && now - last_low > half_second && now - last_probe > probe_period;
++		if (probe) {
++			last_probe = now;
++			probes++;
++		}
++		if (low || probe) {
++		for (unsigned round = 0; round < 16; round++) {
 +			err = engine_msg(NULL, 0, st.input, st.max_input, false);
++			const unsigned length = le16_at(st.input);
 +			if (err) {
 +				errors++;
-+			} else if (le16_at(st.input) <= 2) {
-+				empty++;                     /* the reset response, or nothing to say */
++			} else if (length <= 2) {
++				if (probe) {
++					probe_empty++;
++				} else {
++					empty++;                     /* the reset response, or nothing to say */
++				}
++			} else if (probe && length <= sizeof(passed) && length == passed_length && !memcmp(passed, st.input, length)) {
++				probe_same++;
 +			} else {
 +				coachz_touch_reports++;
++				second_reports++;
++				drained += round > 0;
++				if (probe) {
++					probe_hits++;
++				}
++				if (length <= sizeof(passed)) {
++					memcpy(passed, st.input, length);
++					passed_length = length;
++				}
 +				publish_fingers(st.input);
 +			}
++			if (err || probe || st.dead) {
++				break;
++			}
++			low = !(rd(st.north, GPIO_IO(9)) & 1u);
++			if (!low) {
++				break;
++			}
++		}
 +			const uint8_t *p = st.input;
 +			snprintf(s2, 160, "K42 touch: reports %u empty %u errors %u err %d, to HID %u fingers %u: %02x%02x %02x %02x%02x%02x%02x%02x%02x%02x%02x "
 +			    "| rd %02x%02x%02x%02x", coachz_touch_reports, empty, errors, err, native_touch_hid_reports, native_touch_count,
@@ -570,7 +648,7 @@
 +				break;
 +			}
 +		}
-+		sleep_ms(5);
++		sleep_ms(2);
 +	}
 +out:
 +	(void)thread_terminate(current_thread());

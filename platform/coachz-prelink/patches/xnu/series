@@ -108,3 +108,9 @@ coachz-prelink-io-map.patch
 
 # coachz-gpu-trace=1: the render server's frame trace (sheng-diag=1) summarised per 30 s: encode, scheduling, completion, GPU pass time, submissions, display copy.
 coachz-prelink-gpu-trace.patch
+
+# coachz-sample-bbd=1: every backboardd thread, named, at each report, for the k85 freeze where touches reached HID but no app moved.
+coachz-prelink-thread-sample.patch
+
+# coachz-cpufreq=4: CPU frequency by load on sheng's rules (UniXNU porting/power), bounded by the thermal clamp.
+coachz-prelink-cpufreq.patch

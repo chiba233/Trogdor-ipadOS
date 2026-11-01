@@ -1,0 +1,189 @@
+diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -55,6 +55,7 @@
+ osfmk/arm/io_map.c		standard
+ osfmk/arm64/coachz_early.c	standard
+ osfmk/arm64/coachz_thread.c	standard
++osfmk/arm64/coachz_cpufreq.c	standard
+ osfmk/arm64/loose_ends.c	standard
+ osfmk/arm/locks_arm.c	standard
+ osfmk/arm64/locore.s	optional nos_arm_asm
+diff --git a/bsd/dev/coachz_sample.c b/bsd/dev/coachz_sample.c
+--- a/bsd/dev/coachz_sample.c
++++ b/bsd/dev/coachz_sample.c
+@@ -44,6 +44,8 @@
+ 	coachz_thermal_start(); /* optional read-only TSENS (coachz-thermal=1) */
+ 	extern void coachz_wifi_start(void);
+ 	coachz_wifi_start();   /* optional, read-only SMEM inventory (coachz-wifi=1) */
++	extern void coachz_cpufreq_start(void);
++	coachz_cpufreq_start(); /* CPU frequency by load (coachz-cpufreq=4) */
+ 	extern void coachz_battery_start(void);
+ 	extern void coachz_input_start(void);
+ 
+diff --git a/osfmk/arm64/coachz_cpufreq.c b/osfmk/arm64/coachz_cpufreq.c
+new file mode 100644
+--- /dev/null
++++ b/osfmk/arm64/coachz_cpufreq.c
+@@ -0,0 +1,161 @@
++/*
++ * coachz-cpufreq=4: CPU frequency by load, with sheng's rules from UniXNU porting/power (CpuFreqProbe.cpp, sheng-cpufreq=4), on
++ * sc7180's cpufreq-hw: the A55 domain (CPUs 0-5) at 0x18323000 and the A76 domain (CPUs 6-7) 0x2800 above it, PERF_STATE at +0x920,
++ * the states the K38 line read from the LUT. Every 16 ms each CPU's idle time (recount, current idle span included) gives its load;
++ * a domain follows its busiest CPU with 1.25 times headroom, rises at once and falls only after four windows that all ask for less.
++ * Within 1 s of a touch report the A76 domain runs at its top. When the GPU took submissions in two of the last four windows every
++ * domain stays at 60 % of its top or more for 300 ms. coachz_cpu_state_cap (the thermal clamp, coachz_thermal.c) bounds both. Every
++ * 10 s a line gives each domain's mean clock and its time at the lowest, middle and top states.
++ */
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <kern/processor.h>
++#include <kern/recount.h>
++#include <kern/misc_protos.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern volatile uint32_t coachz_touch_reports;                       /* bsd/dev/coachz_touch.c */
++extern volatile uint32_t coachz_gpu_ahead[5] __attribute__((weak));  /* NativeAdrenoPublish.cpp: submissions, [0] + [4] */
++
++volatile uint32_t coachz_cpu_state_cap[2] = {9, 13};
++volatile uint32_t coachz_cpufreq_active;
++
++static const uint16_t cf_mhz[2][14] = {
++	{288, 576, 768, 1017, 1248, 1324, 1516, 1612, 1708, 1804},
++	{652, 825, 979, 1113, 1267, 1555, 1708, 1843, 1900, 1996, 2112, 2208, 2323, 2400},
++};
++static const unsigned cf_states[2] = {10, 14};
++
++static uint32_t
++cf_gpu_submissions(void)
++{
++	return &coachz_gpu_ahead[0] ? coachz_gpu_ahead[0] + coachz_gpu_ahead[4] : 0;
++}
++
++static void
++cf_thread(void *parameter __unused, wait_result_t result __unused)
++{
++	const vm_offset_t regs = ml_io_map(0x18323000, 0x4000);
++	if (!regs) {
++		printf("COACHZ cpufreq: no register window\n");
++		return;
++	}
++	volatile uint32_t *perf[2] = {(volatile uint32_t *)(regs + 0x920), (volatile uint32_t *)(regs + 0x2800 + 0x920)};
++	unsigned cpus = (unsigned)ml_get_cpu_count();
++	if (cpus > 8) {
++		cpus = 8;
++	}
++	uint64_t last_idle[8] = {0}, last = mach_absolute_time(), touch_until = 0, frame_until = 0;
++	uint64_t mhz_sum[2] = {0, 0}, low[2] = {0, 0}, top_time[2] = {0, 0}, windows = 0, changes[2] = {0, 0};
++	unsigned state[2], lower[2] = {0, 0}, gpu_windows = 0;
++	uint32_t touches = coachz_touch_reports, gpu_last = cf_gpu_submissions();
++	for (unsigned dom = 0; dom < 2; dom++) {
++		state[dom] = *perf[dom];
++		if (state[dom] >= cf_states[dom]) {
++			state[dom] = cf_states[dom] - 1;
++		}
++	}
++	for (unsigned cpu = 0; cpu < cpus; cpu++) {
++		processor_t processor = processor_array[cpu];
++		struct recount_usage usage;
++		if (processor) {
++			recount_processor_usage(&processor->pr_recount, &usage, &last_idle[cpu]);
++		}
++	}
++	coachz_cpufreq_active = 1;
++	printf("COACHZ cpufreq: governing %u CPUs from A55 state %u, A76 state %u\n", cpus, state[0], state[1]);
++	for (uint64_t tick = 0;; tick++) {
++		delay(16000);
++		const uint64_t now = mach_absolute_time(), wall = now - last;
++		unsigned busiest[2] = {0, 0};   /* per mille */
++		last = now;
++		for (unsigned cpu = 0; cpu < cpus; cpu++) {
++			processor_t processor = processor_array[cpu];
++			struct recount_usage usage;
++			uint64_t idle = 0;
++			if (!processor) {
++				continue;
++			}
++			recount_processor_usage(&processor->pr_recount, &usage, &idle);
++			const uint64_t idled = idle >= last_idle[cpu] ? idle - last_idle[cpu] : 0;
++			last_idle[cpu] = idle;
++			const unsigned busy = wall ? (unsigned)(1000 - (idled >= wall ? wall : idled) * 1000 / wall) : 0;
++			const unsigned dom = cpu >= 6;
++			if (busy > busiest[dom]) {
++				busiest[dom] = busy;
++			}
++		}
++		const uint32_t reports = coachz_touch_reports;
++		if (reports != touches) {
++			touch_until = tick + 63;   /* 1 s of 16 ms windows */
++		}
++		touches = reports;
++		const uint32_t submitted = cf_gpu_submissions();
++		gpu_windows = ((gpu_windows << 1) | (submitted != gpu_last)) & 0xfu;
++		gpu_last = submitted;
++		if (__builtin_popcount(gpu_windows) >= 2) {
++			frame_until = tick + 19;   /* 300 ms */
++		}
++		for (unsigned dom = 0; dom < 2; dom++) {
++			const unsigned top = cf_states[dom] - 1;
++			const unsigned cur = state[dom];
++			const uint64_t demand = (uint64_t)busiest[dom] * cf_mhz[dom][cur] * 125 / 100000;
++			unsigned target = 0;
++			while (target < top && cf_mhz[dom][target] < demand) {
++				target++;
++			}
++			if (dom == 1 && tick < touch_until) {
++				target = top;
++			}
++			if (tick < frame_until) {
++				const unsigned floor = cf_mhz[dom][top] * 60 / 100;
++				while (target < top && cf_mhz[dom][target] < floor) {
++					target++;
++				}
++			}
++			const unsigned cap = coachz_cpu_state_cap[dom] <= top ? coachz_cpu_state_cap[dom] : top;
++			if (target > cap) {
++				target = cap;
++			}
++			lower[dom] = target < cur ? lower[dom] + 1 : 0;
++			if (target > cur || (target < cur && (lower[dom] >= 4 || cur > cap))) {
++				*perf[dom] = target;
++				__asm__ volatile ("dsb sy" ::: "memory");
++				state[dom] = target;
++				lower[dom] = 0;
++				changes[dom]++;
++			}
++			mhz_sum[dom] += cf_mhz[dom][state[dom]];
++			low[dom] += state[dom] == 0;
++			top_time[dom] += state[dom] == top;
++		}
++		if (++windows == 625) {
++			printf("K46 cpufreq 10s: A55 mean %llu MHz, lowest %llu%% top %llu%%, %llu changes | A76 mean %llu MHz, lowest %llu%% top %llu%%, "
++			    "%llu changes | caps %u/%u\n", mhz_sum[0] / windows, low[0] * 100 / windows, top_time[0] * 100 / windows, changes[0],
++			    mhz_sum[1] / windows, low[1] * 100 / windows, top_time[1] * 100 / windows, changes[1], coachz_cpu_state_cap[0],
++			    coachz_cpu_state_cap[1]);
++			windows = 0;
++			for (unsigned dom = 0; dom < 2; dom++) {
++				mhz_sum[dom] = low[dom] = top_time[dom] = changes[dom] = 0;
++			}
++		}
++	}
++}
++
++/* From the sampler thread with the other Coachz modules (bsd/dev/coachz_sample.c). */
++void
++coachz_cpufreq_start(void)
++{
++	static int started;
++	unsigned mode = 0;
++	thread_t thread;
++	if (started || !PE_parse_boot_argn("coachz-cpufreq", &mode, sizeof(mode)) || mode != 4) {
++		return;
++	}
++	started = 1;
++	if (kernel_thread_start(cf_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}

@@ -18,7 +18,7 @@
  		/* Keep the captured note readable on the wrapping screen console. */
 --- /dev/null
 +++ b/bsd/dev/coachz_thermal.c
-@@ -0,0 +1,178 @@
+@@ -0,0 +1,185 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* Copyright (c) 2026, UniXNU contributors. All rights reserved.
 + * Optional SC7180 TSENS sampler. Not enabled in the active kernel build.
@@ -57,7 +57,7 @@
 + * Thermal protection, first version (coachz-thermal-clamp=1): above 80 C on the hottest valid channel both CPU domains drop to a
 + * lower cpufreq-hw state (A55 row 6, 1516 MHz; A76 row 9, 1996 MHz, from the tables the K38 line reads) and the GPU is capped at
 + * level 6, 650 MHz (CoachzGpu.cpp's governor reads coachz_gpu_level_cap); below 70 C the states saved at the clamp return. Mainline's
-+ * sc7180 trip points are higher (passive at 95 C). The twelfth poll (about 120 s) applies the clamp for two seconds and reads it back.
++ * sc7180 trip points are higher (passive at 95 C). The third poll (about 30 s) applies the clamp for two seconds and reads it back.
 + */
 +volatile uint32_t coachz_gpu_level_cap = 7;
 +static vm_offset_t thermal_cpufreq;
@@ -70,13 +70,20 @@
 +    static const uint32_t clamp_state[2] = {6, 9};
 +    if (!thermal_cpufreq) thermal_cpufreq = ml_io_map(0x18323000, 0x4000);
 +    if (!thermal_cpufreq || on == thermal_clamped) return;
-+    for (unsigned domain = 0; domain < 2; domain++) {
-+        volatile uint32_t *state = (volatile uint32_t *)(thermal_cpufreq + domain * 0x2800 + 0x920);
-+        if (on) {
-+            thermal_saved[domain] = *state;
-+            if (thermal_saved[domain] > clamp_state[domain]) *state = clamp_state[domain];
-+        } else {
-+            *state = thermal_saved[domain];
++    extern volatile uint32_t coachz_cpu_state_cap[2], coachz_cpufreq_active;
++    if (coachz_cpufreq_active) {
++        /* The governor (osfmk/arm64/coachz_cpufreq.c) owns the state registers; the clamp bounds it within one 16 ms window. */
++        coachz_cpu_state_cap[0] = on ? clamp_state[0] : 9;
++        coachz_cpu_state_cap[1] = on ? clamp_state[1] : 13;
++    } else {
++        for (unsigned domain = 0; domain < 2; domain++) {
++            volatile uint32_t *state = (volatile uint32_t *)(thermal_cpufreq + domain * 0x2800 + 0x920);
++            if (on) {
++                thermal_saved[domain] = *state;
++                if (thermal_saved[domain] > clamp_state[domain]) *state = clamp_state[domain];
++            } else {
++                *state = thermal_saved[domain];
++            }
 +        }
 +    }
 +    __asm__ volatile ("dsb sy" ::: "memory");
@@ -98,7 +105,7 @@
 +{
 +    unsigned mode = 0;
 +    if (!PE_parse_boot_argn("coachz-thermal-clamp", &mode, sizeof(mode)) || mode != 1) return;
-+    if (++thermal_polls == 12 && !thermal_clamped) {
++    if (++thermal_polls == 3 && !thermal_clamped) {
 +        thermal_clamp(1);
 +        delay(20000);
 +        thermal_clamp_report("test on");

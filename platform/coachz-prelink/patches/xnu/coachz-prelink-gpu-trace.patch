@@ -13,14 +13,14 @@ diff --git a/bsd/dev/coachz_trace.c b/bsd/dev/coachz_trace.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/coachz_trace.c
-@@ -0,0 +1,181 @@
+@@ -0,0 +1,195 @@
 +/*
 + * coachz-gpu-trace=1: the render server's frame trace summarised into the log ring. With sheng-diag=1 the Metal front end in
 + * backboardd (NativeBridgeMetalFrontend.mm) writes 72-byte records to frames.trace in its caches: per command buffer (type 1) its
 + * creation, commit, scheduling and completion; per render pass (type 7) Turnip's GPU begin and end timestamps; per kernel submission
 + * (type 8) the call and its waits; per display hand-off (type 5) the copy and the swap. All times are CLOCK_UPTIME_RAW microseconds,
 + * the kernel's own uptime. Per 30 s of uptime this prints the means of each part, so what the GPU executes, without the display copy
-+ * and vsync, stands next to the rest of a frame's time. Read only; every 30 s from 120 s to 480 s, each window once it has ended.
++ * and vsync, stands next to the rest of a frame's time. Read only; every 30 s from 30 s to 480 s, each window once it has ended.
 + */
 +#include <sys/param.h>
 +#include <sys/systm.h>
@@ -46,10 +46,14 @@ new file mode 100644
 +
 +struct ct_window {
 +    uint32_t buffers, scheduled, frames, passes, passes_timed, submissions, swaps;
-+    uint64_t encode, schedule, complete, frame_complete, pass_gpu, pass_max, call, sync, space, copy, swap;
++    uint64_t encode, schedule, complete, frame_complete, pass_gpu, pass_max, call, sync, space, copy, swap, copy_only;
++    uint32_t copies_after_frame;
 +};
 +
 +static struct ct_window ct_windows[CT_WINDOWS];
++/* The newest frame command buffer completion seen so far (file order), to split a display hand-off into its wait for that frame and the
++ * copy itself: copy_only is the part of offer -> copy returned after the frame completed. */
++static uint64_t ct_frame_done;
 +static uint32_t ct_printed;
 +
 +static void
@@ -65,7 +69,11 @@ new file mode 100644
 +        w->encode += r->t1 - r->t0;
 +        w->complete += r->t3 - r->t1;
 +        if (r->t2 >= r->t1 && r->t2 <= r->t3) { w->scheduled++; w->schedule += r->t2 - r->t1; }
-+        if (r->c >= CT_FRAME_KPX) { w->frames++; w->frame_complete += r->t3 - r->t1; }
++        if (r->c >= CT_FRAME_KPX) {
++            w->frames++;
++            w->frame_complete += r->t3 - r->t1;
++            if (r->t3 > ct_frame_done) ct_frame_done = r->t3;
++        }
 +        break;
 +    case 7:
 +        w->passes++;
@@ -87,6 +95,10 @@ new file mode 100644
 +        w->swaps++;
 +        w->copy += r->t1 - r->t0;
 +        w->swap += r->t2 - r->t0;
++        if (ct_frame_done > r->t0 && ct_frame_done <= r->t1) {
++            w->copy_only += r->t1 - ct_frame_done;
++            w->copies_after_frame++;
++        }
 +        break;
 +    default:
 +        break;
@@ -140,6 +152,7 @@ new file mode 100644
 +    uint8_t *buffer = kalloc_data(chunk, Z_WAITOK);
 +    if (!buffer) { vnode_close(vp, FREAD, context); printf("COACHZ trace: no buffer\n"); return; }
 +    bzero(ct_windows, sizeof(ct_windows));
++    ct_frame_done = 0;
 +    uint64_t records = 0;
 +    while (offset + sizeof(struct ct_rec) <= size) {
 +        size_t n = size - offset < chunk ? (size_t)(size - offset) : chunk;
@@ -165,18 +178,19 @@ new file mode 100644
 +        if ((ct_printed & (1u << i)) || (!w->buffers && !w->passes)) continue;
 +        ct_printed |= 1u << i;
 +        printf("COACHZ trace %u-%u s: buffers %u encode %llu sched %llu (n %u) done %llu us | frames %u done %llu us | passes %u/%u"
-+            " gpu %llu ms mean %llu max %llu us | subs %u call %llu sync %llu space %llu us | swaps %u copy %llu swap %llu us\n",
++            " gpu %llu ms mean %llu max %llu us | subs %u call %llu sync %llu space %llu us | swaps %u copy %llu swap %llu us, after frame %llu us (n %u)\n",
 +            i * CT_WINDOW_S, (i + 1) * CT_WINDOW_S, w->buffers, ct_mean(w->encode, w->buffers), ct_mean(w->schedule, w->scheduled),
 +            w->scheduled, ct_mean(w->complete, w->buffers), w->frames, ct_mean(w->frame_complete, w->frames), w->passes_timed, w->passes,
 +            w->pass_gpu / 1000, ct_mean(w->pass_gpu, w->passes_timed), w->pass_max, w->submissions, ct_mean(w->call, w->submissions),
-+            ct_mean(w->sync, w->submissions), ct_mean(w->space, w->submissions), w->swaps, ct_mean(w->copy, w->swaps), ct_mean(w->swap, w->swaps));
++            ct_mean(w->sync, w->submissions), ct_mean(w->space, w->submissions), w->swaps, ct_mean(w->copy, w->swaps), ct_mean(w->swap, w->swaps),
++            ct_mean(w->copy_only, w->copies_after_frame), w->copies_after_frame);
 +    }
 +}
 +
 +static void
 +ct_thread(void *parameter __unused, wait_result_t result __unused)
 +{
-+    for (unsigned s = 120; s <= 480; s += CT_WINDOW_S) {
++    for (unsigned s = 30; s <= 480; s += CT_WINDOW_S) {
 +        uint64_t now;
 +        absolutetime_to_nanoseconds(mach_absolute_time(), &now);
 +        if (now < (uint64_t)s * NSEC_PER_SEC) delay((int)(((uint64_t)s * NSEC_PER_SEC - now) / 1000));

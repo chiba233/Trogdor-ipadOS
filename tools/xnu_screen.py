@@ -277,10 +277,10 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         # The first frame silences the screen console until a panic (CoachzDisplay.cpp); the disk log keeps its output.
         command_line += ' coachz-console-band=0'
         if diagnostics:
-            # Measurement boots: the GPU stack's frame statistics (the plug-in's sheng-diag=1), and the rebuilt MobileGestalt cache in hex to the
-            # log ring (coachz-prelink-mgcache-reset.patch), for the screen answers the system got, and the IOKit queries of locationd,
-            # backboardd and SpringBoard (coachz-prelink-match-log.patch), for what CoreMotion looks for.
-            command_line += ' sheng-diag=1 coachz-dump-mgcache=1 coachz-match-log=1'
+            # Measurement boots: the GPU stack's frame statistics and frame trace (the plug-in's sheng-diag=1). The MobileGestalt dump
+            # (coachz-dump-mgcache=1) and the IOKit query log (coachz-match-log=1) answered their questions (docs/hardware-tests.md) and
+            # stay available by hand: the command line holds 1023 bytes.
+            command_line += ' sheng-diag=1'
         # The GT7375P touchscreen on SE4 as an IOHIDDevice digitizer (coachz-prelink-touch.patch, build-sheng-hid-input.py).
         command_line += ' coachz-touch=1'
         # UniXNU's AppleKeyStoreState: no keybag, no passcode, nothing locked (package/CoachzKeyStore.cpp).
@@ -318,12 +318,17 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
             # Every pass in system memory (the plug-in sets TU_DEBUG from it). Turnip's own tile-memory choice (k82) halved SP busy and cut the
             # UCHE latency by a quarter on hardware, but commit to complete did not fall and every colour came out with red and blue swapped.
             command_line += ' sheng-tu-debug=sysmem,nocb'
-            # The temperature clamp (coachz-prelink-thermal.patch). The busy-driven GPU governor (coachz-gpu-dcvs=1, CoachzGpu.cpp) is left out
-            # while the DDR vote is measured, so the GPU stays at 800 MHz on both sides of it.
-            command_line += ' coachz-thermal-clamp=1'
+            # The temperature clamp (coachz-prelink-thermal.patch) and the GPU governor on sheng's rules (coachz-gpu-dcvs=1, CoachzGpu.cpp:
+            # about half busy, level 3 at least, the top level for 1 s after a touch).
+            command_line += ' coachz-thermal-clamp=1 coachz-gpu-dcvs=1'
+            # CPU frequency by load on the same rules (coachz_cpufreq.c): 16 ms windows, 1.25 headroom, the A76s at their top for 1 s after
+            # a touch, 60 % of the top while the GPU works; it takes over from coachz-max-freq's boot-time top states.
+            command_line += ' coachz-cpufreq=4'
             # The DDR and memory NoC bandwidth mainline votes for the top CPU and GPU states, at start (coachz_wifi.c): without it the
             # memory ran at about two thirds of Debian's speed. The render server's frame trace is summarised per 30 s (coachz_trace.c).
             command_line += ' coachz-ddr-vote=1 coachz-gpu-trace=1'
+            # Every backboardd thread at each report (coachz-prelink-thread-sample.patch), for the k85 freeze.
+            command_line += ' coachz-sample-bbd=1'
             # The system cache as mainline sets it up: sc7180's slices configured, CPUSS active, and the GPU and GPUHTW slices for the GPU (CoachzGpu.cpp).
             command_line += ' coachz-llcc=1'
     if cpus != 1:

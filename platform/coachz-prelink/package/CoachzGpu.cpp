@@ -41,6 +41,10 @@ extern "C" int memprobe_thread_block(void *) __asm__("_thread_block");
 extern kmod_info_t g_kernel_kmod_info;
 extern "C" volatile uint32_t native_adreno_io_coherent;
 extern "C" volatile uint32_t native_adreno_coherent_skips[4];
+extern "C" volatile uint32_t coachz_gpu_ahead[5];   // NativeAdrenoPublish.cpp (patches/gpu/Adreno740.patch)
+extern "C" volatile uint32_t native_adreno_deferred[4];   // NativeAdrenoMemory.cpp: BOs freed only once no process maps them
+extern "C" volatile uint32_t native_adreno_system_bos[3];   // NativeAdrenoMemory.cpp: BOs of system memory, mapped by their VM object
+extern "C" void native_adreno_deferred_poll(void);
 extern "C" vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, unsigned int);
 extern "C" void ml_io_unmap(vm_offset_t, vm_size_t);
 
@@ -113,6 +117,12 @@ void reportThread(void *, wait_result_t) {
         // Imported BOs the submit path left alone under IO coherence: [2] before submissions, [3] after completions.
         printf("COACHZ gpu9: coherent %u, maintenance skipped before submit %u after completion %u\n", native_adreno_io_coherent,
             native_adreno_coherent_skips[2], native_adreno_coherent_skips[3]);
+        // UniXNU porting/gpu#frame-path, submission to GPU start: other processes' jobs ahead of backboardd's in the one ring.
+        printf("COACHZ gpu9: system BOs %u (%u spans, %u refused); deferred BO frees %u, freed later %u, waiting %u, kept %u\n",
+            native_adreno_system_bos[0], native_adreno_system_bos[1], native_adreno_system_bos[2], native_adreno_deferred[0],
+            native_adreno_deferred[1], native_adreno_deferred[2], native_adreno_deferred[3]);
+        printf("COACHZ gpu9: ahead of backboardd: %u of %u submissions behind others, %u jobs in all, at most %u; others submitted %u\n",
+            coachz_gpu_ahead[1], coachz_gpu_ahead[0], coachz_gpu_ahead[2], coachz_gpu_ahead[3], coachz_gpu_ahead[4]);
     }
 }
 
@@ -163,7 +173,7 @@ void profileSetup() {
     coreWrite(GbifEnable, coreRead(GbifEnable) | 0xf);
 }
 
-// Dynamic GPU frequency, tried once 100 s after the driver starts: the DCVS request the bring-up sends (a6xx_gmu_set_freq for a legacy
+// Dynamic GPU frequency, tried once 20 s after the driver starts: the DCVS request the bring-up sends (a6xx_gmu_set_freq for a legacy
 // GMU: DCVS_PERF_SETTING, then OOB DCVS_SET on bit 23, acknowledged on bit 31 and cleared through bit 31), at perf levels 3, 1 and 7
 // (355, 180, 800 MHz), each held half a second while the CP cycle counter measures the clock that results. It ends at 800 MHz, the run level.
 enum : uint32_t {GmuDcvsAck = 0x8ff0, GmuDcvsPerf = 0x8ff4, GmuDcvsBw = 0x8ff8, GmuDcvsReturn = 0x8ffc, GmuHostSet = 0x14650,
@@ -205,6 +215,21 @@ void dcvsTest() {
     }
 }
 
+// The governor (coachz-gpu-dcvs=1), sheng's rules from UniXNU porting/power: every 100 ms the GMU's XO busy count picks the lowest level that
+// keeps the GPU about half busy, never below level 3; within 1 s of a touch report the top level; work resuming from an idle window at least
+// level 5 (565 MHz; sheng doubles to at least 578 MHz); up at once, down after four windows that all ask for less; within the thermal cap.
+// Level clocks as the DCVS test measured them on hardware: 3 355, 4 430, 5 565, 6 650, 7 800 MHz.
+extern "C" volatile uint32_t coachz_touch_reports;   // bsd/dev/coachz_touch.c
+const unsigned kLevelMHz[8] = {0, 180, 267, 355, 430, 565, 650, 800};
+unsigned governorTarget(unsigned level, uint64_t dBusy, uint64_t dAlways, bool touched, bool resumed) {
+    if (touched) return 7;
+    const uint64_t demand = dAlways ? dBusy * kLevelMHz[level] * 2 / dAlways : 0;   // the clock at which it would be half busy
+    unsigned target = 3;
+    while (target < 7 && kLevelMHz[target] < demand) target++;
+    if (resumed && target < 5) target = 5;
+    return target;
+}
+
 void rateThread(void *, wait_result_t) {
     uint64_t cycles = coreCounter(0x400), busy = gmuBusy(), always = coreCounter(0x980), last[ProfileCount], lastGbif[4];
     unsigned governed = 0, level = 7, changes = 0, lower = 0;
@@ -212,9 +237,34 @@ void rateThread(void *, wait_result_t) {
     profileSetup();
     for (unsigned i = 0; i < ProfileCount; i++) last[i] = coreCounter(kProfile[i].counter);
     for (unsigned i = 0; i < 4; i++) lastGbif[i] = gbifCounter(i);
+    uint64_t windowBusy = busy, windowAlways = always, boostUntil = 0, ticks = 0;
+    uint32_t touches = coachz_touch_reports;
+    bool idle = true;
     for (unsigned seconds = 0;; seconds++) {
-        IOSleep(1000);
-        if (seconds == 100) dcvsTest();
+        for (unsigned tick = 0; tick < 10; tick++, ticks++) {
+            IOSleep(100);
+            if (!governed || seconds <= 20) continue;
+            const uint64_t nowBusy = gmuBusy(), nowAlways = coreCounter(0x980);
+            const uint64_t wBusy = nowBusy - windowBusy, wAlways = nowAlways - windowAlways;
+            windowBusy = nowBusy;
+            windowAlways = nowAlways;
+            const uint32_t reports = coachz_touch_reports;
+            if (reports != touches) boostUntil = ticks + 10;
+            touches = reports;
+            const bool working = wAlways && wBusy * 50 >= wAlways;   // at least 2 % busy
+            unsigned target = governorTarget(level, wBusy, wAlways, ticks < boostUntil, working && idle);
+            idle = !working;
+            if (target > coachz_gpu_level_cap) target = coachz_gpu_level_cap;
+            lower = target < level ? lower + 1 : 0;
+            uint32_t result = 0;
+            if ((target > level || (target < level && (lower >= 4 || level > coachz_gpu_level_cap))) && dcvsSet(target, &result)) {
+                level = target;
+                changes++;
+                lower = 0;
+            }
+        }
+        if (seconds == 20) dcvsTest();
+        native_adreno_deferred_poll();
         const uint64_t newCycles = coreCounter(0x400), newBusy = gmuBusy(), newAlways = coreCounter(0x980);
         const uint64_t dCycles = newCycles - cycles, dBusy = newBusy - busy, dAlways = newAlways - always;
         uint64_t d[ProfileCount], g[4];
@@ -231,20 +281,6 @@ void rateThread(void *, wait_result_t) {
         cycles = newCycles;
         busy = newBusy;
         always = newAlways;
-        // The governor (coachz-gpu-dcvs=1), after the step test: the level by last second's load, within the thermal cap (coachz_thermal.c).
-        // Up at once, down only after three seconds that all ask for less (k82 went from 800 to 430 MHz on one quiet second).
-        const unsigned load = dAlways ? unsigned(dBusy * 100 / dAlways) : 0;
-        if (governed && seconds > 100) {
-            unsigned target = load >= 60 ? 7 : load >= 30 ? 6 : load >= 10 ? 4 : 3;
-            if (target > coachz_gpu_level_cap) target = coachz_gpu_level_cap;
-            lower = target < level ? lower + 1 : 0;
-            uint32_t result = 0;
-            if ((target > level || (target < level && (lower >= 3 || level > coachz_gpu_level_cap))) && dcvsSet(target, &result)) {
-                level = target;
-                changes++;
-                lower = 0;
-            }
-        }
         if (!dAlways || dBusy * 20 < dAlways || !dCycles) continue;
         auto pct = [dCycles](uint64_t value) {return static_cast<unsigned long long>(value * 100 / dCycles);};
         // The CP counter counts every core cycle, idle ones too, so the second number is the clock itself.
@@ -385,7 +421,9 @@ void memoryProbeThread(void *, wait_result_t) {
 
 // The SQE firmware, the kit's GPU context and the CP's first packets.
 bool startCp(volatile uint8_t *smmu, size_t smmuBytes, const uint32_t *sqe, uint32_t sqeBytes) {
-    unsigned pool = 512;
+    // 1536 MiB, UniXNU's default (sheng-gpu-pool): k89's pool peaked at 472 of 512 MiB, and a BO outside the pool is the kind a crashed
+    // process's close freed under its mapping.
+    unsigned pool = 1536;
     PE_parse_boot_argn("coachz-gpu-pool", &pool, sizeof pool);
     native_adreno_pool_mib = pool;
     native_adreno_wc_enabled = 1;
@@ -575,6 +613,39 @@ bool publishAccelerator() {
 }
 }  // namespace
 
+// The apps SMMU (MMU-500 at 0x15000000) as found, read only: the first step toward direct scanout (UniXNU porting/display: the display
+// pipe reads the compositor's surface through a window of its own). k85 read sCR0 0x200001, CLIENTPD set, so every master bypasses it
+// today, USB included; a window for the display's stream (0x800 mask 0x2 in sc7180.dtsi) needs to know which stream matches and context
+// banks the firmware left behind. Prints the ID registers, every valid SMR with its S2CR, and how many CBARs are in use.
+void appsSmmuProbe() {
+    const vm_offset_t base = ml_io_map(0x15000000, 0x20000);
+    if (!base) {
+        printf("COACHZ smmu apps: no window\n");
+        return;
+    }
+    const volatile uint32_t *gr0 = reinterpret_cast<const volatile uint32_t *>(base);
+    const uint32_t idr0 = gr0[0x20 / 4], idr1 = gr0[0x24 / 4], idr2 = gr0[0x28 / 4];
+    const unsigned smrs = idr0 & 0xff, cbs = idr1 & 0xff, page = (idr1 >> 31) ? 0x10000 : 0x1000;
+    printf("COACHZ smmu apps: sCR0 0x%x sACR 0x%x IDR0 0x%x IDR1 0x%x IDR2 0x%x IDR7 0x%x, %u SMRs %u CBs page 0x%x\n", gr0[0], gr0[0x10 / 4],
+        idr0, idr1, idr2, gr0[0x3c / 4], smrs, cbs, page);
+    unsigned valid = 0, nondefault = 0;
+    for (unsigned i = 0; i < smrs && i < 128; ++i) {
+        const uint32_t smr = gr0[(0x800 + 4 * i) / 4], s2cr = gr0[(0xc00 + 4 * i) / 4];
+        if (s2cr != 0x20000) ++nondefault;
+        if (!(smr >> 31)) continue;
+        ++valid;
+        printf("COACHZ smmu apps: SMR %u id 0x%x mask 0x%x -> S2CR 0x%x (type %u cb %u)\n", i, smr & 0xffff, (smr >> 16) & 0x7fff, s2cr,
+            (s2cr >> 16) & 3, s2cr & 0xff);
+    }
+    unsigned cbars = 0;
+    if (page == 0x1000) {
+        const volatile uint32_t *gr1 = reinterpret_cast<const volatile uint32_t *>(base + page);
+        for (unsigned i = 0; i < cbs && i < 128; ++i) cbars += gr1[i] != 0;
+    }
+    printf("COACHZ smmu apps: %u valid SMRs, %u S2CRs not at reset, %u of %u CBARs set%s\n", valid, nondefault, cbars, cbs,
+        page == 0x1000 ? "" : " (64 KiB pages: CBARs not read)");
+}
+
 // Called once from coachz_gpu_start with the windows it mapped; the seq left the GMU up. Nonzero when the driver is serving.
 extern "C" int coachz_gpu_driver_start(volatile uint8_t *core, volatile uint8_t *gmu, volatile uint8_t *smmu, size_t smmuBytes, const uint32_t *sqe, uint32_t sqeBytes) {
     gCore = core;
@@ -584,6 +655,7 @@ extern "C" int coachz_gpu_driver_start(volatile uint8_t *core, volatile uint8_t 
         printf("COACHZ gpu9: CP not started; rendering stays on the CPU\n");
         return 0;
     }
+    appsSmmuProbe();
     NativeAdrenoVm *vm = NativeAdrenoGpuContextVm();
     IOReturn status = vm ? gSubmit.attach(vm, &gRing) : kIOReturnNotReady;
     const NativeAdrenoTimeIo timer{nullptr, timerRead};

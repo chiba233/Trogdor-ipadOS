@@ -13,7 +13,7 @@
  	extern void coachz_battery_start(void);
 --- /dev/null
 +++ b/bsd/dev/coachz_wifi.c
-@@ -0,0 +1,868 @@
+@@ -0,0 +1,949 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/* WCN3990 / SC7180 first-stage SMEM inventory. Not in the kernel build.
 + * coachz-wifi=1 plus an explicit /arm-io/coachz-wifi ADT node enables it.
@@ -520,18 +520,21 @@
 +    uint8_t *buffer;
 +    unsigned which = 0;
 +
-+    delay(45 * 1000 * 1000);
 +    buffer = kalloc_data(chunk, Z_WAITOK);
 +    if (!buffer) {
 +        printf("COACHZ modem fw: no %zu-byte buffer\n", chunk);
 +        return;
 +    }
-+    for (; which < 4; which++) {
-+        if (vnode_open(disks[which], FREAD, 0, 0, &disk, context)) continue;
-+        if (!wifi_fw_read(disk, context, wifi_fw_header, sizeof(wifi_fw_header), WIFI_FW_BLOB) &&
-+            !memcmp(wifi_fw_header, "COACHZMODEMFW1", 14)) break;
-+        vnode_close(disk, FREAD, context);
-+        disk = NULLVP;
++    /* As soon as the USB disk opens: tried every 2 s for 2 minutes (there was a fixed 45 s wait). */
++    for (unsigned attempt = 0; attempt < 60 && disk == NULLVP; attempt++) {
++        if (attempt) delay(2 * 1000 * 1000);
++        for (which = 0; which < 4; which++) {
++            if (vnode_open(disks[which], FREAD, 0, 0, &disk, context)) continue;
++            if (!wifi_fw_read(disk, context, wifi_fw_header, sizeof(wifi_fw_header), WIFI_FW_BLOB) &&
++                !memcmp(wifi_fw_header, "COACHZMODEMFW1", 14)) break;
++            vnode_close(disk, FREAD, context);
++            disk = NULLVP;
++        }
 +    }
 +    if (disk == NULLVP) {
 +        printf("COACHZ modem fw: no firmware blob on disk0-3\n");
@@ -580,8 +583,8 @@
 +}
 +
 +/*
-+ * coachz-wifi=4: q6v5_mba_load for sc7180 (qcom_q6v5_mss.c with sc7180-trogdor.dtsi's qcom,sc7180-mss-pil node), once, 200 s after
-+ * start. The AOP is told the modem loads, cx/mx/mss go to their top level, the reset clocks (iface, bus, snoc_axi) are enabled, the
++ * coachz-wifi=4: q6v5_mba_load for sc7180 (qcom_q6v5_mss.c with sc7180-trogdor.dtsi's qcom,sc7180-mss-pil node), once, as soon as
++ * the MBA has been read. The AOP is told the modem loads, cx/mx/mss go to their top level, the reset clocks (iface, bus, snoc_axi) are enabled, the
 + * AOSS mss_restart is pulsed (0x0c2a0000 + 0x10000), the active clocks (mnoc_axi, nav) follow. mba.mbn, verified by sha256 from the disk
 + * blob, is copied to mba_mem (0x94400000, 2 MiB) through a write-combined window that is unmapped again before TF-A assigns the region
 + * to the modem (assign_mem, HLOS -> MSS_MSA read-write). Its address goes to RMB_MBA_IMAGE, then the SC7180 Q6 boot FSM runs (QDSP6SS
@@ -694,7 +697,9 @@
 +    uint32_t status[3] = {0}, before[5];
 +    uint64_t now;
 +    absolutetime_to_nanoseconds(mach_absolute_time(), &now);
-+    if (now < 200ull * NSEC_PER_SEC) delay((int)((200ull * NSEC_PER_SEC - now) / 1000));
++    /* As soon as the firmware thread has the verified MBA (there was a fixed wait until 200 s). */
++    for (unsigned waited = 0; waited < 300 && !wifi_mba_image; waited++) delay(1000 * 1000);
++    (void)now;
 +    const vm_offset_t gcc = wifi_gcc_mss(), qdsp6 = ml_io_map(0x04080000, 0x5000), rmb_page = ml_io_map(0x04180000, 0x1000),
 +        tcsr = ml_io_map(0x01f60000, 0x6000), spare_page = ml_io_map(0x01fcb000, 0x1000), aoss = ml_io_map(0x0c2b0000, 0x1000),
 +        pdc = ml_io_map(0x0b2e0000, 0x1000), smmu = ml_io_map(0x15000000, 0x1000);
@@ -731,11 +736,36 @@
 +    printf("COACHZ mba: clocks on after %d %d %d (reset pulse) %d %d us\n", clock_wait[0], clock_wait[1], clock_wait[2], clock_wait[3], clock_wait[4]);
 +
 +    /* q6v5_load: the MBA image into mba_mem through a write-combined window, unmapped before the region changes owner. */
-+    int64_t assigned = -1, reclaimed = -1;
++    int64_t assigned = -1, reclaimed = -1, mpss_assigned = -1, mpss_reclaimed = -1;
 +    int fsm = -2, pbl = -2, mba_status = -2;
 +    uint32_t pbl_value = 0, mba_value = 0, mss = 0;
-+    const vm_offset_t window = ml_io_map_unmappable((vm_offset_t)mba, (vm_size_t)mba_size, 0x6 /* VM_WIMG_WCOMB */);
++    /* mpss_mem (0x86000000, 32 MiB) to the Q6 first: "some versions of the MBA firmware will upon boot wipe the MPSS region as well"
++     * (q6v5_mba_load). k85 left it with HLOS and stalled after the MBA's own assignment. Nothing here maps this region. */
++    printf("COACHZ mba step: assign mpss_mem\n");
++    mpss_assigned = wifi_assign(0x86000000ull, 0x2000000ull, 3 /* HLOS */, 15 /* MSS_MSA */, 0x6 /* RW */);
++    printf("COACHZ mba: mpss_mem to modem %lld\n", (long long)mpss_assigned);
++    const vm_offset_t window = mpss_assigned ? 0 : ml_io_map_unmappable((vm_offset_t)mba, (vm_size_t)mba_size, 0x6 /* VM_WIMG_WCOMB */);
 +    if (window) {
++        /* What the region held before the copy: Linux reclaims mba_mem after a successful start and a reboot keeps DRAM, so this is the
++         * log of the MBA's last start under Debian, the reference for where k89-k91's stopped ("Secure Device : 1"). */
++        {
++            char text[161];
++            unsigned used = 0, lines = 0;
++            for (unsigned i = 0; i < 4096 && lines < 64; i++) {
++                const char c = ((volatile char *)window)[i];
++                if (c == '\n' || c == '\r' || c == 0 || used == sizeof(text) - 1) {
++                    if (used) {
++                        text[used] = 0;
++                        printf("COACHZ mba prior log: %s\n", text);
++                        used = 0;
++                        lines++;
++                    }
++                    if (c == '\n' || c == '\r' || c == 0) continue;
++                }
++                text[used++] = c >= 32 && c < 127 ? c : '.';
++            }
++            printf("COACHZ mba prior log: %u lines\n", lines);
++        }
 +        memcpy((void *)window, wifi_mba_image, wifi_mba_bytes);
 +        __asm__ volatile ("dsb sy" ::: "memory");
 +        const uint32_t check = *(volatile uint32_t *)window;
@@ -746,23 +776,51 @@
 +        printf("COACHZ mba: no window on mba_mem\n");
 +    }
 +    if (!assigned) {
++        /* Each register step announced first: k85 stopped on one of them without a word. */
++        /* The RMB as found (k89/k90's MBA stopped after "applying debug policy"): a debug policy start or length left from a previous
++         * start would send it after an image that is not there, so both are cleared when set (Linux writes them only for an msadp). */
++        printf("COACHZ mba rmb before: image 0x%x pbl 0x%x cmd 0x%x mba 0x%x meta 0x%x pmi start 0x%x length 0x%x mss 0x%x alt 0x%x\n",
++            rmb[0], rmb[1], rmb[2], rmb[3], rmb[4], rmb[5], rmb[6], rmb[0x40 / 4], rmb[0x44 / 4]);
++        if (rmb[5] || rmb[6]) {
++            rmb[5] = 0;
++            rmb[6] = 0;
++            printf("COACHZ mba: stale debug policy registers cleared\n");
++        }
++        printf("COACHZ mba step: rmb image\n");
 +        rmb[0] = (uint32_t)mba;
 +        /* q6v5proc_reset, the MSS_SC7180 branch. */
++        printf("COACHZ mba step: q6 sleep clock\n");
 +        q6[0x3c / 4] = q6[0x3c / 4] | 1u;
 +        const int sleep_clock = wifi_poll(&q6[0x3c / 4], 1u << 31, 0, 200, 1);
++        printf("COACHZ mba step: q6 xo clock (sleep %d)\n", sleep_clock);
 +        q6[0x38 / 4] = q6[0x38 / 4] | 1u;
 +        const int xo_clock = sleep_clock < 0 ? -2 : wifi_poll(&q6[0x38 / 4], 1u << 31, 0, 200, 1);
 +        if (sleep_clock >= 0 && xo_clock >= 0) {
++            printf("COACHZ mba step: core clock, boot core start, boot cmd (xo %d)\n", xo_clock);
 +            q6[0x20 / 4] = q6[0x20 / 4] | 1u;
 +            q6[0x400 / 4] = 1;
 +            delay(20);
 +            q6[0x404 / 4] = 1;
++            printf("COACHZ mba step: boot fsm\n");
 +            fsm = wifi_poll(&rmb[0x40 / 4], 1u, 1u, 10000, 10);
 +            mss = rmb[0x40 / 4];
++            printf("COACHZ mba step: pbl (fsm %d mss 0x%x)\n", fsm, mss);
 +            if (fsm >= 0) {
 +                for (pbl = 0; pbl <= 1000 && !(pbl_value = rmb[1]); pbl++) delay(1000);
++                printf("COACHZ mba step: mba (pbl 0x%x after %d ms)\n", pbl_value, pbl);
 +                if (pbl_value == 1) {
-+                    for (mba_status = 0; mba_status <= 5000 && !(mba_value = rmb[3]); mba_status++) delay(1000);
++                    /* 15 s (Linux waits 5), the RMB printed whenever it changes, polled every 500 ms after the first 50 ms. */
++                    uint32_t seen[8] = {0};
++                    for (mba_status = 0; mba_status <= 15000 && !(mba_value = rmb[3]); mba_status++) {
++                        delay(1000);
++                        if (mba_status < 50 || mba_status % 500) continue;
++                        const uint32_t now_regs[8] = {rmb[1], rmb[2], rmb[3], rmb[4], rmb[5], rmb[6], rmb[0x40 / 4], rmb[0x44 / 4]};
++                        if (memcmp(now_regs, seen, sizeof(seen))) {
++                            memcpy(seen, now_regs, sizeof(seen));
++                            printf("COACHZ mba rmb at %d ms: pbl 0x%x cmd 0x%x mba 0x%x meta 0x%x pmi 0x%x/0x%x mss 0x%x alt 0x%x\n", mba_status,
++                                now_regs[0], now_regs[1], now_regs[2], now_regs[3], now_regs[4], now_regs[5], now_regs[6], now_regs[7]);
++                        }
++                    }
 +                }
 +            }
 +        }
@@ -772,6 +830,7 @@
 +    }
 +
 +    /* q6v5_mba_reclaim. */
++    printf("COACHZ mba step: reclaim\n");
 +    wifi_halt_port(tcsr, 0x3000, "q6");
 +    wifi_halt_port(tcsr, 0x5000, "modem");
 +    wifi_halt_port(tcsr, 0x4000, "nc");
@@ -797,10 +856,32 @@
 +                    const char c = ((volatile char *)back)[i];
 +                    log[i] = c >= 32 && c < 127 ? c : '.';
 +                }
++                /* The MBA's whole log page (MBA_LOG_SIZE, 4 KiB), line by line: k86's MBA started (PBL 1) but never reported ready. */
++                char text[161];
++                unsigned used = 0, lines = 0;
++                for (unsigned i = 0; i < 4096 && lines < 64; i++) {
++                    const char c = ((volatile char *)back)[i];
++                    if (c == '\n' || c == '\r' || c == 0 || used == sizeof(text) - 1) {
++                        if (used) {
++                            text[used] = 0;
++                            printf("COACHZ mba log: %s\n", text);
++                            used = 0;
++                            lines++;
++                        }
++                        if (c == '\n' || c == '\r' || c == 0) {
++                            continue;
++                        }
++                    }
++                    text[used++] = c >= 32 && c < 127 ? c : '.';
++                }
 +                ml_io_unmap(back, 0x1000);
 +            }
 +        }
 +        printf("COACHZ mba: reclaim to HLOS %lld; log head \"%s\"\n", (long long)reclaimed, log);
++    }
++    if (!mpss_assigned) {
++        mpss_reclaimed = wifi_assign(0x86000000ull, 0x2000000ull, 15 /* MSS_MSA */, 3 /* HLOS */, 0x7 /* RWX */);
++        printf("COACHZ mba: mpss_mem back to HLOS %lld\n", (long long)mpss_reclaimed);
 +    }
 +    const int restored = wifi_rpmh_send(rails, off, 3, status);
 +    const int unloaded = wifi_qmp_send("{class: image, res: load_state, name: modem, val: off}");

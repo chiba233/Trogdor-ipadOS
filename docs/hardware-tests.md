@@ -1441,3 +1441,15 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 - 着色器预热：列表 158 个库，render server 约 170 s 开始，到 230 s 完成 30 个库、197 个 pipeline。
 - 168～205 s 界面不响应：触摸报告照常进入 HID（每 10 s 400～580 次），画面保持每 10 s 100 帧、每帧两个小提交；前台应用和 SpringBoard 的主线程都停在 run loop 等事件；GPU 提交全部完成，没有 panic，约 208 s 恢复。原因未定。
 - MBA 第二段（`coachz-wifi=4`，200 s）：apps SMMU `sCR0` 为 `0x200001`（CLIENTPD，旁路）；load_state、电源轨和五个时钟照常；`mba.mbn` 283296 字节拷进 mba_mem（首字 `0x464c457f`），assign_mem 交给 modem 返回 0。之后的 QDSP6SS/RMB 步骤到 233 s 都没有输出，线程停在某次寄存器访问上；系统其余部分继续运行。
+
+## modem 的 Q6 启动、触摸中断、CPU 调频和 GPU 缓冲区（k86～k91）
+
+- k86，MBA 第二段补上主线的一步：先把 mpss_mem（0x86000000，32 MiB）交给 Q6，再交 mba_mem。之后 Q6 的 sleep 和 XO 时钟、boot FSM 立即完成（MSS 状态 `0x9`/`0xb`），PBL 约 50 ms 报告成功（`0x1`）；MBA 状态 5 s（k91 延长到 15 s）内一直是 0，RMB 寄存器启动前全为 0、期间不变。收回内存后读到的 MBA 日志依次是：MBA Start、sec pil 初始化、BAM 初始化成功、“applying debug policy as secboot is enabled”、“Secure Device : 1”，之后没有输出。Debian 的固件目录没有 `msadp`，Linux 照常启动同一份 `modem/mba.mbn`。
+- k86 和 k87，密集触摸（约每秒 100 份报告，一次轮询读一份，间隔 5–10 ms）之后，触摸控制器的中断线持续高电平几十秒，期间主动读取仍返回控制器上一份报告，之后自己恢复。k88 起中断线拉低时连续读到它回到高电平（最多 16 份），轮询间隔 2 ms，并在中断线 500 ms 没有拉低时每 20 ms 主动读一次、只把内容变化的报告交给 HID；k88 的密集触摸中断线一直正常。
+- k85 的冻结经 k86 的每秒记录确认是触摸输入停住，系统本身仍在运行；k86 那次触摸停住时 GPU 正在以约 30 帧每秒渲染。
+- k86，按进程统计：7202 次 backboardd 提交里只有 7 次前面排着别的进程的任务，每次最多 1 个；UniXNU 记录的“慢帧排在别的进程后面”在这里不成立。
+- k86，GPU 调频改用 UniXNU `porting/power` 的规则（每 100 ms 选让 GPU 约一半时间忙碌的档位，不低于 3 档，触摸后 1 s 最高档，从空闲恢复至少 565 MHz），真机上在 3 档和 7 档之间切换。
+- k87，CPU 调频（`coachz-cpufreq=4`，同一页的规则：每 16 ms 按最忙的核选频率，留 1.25 倍余量，连续 4 个窗口都更闲才降，触摸后 1 s A76 最高档，GPU 有提交时所有频域不低于最高档的 60%）：A55 平均 314–1804 MHz，A76 在触摸和 GPU 工作时多在 2400 MHz。温控钳位在调频器运行时只设上限。
+- k89，panic：`pmap_assert_free`。一个用 GPU 的进程崩溃成 corpse，它的地址空间保留着 GPU 缓冲区的视图，而 `clientClose` 已把不在池里的缓冲区还给 VM。k89 的 512 MiB 池峰值用到 472 MiB。k90 把池扩到 1536 MiB（UniXNU 默认值），并对仍被映射的非池缓冲区延后释放；k91 照 UniXNU 的 `allocateSystem`，让池放不下的用户缓冲区用不属于任何 task 的可分页系统内存，客户端视图映射它自己的描述符。k90、k91 没有 panic，池峰值 216 和 88 MiB，系统内存缓冲区和延后释放都没有用到。
+- k90，送显拆分：一帧渲染完成之后，拷贝到屏幕还要约 15 ms（送显请求到拷贝完成 22–25 ms）。
+- 启动参数上限是 1023 字节；k87 去掉了已完成调查的 `coachz-dump-mgcache=1` 和 `coachz-match-log=1`。

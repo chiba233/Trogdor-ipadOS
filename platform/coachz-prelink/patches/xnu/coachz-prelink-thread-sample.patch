@@ -1,0 +1,109 @@
+--- a/osfmk/arm64/coachz_thread.c
++++ b/osfmk/arm64/coachz_thread.c
+@@ -1339,13 +1339,95 @@
+ 				used += coachz_user_frames(line + used, sizeof(line) - 1 - used, map, fp, sp, 24);
+ 			}
+ 			vm_map_deallocate(map);
++		}
++		if (used > sizeof(line) - 2) {
++			used = sizeof(line) - 2;
++		}
++		line[used++] = '\n';
++		coachz_log_append(line, used);
++	}
++	proc_rele(p);
++}
++
++/*
++ * coachz-sample-bbd=1: every thread of backboardd at each report, named, as the main-thread samples are (state, block hint, priority,
++ * last CPU, the trap it waits in, user frames). In the k85 freeze touches reached HID while the foreground app and SpringBoard sat idle
++ * in their run loops; the threads that route the events are backboardd's.
++ */
++extern void bsd_getthreadname(void *uth, char *buffer);
++
++static void
++coachz_sample_threads(int pid, const char *label, unsigned limit)
++{
++	struct {
++		uint64_t pc, lr, fp, sp, tid;
++		long long x16;
++		unsigned state, hint;
++		int pri, cpu;
++		char name[28];
++	} seen[32];
++	unsigned count = 0;
++	struct proc *p = pid > 0 ? proc_find(pid) : NULL;
++	thread_t thread;
++
++	if (!p) {
++		return;
++	}
++	if (limit > 32) {
++		limit = 32;
++	}
++	task_t task = proc_task(p);
++	task_lock(task);
++	queue_iterate(&task->threads, thread, thread_t, task_threads) {
++		if (count == limit) {
++			break;
++		}
++		arm_saved_state_t *saved = find_user_regs(thread);
++		if (!saved) {
++			continue;
+ 		}
++		char name[64] = {0};
++		bsd_getthreadname(get_bsdthread_info(thread), name);
++		size_t at = 0;
++		for (; at < sizeof(seen[count].name) - 1 && name[at]; at++) {
++			const char c = name[at];
++			seen[count].name[at] = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '-' ? c : '_';
++		}
++		seen[count].name[at] = 0;
++		seen[count].pc = get_saved_state_pc(saved);
++		seen[count].lr = get_saved_state_lr(saved);
++		seen[count].fp = get_saved_state_fp(saved);
++		seen[count].sp = get_saved_state_sp(saved);
++		seen[count].x16 = (long long)get_saved_state_reg(saved, 16);
++		seen[count].tid = thread_tid(thread);
++		seen[count].state = (unsigned)thread->state;
++		seen[count].hint = (unsigned)thread->block_hint;
++		seen[count].pri = thread->sched_pri;
++		seen[count].cpu = thread->last_processor ? thread->last_processor->cpu_id : -1;
++		count++;
++	}
++	const unsigned slide = task->task_shared_region_slide;
++	task_unlock(task);
++	extern vm_map_t get_task_map_reference(task_t);
++	vm_map_t map = get_task_map_reference(task);
++	for (unsigned index = 0; index < count; index++) {
++		char line[512];
++		size_t used = (size_t)snprintf(line, sizeof(line),
++		    "@sample %s.%s[%d] t%u slide 0x%x state 0x%x hint %u pri %d cpu %d tid %llu pc %llx lr %llx x16 %lld:", label,
++		    seen[index].name[0] ? seen[index].name : "-", pid, coachz_launch_seconds(), slide, seen[index].state, seen[index].hint,
++		    seen[index].pri, seen[index].cpu, (unsigned long long)seen[index].tid, seen[index].pc, seen[index].lr, seen[index].x16);
++		if (map != VM_MAP_NULL && used < sizeof(line) - 1) {
++			used += coachz_user_frames(line + used, sizeof(line) - 1 - used, map, seen[index].fp, seen[index].sp, 12);
++		}
+ 		if (used > sizeof(line) - 2) {
+ 			used = sizeof(line) - 2;
+ 		}
+ 		line[used++] = '\n';
+ 		coachz_log_append(line, used);
+ 	}
++	if (map != VM_MAP_NULL) {
++		vm_map_deallocate(map);
++	}
+ 	proc_rele(p);
+ }
+ 
+@@ -1357,6 +1439,10 @@
+ 	}
+ 	coachz_sample_main_thread(coachz_preferences_pid, "Preferences");
+ 	coachz_sample_main_thread(os_atomic_load(&coachz_sb_pid, relaxed), "SpringBoard");
++	unsigned threads = 0;
++	if (PE_parse_boot_argn("coachz-sample-bbd", &threads, sizeof(threads)) && threads) {
++		coachz_sample_threads(os_atomic_load(&coachz_bbd_pid, relaxed), "backboardd", 32);
++	}
+ }
+ 
+ /*

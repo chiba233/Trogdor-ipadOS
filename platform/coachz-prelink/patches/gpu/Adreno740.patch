@@ -177,10 +177,28 @@
  extern "C" {volatile uint32_t native_adreno_view_diag[6],native_adreno_view_kept;}   /* kept: BoCpuUnmap calls that left the view for another lease */
  }
  
-@@ -134,6 +151,28 @@
+@@ -134,7 +151,47 @@
      uint32_t input_bits=0,output_bits=0;
      uint32_t opened=0,closed=0;
  } g;
++/* Coachz: the driver's task timeline by process, as UniXNU porting/gpu#frame-path measures "submission to GPU start": for each of
++ * backboardd's submissions, how many other processes' jobs were still in the ring ahead of it (the one ring runs in order). [0]
++ * backboardd's submissions, [1] those behind another process's job, [2] such jobs in all, [3] the most at once, [4] other processes'
++ * submissions. Runs under the publisher lock. */
++extern "C" {volatile uint32_t coachz_gpu_ahead[5];}
++static uint8_t gCoachzFenceOther[1024];
++static void coachzNoteSubmission(uint32_t fence,bool render)
++{
++    gCoachzFenceOther[fence&1023]=render?0:1;
++    if(!render) {coachz_gpu_ahead[4]=coachz_gpu_ahead[4]+1;return;}
++    coachz_gpu_ahead[0]=coachz_gpu_ahead[0]+1;
++    uint32_t done=fence;
++    if(g.ring)(void)g.ring->observeFence(fence,nullptr,0,&done);
++    uint32_t ahead=0;
++    for(uint32_t f=done+1;f!=fence && fence-f<1024;++f)ahead+=gCoachzFenceOther[f&1023];
++    if(ahead) {coachz_gpu_ahead[1]=coachz_gpu_ahead[1]+1;coachz_gpu_ahead[2]=coachz_gpu_ahead[2]+ahead;}
++    if(ahead>coachz_gpu_ahead[3])coachz_gpu_ahead[3]=ahead;
++}
 +static void coachzWaitForForeground()
 +{
 +    const uint32_t target=gCoachzForegroundFence;
@@ -202,11 +220,32 @@
 +    gCoachzGate[0]=gCoachzGate[0]+1;gCoachzGate[1]=gCoachzGate[1]+us;
 +    if(us>gCoachzGate[2])gCoachzGate[2]=us;
 +    if(timedOut)gCoachzGate[3]=gCoachzGate[3]+1;
-+}
  }
++}
  
  class NativeAdrenoGpuPublished : public IOService {
-@@ -443,8 +482,19 @@
+     OSDeclareDefaultStructors(NativeAdrenoGpuPublished)
+@@ -359,7 +416,18 @@
+         return kIOReturnSuccess;
+     }
+     NativeAdrenoMemory *backing=live_?core_->memoryForToken(type):nullptr;
+-    if(backing) {
++    if(backing && backing->system() && backing->descriptor() && v && !v->descriptor) {
++        /* Coachz, as UniXNU: a system BO's view maps the BO's own descriptor, its VM object, as Metal's resources are mapped into their
++         * process. The pages keep the object's attribute and live while the view does, so a process that dies as a corpse with the view
++         * still mapped no longer has the pages freed under it (k89). */
++        IOMemoryDescriptor *descriptor=backing->descriptor();
++        descriptor->retain();v->token=type;v->descriptor=descriptor;
++        descriptor->retain();*memory=descriptor;
++        *options=kIOMapAnywhere;
++        native_adreno_view_diag[1]=native_adreno_view_diag[1]+1;
++        status=kIOReturnSuccess;
++    }
++    else if(backing) {
+         /* The BO's pages are cached in the kernel and the GPU's PTEs are non-cacheable, so the client needs an uncached
+          * view. A mapping of the buffer descriptor with a different cache mode is not reliable, so describe the same raw
+          * physical spans (the ones the SMMU maps) and ask for kIOMapInhibitCache, exactly how the board code maps the
+@@ -443,8 +511,20 @@
          native_adreno_wait_outer[0]=native_adreno_wait_outer[0]+1;native_adreno_wait_outer[1]=native_adreno_wait_outer[1]+waited;
          if(waited>native_adreno_wait_outer[3])native_adreno_wait_outer[3]=waited;
      } else {
@@ -218,10 +257,11 @@
 +        if(method==NativeAdrenoMethodSubmit && !foreground)coachzWaitForForeground();
          IOLockLock(g.lock);
          status=connection->live_?connection->core_->dispatch(method,input,input_size,output,output_size,&g.clock):kIOReturnNotReady;
-+        if(method==NativeAdrenoMethodSubmit && foreground && !status && output && output_size>=sizeof(NativeAdrenoAbiSubmitReply)) {
++        if(method==NativeAdrenoMethodSubmit && !status && output && output_size>=sizeof(NativeAdrenoAbiSubmitReply)) {
 +            NativeAdrenoAbiSubmitReply reply{};
 +            memcpy(&reply,output,sizeof(reply));
-+            if(reply.fence)gCoachzForegroundFence=(uint32_t)reply.fence;
++            if(reply.fence && foreground)gCoachzForegroundFence=(uint32_t)reply.fence;
++            if(reply.fence)coachzNoteSubmission((uint32_t)reply.fence,!strncmp(connection->name_,"backboardd",sizeof connection->name_));
 +        }
          if(method==NativeAdrenoMethodBoMap && !status && connection->live_ && !connection->kernel_)
              if(NativeAdrenoClientRecord *record=clientRecord(connection->name_))
@@ -326,3 +366,192 @@
      /* Optional constant device facts; absent means the method stays unsupported. */
      IOReturn attachDeviceInfo(const NativeAdrenoAbiDeviceInfo *);
      IOReturn deviceInfo(NativeAdrenoAbiDeviceInfo *);
+--- a/NativeAdrenoMemory.h
++++ b/NativeAdrenoMemory.h
+@@ -33,6 +33,7 @@
+  * References are lifetime accounting, never fences or proof of quiescence. */
+ class NativeAdrenoMemory final {
+     IOBufferMemoryDescriptor *descriptor_=nullptr;
++    bool system_=false;
+     IOMemoryDescriptor *imported_=nullptr;
+     bool read_only_=false;
+     void *mapping_=nullptr;
+@@ -57,6 +58,7 @@
+      * the CPU (writeCombinePool), and the kernel's own objects (SMMU tables, ring, fence and firmware pages) are walked or read by the
+      * CPU through their cacheable mapping (int-153: page tables from the write-combined pool made each map's table update 2.6x slower). */
+     IOReturn allocate(size_t bytes,unsigned output_bits,bool contiguous,size_t byte_budget,bool pooled=false);
++    IOReturn allocateSystem(size_t bytes,uint64_t limit);
+     /* One physically contiguous block taken from the VM early (while memory is not yet fragmented) and cut into BOs afterwards: a BO from it is
+      * one span of the GPU's table instead of one per scattered page (int-137: 59474 spans for 332 MiB, the 65536 span capacity ran out,
+      * BoMap failed, the translator answered out of device memory and the compositor fell back to the CPU; each map also walked every span, 167 ms).
+@@ -74,6 +76,9 @@
+     IOReturn importTask(void *task,uint64_t address,size_t bytes,unsigned output_bits,size_t byte_budget);
+     bool imported() const {return imported_!=nullptr;}
+     bool pooled() const {return pooled_;}
++    /* Coachz, after UniXNU allocateSystem: a BO the pool could not hold, made of system memory with no task. Its descriptor (VM object) is
++     * what a client view maps, so the pages live while any view does, whenever the driver lets the BO go. */
++    bool system() const {return system_;}
+     /* An import of memory the owner maps read-only (the kernel could pin it for reading only): the GPU may read it, never write it. */
+     bool readOnly() const {return read_only_;}
+     /* After allocate(), before any device or client mapping: cleans and invalidates the pages and makes every CPU mapping of them
+--- a/NativeAdrenoMemory.cpp
++++ b/NativeAdrenoMemory.cpp
+@@ -125,6 +125,7 @@
+         }
+         native_adreno_pool_stats[2]=native_adreno_pool_stats[2]+1;
+     }
++    if(!contiguous && pooled)return allocateSystem(bytes,limit);   /* a user BO the pool could not hold (UserClient asks pooled) */
+     IOOptionBits options=static_cast<IOOptionBits>(kIODirectionInOut)|static_cast<IOOptionBits>(kIOMemoryMapperNone);
+     if(contiguous)options|=kIOMemoryPhysicallyContiguous;
+     descriptor_=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,options,bytes,(limit-1)&~UINT64_C(4095));
+@@ -226,8 +227,48 @@
+ failed:
+     (void)release();return status;
+ }
++/* Coachz, after UniXNU NativeAdrenoMemory::allocateSystem: system memory with no task, write-combined from its creation when the board
++ * makes BOs write-combined, wired here. No kernel mapping: the zero fill may still sit in a CPU's cache through the physical aperture
++ * (UniXNU NativeAdreno 4063b92), so every span is cleaned and invalidated by physical address. A client view maps this descriptor
++ * (NativeAdrenoPublish.cpp), so its pages outlive the BO while a view does: no page goes back to the VM under a mapping (k89's panic). */
++extern "C" volatile uint32_t native_adreno_wc_enabled;
++extern "C" {volatile uint32_t native_adreno_system_bos[3];}   /* [0] made, [1] their spans, [2] refused */
++IOReturn NativeAdrenoMemory::allocateSystem(size_t bytes,uint64_t limit)
++{
++    IOOptionBits options=static_cast<IOOptionBits>(kIODirectionInOut)|static_cast<IOOptionBits>(kIOMemoryMapperNone)|
++        static_cast<IOOptionBits>(kIOMemoryPageable);
++    if(native_adreno_wc_enabled)options|=kIOMapWriteCombineCache;
++    descriptor_=IOBufferMemoryDescriptor::inTaskWithOptions(nullptr,options,bytes,4096);
++    IOReturn status=descriptor_?descriptor_->prepare():kIOReturnNoMemory;
++    if(status!=kIOReturnSuccess) {
++        if(descriptor_) {descriptor_->release();descriptor_=nullptr;}
++        native_adreno_system_bos[2]=native_adreno_system_bos[2]+1;
++        return status;
++    }
++    prepared_=true;bytes_=bytes;mapping_=nullptr;system_=true;
++    span_capacity_=bytes/4096;
++    spans_=descriptor_->getLength()==bytes?IONewData(NativeAdrenoPhysicalSpan,span_capacity_):nullptr;
++    status=spans_?kIOReturnSuccess:kIOReturnNoMemory;
++    for(size_t offset=0;!status && offset<bytes;offset+=4096) {
++        IOByteCount length=0;
++        const addr64_t physical=descriptor_->getPhysicalSegment(offset,&length,kIOMemoryMapperNone);
++        if(!physical || (physical&4095) || length<4096 || physical>=limit || 4096>limit-physical) {status=kIOReturnUnsupported;break;}
++        if(span_count_ && physical==spans_[span_count_-1].physical+spans_[span_count_-1].bytes)spans_[span_count_-1].bytes+=4096;
++        else spans_[span_count_++]={offset,physical,4096};
++    }
++    if(!status)status=maintainImported(0,bytes,NativeAdrenoCleanInvalidate);
++    if(status) {
++        native_adreno_system_bos[2]=native_adreno_system_bos[2]+1;
++        (void)release();return status;
++    }
++    native_adreno_system_bos[0]=native_adreno_system_bos[0]+1;native_adreno_system_bos[1]=native_adreno_system_bos[1]+(uint32_t)span_count_;
++    return kIOReturnSuccess;
++}
+ IOReturn NativeAdrenoMemory::makeWriteCombined()
+ {
++    /* A system BO took its cache mode when it was made: write-combined when the board asks for it, and its views follow the object. */
++    if(system_ && !write_combined_ && prepared_ && !device_references_ && !quarantined_)
++        {if(!native_adreno_wc_enabled)return kIOReturnUnsupported;write_combined_=true;return kIOReturnSuccess;}
+     if(!(descriptor_ || pooled_) || imported_ || !prepared_ || quarantined_ || device_references_ || write_combined_ || !mapping_ || !span_count_)
+         return kIOReturnNotReady;
+     if(pooled_ && pool.write_combined) {write_combined_=true;return kIOReturnSuccess;}
+@@ -236,12 +277,57 @@
+     status=NativeAdrenoSetPagesCacheMode(spans_,span_count_,true);
+     if(status)return status;
+     write_combined_=true;return kIOReturnSuccess;
++}
++/* Coachz: a BO that is not in the pool gives its pages back to the VM in release(), but a client's view maps those physical pages without
++ * holding them: a process that crashes becomes a corpse whose address space outlives its ports, so the views were still mapped when its
++ * close freed the BO and XNU's pmap_assert_free panicked (k89). Such a BO's descriptor waits here and is freed, by
++ * native_adreno_deferred_poll (each second, CoachzGpu.cpp), once no CPU maps any of its pages. [0] BOs deferred, [1] freed later,
++ * [2] waiting now, [3] kept for good because the list was full. */
++extern "C" {volatile uint32_t native_adreno_deferred[4];}
++extern "C" boolean_t pmap_verify_free(ppnum_t pn);
++namespace {
++struct DeferredBo {IOBufferMemoryDescriptor *descriptor;bool prepared;};
++DeferredBo gDeferred[256];
++IOLock *gDeferredLock;
++IOLock *deferredLock()
++{
++    if(!gDeferredLock) {
++        IOLock *lock=IOLockAlloc();
++        if(lock && !OSCompareAndSwapPtr(nullptr,lock,reinterpret_cast<void * volatile *>(&gDeferredLock)))IOLockFree(lock);
++    }
++    return gDeferredLock;
+ }
++bool descriptorMapped(IOBufferMemoryDescriptor *descriptor)
++{
++    for(IOByteCount offset=0;offset<descriptor->getLength();) {
++        IOByteCount length=0;
++        const addr64_t pa=descriptor->getPhysicalSegment(offset,&length,kIOMemoryMapperNone);
++        if(!pa || !length)return false;
++        for(IOByteCount at=0;at<length;at+=4096)if(!pmap_verify_free((ppnum_t)((pa+at)>>12)))return true;
++        offset+=length;
++    }
++    return false;
++}
++}
++extern "C" void native_adreno_deferred_poll(void)
++{
++    IOLock *lock=deferredLock();
++    if(!lock || !native_adreno_deferred[2])return;
++    IOLockLock(lock);
++    for(DeferredBo &bo:gDeferred) {
++        if(!bo.descriptor || descriptorMapped(bo.descriptor))continue;
++        if(bo.prepared)(void)bo.descriptor->complete();
++        bo.descriptor->release();bo.descriptor=nullptr;
++        native_adreno_deferred[1]=native_adreno_deferred[1]+1;native_adreno_deferred[2]=native_adreno_deferred[2]-1;
++    }
++    IOLockUnlock(lock);
++}
+ IOReturn NativeAdrenoMemory::release()
+ {
+     native_adreno_trace_stage=30;
+     if(device_references_ || quarantined_)return kIOReturnBusy;
+     if(write_combined_ && pooled_ && pool.write_combined)write_combined_=false;   /* the pool's pages keep the attribute */
++    if(system_)write_combined_=false;   /* a system BO's attribute belongs to its VM object, which keeps its pages while a view does */
+     if(write_combined_) {
+         /* The pages go back to the VM cacheable, as they came. */
+         const IOReturn status=NativeAdrenoSetPagesCacheMode(spans_,span_count_,false);
+@@ -256,6 +342,19 @@
+         }
+         imported_->release();imported_=nullptr;
+     }
++    if(descriptor_ && !pooled_ && !system_ && descriptorMapped(descriptor_)) {
++        native_adreno_deferred[0]=native_adreno_deferred[0]+1;
++        IOLock *lock=deferredLock();
++        bool kept=false;
++        if(lock) {
++            IOLockLock(lock);
++            for(DeferredBo &bo:gDeferred)if(!bo.descriptor) {bo={descriptor_,prepared_};kept=true;break;}
++            if(kept)native_adreno_deferred[2]=native_adreno_deferred[2]+1;
++            IOLockUnlock(lock);
++        }
++        if(!kept)native_adreno_deferred[3]=native_adreno_deferred[3]+1;   /* the descriptor stays alive, never freed under a mapping */
++        descriptor_=nullptr;prepared_=false;
++    }
+     if(descriptor_) {
+         if(prepared_) {
+             native_adreno_trace_stage=31;
+@@ -269,6 +368,7 @@
+         native_adreno_trace_stage=34;
+     }
+     if(pooled_) {poolGive(pool_offset_,bytes_);pooled_=false;prepared_=false;pool_offset_=0;}
++    system_=false;
+     if(spans_)IODeleteData(spans_,NativeAdrenoPhysicalSpan,span_capacity_);
+     mapping_=nullptr;spans_=nullptr;bytes_=span_count_=span_capacity_=0;read_only_=false;
+     return kIOReturnSuccess;
+@@ -292,6 +392,7 @@
+     if(imported_)return maintainImported(offset,bytes,writes?NativeAdrenoCleanInvalidate:NativeAdrenoClean);
+     if(write_combined_)   /* no CPU mapping should cache these pages; if one does, reach its lines through the physical pages */
+         return include_write_combined?maintainImported(offset,bytes,writes?NativeAdrenoCleanInvalidate:NativeAdrenoClean):kIOReturnSuccess;
++    if(system_)return maintainImported(offset,bytes,writes?NativeAdrenoCleanInvalidate:NativeAdrenoClean);   /* no kernel mapping */
+     return NativeAdrenoMaintainOwnedPages(static_cast<unsigned char *>(mapping_)+offset,bytes,
+         writes?NativeAdrenoCleanInvalidate:NativeAdrenoClean);
+ }
+@@ -302,6 +403,7 @@
+     /* Imported pages may hold the owner's unrelated dirty lines next to the GPU's writes: clean as well as invalidate. */
+     if(imported_)return maintainImported(offset,bytes,NativeAdrenoCleanInvalidate);
+     if(write_combined_)return kIOReturnSuccess;
++    if(system_)return maintainImported(offset,bytes,NativeAdrenoCleanInvalidate);
+     return NativeAdrenoMaintainOwnedPages(static_cast<unsigned char *>(mapping_)+offset,bytes,NativeAdrenoInvalidate);
+ }
+ /* Imported pages have no kernel mapping here (and write-combined ones only a non-cacheable one); maintain each span's part of
