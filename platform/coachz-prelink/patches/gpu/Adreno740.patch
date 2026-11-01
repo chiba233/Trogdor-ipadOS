@@ -1,5 +1,5 @@
---- a/NativeAdrenoGpuContext.h	2026-11-01 05:33:09
-+++ b/NativeAdrenoGpuContext.h	2026-11-01 05:33:09
+--- a/NativeAdrenoGpuContext.h
++++ b/NativeAdrenoGpuContext.h
 @@ -5,7 +5,7 @@
  
  /* The GPU's own SMMU context, built like the GMU's (NativeAdrenoGmuContext): a native4K lower-region (TTBR0) table
@@ -20,8 +20,8 @@
  };
  enum : size_t {GpuSqeBytes=0x13000, GpuRingBytes=0x8000, GpuPageBytes=0x1000, GpuBufferCount=5};
  struct NativeAdrenoGpuBuffer {uint64_t physical,bytes,iova;};
---- a/NativeAdrenoRing.cpp	2026-11-01 05:33:09
-+++ b/NativeAdrenoRing.cpp	2026-11-01 05:33:09
+--- a/NativeAdrenoRing.cpp
++++ b/NativeAdrenoRing.cpp
 @@ -17,8 +17,9 @@
      RingWptr = 0x0807,
      RingScratch = 0x0885,     /* CP_SCRATCH(2) for A6XX..A7XX */
@@ -151,8 +151,8 @@
      const uint32_t base_lo=(uint32_t)ring_iova_,base_hi=(uint32_t)(ring_iova_>>32);
      const uint32_t rptr_lo=(uint32_t)fence_iova_,rptr_hi=(uint32_t)(fence_iova_>>32);
      const uint32_t writes[]={RingBase,base_lo,RingBase+1,base_hi,RingControl,control,
---- a/NativeAdrenoPublish.cpp	2026-10-26 05:35:25
-+++ b/NativeAdrenoPublish.cpp	2026-11-01 06:18:51
+--- a/NativeAdrenoPublish.cpp
++++ b/NativeAdrenoPublish.cpp
 @@ -38,6 +38,19 @@
  } native_adreno_metal_diag;
  /* BO CPU views (clientMemoryForType for a BO token): [0] calls, [1] new descriptors, [2] served from the view cache, [3] refused (not a BO / out of
@@ -173,3 +173,80 @@
  extern "C" {volatile uint32_t native_adreno_view_diag[6],native_adreno_view_kept;}   /* kept: BoCpuUnmap calls that left the view for another lease */
  }
  
+--- a/NativeAdrenoABI.h
++++ b/NativeAdrenoABI.h
+@@ -30,6 +30,8 @@
+     NativeAdrenoMethodBoCpuUnmap = 14,
+     NativeAdrenoMethodGetDeviceInfo = 15,
+     NativeAdrenoMethodBoImport = 16,
++    NativeAdrenoMethodSetPriority = 17,   /* Coachz: the two methods of the newer UniXNU userland, so it runs on this framework */
++    NativeAdrenoMethodNote = 18,
+     NativeAdrenoAbiMetadataBytes = 64,
+     NativeAdrenoAbiMaxQueues = 8
+ };
+@@ -114,6 +116,18 @@
+     uint32_t token;               /* exactly the token returned by map */
+     uint32_t reserved;            /* zero */
+ };
++/* As the newer UniXNU ABI: the GPU priorities a process's Metal queues asked for (MTLGPUPriority numbering, 3 refused for foreground), and a
++ * note it leaves in the kernel's log (kind 1 a slow render pass, 2 a pipeline made or refused; the words are the frontend's record). */
++struct NativeAdrenoAbiPriority {
++    uint32_t foreground;
++    uint32_t background;
++};
++enum { NativeAdrenoNoteWords = 30, NativeAdrenoNotePass = 1, NativeAdrenoNotePipeline = 2 };
++struct NativeAdrenoAbiNote {
++    uint32_t kind;
++    uint32_t count;
++    uint32_t words[NativeAdrenoNoteWords];
++};
+ struct NativeAdrenoAbiQueue {
+     uint64_t queue;               /* zero for create, an open id for close */
+ };
+--- a/NativeAdrenoUserClient.cpp
++++ b/NativeAdrenoUserClient.cpp
+@@ -421,6 +421,8 @@
+     case NativeAdrenoMethodBoCpuMap:return sizeof(NativeAdrenoAbiBoCpuMap);
+     case NativeAdrenoMethodBoCpuUnmap:return sizeof(NativeAdrenoAbiBoCpuUnmap);
+     case NativeAdrenoMethodWaitFence:return sizeof(NativeAdrenoAbiWaitFence);
++    case NativeAdrenoMethodSetPriority:return sizeof(NativeAdrenoAbiPriority);
++    case NativeAdrenoMethodNote:return sizeof(NativeAdrenoAbiNote);
+     default:return SIZE_MAX;
+     }
+ }
+@@ -443,6 +445,8 @@
+     case NativeAdrenoMethodBoCpuMap:return sizeof(NativeAdrenoAbiBoCpuMapReply);
+     case NativeAdrenoMethodBoCpuUnmap:return 0;
+     case NativeAdrenoMethodBoImport:return sizeof(NativeAdrenoAbiBoAllocReply);
++    case NativeAdrenoMethodSetPriority:
++    case NativeAdrenoMethodNote:return 0;
+     default:return SIZE_MAX;
+     }
+ }
+@@ -576,6 +580,26 @@
+         NativeAdrenoAbiMetadata reply{};
+         status=getMetadata(&request,&reply);
+         if(!status)memcpy(output,&reply,sizeof(reply));
++        break;
++    }
++    /* Coachz: one ring without priorities, so a priority is only accepted (a refused foreground value, 3, or one above 5 is not). */
++    case NativeAdrenoMethodSetPriority: {
++        NativeAdrenoAbiPriority request{};
++        memcpy(&request,input,sizeof(request));
++        if(request.foreground>5 || request.foreground==3 || request.background>5)status=kIOReturnBadArgument;
++        break;
++    }
++    /* Coachz: a note goes to the log ring, its first words in hex, at most 400 of them a boot. */
++    case NativeAdrenoMethodNote: {
++        NativeAdrenoAbiNote request{};
++        memcpy(&request,input,sizeof(request));
++        if(!request.kind || request.count>NativeAdrenoNoteWords) {status=kIOReturnBadArgument;break;}
++        static uint32_t notes;
++        if(++notes<=400) {
++            const uint32_t *w=request.words;
++            printf("COACHZ gpu note: kind %u count %u: %x %x %x %x %x %x %x %x %x %x %x %x\n",request.kind,request.count,
++                w[0],w[1],w[2],w[3],w[4],w[5],w[6],w[7],w[8],w[9],w[10],w[11]);
++        }
+         break;
+     }
+     case NativeAdrenoMethodGetStatus: {

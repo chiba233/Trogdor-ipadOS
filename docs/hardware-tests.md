@@ -1379,3 +1379,15 @@ EC 探针（k74，`coachz-battery=1`）每 10 秒读一次两个 PD 端口的 `E
 - 同一个充电器在 Debian 下重新插拔，约 0.4 秒就到 12V 2.5A，开始充电，所以充电器和电池没有问题。
 - k74 里重新插拔一次，结果正常。EC 控制台依次是 `Attached.SNK`、5V 3A、请求 12V 2.5A、`PE_SNK_Ready`、`AC on`，前后约 0.2 秒，电池恢复充电。k73 那次的原因不明，没有复现。
 - EC 控制台还有 139 次 `MKBP not cleared within threshold, toggling`：XNU 只轮询按键状态，没有像 Linux 那样把 MKBP 事件取走。这次带着它照样正常充电。
+
+## 新版 GPU 上层（k75）
+
+Turnip、metal2vulkan 运行时和 Metal 插件改从固定在新版本的 UniXNU 副本构建（`upstream.lock.json` 的 `unixnu-gpu`）。内核仍是 k74 那版 Adreno740 框架，补了新上层用的 `SetPriority`（只接收）和 `Note`（写进日志环）两个方法。sysmem 改由启动参数 `sheng-tu-debug=sysmem,nocb` 设置。
+
+- 进桌面，ring 提交 532 次全部 fence，252 帧上屏，失败 0；没有 `@crash` 和 panic。
+- 机主这次没有看到小图标花屏，也没觉得变快。
+- GPU 忙碌率最高 72%（k74 是 56%），时钟仍是 650 MHz。
+- 新插件的分帧统计和 `Note` 都要 `sheng-diag=1` 才记录，这次没开，所以没有可比的帧分解。
+- 渲染服务器最忙的几条线程常在 A55 上运行，优先级多是 37。
+
+同一次的照片：主屏小组件是白色空块，壁纸全黑，图标压在小组件上。面板 EDID 是 2160×1440、233×155 mm（3:2，方形像素），而系统装扮成 11 英寸 iPad Pro（约 1.43:1），启动时的苹果标志被横向拉宽。

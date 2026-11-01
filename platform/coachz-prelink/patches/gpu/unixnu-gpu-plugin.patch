@@ -1,0 +1,12 @@
+--- a/NativeAdrenoMetalPlugin.mm
++++ b/NativeAdrenoMetalPlugin.mm
+@@ -93,7 +93,8 @@
+     size_t size = sizeof args - 1;
+     return sysctlbyname("kern.bootargs", args, &size, nullptr, 0) == 0 && strstr(args, key);
+ }
+-static unsigned patchFramebufferBranch(uintptr_t slide) {
++// Coachz: only the arm64e (iOS 27) build calls it; the iOS 17 build would fail on -Wunused-function.
++[[maybe_unused]] static unsigned patchFramebufferBranch(uintptr_t slide) {
+     const uintptr_t site = 0x184461928 + slide;
+     uint32_t word = 0;
+     if (!readTask(site, &word, sizeof word)) return 0x6E40;

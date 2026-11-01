@@ -296,6 +296,8 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         if gpu == 9:
             # GPU_SET mode of the display driver: the compositor's frames reach the scanout through the GPU, not by a CPU copy.
             command_line += ' sheng-fb-gpu=1'
+            # Every pass in system memory: A618's 512 KiB of GMEM splits this screen into about 30 bins (the plug-in sets TU_DEBUG from it).
+            command_line += ' sheng-tu-debug=sysmem,nocb'
     if cpus != 1:
         # coachz-prelink-smp.patch raises BCM2837's board configuration to eight CPUs in two clusters.
         if not root_uuid or not prelinked or not 2 <= cpus <= 8:
