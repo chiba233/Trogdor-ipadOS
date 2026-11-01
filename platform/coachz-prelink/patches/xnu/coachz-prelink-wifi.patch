@@ -13,7 +13,7 @@
  	extern void coachz_battery_start(void);
 --- /dev/null
 +++ b/bsd/dev/coachz_wifi.c
-@@ -0,0 +1,1659 @@
+@@ -0,0 +1,2243 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/* WCN3990 / SC7180: the modem that hosts the WLAN firmware, started as mainline's qcom_q6v5_mss does (coachz-wifi=4), and the SMEM
 + * inventory (coachz-wifi=1 plus an explicit /arm-io/coachz-wifi ADT node): the public table, the global partition and APPS<->MODEM.
@@ -556,6 +556,11 @@
 +/* qdsp6sw.mbn once its SHA-256 matched: the disk, its byte offset there and its size; read again in place to load the modem. */
 +static volatile int wifi_mpss_disk = -1;
 +static uint64_t wifi_mpss_at, wifi_mpss_bytes;
++/* The modem's EFS images (modem_fs1, fs2, fsc, fsg) once their SHA-256 matched, in memory for rmtfs. */
++struct wifi_efs { char name[16]; uint8_t *data; uint32_t bytes; };
++static struct wifi_efs wifi_efs[4];
++static volatile int wifi_efs_count;
++
 +
 +static int
 +wifi_fw_read(vnode_t disk, vfs_context_t context, void *buffer, size_t bytes, uint64_t offset)
@@ -631,6 +636,19 @@
 +                wifi_mba_image = copy;
 +            } else if (copy) {
 +                kfree_data(copy, rounded);
++            }
++        }
++        /* The modem's EFS images for rmtfs (wg), kept in memory. */
++        if (!error && !memcmp(digest, entry + 32, 32) && !strncmp(name, "modem_fs", 8) && size && size <= (4u << 20) && wifi_efs_count < 4) {
++            uint8_t *copy = kalloc_data((size_t)size, Z_WAITOK);
++            if (copy && !wifi_fw_read(disk, context, copy, (size_t)size, WIFI_FW_BLOB + offset)) {
++                struct wifi_efs *efs = &wifi_efs[wifi_efs_count];
++                strlcpy(efs->name, name, sizeof(efs->name));
++                efs->data = copy;
++                efs->bytes = (uint32_t)size;
++                __atomic_store_n(&wifi_efs_count, wifi_efs_count + 1, __ATOMIC_RELEASE);
++            } else if (copy) {
++                kfree_data(copy, (size_t)size);
 +            }
 +        }
 +        if (!error && !memcmp(digest, entry + 32, 32) && !strcmp(name, "qdsp6sw.mbn") && size >= 4096) {
@@ -1481,6 +1499,565 @@
 +    return voted >= 0 && clocked >= 0 ? 0 : -3;
 +}
 +
++/*
++ * The link to the running modem, set up as Linux does once the modem is up: GLINK over SMEM (qcom_glink_smem.c with qcom_glink_native.c;
++ * the AP's FIFO is item 479, the modem's 480, the descriptor 478 holds our FIFO's tail and head, then the modem's), QRTR on GLINK's
++ * "IPCRTR" channel (net/qrtr af_qrtr.c and the in-kernel name service ns.c, this side node 1 as Debian's qrtr-ns -f 1), and the remote
++ * file system the modem keeps its EFS on (linux-msm rmtfs: QMI service 14 version 1 instance 0, 512-byte sectors moved between the EFS
++ * images and rmtfs_mem). The images (modem_fs1, fs2, fsc, fsg) come with the firmware blob and stay in memory: writes are kept there
++ * only, as Debian's rmtfs -r keeps them. Polled: Linux takes the GLINK interrupt (SPI 449) and kicks the modem through the APSS IPC
++ * register bit 12.
++ */
++#define WG_FIFO_BYTES 16384u
++enum {
++    WG_VERSION = 0, WG_VERSION_ACK = 1, WG_OPEN = 2, WG_CLOSE = 3, WG_OPEN_ACK = 4, WG_INTENT = 5, WG_RX_DONE = 6, WG_INTENT_REQ = 7,
++    WG_INTENT_REQ_ACK = 8, WG_TX_DATA = 9, WG_CLOSE_ACK = 11, WG_TX_DATA_CONT = 12, WG_READ_NOTIF = 13, WG_RX_DONE_REUSE = 14, WG_SIGNALS = 15,
++};
++#define WG_FEATURE_REUSE 1u
++#define WG_LCID 1u
++#define WG_LOCAL_MAX 24
++#define WG_REMOTE_MAX 32
++#define WG_PENDING_MAX 8
++#define WQ_NODE 1u                 /* this side's QRTR node */
++#define WQ_CTRL 0xfffffffeu
++#define WQ_BCAST 0xffffffffu
++#define WQ_RMTFS_PORT 0x4000u
++#define WR_SECTOR 512u
++
++
++static struct {
++    uint32_t desc, tx, rx, rx_bytes;
++    uint32_t features;
++    int open_remote, open_acked, intents_sent, hello_sent, failed;
++    uint32_t rcid, next_liid;
++    struct { uint32_t id, size; int busy, valid; } remote[WG_REMOTE_MAX];
++    struct { uint32_t id, size, fill; uint8_t *data; } local[WG_LOCAL_MAX];
++    unsigned local_count;
++    struct { uint8_t *data; uint32_t bytes; int requested; } pending[WG_PENDING_MAX];
++    uint32_t modem_node;
++    vm_offset_t rmtfs;
++    uint32_t opened[4];
++    uint64_t messages_in, messages_out, qrtr_rx, qrtr_tx, rmtfs_ops, rmtfs_sectors;
++    char channels[160];
++} wg;
++
++static void
++wg_kick(void)
++{
++    if (!wifi_qmp_kick) return;
++    __asm__ volatile ("dsb sy" ::: "memory");
++    *wifi_qmp_kick = 1u << 12;
++}
++
++static uint32_t
++wg_rx_avail(void)
++{
++    const uint32_t head = *wifi_smem_word(wg.desc + 12), tail = *wifi_smem_word(wg.desc + 8);
++    if (head >= wg.rx_bytes || tail >= wg.rx_bytes) return 0;
++    return head >= tail ? head - tail : wg.rx_bytes - tail + head;
++}
++
++static void
++wg_rx_peek(uint32_t offset, void *dst, uint32_t count)
++{
++    uint8_t *d = dst;
++    const uint32_t start = *wifi_smem_word(wg.desc + 8) + offset;
++    __asm__ volatile ("dmb oshld" ::: "memory");
++    for (uint32_t i = 0; i < count; i++) {
++        const uint32_t at = (start + i) % wg.rx_bytes;
++        d[i] = (uint8_t)(*wifi_smem_word(wg.rx + (at & ~3u)) >> (8 * (at & 3u)));
++    }
++}
++
++static void
++wg_rx_advance(uint32_t count)
++{
++    const uint32_t tail = (*wifi_smem_word(wg.desc + 8) + count) % wg.rx_bytes;
++    __asm__ volatile ("dmb osh" ::: "memory");
++    *wifi_smem_word(wg.desc + 8) = tail;
++}
++
++static uint32_t
++wg_tx_avail(void)
++{
++    const uint32_t head = *wifi_smem_word(wg.desc + 4), tail = *wifi_smem_word(wg.desc);
++    const uint32_t avail = tail <= head ? WG_FIFO_BYTES - head + tail : tail - head;
++    return avail < 16 ? 0 : avail - 16;   /* FIFO_FULL_RESERVE + TX_BLOCKED_CMD_RESERVE */
++}
++
++/* One message, header then payload padded to 8 bytes, written word by word before the head moves, then a kick. */
++static int
++wg_tx(const void *hdr, uint32_t hlen, const void *data, uint32_t dlen)
++{
++    const uint32_t total = (hlen + dlen + 7) & ~7u;
++    if (wg.failed || total > WG_FIFO_BYTES / 2) return -1;
++    for (unsigned waited = 0; wg_tx_avail() < total; waited++) {
++        if (waited >= 2000) {
++            wg.failed = 1;
++            printf("COACHZ glink: our FIFO stayed full\n");
++            return -1;
++        }
++        delay(1000);
++    }
++    uint32_t head = *wifi_smem_word(wg.desc + 4);
++    for (uint32_t i = 0; i < total; i += 4) {
++        uint8_t bytes[4];
++        for (unsigned b = 0; b < 4; b++) {
++            const uint32_t k = i + b;
++            bytes[b] = k < hlen ? ((const uint8_t *)hdr)[k] : k - hlen < dlen ? ((const uint8_t *)data)[k - hlen] : 0;
++        }
++        uint32_t word;
++        memcpy(&word, bytes, 4);
++        *wifi_smem_word(wg.tx + head) = word;
++        head = (head + 4) % WG_FIFO_BYTES;
++    }
++    __asm__ volatile ("dsb sy" ::: "memory");
++    *wifi_smem_word(wg.desc + 4) = head;
++    wg_kick();
++    wg.messages_out++;
++    return 0;
++}
++
++static void
++wg_cmd(uint32_t cmd, uint32_t p1, uint32_t p2)
++{
++    const uint32_t m[2] = {cmd | p1 << 16, p2};
++    wg_tx(m, 8, NULL, 0);
++}
++
++/* qcom_glink_advertise_intent: a buffer of size bytes the modem may fill, one message each. */
++static int
++wg_intent_add(uint32_t size)
++{
++    if (wg.local_count >= WG_LOCAL_MAX || !size || size > 65536) return -1;
++    uint8_t *buf = kalloc_data(size, Z_WAITOK);
++    if (!buf) return -1;
++    const unsigned i = wg.local_count++;
++    wg.local[i].id = ++wg.next_liid;
++    wg.local[i].size = size;
++    wg.local[i].fill = 0;
++    wg.local[i].data = buf;
++    const uint32_t m[4] = {WG_INTENT | WG_LCID << 16, 1, size, wg.local[i].id};
++    return wg_tx(m, 16, NULL, 0);
++}
++
++/* A message on IPCRTR: in a free intent the modem advertised, or queued with an RX_INTENT_REQ until it advertises one. */
++static int
++wg_send(const void *data, uint32_t len)
++{
++    for (unsigned i = 0; i < WG_REMOTE_MAX; i++) {
++        if (!wg.remote[i].valid || wg.remote[i].busy || wg.remote[i].size < len) continue;
++        wg.remote[i].busy = 1;
++        const uint32_t h[4] = {WG_TX_DATA | WG_LCID << 16, wg.remote[i].id, len, 0};
++        wg.qrtr_tx++;
++        return wg_tx(h, 16, data, len);
++    }
++    for (unsigned p = 0; p < WG_PENDING_MAX; p++) {
++        if (wg.pending[p].data) continue;
++        wg.pending[p].data = kalloc_data(len, Z_WAITOK);
++        if (!wg.pending[p].data) return -1;
++        memcpy(wg.pending[p].data, data, len);
++        wg.pending[p].bytes = len;
++        wg.pending[p].requested = 1;
++        wg_cmd(WG_INTENT_REQ, WG_LCID, len);
++        return 0;
++    }
++    printf("COACHZ glink: no intent and the queue is full, %u bytes dropped\n", len);
++    return -1;
++}
++
++static void
++wg_retry_pending(void)
++{
++    for (unsigned p = 0; p < WG_PENDING_MAX; p++) {
++        if (!wg.pending[p].data) continue;
++        for (unsigned i = 0; i < WG_REMOTE_MAX; i++) {
++            if (!wg.remote[i].valid || wg.remote[i].busy || wg.remote[i].size < wg.pending[p].bytes) continue;
++            wg.remote[i].busy = 1;
++            const uint32_t h[4] = {WG_TX_DATA | WG_LCID << 16, wg.remote[i].id, wg.pending[p].bytes, 0};
++            wg.qrtr_tx++;
++            wg_tx(h, 16, wg.pending[p].data, wg.pending[p].bytes);
++            kfree_data(wg.pending[p].data, wg.pending[p].bytes);
++            wg.pending[p].data = NULL;
++            break;
++        }
++    }
++}
++
++/* A QRTR v1 packet (af_qrtr.c qrtr_node_enqueue: control packets go to the peer node's control port). */
++static void
++wq_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_port, const void *payload, uint32_t len)
++{
++    uint8_t packet[32 + 1024];
++    if (len > 1024) return;
++    const uint32_t h[8] = {1, type, WQ_NODE, src_port, 0, len, dst_node, dst_port};
++    memcpy(packet, h, 32);
++    memcpy(packet + 32, payload, len);
++    const uint32_t padded = (len + 3) & ~3u;
++    bzero(packet + 32 + len, padded - len);
++    wg_send(packet, 32 + padded);
++}
++
++static void
++wq_ctrl(uint32_t cmd, uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t dst_node)
++{
++    const uint32_t pkt[5] = {cmd, a, b, c, d};
++    wq_send(cmd, WQ_CTRL, dst_node, WQ_CTRL, pkt, sizeof(pkt));
++}
++
++/* QMI over QRTR (soc/qcom/qmi_interface.c): a 7-byte header (type, transaction, message, length) and TLVs (type, u16 length). */
++static int
++wr_tlv(const uint8_t *body, uint32_t n, uint8_t want, const uint8_t **value, uint16_t *len)
++{
++    for (uint32_t at = 0; at + 3 <= n;) {
++        const uint8_t type = body[at];
++        const uint16_t l = (uint16_t)(body[at + 1] | body[at + 2] << 8);
++        if (at + 3 + l > n) return 0;
++        if (type == want) {
++            *value = body + at + 3;
++            *len = l;
++            return 1;
++        }
++        at += 3 + l;
++    }
++    return 0;
++}
++
++static uint32_t
++wr_put(uint8_t *out, uint32_t at, uint8_t type, const void *value, uint16_t len)
++{
++    out[at] = type;
++    out[at + 1] = (uint8_t)len;
++    out[at + 2] = (uint8_t)(len >> 8);
++    memcpy(out + at + 3, value, len);
++    return at + 3 + len;
++}
++
++/* rmtfs.c's handlers, for one request from the modem's client at (node, port). */
++static void
++wr_request(uint32_t node, uint32_t port, const uint8_t *msg, uint32_t n)
++{
++    if (n < 7 || msg[0] != 0) return;
++    const uint16_t txn = (uint16_t)(msg[1] | msg[2] << 8), id = (uint16_t)(msg[3] | msg[4] << 8);
++    const uint16_t blen = (uint16_t)(msg[5] | msg[6] << 8);
++    const uint8_t *body = msg + 7;
++    if (7u + blen > n) return;
++    uint8_t out[64];
++    uint32_t at = 7;
++    uint16_t result[2] = {0, 0};
++    const uint8_t *v = NULL;
++    uint16_t l = 0;
++    wg.rmtfs_ops++;
++    if (id == 1) {                      /* OPEN: path -> caller id */
++        char path[64] = {0};
++        int found = -1;
++        if (wr_tlv(body, blen, 1, &v, &l)) memcpy(path, v, l < sizeof(path) - 1 ? l : sizeof(path) - 1);
++        for (int i = 0; i < wifi_efs_count; i++) {
++            char want[32];
++            snprintf(want, sizeof(want), "/boot/%s", wifi_efs[i].name);
++            if (!strcmp(path, want)) found = i;
++        }
++        if (found < 0) {
++            result[0] = 1;
++            result[1] = 1;
++        } else {
++            wg.opened[found]++;
++        }
++        at = wr_put(out, at, 2, result, 4);
++        if (found >= 0) {
++            const uint32_t caller = (uint32_t)found + 1;
++            at = wr_put(out, at, 16, &caller, 4);
++        }
++        printf("COACHZ rmtfs: open \"%s\" -> %d\n", path, found + 1);
++    } else if (id == 2) {               /* CLOSE */
++        at = wr_put(out, at, 2, result, 4);
++    } else if (id == 3) {               /* RW_IOVEC: sectors between the image and rmtfs_mem */
++        uint32_t caller = 0;
++        uint8_t direction = 0;
++        if (wr_tlv(body, blen, 1, &v, &l) && l >= 4) memcpy(&caller, v, 4);
++        if (wr_tlv(body, blen, 2, &v, &l) && l >= 1) direction = v[0];
++        const struct wifi_efs *efs = caller >= 1 && caller <= (uint32_t)wifi_efs_count ? &wifi_efs[caller - 1] : NULL;
++        if (!efs || !wg.rmtfs || !wr_tlv(body, blen, 3, &v, &l) || l < 1 || 1u + v[0] * 12u > l) {
++            result[0] = 1;
++            result[1] = 2;
++        } else {
++            for (uint32_t e = 0; e < v[0] && !result[0]; e++) {
++                uint32_t entry[3];
++                memcpy(entry, v + 1 + 12 * e, 12);
++                for (uint32_t s = 0; s < entry[2]; s++) {
++                    const uint64_t sector = ((uint64_t)entry[0] + s) * WR_SECTOR, phys = (uint64_t)entry[1] + s * WR_SECTOR;
++                    if (phys < wifi_rmtfs_base || phys + WR_SECTOR > wifi_rmtfs_base + wifi_rmtfs_size || sector + WR_SECTOR > efs->bytes) {
++                        result[0] = 1;
++                        result[1] = 1;
++                        break;
++                    }
++                    uint8_t *shared = (uint8_t *)(wg.rmtfs + (phys - wifi_rmtfs_base));
++                    if (direction) memcpy(efs->data + sector, shared, WR_SECTOR);
++                    else memcpy(shared, efs->data + sector, WR_SECTOR);
++                    wg.rmtfs_sectors++;
++                }
++            }
++            __asm__ volatile ("dsb sy" ::: "memory");
++        }
++        at = wr_put(out, at, 2, result, 4);
++    } else if (id == 4) {               /* ALLOC_BUFF: rmtfs_mem */
++        uint32_t size = 0;
++        if (wr_tlv(body, blen, 2, &v, &l) && l >= 4) memcpy(&size, v, 4);
++        const uint64_t address = wifi_rmtfs_base;
++        if (size > wifi_rmtfs_size) {
++            result[0] = 1;
++            result[1] = 1;
++        }
++        at = wr_put(out, at, 2, result, 4);
++        if (!result[0]) at = wr_put(out, at, 16, &address, 8);
++        printf("COACHZ rmtfs: buffer of %u bytes -> %s\n", size, result[0] ? "refused" : "rmtfs_mem");
++    } else if (id == 5) {               /* GET_DEV_ERROR */
++        const uint8_t status = 0;
++        at = wr_put(out, at, 2, result, 4);
++        at = wr_put(out, at, 16, &status, 1);
++    } else {
++        printf("COACHZ rmtfs: request 0x%x not handled\n", id);
++        return;
++    }
++    out[0] = 2;
++    out[1] = (uint8_t)txn;
++    out[2] = (uint8_t)(txn >> 8);
++    out[3] = (uint8_t)id;
++    out[4] = (uint8_t)(id >> 8);
++    out[5] = (uint8_t)(at - 7);
++    out[6] = (uint8_t)((at - 7) >> 8);
++    wq_send(1, WQ_RMTFS_PORT, node, port, out, at);
++}
++
++/* One complete QRTR packet from the modem. */
++static void
++wq_rx(const uint8_t *p, uint32_t n)
++{
++    uint32_t type, src_node, src_port, dst_port, size, confirm, hdr;
++    wg.qrtr_rx++;
++    if (n >= 32 && p[0] == 1) {
++        uint32_t h[8];
++        memcpy(h, p, 32);
++        type = h[1]; src_node = h[2]; src_port = h[3]; confirm = h[4]; size = h[5]; dst_port = h[7]; hdr = 32;
++    } else if (n >= 16 && p[0] == 3) {
++        type = p[1]; confirm = p[2] & 1; hdr = 16 + p[3];
++        memcpy(&size, p + 4, 4);
++        src_node = (uint32_t)(p[8] | p[9] << 8); src_port = (uint32_t)(p[10] | p[11] << 8); dst_port = (uint32_t)(p[14] | p[15] << 8);
++        if (src_port == 0xffff) src_port = WQ_CTRL;
++        if (dst_port == 0xffff) dst_port = WQ_CTRL;
++    } else {
++        printf("COACHZ qrtr: %u bytes of version %u refused\n", n, n ? p[0] : 0);
++        return;
++    }
++    if (hdr + size > n) return;
++    const uint8_t *body = p + hdr;
++    uint32_t ctrl[5] = {0};
++    if (type != 1) memcpy(ctrl, body, size < 20 ? size : 20);
++    switch (type) {
++    case 1:
++        if (dst_port == WQ_RMTFS_PORT) wr_request(src_node, src_port, body, size);
++        else printf("COACHZ qrtr: data for port 0x%x from %u:0x%x\n", dst_port, src_node, src_port);
++        if (confirm) wq_send(7, dst_port, src_node, src_port, (const uint32_t[]){7, WQ_NODE, dst_port, 0, 0}, 20);
++        break;
++    case 2:                             /* HELLO: ns.c ctrl_cmd_hello announces this node's servers to the peer */
++        wg.modem_node = src_node;
++        printf("COACHZ qrtr: hello from node %u\n", src_node);
++        if (!wg.hello_sent) {
++            wq_ctrl(2, 0, 0, 0, 0, src_node);
++            wg.hello_sent = 1;
++        }
++        wq_ctrl(4, 14, 1 | 0 << 8, WQ_NODE, WQ_RMTFS_PORT, src_node);
++        break;
++    case 4:
++        printf("COACHZ qrtr: new server %u version %u instance %u at %u:0x%x\n", ctrl[1], ctrl[2] & 0xff, ctrl[2] >> 8, ctrl[3], ctrl[4]);
++        break;
++    case 5:
++        printf("COACHZ qrtr: server %u gone at %u:0x%x\n", ctrl[1], ctrl[3], ctrl[4]);
++        break;
++    case 10:
++        printf("COACHZ qrtr: lookup for %u from %u:0x%x (remote lookups are ns.c's to refuse)\n", ctrl[1], src_node, src_port);
++        break;
++    default:
++        printf("COACHZ qrtr: control %u from %u:0x%x\n", type, src_node, src_port);
++        break;
++    }
++}
++
++/* Every message waiting in the modem's FIFO, as qcom_glink_native_rx and qcom_glink_work handle them. */
++static void
++wg_poll(void)
++{
++    while (!wg.failed) {
++        const uint32_t avail = wg_rx_avail();
++        uint32_t m[4] = {0};
++        if (avail < 8) break;
++        wg_rx_peek(0, m, 8);
++        const uint32_t cmd = m[0] & 0xffff, p1 = m[0] >> 16, p2 = m[1];
++        wg.messages_in++;
++        if (cmd == WG_VERSION || cmd == WG_VERSION_ACK) {
++            wg_rx_advance(8);
++            const uint32_t features = wg.features & p2;
++            printf("COACHZ glink: %s version %u features 0x%x\n", cmd ? "ack" : "remote", p1, p2);
++            if (cmd == WG_VERSION) {
++                wg.features = features;
++                wg_cmd(WG_VERSION_ACK, 1, wg.features);
++            } else if (features != wg.features) {
++                wg.features = features;
++                wg_cmd(WG_VERSION, 1, wg.features);
++            }
++        } else if (cmd == WG_OPEN) {
++            const uint32_t name_len = p2 & 0xffff, extra = (name_len + 7) & ~7u;
++            if (avail < 8 + extra) break;
++            char name[33] = {0};
++            wg_rx_peek(8, name, name_len < 32 ? name_len : 32);
++            wg_rx_advance(8 + extra);
++            const size_t used = strlen(wg.channels);
++            snprintf(wg.channels + used, sizeof(wg.channels) - used, " %s(%u)", name, p1);
++            if (!strcmp(name, "IPCRTR") && !wg.open_remote) {
++                /* qcom_glink_create_remote: the open acknowledged, then ours with the same name. */
++                wg.rcid = p1;
++                wg.open_remote = 1;
++                wg_cmd(WG_OPEN_ACK, p1, 0);
++                uint32_t req[2 + 2] = {WG_OPEN | WG_LCID << 16, 7, 0, 0};
++                memcpy(&req[2], "IPCRTR", 7);
++                wg_tx(req, 16, NULL, 0);
++            }
++            printf("COACHZ glink: modem opens \"%s\" as %u%s\n", name, p1, strcmp(name, "IPCRTR") ? ", left alone" : "");
++        } else if (cmd == WG_OPEN_ACK) {
++            wg_rx_advance(8);
++            if (p1 == WG_LCID && !wg.open_acked) {
++                wg.open_acked = 1;
++                /* qcom_glink_announce_create's default set: five intents (1 KiB each there; larger here, for rmtfs's iovec requests). */
++                for (unsigned i = 0; i < 5; i++) wg_intent_add(4096);
++                wg.intents_sent = 1;
++                /* af_qrtr.c qrtr_endpoint_register: hello to the peer's control port at once. */
++                wq_ctrl(2, 0, 0, 0, 0, WQ_BCAST);
++                wg.hello_sent = 1;
++                printf("COACHZ glink: IPCRTR open, intents advertised, QRTR hello sent\n");
++            }
++        } else if (cmd == WG_CLOSE) {
++            wg_rx_advance(8);
++            wg_cmd(WG_CLOSE_ACK, p1, 0);
++            printf("COACHZ glink: modem closes %u\n", p1);
++        } else if (cmd == WG_INTENT) {
++            const uint32_t len = 8 + 8 * p2, padded = (len + 7) & ~7u;
++            if (avail < padded) break;
++            for (uint32_t i = 0; i < p2; i++) {
++                uint32_t pair[2];
++                wg_rx_peek(8 + 8 * i, pair, 8);
++                for (unsigned r = 0; r < WG_REMOTE_MAX; r++) {
++                    if (wg.remote[r].valid) continue;
++                    wg.remote[r].valid = 1;
++                    wg.remote[r].busy = 0;
++                    wg.remote[r].size = pair[0];
++                    wg.remote[r].id = pair[1];
++                    break;
++                }
++            }
++            wg_rx_advance(padded);
++            wg_retry_pending();
++        } else if (cmd == WG_RX_DONE || cmd == WG_RX_DONE_REUSE) {
++            wg_rx_advance(8);
++            for (unsigned r = 0; r < WG_REMOTE_MAX; r++) {
++                if (!wg.remote[r].valid || wg.remote[r].id != p2) continue;
++                wg.remote[r].busy = 0;
++                if (cmd == WG_RX_DONE) wg.remote[r].valid = 0;
++            }
++            wg_retry_pending();
++        } else if (cmd == WG_INTENT_REQ) {
++            wg_rx_advance(8);
++            const int granted = !wg_intent_add(p2 < 1024 ? 1024 : p2);
++            wg_cmd(WG_INTENT_REQ_ACK, WG_LCID, (uint32_t)granted);
++        } else if (cmd == WG_INTENT_REQ_ACK || cmd == WG_CLOSE_ACK || cmd == WG_SIGNALS) {
++            wg_rx_advance(8);
++        } else if (cmd == WG_READ_NOTIF) {
++            wg_rx_advance(8);
++            wg_kick();
++        } else if (cmd == WG_TX_DATA || cmd == WG_TX_DATA_CONT) {
++            if (avail < 16) break;
++            wg_rx_peek(0, m, 16);
++            const uint32_t chunk = m[2], left = m[3], padded = (16 + chunk + 7) & ~7u;
++            if (avail < 16 + chunk) break;
++            int slot = -1;
++            for (unsigned i = 0; i < wg.local_count; i++) if (wg.local[i].id == p2) slot = (int)i;
++            if (slot < 0 || wg.local[slot].fill + chunk > wg.local[slot].size) {
++                printf("COACHZ glink: data for intent %u (%u bytes) has no room\n", p2, chunk);
++                wg_rx_advance(padded);
++                continue;
++            }
++            wg_rx_peek(16, wg.local[slot].data + wg.local[slot].fill, chunk);
++            wg.local[slot].fill += chunk;
++            wg_rx_advance(padded);
++            if (!left) {
++                const uint32_t length = wg.local[slot].fill;
++                wg.local[slot].fill = 0;
++                wq_rx(wg.local[slot].data, length);
++                /* qcom_glink_rx_done: the intent kept for reuse when that was negotiated, else given up and a new one advertised. */
++                if (wg.features & WG_FEATURE_REUSE) {
++                    wg_cmd(WG_RX_DONE_REUSE, WG_LCID, p2);
++                } else {
++                    wg_cmd(WG_RX_DONE, WG_LCID, p2);
++                    wg.local[slot].id = ++wg.next_liid;
++                    const uint32_t a[4] = {WG_INTENT | WG_LCID << 16, 1, wg.local[slot].size, wg.local[slot].id};
++                    wg_tx(a, 16, NULL, 0);
++                }
++            }
++        } else {
++            printf("COACHZ glink: command %u (0x%x 0x%x) not understood, link stopped\n", cmd, p1, p2);
++            wg.failed = 1;
++        }
++    }
++}
++
++/* qcom_glink_smem_register, once the modem is up: our FIFO allocated, the modem's descriptor and FIFO found, our tail and head reset,
++ * our version sent. */
++static int
++wg_start(void)
++{
++    struct cw_smem layout;
++    struct cw_item item;
++    const int64_t fifo = wifi_smem_alloc(479, WG_FIFO_BYTES);
++    if (fifo < 0 || !wifi_smem_now(&layout) || !layout.has_modem) return -1;
++    if (cw_smem_find(&wifi_smem_reader, &layout.modem, 478, &item) || item.bytes != 32) return -2;
++    wg.desc = item.offset;
++    if (cw_smem_find(&wifi_smem_reader, &layout.modem, 480, &item) || item.bytes < 1024) return -3;
++    wg.rx = item.offset;
++    wg.rx_bytes = item.bytes;
++    wg.tx = (uint32_t)fifo;
++    wg.features = WG_FEATURE_REUSE;
++    *wifi_smem_word(wg.desc + 8) = 0;
++    *wifi_smem_word(wg.desc + 4) = 0;
++    __asm__ volatile ("dsb sy" ::: "memory");
++    if (!wg.rmtfs) wg.rmtfs = ml_io_map_unmappable((vm_offset_t)wifi_rmtfs_base, (vm_size_t)wifi_rmtfs_size, 0x6);
++    if (!wifi_efs_count) {
++        /* Without images in the blob: four blank 2 MiB ones, which is what Debian's /lib/firmware/rmtfs holds on this machine. */
++        static const char *const names[4] = {"modem_fs1", "modem_fs2", "modem_fsc", "modem_fsg"};
++        for (unsigned i = 0; i < 4; i++) {
++            uint8_t *blank = kalloc_data(2u << 20, Z_WAITOK | Z_ZERO);
++            if (!blank) break;
++            strlcpy(wifi_efs[i].name, names[i], sizeof(wifi_efs[i].name));
++            wifi_efs[i].data = blank;
++            wifi_efs[i].bytes = 2u << 20;
++            wifi_efs_count = (int)i + 1;
++        }
++    }
++    wg_cmd(WG_VERSION, 1, wg.features);
++    printf("COACHZ glink: started, modem FIFO %u bytes, %d EFS images, rmtfs_mem %s\n", wg.rx_bytes, wifi_efs_count,
++        wg.rmtfs ? "mapped" : "not mapped");
++    return 0;
++}
++
++static void
++wg_report(unsigned second)
++{
++    unsigned remote = 0;
++    for (unsigned r = 0; r < WG_REMOTE_MAX; r++) remote += wg.remote[r].valid;
++    printf("COACHZ glink at %u s: rx %llu tx %llu, IPCRTR %s, intents %u ours %u theirs, qrtr rx %llu tx %llu, rmtfs %llu requests %llu sectors, "
++        "opened %u/%u/%u/%u, channels%s\n", second, wg.messages_in, wg.messages_out, wg.open_acked ? "open" : wg.open_remote ? "half open" : "closed",
++        wg.local_count, remote, wg.qrtr_rx, wg.qrtr_tx, wg.rmtfs_ops, wg.rmtfs_sectors, wg.opened[0], wg.opened[1], wg.opened[2],
++        wg.opened[3], wg.channels[0] ? wg.channels : " none");
++}
++
 +static void
 +wifi_mba_stage2_thread(void *parameter __unused, wait_result_t result __unused)
 +{
@@ -1562,8 +2139,8 @@
 +    /*
 +     * The modem runs. Its bits are watched as qcom_q6v5.c's interrupts would see them: every change printed (each second for a minute,
 +     * then every 10 s, with a line each minute); at handover the proxy votes go as q6v5_handover drops them (cx/mx/mss to 0; xo stays
-+     * voted, as this kernel's own); on a fatal error the crash reason is printed and the watch ends. SMEM's GLINK items show whether the
-+     * modem waits for this side's GLINK, which nothing here sets up yet.
++     * voted, as this kernel's own); on a fatal error the crash reason is printed and the watch ends. GLINK starts at once (Linux registers
++     * the edge when the remote processor is up) and its FIFO is serviced every millisecond, with a line every 10 s for the first minutes.
 +     */
 +    int64_t seen = wifi_modem_bits();
 +    int handed = 0;
@@ -1572,8 +2149,14 @@
 +    wifi_smem_list("running");
 +    wifi_smp2p_print("running");
 +    if (wifi_smem_now(&now_layout)) wifi_glink_state(&wifi_smem_reader, &now_layout);
++    const int link = wg_start();
++    if (link) printf("COACHZ glink: not started (%d)\n", link);
 +    for (unsigned second = 1;; second++) {
-+        delay(1000 * 1000);
++        for (unsigned ms = 0; ms < 1000; ms++) {
++            if (!link) wg_poll();
++            delay(1000);
++        }
++        if (!link && (second <= 120 ? !(second % 10) : !(second % 60))) wg_report(second);
 +        if (second > 60 && second % 10) continue;
 +        const int64_t bits = wifi_modem_bits();
 +        if (bits != seen || !(second % 60)) {
@@ -1592,6 +2175,7 @@
 +        if (bits >= 0 && (bits & 1)) {
 +            printf("COACHZ mpss: fatal error at %u s\n", second);
 +            wifi_modem_reason();
++            if (!link) wg_report(second);
 +            return;
 +        }
 +    }

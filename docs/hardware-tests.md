@@ -1471,3 +1471,9 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 - Debian 上 `qrtr-ns` 和 `rmtfs -r -s -v -o /lib/firmware/rmtfs` 在跑，EFS 是那个目录里的 `modem_fs1`、`modem_fs2`、`modem_fsc`、`modem_fsg`（各 2 MiB）。
 - GPU 提交时间戳（`COACHZ gpu stamps`，CP_ALWAYS_ON_COUNTER，结束前先 CP_WAIT_FOR_IDLE）：GPU 执行一次提交约 2–6 ms，排队平时几十微秒、忙时平均约 3–4 ms，完成后约 0.1 ms 被看到。同时段渲染一帧“提交到完成”平均 13–19 ms，大部分不在 GPU 上。送显拷贝平均 8–10 ms，其中 GPU 执行约 1.5–2 ms。
 - 触摸：k97 的 764 份报告全部送进 HID，0 错误；杂散 SGI 一直是 0。
+
+## GLINK、QRTR、rmtfs 和 modem 的服务（k98）
+
+- AP 这边按主线建了 GLINK（FIFO 479，交换版本，modem 的 features 是 `0x7`，协商为 `0x1`）。modem 依次打开 `glink_ssr`、`IPCRTR`、`SSM_RTR_MODEM_APPS`、`apr_voice_svc`、`apr_apps2`、`LOOPBACK_CTL_MPSS`、`DS` 等通道，只有 `IPCRTR` 由这边打开。
+- QRTR：这边是节点 1，modem 是节点 0。收到 modem 的 hello 后通告了 rmtfs（服务 14）。modem 随后打开 `/boot/modem_fs1`、`modem_fs2`、`modem_fsg`，要了 2 MiB 共享缓冲区，读写了 8194 个扇区；EFS 是 Debian 的那四个全零镜像，只留在内存里。
+- modem 通告了约 30 个 QMI 服务，其中有 69（WLFW，WLAN 固件服务）、3、5、9、10、11、12、15、17、21–24、34、36、43、47、49、51、66、74、76、4098。k97 那次 40 s 后的 “DOG detects stalled initialization” 没有再出现，120 s 时状态位仍是 ready 加 handover。

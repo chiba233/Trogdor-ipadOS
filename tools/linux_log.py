@@ -187,7 +187,10 @@ def modem_blob(image, kpart, directory, partition_end):
     partition after the signed container, which depthcharge reads by its own size, so the GPT and the signature stay as they are."""
     if (1 << 20) + kpart.stat().st_size > MODEM_BLOB:
         raise SystemExit('the kernel container reaches the modem firmware')
-    files = [directory / name for name in ('mba.mbn', 'qdsp6sw.mbn')]
+    # The modem's EFS images (rmtfs/modem_fs1, fs2, fsc, fsg; device data from the machine's own Linux, kept out of the repository) go
+    # before qdsp6sw.mbn when they are there, so the kernel has them before the modem asks.
+    efs = [directory / 'rmtfs' / name for name in ('modem_fs1', 'modem_fs2', 'modem_fsc', 'modem_fsg')]
+    files = [directory / 'mba.mbn', *(efs if all(path.is_file() for path in efs) else []), directory / 'qdsp6sw.mbn']
     header = bytearray(4096)
     header[:16] = b'COACHZMODEMFW1\0\0'
     struct.pack_into('<I', header, 16, len(files))
