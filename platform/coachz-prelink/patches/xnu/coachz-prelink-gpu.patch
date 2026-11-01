@@ -1476,7 +1476,7 @@
 +#define GMU_CGC_HYST_CNTL 0x24c2cu
 +#define GMU_CX_BUSY_MASK 0x24c38u
 +#define CORE_PERF_LOWEST 1u                             /* 180 MHz: index 0 is the "off" level */
-+#define CORE_PERF_RUN 6u                                /* 650 MHz for the driver, no thermal control yet */
++#define CORE_PERF_RUN 7u                                /* 800 MHz, the top level mainline offers every sc7180 speed bin; no thermal control yet */
 +
 +/* PM4 (adreno_pm4.xml) */
 +#define PM4_NOP 0x10u

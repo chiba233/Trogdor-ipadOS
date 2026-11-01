@@ -10,3 +10,6 @@ __pycache__/
 /platform/coachz/.cache/
 /platform/coachz/unixnu.lock
 *.ipsw
+
+# macOS Finder metadata
+.DS_Store

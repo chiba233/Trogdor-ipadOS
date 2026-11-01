@@ -1,0 +1,29 @@
+diff --git a/osfmk/arm/io_map.c b/osfmk/arm/io_map.c
+--- a/osfmk/arm/io_map.c
++++ b/osfmk/arm/io_map.c
+@@ -62,7 +62,14 @@
+
+ extern vm_offset_t virtual_space_start;     /* Next available kernel VA */
+
+-#define IO_MAP_SIZE            (8ul << 20)
++/*
++ * Coachz: 32 MiB, as x86 has. The register windows the Coachz drivers keep for the life of the kernel (GPU, GMU, SMMU, LLCC, SMEM,
++ * the USB DMA pool, clock controllers) filled the 8 MiB submap on hardware, and a later 576 KiB ml_io_map then panicked in
++ * kmem_alloc (KMA_NOFAIL, KERN_NO_SPACE). coachz_io_submap_bytes counts what the submap holds; the K44 line prints it.
++ */
++#define IO_MAP_SIZE            (32ul << 20)
++
++uint64_t coachz_io_submap_bytes;
+
+ __startup_data static struct mach_vm_range io_range;
+ static SECURITY_READ_ONLY_LATE(vm_map_t) io_submap;
+@@ -127,6 +134,9 @@
+
+ 		kmem_alloc(unmappable ? kernel_map : io_submap,
+ 		    &start, alloc_size, kmaflags, VM_KERN_MEMORY_IOKIT);
++		if (!unmappable) {
++			os_atomic_add(&coachz_io_submap_bytes, alloc_size, relaxed);
++		}
+ 		pmap_map(start, phys_addr, phys_addr + alloc_size, prot, flags);
+ 	}
+ 	return start + start_offset;

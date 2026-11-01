@@ -10,7 +10,7 @@
  bsd/dev/unix_startup.c			standard
 --- a/bsd/dev/coachz_touch.c
 +++ b/bsd/dev/coachz_touch.c
-@@ -0,0 +1,580 @@
+@@ -0,0 +1,582 @@
 +/*
 + * Coachz touchscreen (coachz-touch=1): the Goodix GT7375P on QUPv3 wrap0 SE4 as HID over I2C.
 + * Reads the HID descriptor and report descriptor, powers the device on, starts ShengHidInput's touch digitizer
@@ -37,6 +37,7 @@
 +#include <pexpert/pexpert.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern uint64_t coachz_io_submap_bytes; /* osfmk/arm/io_map.c */
 +extern kern_return_t thread_terminate(thread_t);
 +extern void coachz_hid_touch_start(void);
 +void coachz_touch_start(void);
@@ -546,7 +547,8 @@
 +			heartbeat = mach_absolute_time();
 +			uint64_t ns;
 +			absolutetime_to_nanoseconds(heartbeat, &ns);
-+			printf("K44 alive %llu s, touch reports %u\n", ns / NSEC_PER_SEC, coachz_touch_reports);
++			printf("K44 alive %llu s, touch reports %u, io_submap %llu KiB\n", ns / NSEC_PER_SEC, coachz_touch_reports,
++			    coachz_io_submap_bytes / 1024);
 +		}
 +		/* The interrupt line is low while the controller has a report (or the reset response) waiting. */
 +		if (!(rd(st.north, GPIO_IO(9)) & 1u)) {

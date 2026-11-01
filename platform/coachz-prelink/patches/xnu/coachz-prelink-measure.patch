@@ -209,7 +209,7 @@
  extern volatile int32_t armcpu_smp_psci_rc[8];
  extern void armcpu_group1_sgi_probe(uint64_t *);
  static char coachz_sgi_probe[256];
-@@ -625,11 +735,440 @@
+@@ -625,11 +735,442 @@
  	}
  }
  
@@ -507,30 +507,32 @@
 +			uint32_t s55 = *(volatile uint32_t *)(freq_regs + 0x920), s76 = *(volatile uint32_t *)(freq_regs + 0x2800 + 0x920);
 +			printf(" | vote A55 0x%x=%u MHz state %u, A76 0x%x=%u MHz state %u", a55, (a55 & 0x3ff) * 192 / 10, s55,
 +			    a76, (a76 & 0x3ff) * 192 / 10, s76);
-+			if (!coachz_lut_reported) {
-+				/* Once, read only, for DVFS and thermal limits: each CPU domain's table as qcom-cpufreq-hw reads it (32-byte rows from
-+				 * +0x110: L_VAL in bits 7:0 times 19.2 MHz, the source in 31:30, the core count in 18:16; the voltage in mV in bits 11:0
-+				 * of +0x114; the table ends where a frequency repeats), and the PSCI calls a suspend would use. */
-+				coachz_lut_reported = 1;
-+				printf("\n");
-+				for (unsigned domain = 0; domain < 2; domain++) {
-+					const vm_offset_t base = freq_regs + domain * 0x2800;
-+					printf("K38 lut %s MHz/src/cores/mV:", domain ? "A76" : "A55");
-+					for (unsigned row = 0; row < 40; row++) {
-+						const uint32_t f = *(volatile uint32_t *)(base + 0x110 + 32 * row), v = *(volatile uint32_t *)(base + 0x114 + 32 * row);
-+						if (row && f == *(volatile uint32_t *)(base + 0x110 + 32 * (row - 1))) {
-+							break;
-+						}
-+						printf(" %u/%u/%u/%u", (f & 0xff) * 192 / 10, (f >> 30) & 3, (f >> 16) & 7, v & 0xfff);
-+					}
-+					printf("\n");
-+				}
-+				coachz_psci_report();
-+			}
 +		}
 +		printf("\n");
 +	}
 +
++	if (!coachz_lut_reported) {
++		/* Once, read only, for DVFS and thermal limits: each CPU domain's table as qcom-cpufreq-hw reads it (32-byte rows from +0x110:
++		 * L_VAL in bits 7:0 times 19.2 MHz, the source in 31:30, the core count in 18:16; the voltage in mV in bits 11:0 of +0x114; the
++		 * table ends where a frequency repeats), and the PSCI calls a suspend would use. */
++		coachz_lut_reported = 1;
++		if (!freq_regs) {
++			freq_regs = ml_io_map(0x18323000, 0x4000);
++		}
++		for (unsigned domain = 0; freq_regs && domain < 2; domain++) {
++			const vm_offset_t base = freq_regs + domain * 0x2800;
++			printf("K38 lut %s MHz/src/cores/mV:", domain ? "A76" : "A55");
++			for (unsigned row = 0; row < 40; row++) {
++				const uint32_t f = *(volatile uint32_t *)(base + 0x110 + 32 * row), v = *(volatile uint32_t *)(base + 0x114 + 32 * row);
++				if (row && f == *(volatile uint32_t *)(base + 0x110 + 32 * (row - 1))) {
++					break;
++				}
++				printf(" %u/%u/%u/%u", (f & 0xff) * 192 / 10, (f >> 30) & 3, (f >> 16) & 7, v & 0xfff);
++			}
++			printf("\n");
++		}
++		coachz_psci_report();
++	}
 +	printf("K36 frames %llu (+%llu), copy us min %llu max %llu last %llu, gap ms max %llu last %llu, cores 0x%llx last %llu\n",
 +	    coachz_frame_stats[0], coachz_frame_stats[0] - coachz_frame_stats[8],
 +	    coachz_frame_stats[0] != coachz_frame_stats[8] ? coachz_frame_stats[4] : 0, coachz_frame_stats[3],

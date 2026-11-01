@@ -1,0 +1,197 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@
+ bsd/dev/coachz_ec.c		standard
+ bsd/dev/coachz_wifi.c		standard
+ bsd/dev/coachz_gpu.c		standard
++bsd/dev/coachz_trace.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/coachz_trace.c b/bsd/dev/coachz_trace.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/coachz_trace.c
+@@ -0,0 +1,181 @@
++/*
++ * coachz-gpu-trace=1: the render server's frame trace summarised into the log ring. With sheng-diag=1 the Metal front end in
++ * backboardd (NativeBridgeMetalFrontend.mm) writes 72-byte records to frames.trace in its caches: per command buffer (type 1) its
++ * creation, commit, scheduling and completion; per render pass (type 7) Turnip's GPU begin and end timestamps; per kernel submission
++ * (type 8) the call and its waits; per display hand-off (type 5) the copy and the swap. All times are CLOCK_UPTIME_RAW microseconds,
++ * the kernel's own uptime. Per 30 s of uptime this prints the means of each part, so what the GPU executes, without the display copy
++ * and vsync, stands next to the rest of a frame's time. Read only; every 30 s from 120 s to 480 s, each window once it has ended.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/vnode.h>
++#include <sys/fcntl.h>
++#include <sys/uio.h>
++#include <sys/kernel.h>
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++
++struct ct_rec {
++    uint32_t type, idx;
++    uint64_t t0, t1, t2, t3;
++    uint32_t a, b, c, d, tid, cpu0, cpu1, tid2;
++};
++_Static_assert(sizeof(struct ct_rec) == 72, "TraceRec");
++
++#define CT_WINDOW_S 30u
++#define CT_WINDOWS 16u
++#define CT_FRAME_KPX 1953u   /* the front end's frame: at least 2000000 pixels, kept in c as pixels >> 10 */
++
++struct ct_window {
++    uint32_t buffers, scheduled, frames, passes, passes_timed, submissions, swaps;
++    uint64_t encode, schedule, complete, frame_complete, pass_gpu, pass_max, call, sync, space, copy, swap;
++};
++
++static struct ct_window ct_windows[CT_WINDOWS];
++static uint32_t ct_printed;
++
++static void
++ct_add(const struct ct_rec *r)
++{
++    const uint64_t at = r->t0 / 1000000u / CT_WINDOW_S;
++    if (at >= CT_WINDOWS) return;
++    struct ct_window *w = &ct_windows[at];
++    switch (r->type) {
++    case 1:
++        if (r->t1 < r->t0 || r->t3 < r->t1) return;
++        w->buffers++;
++        w->encode += r->t1 - r->t0;
++        w->complete += r->t3 - r->t1;
++        if (r->t2 >= r->t1 && r->t2 <= r->t3) { w->scheduled++; w->schedule += r->t2 - r->t1; }
++        if (r->c >= CT_FRAME_KPX) { w->frames++; w->frame_complete += r->t3 - r->t1; }
++        break;
++    case 7:
++        w->passes++;
++        if (r->t3 > r->t2 && r->t3 - r->t2 < 10000000u) {
++            const uint64_t us = r->t3 - r->t2;
++            w->passes_timed++;
++            w->pass_gpu += us;
++            if (us > w->pass_max) w->pass_max = us;
++        }
++        break;
++    case 8:
++        w->submissions++;
++        w->sync += r->b;
++        w->call += r->c;
++        w->space += r->d;
++        break;
++    case 5:
++        if (r->t1 < r->t0 || r->t2 < r->t0) return;
++        w->swaps++;
++        w->copy += r->t1 - r->t0;
++        w->swap += r->t2 - r->t0;
++        break;
++    default:
++        break;
++    }
++}
++
++static uint64_t
++ct_mean(uint64_t sum, uint32_t n)
++{
++    return n ? sum / n : 0;
++}
++
++/* The newer of the two paths the front end tries (it truncates its file at each start). */
++static vnode_t
++ct_open(vfs_context_t context, uint64_t *size)
++{
++    static const char *const paths[] = {
++        "/private/var/mobile/Library/Caches/com.apple.backboardd/m2v/frames.trace",
++        "/private/var/root/Library/Caches/com.apple.backboardd/m2v/frames.trace",
++    };
++    vnode_t best = NULLVP;
++    struct timespec best_time = {0, 0};
++    for (unsigned i = 0; i < 2; i++) {
++        vnode_t vp = NULLVP;
++        if (vnode_open(paths[i], FREAD, 0, 0, &vp, context)) continue;
++        struct vnode_attr va;
++        VATTR_INIT(&va);
++        VATTR_WANTED(&va, va_modify_time);
++        VATTR_WANTED(&va, va_data_size);
++        if (vnode_getattr(vp, &va, context) || (best != NULLVP && (va.va_modify_time.tv_sec < best_time.tv_sec ||
++            (va.va_modify_time.tv_sec == best_time.tv_sec && va.va_modify_time.tv_nsec <= best_time.tv_nsec)))) {
++            vnode_close(vp, FREAD, context);
++            continue;
++        }
++        if (best != NULLVP) vnode_close(best, FREAD, context);
++        best = vp;
++        best_time = va.va_modify_time;
++        *size = va.va_data_size;
++    }
++    return best;
++}
++
++static void
++ct_report(void)
++{
++    const size_t chunk = 72u * 910u;
++    vfs_context_t context = vfs_context_kernel();
++    uint64_t size = 0, offset = 0, now;
++    vnode_t vp = ct_open(context, &size);
++    if (vp == NULLVP) { printf("COACHZ trace: no frames.trace\n"); return; }
++    uint8_t *buffer = kalloc_data(chunk, Z_WAITOK);
++    if (!buffer) { vnode_close(vp, FREAD, context); printf("COACHZ trace: no buffer\n"); return; }
++    bzero(ct_windows, sizeof(ct_windows));
++    uint64_t records = 0;
++    while (offset + sizeof(struct ct_rec) <= size) {
++        size_t n = size - offset < chunk ? (size_t)(size - offset) : chunk;
++        n -= n % sizeof(struct ct_rec);
++        int residual = 0;
++        if (vn_rdwr(UIO_READ, vp, (caddr_t)buffer, (int)n, (off_t)offset, UIO_SYSSPACE, 0, vfs_context_ucred(context), &residual,
++            vfs_context_proc(context)) || residual) break;
++        for (size_t at = 0; at < n; at += sizeof(struct ct_rec)) {
++            struct ct_rec r;
++            memcpy(&r, buffer + at, sizeof(r));
++            ct_add(&r);
++            records++;
++        }
++        offset += n;
++    }
++    vnode_close(vp, FREAD, context);
++    kfree_data(buffer, chunk);
++    absolutetime_to_nanoseconds(mach_absolute_time(), &now);
++    const uint64_t current = now / NSEC_PER_SEC / CT_WINDOW_S;
++    printf("COACHZ trace: %llu records, %llu bytes\n", (unsigned long long)records, (unsigned long long)size);
++    for (uint32_t i = 0; i < CT_WINDOWS && i < current; i++) {
++        const struct ct_window *w = &ct_windows[i];
++        if ((ct_printed & (1u << i)) || (!w->buffers && !w->passes)) continue;
++        ct_printed |= 1u << i;
++        printf("COACHZ trace %u-%u s: buffers %u encode %llu sched %llu (n %u) done %llu us | frames %u done %llu us | passes %u/%u"
++            " gpu %llu ms mean %llu max %llu us | subs %u call %llu sync %llu space %llu us | swaps %u copy %llu swap %llu us\n",
++            i * CT_WINDOW_S, (i + 1) * CT_WINDOW_S, w->buffers, ct_mean(w->encode, w->buffers), ct_mean(w->schedule, w->scheduled),
++            w->scheduled, ct_mean(w->complete, w->buffers), w->frames, ct_mean(w->frame_complete, w->frames), w->passes_timed, w->passes,
++            w->pass_gpu / 1000, ct_mean(w->pass_gpu, w->passes_timed), w->pass_max, w->submissions, ct_mean(w->call, w->submissions),
++            ct_mean(w->sync, w->submissions), ct_mean(w->space, w->submissions), w->swaps, ct_mean(w->copy, w->swaps), ct_mean(w->swap, w->swaps));
++    }
++}
++
++static void
++ct_thread(void *parameter __unused, wait_result_t result __unused)
++{
++    for (unsigned s = 120; s <= 480; s += CT_WINDOW_S) {
++        uint64_t now;
++        absolutetime_to_nanoseconds(mach_absolute_time(), &now);
++        if (now < (uint64_t)s * NSEC_PER_SEC) delay((int)(((uint64_t)s * NSEC_PER_SEC - now) / 1000));
++        ct_report();
++    }
++}
++
++/* From the GPU driver once it has published (CoachzGpu.cpp). */
++void
++coachz_gpu_trace_start(void)
++{
++    static int started;
++    unsigned mode = 0;
++    thread_t thread;
++    if (started || !PE_parse_boot_argn("coachz-gpu-trace", &mode, sizeof(mode)) || mode != 1) return;
++    started = 1;
++    if (kernel_thread_start(ct_thread, NULL, &thread) == KERN_SUCCESS) thread_deallocate(thread);
++}

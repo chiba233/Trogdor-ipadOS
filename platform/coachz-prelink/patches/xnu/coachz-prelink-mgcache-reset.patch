@@ -1,6 +1,6 @@
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -8445,7 +8445,86 @@
+@@ -8445,7 +8445,91 @@
  {
  	return coachz_watchdog_policy_check(path, bytes, length, true);
  }
@@ -44,7 +44,12 @@
 +			vnode_close(vnode, FREAD, context);
 +			continue;
 +		}
-+		data = kalloc_data((size_t)size, Z_WAITOK | Z_NOFAIL);
++		data = kalloc_data((size_t)size, Z_WAITOK);   /* no Z_NOFAIL: refused above the zone sizes */
++		if (!data) {
++			vnode_close(vnode, FREAD, context);
++			printf("COACHZ mg: no %llu-byte buffer\n", (unsigned long long)size);
++			return;
++		}
 +		error = vn_rdwr(UIO_READ, vnode, data, (int)size, 0, UIO_SYSSPACE, 0, vfs_context_ucred(context), &residual,
 +		    vfs_context_proc(context));
 +		vnode_close(vnode, FREAD, context);
@@ -87,7 +92,7 @@
  static int
  coachz_watchdog_policy_prepare(void)
  {
-@@ -8590,6 +8669,7 @@
+@@ -8590,6 +8674,7 @@
  		if (error) {
  			panic("Coachz temporary watchdog launch policy failed: %d", error);
  		}

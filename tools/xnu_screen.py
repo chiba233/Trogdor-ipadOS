@@ -297,8 +297,11 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         # The panel backlight behind the system's brightness control, and the Zed keyboard (docs/plans/backlight.md, input.md).
         command_line += ' coachz-backlight=1 coachz-usb-keyboard=1'
         # Read-only probes: SoC temperatures and the SMEM inventory, with their nodes from prelink_tree (docs/plans/thermal.md, wifi.md).
-        # coachz-wifi=2 adds the AOSS channel and one RPMh vote to the read-only MPSS inventory (coachz-prelink-wifi.patch).
-        command_line += ' coachz-thermal=1 coachz-wifi=2 coachz-motion=1 coachz-switches=1'
+        # coachz-wifi=2 adds the AOSS channel and one RPMh vote to the read-only MPSS inventory, 3 the first part of the MBA start, undone after
+        # 2 s, 4 the whole MBA start (Q6 boot FSM, PBL, MBA) at 200 s followed by Linux's reclaim (coachz-prelink-wifi.patch).
+        command_line += ' coachz-thermal=1 coachz-wifi=4 coachz-motion=1 coachz-switches=1'
+        # The MPSS firmware tools/linux_log.py --modem-firmware stores in the kernel partition, read back and hashed (nothing is started).
+        command_line += ' coachz-modem-fw=1'
     if gpu:
         # Adreno 618 bring-up stages (docs/plans/gpu.md): 1 inventory, 2 CX + GMU clock window, 3 also the GMU firmware into TCM,
         # 4 the window with a read-only GPU SMMU inventory.
@@ -312,8 +315,15 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         if gpu == 9:
             # GPU_SET mode of the display driver: the compositor's frames reach the scanout through the GPU, not by a CPU copy.
             command_line += ' sheng-fb-gpu=1'
-            # Every pass in system memory: A618's 512 KiB of GMEM splits this screen into about 30 bins (the plug-in sets TU_DEBUG from it).
+            # Every pass in system memory (the plug-in sets TU_DEBUG from it). Turnip's own tile-memory choice (k82) halved SP busy and cut the
+            # UCHE latency by a quarter on hardware, but commit to complete did not fall and every colour came out with red and blue swapped.
             command_line += ' sheng-tu-debug=sysmem,nocb'
+            # The temperature clamp (coachz-prelink-thermal.patch). The busy-driven GPU governor (coachz-gpu-dcvs=1, CoachzGpu.cpp) is left out
+            # while the DDR vote is measured, so the GPU stays at 800 MHz on both sides of it.
+            command_line += ' coachz-thermal-clamp=1'
+            # The DDR and memory NoC bandwidth mainline votes for the top CPU and GPU states, at start (coachz_wifi.c): without it the
+            # memory ran at about two thirds of Debian's speed. The render server's frame trace is summarised per 30 s (coachz_trace.c).
+            command_line += ' coachz-ddr-vote=1 coachz-gpu-trace=1'
             # The system cache as mainline sets it up: sc7180's slices configured, CPUSS active, and the GPU and GPUHTW slices for the GPU (CoachzGpu.cpp).
             command_line += ' coachz-llcc=1'
     if cpus != 1:

@@ -178,6 +178,35 @@ def compile_wrapper(out, kernel, memory, checkpoint=None, discovery=False, patte
     return image, {"header": header, "scalar_code": scalar, "c_relocations": {**relocations, **usb_relocations}, "linux_offset": start, **({"display_discovery_schema":4 if backlight else 3 if pattern else 2} if discovery else {}), **extra}
 
 
+MODEM_BLOB = 144 << 20
+
+
+def modem_blob(image, kpart, directory, partition_end):
+    """The MPSS firmware for the kernel to read from the disk (coachz-prelink-wifi.patch): a 4 KiB header (magic, count, then per file a
+    16-byte name, offset from the header and size as u64, and its SHA-256), then each file at a 4 KiB boundary. It sits inside the kernel
+    partition after the signed container, which depthcharge reads by its own size, so the GPT and the signature stay as they are."""
+    if (1 << 20) + kpart.stat().st_size > MODEM_BLOB:
+        raise SystemExit('the kernel container reaches the modem firmware')
+    files = [directory / name for name in ('mba.mbn', 'qdsp6sw.mbn')]
+    header = bytearray(4096)
+    header[:16] = b'COACHZMODEMFW1\0\0'
+    struct.pack_into('<I', header, 16, len(files))
+    at, body = 4096, []
+    for index, path in enumerate(files):
+        data = path.read_bytes()
+        struct.pack_into('<16sQQ32s', header, 32 + 64 * index, path.name.encode(), at, len(data), hashlib.sha256(data).digest())
+        body.append((at, data))
+        at = (at + len(data) + 4095) & ~4095
+    if MODEM_BLOB + at > partition_end:
+        raise SystemExit('the modem firmware does not fit the kernel partition')
+    with Path(image).open('r+b') as out:
+        out.seek(MODEM_BLOB)
+        out.write(header)
+        for offset, data in body:
+            out.seek(MODEM_BLOB + offset)
+            out.write(data)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--source", type=Path, required=True, help="existing signed native Linux container")
@@ -190,6 +219,8 @@ def main():
     p.add_argument("--xnu-screen", type=Path, help="screen-output XNU payload: keeps the display on and never returns to Linux")
     p.add_argument("--xnu-root-partition", type=Path, action="append", default=[],
                    help="with --xnu-screen: APFS container for a GPT partition after the kernel; repeat for more, in order")
+    p.add_argument("--modem-firmware", type=Path,
+                   help="with --xnu-screen: a directory with mba.mbn and qdsp6sw.mbn, stored after the kernel container at 144 MiB of the disk")
     p.add_argument("--xnu-kernel-only", action="store_true",
                    help="with --xnu-root-partition: an image of only the GPT and kernel partition, for a medium that has the containers")
     p.add_argument("--usb-read", action="store_true", help="read three known sectors of the USB medium through the libpayload stack, then Linux; issues no writes")
@@ -276,6 +307,8 @@ def main():
         disk_mib = kernel_mib + root_mib + 4
     create_image(kpart, image, "EL1 probe Linux log", disk_mib=disk_mib, kernel_mib=kernel_mib, tries=15 if a.screen or a.usb_read else 1,
                  roots=a.xnu_root_partition, kernel_only=a.xnu_kernel_only)
+    if a.modem_firmware:
+        modem_blob(image, kpart, a.modem_firmware, (1 + kernel_mib) << 20)
     code_files = ("boot/entry.S", "boot/probe.c", "boot/fdt.c", "boot/checkpoint.c", "boot/chain.ld",
                   "tools/linux_log.py", "tools/fdt.py", "tools/build.py", "tools/artifacts.py",
                   "tools/sign.py", "tools/disk.py", "tools/read_probe.py", "tools/relocation_audit.py")

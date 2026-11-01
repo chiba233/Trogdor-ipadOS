@@ -18,7 +18,7 @@
  		/* Keep the captured note readable on the wrapping screen console. */
 --- /dev/null
 +++ b/bsd/dev/coachz_thermal.c
-@@ -0,0 +1,111 @@
+@@ -0,0 +1,178 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* Copyright (c) 2026, UniXNU contributors. All rights reserved.
 + * Optional SC7180 TSENS sampler. Not enabled in the active kernel build.
@@ -30,6 +30,7 @@
 +#include <pexpert/pexpert.h>
 +#include <pexpert/device_tree.h>
 +#include <libkern/libkern.h>
++#include <kern/clock.h>
 +#include "coachz_tsens.h"
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
@@ -52,9 +53,73 @@
 +    return 0;
 +}
 +
++/*
++ * Thermal protection, first version (coachz-thermal-clamp=1): above 80 C on the hottest valid channel both CPU domains drop to a
++ * lower cpufreq-hw state (A55 row 6, 1516 MHz; A76 row 9, 1996 MHz, from the tables the K38 line reads) and the GPU is capped at
++ * level 6, 650 MHz (CoachzGpu.cpp's governor reads coachz_gpu_level_cap); below 70 C the states saved at the clamp return. Mainline's
++ * sc7180 trip points are higher (passive at 95 C). The twelfth poll (about 120 s) applies the clamp for two seconds and reads it back.
++ */
++volatile uint32_t coachz_gpu_level_cap = 7;
++static vm_offset_t thermal_cpufreq;
++static uint32_t thermal_saved[2];
++static int thermal_clamped, thermal_polls;
++
++static void
++thermal_clamp(int on)
++{
++    static const uint32_t clamp_state[2] = {6, 9};
++    if (!thermal_cpufreq) thermal_cpufreq = ml_io_map(0x18323000, 0x4000);
++    if (!thermal_cpufreq || on == thermal_clamped) return;
++    for (unsigned domain = 0; domain < 2; domain++) {
++        volatile uint32_t *state = (volatile uint32_t *)(thermal_cpufreq + domain * 0x2800 + 0x920);
++        if (on) {
++            thermal_saved[domain] = *state;
++            if (thermal_saved[domain] > clamp_state[domain]) *state = clamp_state[domain];
++        } else {
++            *state = thermal_saved[domain];
++        }
++    }
++    __asm__ volatile ("dsb sy" ::: "memory");
++    coachz_gpu_level_cap = on ? 6 : 7;
++    thermal_clamped = on;
++}
++
++static void
++thermal_clamp_report(const char *why)
++{
++    if (!thermal_cpufreq) return;
++    const volatile uint32_t *a55 = (const volatile uint32_t *)thermal_cpufreq, *a76 = (const volatile uint32_t *)(thermal_cpufreq + 0x2800);
++    printf("COACHZ thermal clamp %s: A55 state %u vote %u MHz, A76 state %u vote %u MHz, gpu cap %u\n", why, a55[0x920 / 4],
++        (a55[0x704 / 4] & 0x3ff) * 192 / 10, a76[0x920 / 4], (a76[0x704 / 4] & 0x3ff) * 192 / 10, coachz_gpu_level_cap);
++}
++
++static void
++thermal_policy(int32_t peak)
++{
++    unsigned mode = 0;
++    if (!PE_parse_boot_argn("coachz-thermal-clamp", &mode, sizeof(mode)) || mode != 1) return;
++    if (++thermal_polls == 12 && !thermal_clamped) {
++        thermal_clamp(1);
++        delay(20000);
++        thermal_clamp_report("test on");
++        delay(2000000);
++        thermal_clamp(0);
++        delay(20000);
++        thermal_clamp_report("test off");
++    }
++    if (!thermal_clamped && peak > 80000) {
++        thermal_clamp(1);
++        thermal_clamp_report("on");
++    } else if (thermal_clamped && peak < 70000) {
++        thermal_clamp(0);
++        thermal_clamp_report("off");
++    }
++}
++
 +static void
 +thermal_report(int detail)
 +{
++    int32_t hottest = 0;
 +    for (unsigned bank = 0; bank < CT_BANKS; ++bank) {
 +        const struct ct_reader reader = {&mappings[bank], thermal_read};
 +        struct ct_sample sample;
@@ -62,6 +127,7 @@
 +        ct_collect(mappings[bank].srot && mappings[bank].tm ? &reader : NULL,
 +            ct_banks[bank].mask, &sample);
 +        if (ct_peak(&sample, &peak)) {
++            if (peak > hottest) hottest = peak;
 +            printf("COACHZ thermal: bank %u version 0x%x control 0x%x ready 0x%x requested 0x%x enabled 0x%x valid 0x%x peak %d mC\n",
 +                bank, sample.version, sample.control, sample.ready, (unsigned)sample.requested,
 +                (unsigned)sample.enabled, (unsigned)sample.valid, peak);
@@ -81,6 +147,7 @@
 +                    bank, sensor, ct_status_name(sample.status[sensor]), sample.raw[sensor]);
 +        }
 +    }
++    thermal_policy(hottest);
 +}
 +
 +/* Both entry points run only on coachz_sample_thread, with no second thread. */

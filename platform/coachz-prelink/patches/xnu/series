@@ -102,3 +102,9 @@ coachz-prelink-gpu-addon.patch
 
 # Diagnostics (coachz-match-log=1): the IOKit matching and service opens of locationd, backboardd and SpringBoard, to find what CoreMotion needs.
 coachz-prelink-match-log.patch
+
+# The ARM io_submap at 32 MiB, as x86 has, and a count of what it holds for the K44 line: the 8 MiB submap filled up and a 576 KiB ml_io_map panicked.
+coachz-prelink-io-map.patch
+
+# coachz-gpu-trace=1: the render server's frame trace (sheng-diag=1) summarised per 30 s: encode, scheduling, completion, GPU pass time, submissions, display copy.
+coachz-prelink-gpu-trace.patch

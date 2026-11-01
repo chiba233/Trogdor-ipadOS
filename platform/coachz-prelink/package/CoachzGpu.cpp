@@ -17,6 +17,8 @@
 #include <string.h>
 #include "NativeAdrenoABI.h"
 #include "NativeAdrenoGpuContext.h"
+#include "NativeAdrenoMemory.h"
+#include "NativeAdrenoVm.h"
 #include "NativeAdrenoRing.h"
 #include "NativeAdrenoSubmit.h"
 #include "NativeAdrenoTimer.h"
@@ -26,6 +28,7 @@ extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *, NativeAdrenoSubmit *
     const NativeAdrenoTimer *, const NativeAdrenoAbiDeviceInfo *, uint32_t, uint32_t);
 extern "C" volatile uint32_t native_adreno_pool_mib;
 extern "C" volatile uint32_t native_adreno_wc_enabled;
+extern "C" volatile uint32_t coachz_gpu_level_cap;   // coachz_thermal.c: 7, or 6 while the temperature clamp holds
 extern "C" void native_adreno_accelerator_static_init(void) __asm__("__GLOBAL__sub_I_NativeAdrenoAccelerator.cpp");
 extern "C" IOService *native_adreno_accelerator_allocate(void);
 extern "C" unsigned native_adreno_accelerator_instance_size(void);
@@ -36,6 +39,10 @@ extern "C" void *memprobe_cpu_to_processor(int) __asm__("_cpu_to_processor");
 extern "C" void *memprobe_thread_bind(void *) __asm__("_thread_bind");
 extern "C" int memprobe_thread_block(void *) __asm__("_thread_block");
 extern kmod_info_t g_kernel_kmod_info;
+extern "C" volatile uint32_t native_adreno_io_coherent;
+extern "C" volatile uint32_t native_adreno_coherent_skips[4];
+extern "C" vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, unsigned int);
+extern "C" void ml_io_unmap(vm_offset_t, vm_size_t);
 
 // NativeAdrenoPublish's sink for the plug-in's cache export to the boot log disk, which this board does not have.
 extern "C" int boot_log_export_put(uint32_t, uint32_t, uint32_t, const void *, uint32_t) {return 0;}
@@ -103,6 +110,9 @@ void reportThread(void *, wait_result_t) {
             gRing.lastSubmitted(), static_cast<unsigned long long>(native_gop_gpu_offers), static_cast<unsigned long long>(native_gop_gpu_completions),
             static_cast<unsigned long long>(native_gop_gpu_failures), static_cast<unsigned long long>(native_gop_gpu_abandoned));
         cpState("now");
+        // Imported BOs the submit path left alone under IO coherence: [2] before submissions, [3] after completions.
+        printf("COACHZ gpu9: coherent %u, maintenance skipped before submit %u after completion %u\n", native_adreno_io_coherent,
+            native_adreno_coherent_skips[2], native_adreno_coherent_skips[3]);
     }
 }
 
@@ -153,9 +163,9 @@ void profileSetup() {
     coreWrite(GbifEnable, coreRead(GbifEnable) | 0xf);
 }
 
-// Dynamic GPU frequency, tried once 150 s after the driver starts: the DCVS request the bring-up sends (a6xx_gmu_set_freq for a legacy
-// GMU: DCVS_PERF_SETTING, then OOB DCVS_SET on bit 23, acknowledged on bit 31 and cleared through bit 31), at perf levels 3, 1 and 6
-// (355, 180, 650 MHz), each held half a second while the CP cycle counter measures the clock that results. It ends at 650 MHz.
+// Dynamic GPU frequency, tried once 100 s after the driver starts: the DCVS request the bring-up sends (a6xx_gmu_set_freq for a legacy
+// GMU: DCVS_PERF_SETTING, then OOB DCVS_SET on bit 23, acknowledged on bit 31 and cleared through bit 31), at perf levels 3, 1 and 7
+// (355, 180, 800 MHz), each held half a second while the CP cycle counter measures the clock that results. It ends at 800 MHz, the run level.
 enum : uint32_t {GmuDcvsAck = 0x8ff0, GmuDcvsPerf = 0x8ff4, GmuDcvsBw = 0x8ff8, GmuDcvsReturn = 0x8ffc, GmuHostSet = 0x14650,
     GmuInfo = 0x14648, GmuClearIrq = 0x14644};
 uint32_t gmuRead(uint32_t at) {return *reinterpret_cast<volatile uint32_t *>(gGmu + at);}
@@ -180,7 +190,7 @@ unsigned dcvsSet(unsigned level, uint32_t *result) {
     return polls < 1000 ? polls + 1 : 0;
 }
 void dcvsTest() {
-    static const unsigned levels[] = {3, 1, 6};
+    static const unsigned levels[] = {3, 1, 7};
     for (unsigned level : levels) {
         uint32_t result = 0;
         const uint64_t began = mach_absolute_time();
@@ -197,12 +207,14 @@ void dcvsTest() {
 
 void rateThread(void *, wait_result_t) {
     uint64_t cycles = coreCounter(0x400), busy = gmuBusy(), always = coreCounter(0x980), last[ProfileCount], lastGbif[4];
+    unsigned governed = 0, level = 7, changes = 0, lower = 0;
+    PE_parse_boot_argn("coachz-gpu-dcvs", &governed, sizeof(governed));
     profileSetup();
     for (unsigned i = 0; i < ProfileCount; i++) last[i] = coreCounter(kProfile[i].counter);
     for (unsigned i = 0; i < 4; i++) lastGbif[i] = gbifCounter(i);
     for (unsigned seconds = 0;; seconds++) {
         IOSleep(1000);
-        if (seconds == 150) dcvsTest();
+        if (seconds == 100) dcvsTest();
         const uint64_t newCycles = coreCounter(0x400), newBusy = gmuBusy(), newAlways = coreCounter(0x980);
         const uint64_t dCycles = newCycles - cycles, dBusy = newBusy - busy, dAlways = newAlways - always;
         uint64_t d[ProfileCount], g[4];
@@ -219,10 +231,25 @@ void rateThread(void *, wait_result_t) {
         cycles = newCycles;
         busy = newBusy;
         always = newAlways;
+        // The governor (coachz-gpu-dcvs=1), after the step test: the level by last second's load, within the thermal cap (coachz_thermal.c).
+        // Up at once, down only after three seconds that all ask for less (k82 went from 800 to 430 MHz on one quiet second).
+        const unsigned load = dAlways ? unsigned(dBusy * 100 / dAlways) : 0;
+        if (governed && seconds > 100) {
+            unsigned target = load >= 60 ? 7 : load >= 30 ? 6 : load >= 10 ? 4 : 3;
+            if (target > coachz_gpu_level_cap) target = coachz_gpu_level_cap;
+            lower = target < level ? lower + 1 : 0;
+            uint32_t result = 0;
+            if ((target > level || (target < level && (lower >= 3 || level > coachz_gpu_level_cap))) && dcvsSet(target, &result)) {
+                level = target;
+                changes++;
+                lower = 0;
+            }
+        }
         if (!dAlways || dBusy * 20 < dAlways || !dCycles) continue;
         auto pct = [dCycles](uint64_t value) {return static_cast<unsigned long long>(value * 100 / dCycles);};
-        printf("COACHZ gpu rate: busy %llu%%, %llu MHz over the second, %llu MHz while busy\n", static_cast<unsigned long long>(dBusy * 100 / dAlways),
-            static_cast<unsigned long long>(dCycles * 192 / dAlways / 10), static_cast<unsigned long long>(dBusy ? dCycles * 192 / dBusy / 10 : 0));
+        // The CP counter counts every core cycle, idle ones too, so the second number is the clock itself.
+        printf("COACHZ gpu rate: busy %llu%%, %llu MHz over the second, level %u (%u changes)\n",
+            static_cast<unsigned long long>(dBusy * 100 / dAlways), static_cast<unsigned long long>(dCycles * 192 / dAlways / 10), level, changes);
         printf("COACHZ gpu prof: sp %llu alu %llu st tp %llu uche %llu rb %llu ne %llu | tp %llu st %llu l1 %lluk miss %llu%% | uche %llu arb %llu lat %llu"
             " | rb %llu starve sp %llu ccu %llu c r %lluk w %lluk | gbif r %lluk %lluk w %lluk %lluk\n",
             pct(d[0]), pct(d[1]), pct(d[2]), pct(d[3]), pct(d[4]), pct(d[5]), pct(d[6]), pct(d[7]), static_cast<unsigned long long>(d[8] / 1000),
@@ -303,17 +330,13 @@ void cacheSetup() {
     report("after");
 }
 
-// Memory bandwidth and latency on an A55 and an A76, with loops the same as a Debian baseline's on this hardware: no XNU memory path votes for bandwidth,
-// so this says how much the DRAM gives here compared with Linux, which votes.
-void memoryProbeThread(void *, wait_result_t) {
+// Memory bandwidth and latency on an A55 and an A76, with loops the same as a Debian baseline's on this hardware (Debian: chase 132-136 ns,
+// A76 read 11-13 GB/s; here without a vote 195-199 ns and 8 GB/s, after coachz_wifi.c's DDR vote 134-142 ns and 11-12 GB/s on hardware).
+// Run 40 s after the driver starts, then again once the vote (coachz-ddr-vote=1 at start, 2 at 150 s) has been sent, labelled with its result.
+extern "C" volatile uint32_t coachz_ddr_voted;
+extern "C" void coachz_gpu_trace_start(void);   // bsd/dev/coachz_trace.c, coachz-gpu-trace=1
+void memoryProbeRun(volatile uint64_t *b, const char *label) {
     enum : uint32_t {Bytes = 32u << 20, Line = 64, Passes = 8, Hops = 2000000};
-    IOSleep(40000);
-    IOBufferMemoryDescriptor *memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, static_cast<IOOptionBits>(kIODirectionInOut) | kIOMemoryPhysicallyContiguous, Bytes, 4096);
-    if (!memory) {
-        printf("COACHZ mem: no buffer\n");
-        return;
-    }
-    volatile uint64_t *b = static_cast<volatile uint64_t *>(memory->getBytesNoCopy());
     static const int cpus[2] = {0, 6};
     for (int c = 0; c < 2; ++c) {
         memprobe_thread_bind(memprobe_cpu_to_processor(cpus[c]));
@@ -333,13 +356,30 @@ void memoryProbeThread(void *, wait_result_t) {
             uint32_t at = 0;
             for (uint32_t i = 0; i < Hops; ++i) at = q[at];
             const uint64_t chase = ringNow(nullptr) - start;
-            printf("COACHZ mem: cpu %d read %llu MB/s write %llu MB/s chase %llu ns (%u %llu)\n", cpus[c],
+            printf("COACHZ mem%s: cpu %d read %llu MB/s write %llu MB/s chase %llu ns (%u %llu)\n", label, cpus[c],
                 static_cast<unsigned long long>(uint64_t(Bytes) * Passes / (read ? read : 1)), static_cast<unsigned long long>(uint64_t(Bytes) * Passes / (write ? write : 1)),
                 static_cast<unsigned long long>(chase * 1000 / Hops), at, static_cast<unsigned long long>(sum & 1));
         }
     }
     memprobe_thread_bind(nullptr);
     memprobe_thread_block(nullptr);
+}
+
+void memoryProbeThread(void *, wait_result_t) {
+    IOSleep(40000);
+    IOBufferMemoryDescriptor *memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, static_cast<IOOptionBits>(kIODirectionInOut) | kIOMemoryPhysicallyContiguous, 32u << 20, 4096);
+    if (!memory) {
+        printf("COACHZ mem: no buffer\n");
+        return;
+    }
+    volatile uint64_t *b = static_cast<volatile uint64_t *>(memory->getBytesNoCopy());
+    memoryProbeRun(b, "");
+    unsigned vote = 0;
+    if (PE_parse_boot_argn("coachz-ddr-vote", &vote, sizeof(vote)) && (vote == 1 || vote == 2)) {
+        for (unsigned waited = 0; waited < 600 && !coachz_ddr_voted; ++waited) IOSleep(1000);
+        IOSleep(2000);
+        memoryProbeRun(b, coachz_ddr_voted == 1 ? " voted" : coachz_ddr_voted == 2 ? " vote-failed" : " no-vote");
+    }
     memory->release();
 }
 
@@ -411,6 +451,93 @@ bool startCp(volatile uint8_t *smmu, size_t smmuBytes, const uint32_t *sqe, uint
     return true;
 }
 
+// IO coherence, before any client (sheng-gpu-coherent, default 1), as UniXNU-sheng package/GpuPowerProbe.cpp coherenceProbe (MIT) proves
+// it: mainline marks A618 ADRENO_QUIRK_HAS_CACHED_COHERENT (a6xx_catalog.c), like sheng's A740. Without native_adreno_io_coherent the
+// driver cleans and invalidates every imported page around every submission (asteroids T40c: 18 s for 3000 submissions; sheng int-143:
+// about 12 ms each). A page of kernel memory is imported and mapped write-back inner-shareable, and both directions are proved against
+// DRAM: the GPU copies a page whose new words only the CPU's caches hold (at least 48 of 64 lines seen dirty first), and the CPU reads,
+// with plain cached loads, a page the GPU wrote over clean lines it holds. Only both proofs turn the flag on. The copies are CP_MEMCPY and
+// CP_WAIT_MEM_WRITES, which Turnip itself emits on A6xx.
+bool dramPage(uint64_t pa, uint32_t *out) {
+    const vm_offset_t page = ml_io_map_unmappable(vm_offset_t(pa), 0x1000, 0x7 /* VM_WIMG_IO */);
+    if (!page) return false;
+    for (unsigned i = 0; i < 1024; ++i) out[i] = reinterpret_cast<const volatile uint32_t *>(page)[i];
+    ml_io_unmap(page, 0x1000);
+    return true;
+}
+bool gpuCopyPage(uint64_t src, uint64_t dst) {
+    uint32_t words[7] = {};
+    if (AdrenoPM4Type7(0x75, 5, &words[0]) != AdrenoPM4Success || AdrenoPM4Type7(0x12, 0, &words[6]) != AdrenoPM4Success) return false;
+    words[1] = 1024; words[2] = uint32_t(src); words[3] = uint32_t(src >> 32); words[4] = uint32_t(dst); words[5] = uint32_t(dst >> 32);
+    uint32_t fence = 0, observed = 0;
+    const NativeAdrenoRingClock clock{nullptr, ringNow, ringIdle};
+    return !gRing.submit(words, 7, &fence) && gRing.wait(fence, &clock, 200000, &observed) == NativeAdrenoRingFenceComplete;
+}
+void coherenceProbe(NativeAdrenoVm *vm) {
+    uint32_t k[8] = {};
+    unsigned wanted = 1, attempts = 0;
+    PE_parse_boot_argn("sheng-gpu-coherent", &wanted, sizeof wanted);
+    if (!wanted || !vm) {
+        printf("COACHZ gpu9: coherence H skip (arg %u vm %d)\n", wanted, vm != nullptr);
+        return;
+    }
+    constexpr size_t kBytes = 4 * 4096;
+    uint64_t iova = 0;
+    uint8_t *buf = static_cast<uint8_t *>(IOMallocAligned(kBytes, 4096));
+    NativeAdrenoMemory mem;
+    uint64_t handle = 0;
+    IOReturn st = buf ? mem.importTask(kernel_task, uint64_t(uintptr_t(buf)), kBytes, gReport.output_bits, kBytes) : kIOReturnNoMemory;
+    k[0] = 1;
+    if (!st) st = vm->findAddress(0, kBytes, 4096, &iova);
+    if (!st) {k[0] = 2; st = vm->map(&mem, 0, iova, 3, 1, 3, &handle);}
+    uint64_t phys[4] = {};
+    for (size_t j = 0; !st && j < mem.spanCount(); ++j)
+        for (size_t at = 0; at < mem.spans()[j].bytes; at += 4096) phys[(mem.spans()[j].offset + at) / 4096] = mem.spans()[j].physical + at;
+    static uint32_t words[1024];
+    bool pass = false;
+    if (!st && phys[0] && phys[1] && phys[2] && phys[3]) {
+        k[0] = 3;
+        volatile uint32_t *S = reinterpret_cast<volatile uint32_t *>(buf), *D = S + 1024, *R = S + 2048, *T = S + 3072;
+        bool dirty = false;
+        for (unsigned attempt = 0; attempt < 8 && !st && !dirty; ++attempt) {
+            attempts = attempt + 1;
+            for (unsigned i = 0; i < 1024; ++i) {S[i] = 0x11110000u | i; D[i] = 0; R[i] = 0x33330000u | i; T[i] = 0x44440000u | i;}
+            st = NativeAdrenoMaintainOwnedPages(buf, kBytes, NativeAdrenoCleanInvalidate);
+            for (unsigned i = 0; i < 1024; ++i) S[i] = 0x22220000u | i;
+            __asm__ volatile("dsb sy" ::: "memory");
+            k[1] = 0;
+            if (!st && dramPage(phys[0], words)) for (unsigned i = 0; i < 1024; i += 16) k[1] += words[i] == (0x11110000u | i);
+            dirty = k[1] >= 48;
+        }
+        if (!st && dirty) {
+            k[0] = 4;
+            if (gpuCopyPage(iova, iova + 4096) && dramPage(phys[1], words)) {
+                k[0] = 5;
+                for (unsigned i = 0; i < 1024; ++i) {k[2] += words[i] == (0x22220000u | i); k[3] += words[i] == (0x11110000u | i);}
+            }
+        }
+        if (!st && k[0] == 5) st = NativeAdrenoMaintainOwnedPages(const_cast<uint32_t *>(T), 4096, NativeAdrenoClean);
+        uint32_t touch = 0;
+        for (unsigned i = 0; i < 1024; ++i) touch += T[i];
+        __asm__ volatile("dsb sy" ::: "memory");
+        if (!st && k[0] == 5 && gpuCopyPage(iova + 8192, iova + 12288)) {
+            k[0] = 6;
+            for (unsigned i = 0; i < 1024; ++i) k[4] += T[i] == (0x33330000u | i);
+            if (dramPage(phys[3], words)) for (unsigned i = 0; i < 1024; ++i) k[5] += words[i] == (0x33330000u | i);
+        }
+        (void)touch;
+        pass = k[0] == 6 && k[1] >= 48 && k[2] == 1024 && k[4] == 1024 && k[5] == 1024;
+    }
+    k[6] = uint32_t(st);
+    if (handle) (void)vm->unmap(handle);
+    if (buf) (void)NativeAdrenoMaintainOwnedPages(buf, kBytes, NativeAdrenoCleanInvalidate);
+    (void)mem.release();
+    if (buf) IOFreeAligned(buf, kBytes);
+    native_adreno_io_coherent = pass ? 1 : 0;
+    printf("COACHZ gpu9: coherence H d%u/64 a%u r%u/%u w%u/%u s%x k%u at 0x%llx -> %s\n", k[1], attempts, k[2], k[3], k[4], k[5], k[6], k[0],
+        static_cast<unsigned long long>(iova), pass ? "on" : "off");
+}
+
 // The accelerator the original _MTLRegisterDevices finds: its class derives from the original IOAcceleratorES, which exists once IOGPUFamily loaded.
 bool publishAccelerator() {
     const kern_return_t kext = OSKextLoadKextWithIdentifier("com.apple.iokit.IOGPUFamily");
@@ -462,6 +589,7 @@ extern "C" int coachz_gpu_driver_start(volatile uint8_t *core, volatile uint8_t 
     const NativeAdrenoTimeIo timer{nullptr, timerRead};
     const IOReturn timed = gTimer.attach(&timer, NativeAdrenoTimeCp);
     const NativeAdrenoRingClock clock{nullptr, ringNow, ringIdle};
+    if (!status) coherenceProbe(vm);
     if (!status) status = native_adreno_publish(vm, &gSubmit, &gRing, &clock, timed ? nullptr : &gTimer, &gDeviceInfo, 32, gReport.output_bits);
     printf("COACHZ gpu9: published 0x%x, timer 0x%x\n", status, timed);
     if (status) return 0;
@@ -472,5 +600,6 @@ extern "C" int coachz_gpu_driver_start(volatile uint8_t *core, volatile uint8_t 
     if (kernel_thread_start(memoryProbeThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
     cacheSetup();
     if (kernel_thread_start(rateThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
+    coachz_gpu_trace_start();
     return accelerator;
 }

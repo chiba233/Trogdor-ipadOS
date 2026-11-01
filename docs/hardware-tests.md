@@ -1411,3 +1411,33 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 - k80，AOSS QMP 通道照 `qmp_open` 打开：链路、通道、应答都是 UP。
 - k80，AP 侧 RPMh：经 apps RSC 的第一个 active TCS 发出 `mss.lvl=0`，10 µs 内 issued 和 completed 都置位，IRQ 状态位置位。之后的电源轨投票和带宽投票走同一条路。
 - k80，locationd 读了 `gyro` 节点的 `gyro-interrupt-calibration`（CFData，至少 8 字节：偏移 0 的 u16 版本、偏移 4 的 u16 dt、偏移 8 的 u16 rate），之后没有别的内核查询。运动数据走 HID 事件系统的快速通道（`IOHIDServiceClientFastPath*`），需要一个能提供快速通道的加速度计 HID 服务。
+
+## modem 固件、GPU 调频、io_submap 和内存带宽投票（k81～k84）
+
+- k81 第一次构建为 modem 固件申请了带 `Z_NOFAIL` 的 1 MiB `kalloc_data`，开机即 panic；改成不带 `Z_NOFAIL` 的 256 KiB 并检查返回值后正常。固件块在内核分区 144 MiB 处：`mba.mbn` 283296 字节、`qdsp6sw.mbn` 65583404 字节，sha256 都对，ELF machine 164（Hexagon），入口 `0x4417000` 和 `0x86000000`。
+- k81，GPU DCVS 切档（`GMU_DCVS_PERF_SETTING` 加 HOST2GMU bit 23，等 GMU2HOST bit 31）：3、1、7 档分别在 60、60、28 µs 内应答，CP 周期计数器测得 354、179、799 MHz。800 MHz 比 650 MHz 没有更快，UCHE 延迟按周期数上升。
+- k81，频率表：A55 288～1804 MHz（596～868 mV），A76 652～2400 MHz（588～956 mV）。PSCI 1.1：CPU_SUSPEND 特性 2（支持 OS 发起），SYSTEM_SUSPEND 支持，SET_SUSPEND_MODE 和 CPU_DEFAULT_SUSPEND 不支持，SMCCC 1.2。
+- k82 让 Turnip 自选 tile 内存（`sheng-tu-debug=nocb`）：SP 忙从 48.6% 降到 26.9%，UCHE 延迟从 366 降到 274 周期，但提交到完成从 52.3 ms 升到 56.9 ms，所有颜色红蓝互换（照片）。UniXNU `porting/gpu` 的渲染模式一节早已记录同样的结论，k83 起回到 `sysmem,nocb`。
+- k82 第二次启动 panic：`kmem_alloc(…, 589824, …) failed with 3`。589824 字节是 MBA 第一段整块映射 GCC 的大小；ARM 的 io_submap 固定 8 MiB，`ml_io_map` 的映射不释放，已经被各驱动的寄存器窗口占满。
+- k82，温控自检：钳位时档位寄存器读回 A55 6、A76 9，GPU 上限 6；撤销后读回 9、13 和 7。0x704 寄存器始终是 2995 MHz，实际频率是否下降没有测。调频器在一个安静的秒里就从 800 降到 430 MHz。
+- k83，io_submap 扩到 32 MiB（同 x86），K44 行打印用量：开机后 7420 KiB，原来的 8 MiB 再放 576 KiB 必然失败。Wi‑Fi 代码改为共用一个 4 KiB 的 GCC 页。没有 panic。
+- k83，MBA 第一段：AOP 接受 load_state 开和关（返回 0）；cx/mx/mss 投到 15 档，40 µs 内三条命令 issued 和 completed（`0x10101`）；iface 时钟本来就在跑（`0x9`），bus、snoc_axi 从 `0x80000000` 变成 `0x1`，mnoc_axi、nav 从 `0x0` 变成 `0x1`；保持 2 s 后全部撤回，电源轨 10 µs 回到 0。
+- k84，DDR 和内存 NoC 的带宽投票（`coachz-ddr-vote`，按主线 `bcm-voter.c` 的公式，峰值取 sc7180.dtsi 中 A76 2.4 GHz 与 GPU 800 MHz 的 8532000 kBps）：MC0（地址 `0x50000`，unit 2050000，width 16，VCD 0）y 截到 16383，ACV（`0x5000c`）使能位 8，SH0（`0x5003c`，unit 1100000，width 16，VCD 1）和 SH4（`0x50028`）y 为 7756；1270 µs 内四条全部完成。XNU 里原本没有任何人投这一票。
+- k84，同一段测速循环在投票前后和 Debian 上：
+
+| | 投票前 | 投票后 | Debian |
+| --- | --- | --- | --- |
+| A55 延迟 | 192～198 ns | 134～140 ns | 133～136 ns |
+| A55 读/写 | 3.9～4.3 / 6.2～6.3 GB/s | 5.7 / 10.5～11.0 GB/s | 5.5 / 9.5 GB/s |
+| A76 延迟 | 194～196 ns | 137～142 ns | 132 ns |
+| A76 读/写 | 7.6～7.9 / 7.0～7.3 GB/s | 11.0～11.9 / 13.6～14.4 GB/s | 11.4～13.2 / 14.6～15.1 GB/s |
+
+- k84，GPU 的 UCHE 平均延迟从 323 降到 247 周期，GPU 忙约 33～36%，帧时间几乎没变（前后操作不同）。插件的 commit-to-complete 是从 CPU 提交到用户态完成回调，不只是 GPU 执行：k83 某 10 s 里 227 个命令缓冲按 GMU 忙碌计数合计约 3.4 s GPU 时间，平均每个约 15 ms，而提交到完成约 70 ms。
+
+## IO 一致性、着色器预热、帧拆分和 MBA 第二段（k85）
+
+- UniXNU-sheng 的一致性探针在 A618 上通过：`H d64/64 a1 r1024/0 w1024/1024 s0 k6 -> on`（CPU 脏行 64/64，GPU 读到新值 1024、旧值 0，CPU 读到 GPU 写的 1024，DRAM 也是 1024）。打开 `native_adreno_io_coherent` 后，到约 200 s 提交前跳过约 43 万次、完成后跳过约 18 万次导入缓冲的缓存维护。提交到完成平均 24.8 ms（k84 约 52 ms），每个 render pass 的 GPU 时间平均约 1 ms。
+- 帧拆分（`coachz-gpu-trace=1`，按 30 s 汇总 backboardd 的 frames.trace）：120～150 s 有 1308 个命令缓冲，编码 2.3 ms、提交到调度 12.9 ms、提交到完成 35.8 ms，5962 个 pass 共 6.05 s GPU 时间；交给显示的拷贝平均 30 ms（安静时约 17 ms），是现在最大的一段。
+- 着色器预热：列表 158 个库，render server 约 170 s 开始，到 230 s 完成 30 个库、197 个 pipeline。
+- 168～205 s 界面不响应：触摸报告照常进入 HID（每 10 s 400～580 次），画面保持每 10 s 100 帧、每帧两个小提交；前台应用和 SpringBoard 的主线程都停在 run loop 等事件；GPU 提交全部完成，没有 panic，约 208 s 恢复。原因未定。
+- MBA 第二段（`coachz-wifi=4`，200 s）：apps SMMU `sCR0` 为 `0x200001`（CLIENTPD，旁路）；load_state、电源轨和五个时钟照常；`mba.mbn` 283296 字节拷进 mba_mem（首字 `0x464c457f`），assign_mem 交给 modem 返回 0。之后的 QDSP6SS/RMB 步骤到 233 s 都没有输出，线程停在某次寄存器访问上；系统其余部分继续运行。

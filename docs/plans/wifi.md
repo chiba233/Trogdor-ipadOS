@@ -17,6 +17,8 @@
 真机（k78，只读）：TF-A 的 SMC64 SIP 调用可用，PAS 系列一个都没实现，`assign_mem` 实现了，所以 MPSS 只能走主线 trogdor 的 MBA 自认证（`qcom_q6v5_mss.c`，`qcom,sc7180-mss-pil`）。TCSR 0x01f60000 的 Q6/NC halt 空闲、无请求。`qdsp6sw.mbn` 有 65.6 MB，进不了 payload，需要另找传送方式；`mba.mbn` 283 KB 可以。
 
 真机（k80）：AOSS QMP 通道已照 `qmp_open` 打开（链路、通道和应答都是 UP）；AP 侧 RPMh 写入通路可用（active TCS 发出 `mss.lvl=0`，10 µs 完成）。下一步：把 MPSS 固件送进内核，然后照 `qcom_q6v5_mss.c` 做 MBA 启动。
+
+真机（k81～k85）：MPSS 固件经内核分区 144 MiB 处的固件块送进内核，`mba.mbn` 和 `qdsp6sw.mbn` 的 sha256 都对。MBA 第一段（`coachz-wifi=3`：load_state、cx/mx/mss 最高档、五个 MSS 时钟）照常完成并撤回。MBA 第二段（`coachz-wifi=4`）把 `mba.mbn` 拷进 mba_mem，TF-A 的 `assign_mem` 把它交给 modem（返回 0），随后线程停在下一次 QDSP6SS 或 RMB 访问上，Q6 还没有启动。UniXNU 的 Wi‑Fi 页写的是 PCIe 上的 WCN7850（Ath12kWifi）；Coachz 的 WCN3990 由主线 `ath10k_snoc` 经 QMI 连到 modem 上的 WLAN 固件服务，所以先要启动 MPSS，之上再接 `nw_abi.h` 与 `WifiNet.cpp` 那几层。
 | 无线扫描 | 待做：正确BDF、firmware/host SMMU、CE、HTC/WMI/HTT、真实BSS | 重复扫描与错误回收 |
 | 联网与系统接入 | 待做：station/WPA2、ifnet/Apple80211、wifid/configd、DHCP和DNS | 系统网络栈联网，再验证设置操作和生命周期 |
 
