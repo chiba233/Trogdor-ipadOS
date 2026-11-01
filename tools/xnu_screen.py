@@ -239,7 +239,8 @@ def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=T
 
 
 def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=False, root_cache=None, root_device=None,
-         root_uuid=None, data_seed=None, data_uuid=None, display=False, cpus=1, gpu=0, gmu_firmware=None, sqe_firmware=None, gpu_addon=None):
+         root_uuid=None, data_seed=None, data_uuid=None, display=False, cpus=1, gpu=0, gmu_firmware=None, sqe_firmware=None, gpu_addon=None,
+         diagnostics=False):
     if window & 0x1fffff or memory & 0x1fffff:
         raise ValueError('window base and size must be 2 MiB aligned')
     kernel = macho(data)
@@ -258,6 +259,8 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         command_line = command_line.replace(' rd=md0', '')
         # Compose all SystemOS files at their normal paths, not only the shared-cache directory.
         command_line += ' coachz-systemos-union=1'
+    if diagnostics and not display:
+        raise ValueError('diagnostics go with the native display route')
     if display:
         if not root_uuid or not prelinked:
             raise ValueError('the native display route needs the prelinked main OS')
@@ -266,6 +269,11 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         command_line += ' sheng-vsync=60 sheng-early-retire=0 coachz-reset-mgcache=1'
         # The first frame silences the screen console until a panic (CoachzDisplay.cpp); the disk log keeps its output.
         command_line += ' coachz-console-band=0'
+        if diagnostics:
+            # Measurement boots: the GPU stack's frame statistics (the plug-in's sheng-diag=1), and the rebuilt MobileGestalt cache in hex to the
+            # log ring (coachz-prelink-mgcache-reset.patch), for the screen answers the system got, and the IOKit queries of locationd,
+            # backboardd and SpringBoard (coachz-prelink-match-log.patch), for what CoreMotion looks for.
+            command_line += ' sheng-diag=1 coachz-dump-mgcache=1 coachz-match-log=1'
         # The GT7375P touchscreen on SE4 as an IOHIDDevice digitizer (coachz-prelink-touch.patch, build-sheng-hid-input.py).
         command_line += ' coachz-touch=1'
         # UniXNU's AppleKeyStoreState: no keybag, no passcode, nothing locked (package/CoachzKeyStore.cpp).
@@ -386,6 +394,7 @@ def main():
     p.add_argument('--gmu-firmware', type=Path, help='with --gpu 3 or 6 to 9: the legacy A618 GMU firmware, linux-firmware qcom/a630_gmu.bin')
     p.add_argument('--data-uuid', help='with --root-uuid: selected external Data APFS volume UUID')
     p.add_argument('--data-image', type=Path, help='with --root-uuid: APFS Data seed, the RAM disk the kernel mounts on /private/var')
+    p.add_argument('--diagnostics', action='store_true', help='with --display: GPU frame statistics and a MobileGestalt cache dump in the log')
     a = p.parse_args()
     if a.output.exists() or a.output.resolve().is_relative_to(Path('/dev')):
         p.error('output must be a new ordinary file')
@@ -400,7 +409,7 @@ def main():
                    root_uuid=a.root_uuid, data_seed=a.data_image.read_bytes() if a.data_image else None, data_uuid=a.data_uuid, display=a.display, cpus=a.smp,
                    gpu=a.gpu, gmu_firmware=a.gmu_firmware.read_bytes() if a.gmu_firmware else None,
                    sqe_firmware=a.sqe_firmware.read_bytes() if a.sqe_firmware else None,
-                   gpu_addon=a.gpu_addon.read_bytes() if a.gpu_addon else None)
+                   gpu_addon=a.gpu_addon.read_bytes() if a.gpu_addon else None, diagnostics=a.diagnostics)
     a.output.parent.mkdir(parents=True, exist_ok=True)
     a.output.write_bytes(payload)
     print('Built screen-output XNU payload', hashlib.sha256(payload).hexdigest())

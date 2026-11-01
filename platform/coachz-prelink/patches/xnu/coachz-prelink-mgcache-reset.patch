@@ -1,6 +1,6 @@
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -8445,7 +8445,27 @@
+@@ -8445,7 +8445,86 @@
  {
  	return coachz_watchdog_policy_check(path, bytes, length, true);
  }
@@ -10,16 +10,75 @@
 + */
 +int unlink1(vfs_context_t, vnode_t, user_addr_t, enum uio_seg, int);
  
++/* Diagnostic (coachz-dump-mgcache=1): the rebuilt cache in hex to the log ring, once it exists and its size held for ten seconds,
++ * read only. It shows the main-screen answers MobileGestalt gave this display.
++ */
++static void
++coachz_mobilegestalt_cache_dump(void *parameter __unused, wait_result_t result __unused)
++{
++	static const char path[] = "/private/var/containers/Shared/SystemGroup/"
++	    "systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist";
++	static const char digits[] = "0123456789abcdef";
++	vfs_context_t context = vfs_context_kernel();
++	uint64_t last = 0;
++
++	for (int tries = 0; tries < 60; tries++) {
++		struct vnode_attr attributes;
++		vnode_t vnode = NULLVP;
++		uint64_t size = 0;
++		char line[2 * 48 + 1];
++		char *data;
++		int error, residual = 0;
++
++		delay(10 * 1000 * 1000);
++		if (vnode_open(path, FREAD | O_NOFOLLOW, 0, 0, &vnode, context)) {
++			continue;
++		}
++		VATTR_INIT(&attributes);
++		VATTR_WANTED(&attributes, va_data_size);
++		if (!vnode_getattr(vnode, &attributes, context) && VATTR_IS_SUPPORTED(&attributes, va_data_size)) {
++			size = attributes.va_data_size;
++		}
++		if (!size || size > (1 << 20) || size != last) {
++			last = size;
++			vnode_close(vnode, FREAD, context);
++			continue;
++		}
++		data = kalloc_data((size_t)size, Z_WAITOK | Z_NOFAIL);
++		error = vn_rdwr(UIO_READ, vnode, data, (int)size, 0, UIO_SYSSPACE, 0, vfs_context_ucred(context), &residual,
++		    vfs_context_proc(context));
++		vnode_close(vnode, FREAD, context);
++		printf("COACHZ mg: cache %llu bytes, read %d residual %d\n", (unsigned long long)size, error, residual);
++		for (uint64_t at = 0; !error && !residual && at < size; at += 48) {
++			unsigned count = size - at < 48 ? (unsigned)(size - at) : 48;
++			for (unsigned index = 0; index < count; index++) {
++				line[2 * index] = digits[(uint8_t)data[at + index] >> 4];
++				line[2 * index + 1] = digits[(uint8_t)data[at + index] & 15];
++			}
++			line[2 * count] = 0;
++			printf("COACHZ mg %05llx %s\n", (unsigned long long)at, line);
++		}
++		kfree_data(data, (size_t)size);
++		return;
++	}
++	printf("COACHZ mg: no settled cache in ten minutes\n");
++}
++
 +static void
 +coachz_mobilegestalt_cache_reset(void)
 +{
 +	static const char path[] = "/private/var/containers/Shared/SystemGroup/"
 +	    "systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist";
-+	int reset = 0;
++	int reset = 0, dump = 0;
++	thread_t thread;
 +	int error;
 +
 +	if (!PE_parse_boot_argn("coachz-reset-mgcache", &reset, sizeof(reset)) || reset != 1) {
 +		return;
++	}
++	if (PE_parse_boot_argn("coachz-dump-mgcache", &dump, sizeof(dump)) && dump == 1 &&
++	    kernel_thread_start(coachz_mobilegestalt_cache_dump, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
 +	}
 +	error = unlink1(vfs_context_kernel(), NULLVP, CAST_USER_ADDR_T(path), UIO_SYSSPACE, 0);
 +	printf("COACHZ MobileGestalt cache removed: %d\n", error);
@@ -28,7 +87,7 @@
  static int
  coachz_watchdog_policy_prepare(void)
  {
-@@ -8590,6 +8610,7 @@
+@@ -8590,6 +8669,7 @@
  		if (error) {
  			panic("Coachz temporary watchdog launch policy failed: %d", error);
  		}

@@ -124,19 +124,87 @@ uint64_t gmuBusy() {
     } while (high != *top);
     return uint64_t(high) << 32 | value;
 }
+// Where a busy second goes, by the A6xx performance counters (a6xx.xml countables; the selects are written once): SP busy, ALU, its stalls on
+// TP, UCHE and RB and its non-execution cycles; TP busy, its UCHE stall and L1 requests and misses; UCHE busy, arbiter stalls and the bus latency;
+// RB busy, its SP and CCU starvation and colour reads and writes; and the GBIF's AXI0/AXI1 read and write beats (kgsl's GBIF countables 34, 35,
+// 46 and 47). Percentages are of the core cycles of that second.
+struct ProfileCounter {uint32_t select, countable, counter;};
+const ProfileCounter kProfile[] = {
+    {0xae10, 0, 0x4a6}, {0xae11, 1, 0x4a8}, {0xae12, 4, 0x4aa}, {0xae13, 5, 0x4ac}, {0xae14, 6, 0x4ae}, {0xae15, 7, 0x4b0},
+    {0xb610, 0, 0x48e}, {0xb611, 1, 0x490}, {0xb612, 6, 0x492}, {0xb613, 7, 0x494},
+    {0x0e1c, 0, 0x476}, {0x0e1d, 1, 0x478}, {0x0e1e, 2, 0x47a}, {0x0e1f, 3, 0x47c},
+    {0x8e10, 0, 0x4d6}, {0x8e11, 5, 0x4d8}, {0x8e12, 7, 0x4da}, {0x8e13, 14, 0x4dc}, {0x8e14, 15, 0x4de},
+};
+enum : unsigned {ProfileCount = sizeof(kProfile) / sizeof(kProfile[0]), GbifSel = 0x3cc2, GbifEnable = 0x3cc0, GbifClear = 0x3cc1, GbifLow = 0x3cc4, GbifHigh = 0x3cc8};
+uint64_t gbifCounter(unsigned index) {
+    uint32_t high, low;
+    do {
+        high = coreRead(GbifHigh + index);
+        low = coreRead(GbifLow + index);
+    } while (high != coreRead(GbifHigh + index));
+    return uint64_t(high) << 32 | low;
+}
+void profileSetup() {
+    for (const ProfileCounter &c : kProfile) coreWrite(c.select, c.countable);
+    coreWrite(GbifClear, 0xf);
+    coreWrite(GbifClear, 0);
+    coreWrite(GbifSel, 34u | 35u << 8 | 46u << 16 | 47u << 24);
+    coreWrite(GbifEnable, coreRead(GbifEnable) | 0xf);
+}
+
 void rateThread(void *, wait_result_t) {
-    uint64_t cycles = coreCounter(0x400), busy = gmuBusy(), always = coreCounter(0x980);
+    uint64_t cycles = coreCounter(0x400), busy = gmuBusy(), always = coreCounter(0x980), last[ProfileCount], lastGbif[4];
+    profileSetup();
+    for (unsigned i = 0; i < ProfileCount; i++) last[i] = coreCounter(kProfile[i].counter);
+    for (unsigned i = 0; i < 4; i++) lastGbif[i] = gbifCounter(i);
     for (;;) {
         IOSleep(1000);
         const uint64_t newCycles = coreCounter(0x400), newBusy = gmuBusy(), newAlways = coreCounter(0x980);
         const uint64_t dCycles = newCycles - cycles, dBusy = newBusy - busy, dAlways = newAlways - always;
+        uint64_t d[ProfileCount], g[4];
+        for (unsigned i = 0; i < ProfileCount; i++) {
+            const uint64_t now = coreCounter(kProfile[i].counter);
+            d[i] = now - last[i];
+            last[i] = now;
+        }
+        for (unsigned i = 0; i < 4; i++) {
+            const uint64_t now = gbifCounter(i);
+            g[i] = now - lastGbif[i];
+            lastGbif[i] = now;
+        }
         cycles = newCycles;
         busy = newBusy;
         always = newAlways;
-        if (dAlways && dBusy * 20 >= dAlways)
-            printf("COACHZ gpu rate: busy %llu%%, %llu MHz over the second, %llu MHz while busy\n", static_cast<unsigned long long>(dBusy * 100 / dAlways),
-                static_cast<unsigned long long>(dCycles * 192 / dAlways / 10), static_cast<unsigned long long>(dBusy ? dCycles * 192 / dBusy / 10 : 0));
+        if (!dAlways || dBusy * 20 < dAlways || !dCycles) continue;
+        auto pct = [dCycles](uint64_t value) {return static_cast<unsigned long long>(value * 100 / dCycles);};
+        printf("COACHZ gpu rate: busy %llu%%, %llu MHz over the second, %llu MHz while busy\n", static_cast<unsigned long long>(dBusy * 100 / dAlways),
+            static_cast<unsigned long long>(dCycles * 192 / dAlways / 10), static_cast<unsigned long long>(dBusy ? dCycles * 192 / dBusy / 10 : 0));
+        printf("COACHZ gpu prof: sp %llu alu %llu st tp %llu uche %llu rb %llu ne %llu | tp %llu st %llu l1 %lluk miss %llu%% | uche %llu arb %llu lat %llu"
+            " | rb %llu starve sp %llu ccu %llu c r %lluk w %lluk | gbif r %lluk %lluk w %lluk %lluk\n",
+            pct(d[0]), pct(d[1]), pct(d[2]), pct(d[3]), pct(d[4]), pct(d[5]), pct(d[6]), pct(d[7]), static_cast<unsigned long long>(d[8] / 1000),
+            static_cast<unsigned long long>(d[8] ? d[9] * 100 / d[8] : 0), pct(d[10]), pct(d[11]), static_cast<unsigned long long>(d[13] ? d[12] / d[13] : 0),
+            pct(d[14]), pct(d[15]), pct(d[16]), static_cast<unsigned long long>(d[17] / 1000), static_cast<unsigned long long>(d[18] / 1000),
+            static_cast<unsigned long long>(g[0] / 1000), static_cast<unsigned long long>(g[1] / 1000), static_cast<unsigned long long>(g[2] / 1000),
+            static_cast<unsigned long long>(g[3] / 1000));
     }
+}
+
+// Whether the system cache serves the GPU, read only: mainline activates sc7180's GPU and GPUHTW LLCC slices (12 and 11; CPUSS 1, MDM 8) through
+// the broadcast ACT_CTRL and STATUS registers (llcc-qcom.c, n * 4 KiB and 4 + n * 4 KiB; ATTR0/1 at 0x21000 + 8n), then writes the slice IDs to
+// CX_MISC SYSTEM_CACHE_CNTL_1 (a6xx_llc_activate). Bank 0 holds the same registers.
+extern "C" vm_offset_t ml_io_map(vm_offset_t physical, vm_size_t size);
+void cacheProbe() {
+    const vm_offset_t llcc = ml_io_map(0x09200000, 0x22000), misc = ml_io_map(0x0509e000, 0x1000);
+    auto read = [](vm_offset_t at) {return *reinterpret_cast<volatile uint32_t *>(at);};
+    if (!llcc || !misc) {
+        printf("COACHZ llcc: map failed\n");
+        return;
+    }
+    static const unsigned slices[] = {1, 8, 11, 12};
+    for (unsigned id : slices)
+        printf("COACHZ llcc: slice %u act 0x%x status 0x%x attr0 0x%x attr1 0x%x\n", id, read(llcc + id * 0x1000), read(llcc + 4 + id * 0x1000),
+            read(llcc + 0x21000 + 8 * id), read(llcc + 0x21004 + 8 * id));
+    printf("COACHZ llcc: gpu system cache cntl0 0x%x cntl1 0x%x\n", read(misc + 4), read(misc + 8));
 }
 
 // Memory bandwidth and latency on an A55 and an A76, with loops the same as a Debian baseline's on this hardware: no XNU memory path votes for bandwidth,
@@ -306,6 +374,7 @@ extern "C" int coachz_gpu_driver_start(volatile uint8_t *core, volatile uint8_t 
     thread_t thread = THREAD_NULL;
     if (kernel_thread_start(reportThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
     if (kernel_thread_start(memoryProbeThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
+    cacheProbe();
     if (kernel_thread_start(rateThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
     return accelerator;
 }

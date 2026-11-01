@@ -99,3 +99,6 @@ coachz-prelink-audio.patch
 
 # coachz-gpu=9: launchd waits for the driver, and the Metal plug-in is installed and shown in the extensions directory.
 coachz-prelink-gpu-addon.patch
+
+# Diagnostics (coachz-match-log=1): the IOKit matching and service opens of locationd, backboardd and SpringBoard, to find what CoreMotion needs.
+coachz-prelink-match-log.patch

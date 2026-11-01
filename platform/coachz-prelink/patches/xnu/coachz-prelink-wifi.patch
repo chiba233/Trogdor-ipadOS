@@ -13,7 +13,7 @@
  	extern void coachz_battery_start(void);
 --- /dev/null
 +++ b/bsd/dev/coachz_wifi.c
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,171 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/* WCN3990 / SC7180 first-stage SMEM inventory. Not in the kernel build.
 + * coachz-wifi=1 plus an explicit /arm-io/coachz-wifi ADT node enables it.
@@ -94,6 +94,53 @@
 +    }
 +}
 +
++/*
++ * MPSS bring-up inputs, read only: which loader calls TF-A offers, by the fast INFO IS_CALL_AVAIL queries Linux's qcom_scm makes at
++ * probe (SMC64 SIP convention, qcom_scm-smc.c), and the Q6, modem and NC AXI halt registers q6v5_mss drives (sc7180 TCSR at 0x01f60000
++ * plus 0x3000, 0x5000 and 0x4000: HALTREQ, HALTACK, IDLE). No standard call, no memory assignment, no reset, no clock.
++ */
++static uint64_t
++wifi_smc_fast(uint64_t function, uint64_t arguments, uint64_t argument, uint64_t *result)
++{
++    register uint64_t x0 __asm__("x0") = function;
++    register uint64_t x1 __asm__("x1") = arguments;
++    register uint64_t x2 __asm__("x2") = argument;
++    register uint64_t x3 __asm__("x3") = 0;
++    register uint64_t x4 __asm__("x4") = 0;
++    register uint64_t x5 __asm__("x5") = 0;
++    register uint64_t x6 __asm__("x6") = 0;
++    __asm__ volatile ("smc #0"
++        : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6)
++        :
++        : "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++    *result = x1;
++    return x0;
++}
++
++static void
++wifi_mpss_probe(void)
++{
++    /* ARM_SMCCC_CALL_VAL(FAST, SMC_64, SIP, SCM_SMC_FNID(INFO 0x06, IS_CALL_AVAIL 0x01)); the queried call is SIP-owned. */
++    static const struct { uint32_t svc, cmd; const char *name; } calls[] = {
++        {0x06, 0x01, "info is-call-available"}, {0x02, 0x01, "pas init-image"}, {0x02, 0x02, "pas mem-setup"},
++        {0x02, 0x05, "pas auth-and-reset"}, {0x02, 0x07, "pas is-supported"}, {0x02, 0x0a, "pas mss-reset"},
++        {0x0c, 0x16, "mp assign"}, {0x0c, 0x02, "mp restore-sec-cfg"},
++    };
++    for (unsigned i = 0; i < sizeof(calls) / sizeof(calls[0]); i++) {
++        uint64_t available = 0;
++        const uint64_t status = wifi_smc_fast(0xc2000601u, 1, (2u << 24) | (calls[i].svc << 8) | calls[i].cmd, &available);
++        printf("COACHZ mpss: scm %s (%x/%x) status 0x%llx available %llu\n", calls[i].name, calls[i].svc, calls[i].cmd,
++            (unsigned long long)status, (unsigned long long)available);
++    }
++    const vm_offset_t tcsr = ml_io_map(0x01f60000, 0x6000);
++    if (!tcsr) { printf("COACHZ mpss: TCSR map failed\n"); return; }
++    static const struct { uint32_t offset; const char *name; } halts[] = {{0x3000, "q6"}, {0x5000, "modem"}, {0x4000, "nc"}};
++    for (unsigned i = 0; i < 3; i++) {
++        const volatile uint32_t *halt = (const volatile uint32_t *)(tcsr + halts[i].offset);
++        printf("COACHZ mpss: halt %s req 0x%x ack 0x%x idle 0x%x\n", halts[i].name, halt[0], halt[1], halt[2]);
++    }
++}
++
 +/* Call from the existing sampler thread after IOKit has started, once. */
 +void
 +coachz_wifi_start(void)
@@ -102,6 +149,7 @@
 +    unsigned mode = 0;
 +    if (started || !PE_parse_boot_argn("coachz-wifi", &mode, sizeof(mode)) || mode != 1) return;
 +    started = 1;
++    wifi_mpss_probe();
 +    DTEntry node;
 +    const void *property = NULL;
 +    unsigned size = 0;

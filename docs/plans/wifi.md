@@ -13,6 +13,8 @@
 | SMEM平台清点 | 已写：确认ADT范围与XNU内存窗口不重叠，解析公开partition table，仅读global/APPS-MODEM，读取incoming SMP2P及已有GLINK描述符 | 主机夹具通过；XNU侧尚未编译/实机运行 |
 | WLFW控制报文 | 已写：QMI/TLV、indication registration、CAP、SC7180 MSA-info请求、严格响应匹配、能力字段、QRTR服务增删 | 主机固定报文通过；没有实际发送或收到固件响应 |
 | MPSS/传输 | 待做：SC7180 MBA/PIL、权限和资源、SMEM锁/分配、SMP2P/GLINK握手、QRTR/QMI事务与超时 | 真实WLFW服务与有效响应 |
+
+真机（k78，只读）：TF-A 的 SMC64 SIP 调用可用，PAS 系列一个都没实现，`assign_mem` 实现了，所以 MPSS 只能走主线 trogdor 的 MBA 自认证（`qcom_q6v5_mss.c`，`qcom,sc7180-mss-pil`）。TCSR 0x01f60000 的 Q6/NC halt 空闲、无请求。`qdsp6sw.mbn` 有 65.6 MB，进不了 payload，需要另找传送方式；`mba.mbn` 283 KB 可以。
 | 无线扫描 | 待做：正确BDF、firmware/host SMMU、CE、HTC/WMI/HTT、真实BSS | 重复扫描与错误回收 |
 | 联网与系统接入 | 待做：station/WPA2、ifnet/Apple80211、wifid/configd、DHCP和DNS | 系统网络栈联网，再验证设置操作和生命周期 |
 

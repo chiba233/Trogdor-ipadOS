@@ -1,0 +1,98 @@
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -2694,6 +2694,56 @@
+ 	return internal_io_service_match_property_table(service, matching, matchingCnt, matches);
+ }
+ 
++/*
++ * Diagnostic (coachz-match-log=1): the IOKit matching dictionaries and the services that locationd, backboardd and SpringBoard ask for,
++ * each distinct one once, to the log ring. It shows what CoreMotion looks for before an orientation source is made for it. Read only.
++ */
++#include <pexpert/pexpert.h>
++extern "C" void proc_selfname(char * buf, int size);
++static void
++coachz_match_log(const char * what, const OSObject * object)
++{
++	static int enabled = -1;
++	static uint32_t seen[256];
++	static unsigned count;
++	char name[17] = {};
++
++	if (enabled < 0) {
++		int value = 0;
++		enabled = PE_parse_boot_argn("coachz-match-log", &value, sizeof(value)) && value == 1;
++	}
++	if (!enabled || !object) {
++		return;
++	}
++	proc_selfname(name, sizeof(name));
++	if (strcmp(name, "locationd") && strcmp(name, "backboardd") && strcmp(name, "SpringBoard")) {
++		return;
++	}
++	OSSerialize * s = OSSerialize::withCapacity(512);
++	if (!s) {
++		return;
++	}
++	if (object->serialize(s)) {
++		const char * text = s->text();
++		uint32_t hash = 2166136261u;
++		const char * parts[] = {name, what, text};
++		for (const char * at : parts) {
++			for (; *at; at++) {
++				hash = (hash ^ (uint8_t) *at) * 16777619u;
++			}
++		}
++		bool known = false;
++		for (unsigned i = 0; i < count; i++) {
++			known = known || seen[i] == hash;
++		}
++		if (!known && count < 256) {
++			seen[count++] = hash;
++			printf("COACHZ match %s %s: %.400s\n", name, what, text);
++		}
++	}
++	s->release();
++}
++
+ static kern_return_t
+ internal_io_service_get_matching_services(
+ 	mach_port_t main_port,
+@@ -2711,6 +2761,7 @@
+ 
+ 	assert(matching_size);
+ 	obj = OSUnserializeXML(matching, matching_size);
++	coachz_match_log("services", obj);
+ 
+ 	if ((dict = OSDynamicCast( OSDictionary, obj))) {
+ 		IOTaskRegistryCompatibilityMatching(current_task(), dict);
+@@ -2794,6 +2845,7 @@
+ 
+ 	assert(matching_size);
+ 	obj = OSUnserializeXML(matching, matching_size);
++	coachz_match_log("service", obj);
+ 
+ 	if ((dict = OSDynamicCast( OSDictionary, obj))) {
+ 		IOTaskRegistryCompatibilityMatching(current_task(), dict);
+@@ -2896,6 +2948,7 @@
+ 
+ 		assert(matching_size);
+ 		obj = OSUnserializeXML(matching, matching_size);
++		coachz_match_log(notification_type, obj);
+ 		dict = OSDynamicCast(OSDictionary, obj);
+ 		if (!dict) {
+ 			err = kIOReturnBadArgument;
+@@ -4377,6 +4430,14 @@
+ 	bool           disallowAccess = false;
+ 
+ 	CHECK( IOService, _service, service );
++
++	{
++		char text[96];
++		snprintf(text, sizeof(text), "%s type %u", service->getMetaClass()->getClassName(), connect_type);
++		OSString * opened = OSString::withCString(text);
++		coachz_match_log("open", opened);
++		OSSafeReleaseNULL(opened);
++	}
+ 
+ 	if (!owningTask) {
+ 		return kIOReturnBadArgument;
