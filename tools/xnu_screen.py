@@ -298,9 +298,10 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         command_line += ' coachz-backlight=1 coachz-usb-keyboard=1'
         # Read-only probes: SoC temperatures and the SMEM inventory, with their nodes from prelink_tree (docs/plans/thermal.md, wifi.md).
         # coachz-wifi=2 adds the AOSS channel and one RPMh vote to the read-only MPSS inventory, 3 the first part of the MBA start, undone after
-        # 2 s, 4 the whole MBA start (Q6 boot FSM, PBL, MBA) at 200 s followed by Linux's reclaim (coachz-prelink-wifi.patch).
+        # 2 s, 4 the modem's start as qcom_q6v5_mss does it (MBA, then qdsp6sw.mbn's MPSS once the firmware below is verified; Linux's
+        # reclaim when the modem does not report ready; coachz-prelink-wifi.patch).
         command_line += ' coachz-thermal=1 coachz-wifi=4 coachz-motion=1 coachz-switches=1'
-        # The MPSS firmware tools/linux_log.py --modem-firmware stores in the kernel partition, read back and hashed (nothing is started).
+        # The MPSS firmware tools/linux_log.py --modem-firmware stores in the kernel partition, read back and hashed for coachz-wifi=4.
         command_line += ' coachz-modem-fw=1'
     if gpu:
         # Adreno 618 bring-up stages (docs/plans/gpu.md): 1 inventory, 2 CX + GMU clock window, 3 also the GMU firmware into TCM,

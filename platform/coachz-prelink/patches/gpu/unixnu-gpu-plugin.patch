@@ -10,3 +10,171 @@
      const uintptr_t site = 0x184461928 + slide;
      uint32_t word = 0;
      if (!readTask(site, &word, sizeof word)) return 0x6E40;
+--- a/GpuScanoutClient.h
++++ b/GpuScanoutClient.h
+@@ -35,6 +35,7 @@
+     uint64_t mismatchRows;   // rows of those frames that differ (CPU reads only: nothing is rendered or copied by the CPU)
+     uint32_t lastMs;    // the GPU copy's time for the last frame
+     uint64_t totalMs;   // and for all frames (the mean is totalMs / (frames + failures))
++    int wide;           // Coachz: scanout_opaque4 0 not tried yet, 1 in use, 2 turned off by a check, 3 not available
+ };
+ 
+ class Client {
+@@ -99,7 +100,11 @@
+             stats_->totalMs += stats_->lastMs;
+         }
+         stats_->lastResult = (int)r;
+-        if (r == gpupresent::kOk && swap.format == NGP_BGRX8888 && stats_->verified < 4) verify(swap);
++        if (r == gpupresent::kOk && swap.format == NGP_BGRX8888 && stats_->verified < 4) {
++            verify(swap);
++            if (presenter_->lastWide() && !matchesIgnoringAlpha(swap)) presenter_->disableWide();
++        }
++        stats_->wide = presenter_->wideState();
+         note(0x6731);   // the GPU copy returned
+         const uint64_t copiedUs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000;
+         NGPComplete done = {swap.sequence, r == gpupresent::kOk ? 0u : 0xe00002bcu /* kIOReturnError */, 0};
+@@ -122,6 +127,18 @@
+                 if (a[x] != b[x]) {++stats_->mismatchRows; break;}
+         }
+         ++stats_->verified;
++    }
++    // Coachz: the same rows as verify(), compared without the alpha byte the copy sets.
++    bool matchesIgnoringAlpha(const NGPSwap &swap) const {
++        const uint32_t rows = swap.height < 400 ? swap.height : 400, words = swap.width;
++        const volatile uint32_t *shown = (const volatile uint32_t *)scanout_.base;
++        const volatile uint32_t *surface = (const volatile uint32_t *)(uintptr_t)swap.address;
++        for (uint32_t y = 0; y < rows; ++y) {
++            const volatile uint32_t *a = shown + (size_t)y * (scanout_.stride / 4), *b = surface + (size_t)y * (swap.stride / 4);
++            for (uint32_t x = 0; x < words; ++x)
++                if ((a[x] | 0xff000000u) != (b[x] | 0xff000000u)) return false;
++        }
++        return true;
+     }
+     void note(uint32_t value) {if (transport_.mark) transport_.mark(transport_.context, value);}
+     bool fail(int step, int error) {stats_->step = step; stats_->error = error; return false;}
+--- a/GpuScanoutPresenter.h
++++ b/GpuScanoutPresenter.h
+@@ -51,6 +51,10 @@
+         target_ = [device newBufferWithBytesNoCopy:scanout.base length:scanout.bytes options:MTLResourceStorageModeShared deallocator:nil];
+     }
+     bool ready() const { return target_ != nil; }
++    // Coachz: whether the last frame went through scanout_opaque4, and the switch a failed check turns off for good.
++    bool lastWide() const { return lastWide_; }
++    void disableWide() { wide_ = false; }
++    int wideState() const { return !wide_ ? 2 : opaque4_ ? 1 : opaque4Failed_ ? 3 : 0; }
+     // One frame: encodes the GPU copy, commits, waits for the GPU. Rows are copied as whole rows of width*4 bytes.
+     Result present(const Frame &frame) {
+         if (!ready()) return kBadScanout;
+@@ -63,6 +67,24 @@
+         const uint32_t rows = gHalfRows.load(std::memory_order_relaxed) ? frame.height / 2 : frame.height;
+         id<MTLBuffer> source = sourceFor(frame);
+         if (!source) return kNoResource;
++        lastWide_ = false;
++        if (wide_ && !(frame.width & 3) && !(frame.stride & 15) && !(scanout_.stride & 15) && pipeline(opaque4_, opaque4Failed_, @"scanout_opaque4")) {
++            // Coachz: four pixels a thread with 16-byte accesses (both bases are page aligned).
++            id<MTLCommandBuffer> commands = [queue_ commandBuffer];
++            id<MTLComputeCommandEncoder> encoder = commands ? [commands computeCommandEncoder] : nil;
++            if (!encoder) return kNoResource;
++            const uint32_t params[4] = {frame.width / 4, rows, (uint32_t)(frame.stride / 16), (uint32_t)(scanout_.stride / 16)};
++            [encoder setComputePipelineState:opaque4_];
++            [encoder setBuffer:source offset:0 atIndex:0];
++            [encoder setBuffer:target_ offset:0 atIndex:1];
++            [encoder setBytes:params length:sizeof params atIndex:3];
++            [encoder dispatchThreadgroups:MTLSizeMake((frame.width / 4 + 15) / 16, (rows + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
++            [encoder endEncoding];
++            [commands commit];
++            [commands waitUntilCompleted];
++            lastWide_ = true;
++            return commands.status == MTLCommandBufferStatusCompleted ? kOk : kGpuFailed;
++        }
+         if (!(frame.stride & 3) && !(scanout_.stride & 3) && pipeline(opaque_, opaqueFailed_, @"scanout_opaque")) {
+             id<MTLCommandBuffer> commands = [queue_ commandBuffer];
+             id<MTLComputeCommandEncoder> encoder = commands ? [commands computeCommandEncoder] : nil;
+@@ -187,8 +209,8 @@
+     Scanout scanout_;
+     id<MTLCommandQueue> queue_;
+     id<MTLBuffer> target_;
+-    id<MTLComputePipelineState> convert_ = nil, opaque_ = nil;
+-    bool convertFailed_ = false, opaqueFailed_ = false;
++    id<MTLComputePipelineState> convert_ = nil, opaque_ = nil, opaque4_ = nil;
++    bool convertFailed_ = false, opaqueFailed_ = false, opaque4Failed_ = false, wide_ = true, lastWide_ = false;
+     id<MTLBuffer> tables_[2] = {nil, nil};
+     Source sources_[kSources] = {};
+     uint64_t uses_ = 0;
+--- a/NativeMetalBridgePhase.h
++++ b/NativeMetalBridgePhase.h
+@@ -129,9 +129,9 @@
+                     reportedFrames = st.frames ? st.frames : reportedFrames;
+                     reportedFailures = st.failures ? st.failures : reportedFailures;
+                     const uint64_t served = st.frames + st.failures;
+-                    snprintf(line, sizeof line, "PF %llu/%llu r%d v%llu/%llu t%u a%llu", (unsigned long long)st.frames, (unsigned long long)st.failures,
++                    snprintf(line, sizeof line, "PF %llu/%llu r%d v%llu/%llu t%u a%llu w%d", (unsigned long long)st.frames, (unsigned long long)st.failures,
+                              st.lastResult, (unsigned long long)st.verified, (unsigned long long)st.mismatchRows, st.lastMs,
+-                             (unsigned long long)(served ? st.totalMs / served : 0));
++                             (unsigned long long)(served ? st.totalMs / served : 0), st.wide);
+                     streamText7(gpu, line);
+                 }
+             }
+--- a/shaders/scanout_convert.ll
++++ b/shaders/scanout_convert.ll
+@@ -106,10 +106,51 @@
+   ret void
+ }
+ 
++; scanout_opaque4 (Coachz): scanout_opaque with four pixels a thread, one 16-byte load and store each (A618 moves 4-byte accesses
++; one pixel a thread at a fraction of its bandwidth). Width a multiple of 4, both row pitches multiples of 16 bytes, both bases page aligned.
++; p: width / 4, height, source and destination row pitch in 16-byte units.
++;   kernel void scanout_opaque4(device const uint4 *src [[buffer(0)]], device uint4 *dst [[buffer(1)]], constant uint4 &p [[buffer(3)]],
++;                               uint2 gid [[thread_position_in_grid]])
++define void @scanout_opaque4(ptr addrspace(1) noundef readonly "air-buffer-no-alias" %src, ptr addrspace(1) noundef "air-buffer-no-alias" %dst, ptr addrspace(2) noundef readonly align 16 dereferenceable(16) "air-buffer-no-alias" %p, <2 x i32> noundef %gid) local_unnamed_addr #0 {
++entry:
++  %w = load i32, ptr addrspace(2) %p, align 16
++  %ph = getelementptr inbounds i32, ptr addrspace(2) %p, i64 1
++  %h = load i32, ptr addrspace(2) %ph, align 4
++  %pss = getelementptr inbounds i32, ptr addrspace(2) %p, i64 2
++  %ss = load i32, ptr addrspace(2) %pss, align 8
++  %pds = getelementptr inbounds i32, ptr addrspace(2) %p, i64 3
++  %ds = load i32, ptr addrspace(2) %pds, align 4
++  %x = extractelement <2 x i32> %gid, i64 0
++  %y = extractelement <2 x i32> %gid, i64 1
++  %inx = icmp ult i32 %x, %w
++  %iny = icmp ult i32 %y, %h
++  %in = and i1 %inx, %iny
++  br i1 %in, label %body, label %done
++
++body:
++  %x64 = zext i32 %x to i64
++  %y64 = zext i32 %y to i64
++  %ss64 = zext i32 %ss to i64
++  %srow = mul i64 %y64, %ss64
++  %si = add i64 %srow, %x64
++  %sp = getelementptr inbounds <4 x i32>, ptr addrspace(1) %src, i64 %si
++  %v = load <4 x i32>, ptr addrspace(1) %sp, align 16
++  %px = or <4 x i32> %v, <i32 -16777216, i32 -16777216, i32 -16777216, i32 -16777216>
++  %ds64 = zext i32 %ds to i64
++  %drow = mul i64 %y64, %ds64
++  %di = add i64 %drow, %x64
++  %dp = getelementptr inbounds <4 x i32>, ptr addrspace(1) %dst, i64 %di
++  store <4 x i32> %px, ptr addrspace(1) %dp, align 16
++  br label %done
++
++done:
++  ret void
++}
++
+ attributes #0 = { mustprogress nofree norecurse nosync nounwind willreturn "frame-pointer"="all" "min-legal-vector-width"="0" "no-builtins" "no-trapping-math"="true" "stack-protector-buffer-size"="8" }
+ 
+ !llvm.module.flags = !{!0, !1, !2, !3, !4, !5, !6, !7, !8}
+-!air.kernel = !{!9, !22}
++!air.kernel = !{!9, !22, !26}
+ !air.compile_options = !{!17, !18}
+ !llvm.ident = !{!19}
+ !air.version = !{!20}
+@@ -141,3 +182,7 @@
+ !23 = !{!12, !13, !25, !24}
+ !24 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"gid"}
+ !25 = !{i32 2, !"air.buffer", !"air.buffer_size", i32 16, !"air.location_index", i32 3, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"uint4", !"air.arg_name", !"p"}
++!26 = !{ptr @scanout_opaque4, !10, !27}
++!27 = !{!28, !29, !25, !24}
++!28 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"uint4", !"air.arg_name", !"src"}
++!29 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"uint4", !"air.arg_name", !"dst"}

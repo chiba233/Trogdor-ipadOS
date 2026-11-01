@@ -1453,3 +1453,13 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 - k89，panic：`pmap_assert_free`。一个用 GPU 的进程崩溃成 corpse，它的地址空间保留着 GPU 缓冲区的视图，而 `clientClose` 已把不在池里的缓冲区还给 VM。k89 的 512 MiB 池峰值用到 472 MiB。k90 把池扩到 1536 MiB（UniXNU 默认值），并对仍被映射的非池缓冲区延后释放；k91 照 UniXNU 的 `allocateSystem`，让池放不下的用户缓冲区用不属于任何 task 的可分页系统内存，客户端视图映射它自己的描述符。k90、k91 没有 panic，池峰值 216 和 88 MiB，系统内存缓冲区和延后释放都没有用到。
 - k90，送显拆分：一帧渲染完成之后，拷贝到屏幕还要约 15 ms（送显请求到拷贝完成 22–25 ms）。
 - 启动参数上限是 1023 字节；k87 去掉了已完成调查的 `coachz-dump-mgcache=1` 和 `coachz-match-log=1`。
+
+## MBA 就绪、MPSS 认证、modem 运行和送显拷贝（k92～k95）
+
+- k92，apps SMMU 只读：`sCR0` 为 `0x200001`（CLIENTPD，旁路），160 个 SMR、80 个上下文，没有有效的 SMR，14 个 S2CR 不在复位值，80 个 CBAR 都设过值。mba_mem 里读不到 Linux 上次留下的 MBA 日志；k93 起确认那里开头全为 0，和 MBA 成功时的状态 `0x2`（解锁并擦除）一致。
+- k93，Debian 正在用的设备树里，LTE 版的 mpss_mem 是 0x86000000 起 140 MiB（主线 `sc7180-trogdor-lte-sku.dtsi`），加载的也是 LTE 版 `mba.mbn`（和 Debian 的 `modem/` 哈希一致）。之前交给 modem 的是非 LTE 的 32 MiB。改成 140 MiB 后，PBL 51 ms 通过，MBA 157 ms 报告就绪（状态 `0x2`）。IPA 的五个总线 BCM（SN9、SN0、SN1、SN12、CN0）和 IP0（100 MHz）投票都完成，状态 `0x10101`。
+- k93，开机约 34 s，CPU 7 panic：`ArmCpu: unexpected architectural IRQ 3`。时间和核号都对应第一次 SMP 报告里那次一次性的 Group 1 SGI 自检：它给本核发 SGI 0–7，每个只轮询 400 次，在 A76 上留下了一个没收走的 SGI 3，而 ArmCpu 只认 SGI 0。k94 起去掉这次自检，ArmCpu 收到 SGI 1–15 只计数；k94、k95 计数都是 0，没有 panic。
+- k94，照 `q6v5_mpss_load` 加载 `qdsp6sw.mbn`：元数据 1076 + 8104 字节 5 ms 认证通过；30 个可加载段（文件 65.5 MB，展开 144 MB）从 USB 盘 5.8 s 装完，MBA 58 ms 后报告认证完成，MBA 日志写着 “Received size greater than 32MB updating LTE” 和 “MBA Execution is successful”。15 s 内没找到 modem 的 SMP2P 条目，回收时 modem 的 AXI 口忙、不应答（k93 只跑 MBA 时是空闲的）。原因之一在这边：查 SMEM 条目时用的是开机清点时读到的分区末尾，之后新建的条目都看不到。
+- k95，每次查找都重新读分区头之后：apps-modem 分区的已分配末尾从 `0x20` 涨到 `0x5208`，modem 运行并建了约 20 KiB 的条目。它没有置 ready 位；AP 这边自己的 SMP2P 条目（435）和 GLINK 都还没有，15 s 后照 Linux 的失败流程回收了 modem。
+- 送显拷贝：GPU 把每一帧拷进固件帧缓冲（UniXNU 的 hand-off）。k94 时这一拷平均 24 ms（71 帧），从一帧渲染完到拷贝结束约 31 ms，而每个渲染 pass 的 GPU 时间平均约 2 ms；提交到送进 GPU 之前还在编码线程上等约 12.7 ms。k95 的拷贝核每个线程搬 4 个像素（16 字节读写），406 帧平均 11 ms、最近一次 9 ms，前 4 帧逐行比对无差异；等待拷贝完成的平均时间从 23.3 ms 降到 10.6 ms。
+- 触摸：k94 的 48 份、k95 的 219 份报告全部送进 HID，0 错误。

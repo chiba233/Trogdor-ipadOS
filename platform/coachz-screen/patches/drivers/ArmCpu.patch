@@ -128,7 +128,14 @@
  }
  
  static bool waitClear (uintptr_t base, unsigned offset, uint32_t mask)
-@@ -321,7 +419,7 @@
+@@ -170,4 +268,6 @@
+ extern "C" {
+ volatile uint64_t armcpu_spi_unhandled = 0;
+ volatile uint32_t armcpu_spi_unhandled_id = 0;
++volatile uint64_t armcpu_sgi_stray = 0;      // SGIs 1-15 taken: this kernel signals only with SGI 0
++volatile uint32_t armcpu_sgi_stray_id = 0;
+ }
+@@ -321,7 +421,7 @@
    uint64_t value;
    __asm__ volatile ("mrs %0, icc_sre_el1" : "=r" (value));
    value |= 1;
@@ -137,7 +144,7 @@
    __asm__ volatile ("mrs %0, icc_sre_el1" : "=r" (value));
    if ((value & 1) == 0) { panic ("ArmCpu: GICv3 system register interface unavailable"); }
    __asm__ volatile ("mrs %0, icc_ctlr_el1" : "=r" (value));
-@@ -337,7 +435,7 @@
+@@ -337,7 +437,7 @@
      write32 (dist, 0, read32 (dist, 0) | 0x12U);
    }
    value = 1;
@@ -146,7 +153,7 @@
    if (!secondary) {
      uint64_t pmr, ig, sre;
      __asm__ volatile ("mrs %0, icc_pmr_el1" : "=r" (pmr));
-@@ -347,12 +445,21 @@
+@@ -347,12 +447,21 @@
      armcpu_gic_boot[1] = read32 (redist + 0x10000, 0x100);
      armcpu_gic_boot[2] = read32 (dist, 0);
      armcpu_gic_boot[3] = read32 (dist, 4);
@@ -168,7 +175,7 @@
  }
  
  
-@@ -367,6 +474,9 @@
+@@ -367,6 +476,9 @@
    unsigned spiIpi = 0;
    PE_parse_boot_argn ("armcpu-spi-ipi", &spiIpi, sizeof (spiIpi));
    gSpiIpi = spiIpi == 1;
@@ -178,7 +185,7 @@
    unsigned diagnostic = 0;
    PE_parse_boot_argn("armcpu-diagnostics", &diagnostic, sizeof(diagnostic));
    diagnosePower=diagnostic==1;
-@@ -387,10 +497,19 @@
+@@ -387,10 +499,19 @@
      if (gBootRegistered != 0) { drainPending (); }
      return true;
    } else {
@@ -199,7 +206,7 @@
    }
    cpuName = OSSymbol::withCStringNoCopy ("ARM architectural boot CPU");
    if (cpuName == nullptr) { return false; }
-@@ -449,7 +568,10 @@
+@@ -449,7 +570,10 @@
    info.phys_id = static_cast<uint32_t> (affinity);
    info.log_id = logicalId;
    info.cluster_id = static_cast<uint32_t> (ml_get_cluster_number (static_cast<uint32_t> (affinity)));
@@ -211,7 +218,7 @@
    perfmon_interrupt_handler_func pmi = nullptr;
    kern_return_t status = ml_processor_register (&info, &machProcessor, &ipi_handler, &pmi);
    if (status != KERN_SUCCESS) { armcpu_smp_fail[logicalId] = 4; return false; }
-@@ -518,6 +640,13 @@
+@@ -518,6 +642,13 @@
      uint64_t mpidr;
      __asm__ volatile ("mrs %0, mpidr_el1" : "=r" (mpidr));
      armcpu_smp_seen_mpidr[logicalId] = static_cast<uint32_t> (mpidr);
@@ -225,7 +232,7 @@
      // A failure is recorded and the core parked (rather than a panic that hides the other cores' state).
      if ((mpidr & 0xffff) != (affinity & 0xffff)) { armcpu_smp_fail[logicalId] = 1; for (;;) { __asm__ volatile ("wfe"); } }
      if (!gRemoteGic && !wakeRedistributor (true)) { armcpu_smp_fail[logicalId] = 2; for (;;) { __asm__ volatile ("wfe"); } }
-@@ -531,8 +660,16 @@
+@@ -531,8 +662,16 @@
      setCPUState (kIOCPUStateRunning);
      armcpu_smp_step[logicalId] = 7;
      armcpu_smp_running = armcpu_smp_running + 1;
@@ -242,7 +249,7 @@
      if (gSelfIpi) { signalCPU (this); }
      return;
    }
-@@ -565,7 +702,8 @@
+@@ -565,7 +704,8 @@
      armcpu_irq_id=static_cast<uint32_t>(id & 0xffffff);
      if ((id & 0xffffff) >= 1020) { armcpu_irq_phase=0;break; }
      if(diagnosePower && ++drained>128)panic("ArmCpu: IRQ drain exceeds 128 id=%llx timer=%llu IPI=%llu",id,armcpu_timer_interrupts,armcpu_ipi_interrupts);
@@ -252,7 +259,18 @@
        armcpu_timer_interrupts = armcpu_timer_interrupts + 1;
        armcpu_core_timer[logicalId & 7] = armcpu_core_timer[logicalId & 7] + 1;
        armcpu_irq_phase=2;
-@@ -603,7 +741,7 @@
+@@ -603,13 +743,18 @@
+       } else if (intid >= 32 && gDist != 0) {
+         armcpu_spi_unhandled = armcpu_spi_unhandled + 1;
+         armcpu_spi_unhandled_id = intid;
+         write32 (gDist, 0x180 + (intid / 32) * 4, 1U << (intid % 32));
++      } else if (intid < 16) {
++        // Coachz: an SGI nobody sends here is counted and ended, as Linux only warns about an unknown IPI. k93 panicked on SGI 3
++        // that the one-time Group 1 self-probe had left pending.
++        armcpu_sgi_stray = armcpu_sgi_stray + 1;
++        armcpu_sgi_stray_id = intid;
+       } else {
+         panic ("ArmCpu: unexpected architectural IRQ %llu", id);
        }
      }
      armcpu_irq_phase=6;
@@ -261,7 +279,7 @@
    }
  }
  
-@@ -618,7 +756,7 @@
+@@ -618,7 +763,7 @@
                   ((aff & 0xff00) << 8) | (1ULL << (aff & 0xff));
    armcpu_ipi_sent = armcpu_ipi_sent + 1;
    if (gSpiIpi) { spiIpiSend (gDist, peer->logicalId & 7); return; }
@@ -270,7 +288,7 @@
  }
  
  // Diagnostic: sends SGI 0 to the core whose MPIDR affinity is aff (the DT "reg" value, e.g. 0x100 for core 1) exactly as signalCPU
-@@ -660,11 +798,46 @@
+@@ -660,11 +805,46 @@
  // MMIO). With IRQs masked, SGIs 0..15 are sent one at a time to this core's own MPIDR affinity through ICC_SGI1R_EL1 (Group 1) and, when that
  // shows nothing, through ICC_SGI0R_EL1 (Group 0); ICC_HPPIR1_EL1 / ICC_HPPIR0_EL1 is polled and a pending SGI is acknowledged and ended here so the
  // kernel never sees it. out[8], out[9]: CNTVCT ticks of one ICC_SGI1R_EL1 write and of one ICC_PMR_EL1 read (a trapped write costs far more). out: 0 MPIDR, 1 INTIDs pending as Group 1, 2 INTIDs pending as Group 0, 3 ICC_PMR, 4 ICC_IGRPEN1, 5 ICC_SRE, 6 ICC_CTLR, 7 ICC_RPR.
@@ -319,7 +337,7 @@
    for (unsigned i = 0; i < 10; i++) { out[i] = 0; }
    out[0] = mpidr;
    __asm__ volatile ("mrs %0, icc_pmr_el1" : "=r" (v)); out[3] = v;
-@@ -677,8 +850,8 @@
+@@ -677,8 +857,8 @@
      for (uint64_t intid = 0; intid < 16; intid++) {
        const uint64_t sgi = base | (intid << 24);
        uint64_t h = 1023, ta, tb;
@@ -330,7 +348,7 @@
        if (intid == 0) { out[8] = tb - ta; }
        for (unsigned polls = 0; polls < 400; polls++) {
          __asm__ volatile ("mrs %0, icc_hppir1_el1" : "=r" (h));
-@@ -688,10 +861,10 @@
+@@ -688,10 +868,10 @@
        if ((h & 0xffffff) == intid) {
          out[1] |= 1ULL << intid;
          __asm__ volatile ("mrs %0, icc_iar1_el1" : "=r" (v));
@@ -343,7 +361,7 @@
        for (unsigned polls = 0; polls < 400; polls++) {
          __asm__ volatile ("mrs %0, icc_hppir0_el1" : "=r" (h));
          if ((h & 0xffffff) == intid) { break; }
-@@ -700,16 +873,16 @@
+@@ -700,16 +880,16 @@
        if ((h & 0xffffff) == intid) {
          out[2] |= 1ULL << intid;
          __asm__ volatile ("mrs %0, icc_iar0_el1" : "=r" (v));
@@ -363,7 +381,7 @@
  }
  
  extern "C" void armcpu_ipi_selftest (uint64_t aff)
-@@ -717,13 +890,13 @@
+@@ -717,13 +897,13 @@
    uint64_t sgi = ((aff & 0xff00000000ULL) << 16) | ((aff & 0xff0000) << 16) | ((aff & 0xff00) << 8) | (1ULL << (aff & 0xff));
    armcpu_ipi_selftest_sent = armcpu_ipi_selftest_sent + 1;
    if (gSpiIpi) { spiIpiSend (gDist, static_cast<uint32_t> ((aff >> 8) & 7)); return; }
@@ -379,7 +397,7 @@
  }
  
  void ArmCpu::quiesceCPU (void)
-@@ -732,7 +905,7 @@
+@@ -732,7 +912,7 @@
    if(diagnosePower)panic("ArmCpu: unsupported quiesce requested before timer/GIC disable caller=%p halt=%u timer=%llu phase=%u",__builtin_return_address(0),armcpu_halt_calls,armcpu_timer_interrupts,armcpu_irq_phase);
    enableCPUTimeBase (false);
    uint64_t value = 0;
@@ -388,7 +406,7 @@
  }
  
  void ArmCpu::haltCPU (void)
-@@ -754,7 +927,7 @@
+@@ -754,7 +934,7 @@
    uintptr_t line = static_cast<uintptr_t> (4) << ((ctr >> 16) & 15);
    uintptr_t address = reinterpret_cast<uintptr_t> (start) & ~(line - 1), end = reinterpret_cast<uintptr_t> (start) + length;
    for (; address < end; address += line) { __asm__ volatile ("dc civac, %0" :: "r" (address) : "memory"); }
@@ -397,7 +415,7 @@
  }
  
  kern_return_t ArmCpu::startCPU (vm_offset_t, vm_offset_t)
-@@ -769,9 +942,20 @@
+@@ -769,9 +949,20 @@
    cleanToMemory (LowResetVectorBase, 0x10000);   // reset vector, start_cpu and the code up to the MMU enable
    cleanToMemory (ResetHandlerData, 0x1000);
    cleanToMemory (const_boot_args, 0x1000);

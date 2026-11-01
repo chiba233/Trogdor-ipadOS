@@ -14,7 +14,7 @@
  
  void coachz_sample_task(const char *name, int pid, task_t task);
  void coachz_critical_user_state(const char *name, int pid);
-@@ -314,12 +321,315 @@
+@@ -314,12 +321,314 @@
  done:
  	os_atomic_store(&coachz_sb_captured, 2, release);
  	printf("%s", coachz_sb_failure);
@@ -204,13 +204,12 @@
 +		}
 +		printf("\n");
 +	}
-+	/* Once: which non-secure SGIs to this core become pending as Group 1, and how is the CPU interface set? */
-+	if (!coachz_sgi_probe[0]) {
-+		uint64_t out[10];
-+		armcpu_group1_sgi_probe(out);
-+		snprintf(coachz_sgi_probe, sizeof(coachz_sgi_probe),
-+		    "COACHZ SGI probe mpidr 0x%llx: grp1 0x%llx pmr 0x%llx igrpen1 0x%llx sre 0x%llx ctlr 0x%llx rpr 0x%llx hppir 0x%llx\n",
-+		    out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7]);
++	/* SGIs other than 0 that reached a core; this kernel sends none. The one-time Group 1 self-probe that stood here (SGIs 0-7 to its
++	 * own core, 400 polls each, grp1 0xff on every boot) once left SGI 3 pending on an A76, and ArmCpu panicked (k93). */
++	{
++		extern volatile uint64_t armcpu_sgi_stray;
++		extern volatile uint32_t armcpu_sgi_stray_id;
++		snprintf(coachz_sgi_probe, sizeof(coachz_sgi_probe), "COACHZ SGI stray %llu (last %u)\n", armcpu_sgi_stray, armcpu_sgi_stray_id);
 +	}
 +	printf("%s", coachz_sgi_probe);
 +	{

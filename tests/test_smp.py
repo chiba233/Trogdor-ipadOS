@@ -181,8 +181,11 @@ class SmpTreeTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1] / 'platform'
         report = (root / 'coachz-prelink/patches/xnu/coachz-prelink-launch-diagnostic.patch').read_text()
         self.assertNotIn('armcpu_sgi_selfprobe(', report)
-        self.assertIn('armcpu_group1_sgi_probe(out);', report)
+        # Nor the Group 1 self-probe: one SGI it left pending panicked ArmCpu (k93). Stray SGIs are counted instead.
+        self.assertNotIn('armcpu_group1_sgi_probe(out);', report)
+        self.assertIn('COACHZ SGI stray %llu', report)
         probe = (root / 'coachz-screen/patches/drivers/ArmCpu.patch').read_text()
+        self.assertIn('+      } else if (intid < 16) {', probe)
         start = probe.index('+extern "C" void armcpu_group1_sgi_probe')
         body = probe[start:probe.index('+extern "C" void armcpu_sgi_selfprobe', start) if '+extern "C" void armcpu_sgi_selfprobe' in probe[start:] else None]
         for register in ('icc_sgi0r', 'icc_hppir0', 'icc_iar0', 'icc_eoir0', 'icc_igrpen0'):
