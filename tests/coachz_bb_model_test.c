@@ -261,6 +261,44 @@ static void test_sahara(void)
     if (!failures) printf("PASS sahara device\n");
 }
 
+/* BBUEUR10Loader's order: mode 3, chip id and serial number in command mode, then a switch to mode 0 and a new HELLO. */
+static void test_sahara_command(void)
+{
+    static const uint32_t list[] = { 0x15 };
+    static struct cbs_device d;
+    struct cbs_out o = { 0 };
+    uint8_t in[0x30] = { 0 };
+    cbs_init(&d, list, 1, 0x100);
+    cbs_start(&d, &o);
+    CHECK(o.count == 1 && cbs_get32(o.data[0]) == CBS_HELLO);
+    cbs_put32(in, CBS_HELLO_RESP); cbs_put32(in + 4, 0x30); cbs_put32(in + 8, 2); cbs_put32(in + 12, 1); cbs_put32(in + 20, CBS_MODE_COMMAND);
+    CHECK(cbs_receive(&d, in, 0x30, &o) == 0x30 && o.count == 1 && cbs_get32(o.data[0]) == CBS_COMMAND_READY && o.len[0] == 8 && d.state == CBS_COMMAND);
+    cbs_put32(in, CBS_EXECUTE); cbs_put32(in + 4, 0xc); cbs_put32(in + 8, CBS_EXEC_HW_ID);
+    cbs_receive(&d, in, 0xc, &o);
+    CHECK(o.count == 1 && cbs_get32(o.data[0]) == CBS_EXECUTE_RESP && o.len[0] == 0x10 && cbs_get32(o.data[0] + 8) == CBS_EXEC_HW_ID && cbs_get32(o.data[0] + 12) == 8);
+    cbs_put32(in, CBS_EXECUTE_DATA);
+    cbs_receive(&d, in, 0xc, &o);
+    CHECK(o.count == 1 && o.len[0] == 8 && cbs_get32(o.data[0] + 4) == CBS_CHIP_ID);
+    cbs_put32(in, CBS_EXECUTE); cbs_put32(in + 8, CBS_EXEC_SERIAL);
+    cbs_receive(&d, in, 0xc, &o);
+    CHECK(o.count == 1 && cbs_get32(o.data[0] + 12) == 4);
+    cbs_put32(in, CBS_EXECUTE_DATA);
+    cbs_receive(&d, in, 0xc, &o);
+    CHECK(o.count == 1 && o.len[0] == 4 && d.executes == 2);
+    cbs_put32(in, CBS_EXECUTE); cbs_put32(in + 8, 0x77);       /* unknown: answers empty */
+    cbs_receive(&d, in, 0xc, &o);
+    CHECK(cbs_get32(o.data[0] + 12) == 0);
+    cbs_put32(in, CBS_EXECUTE_DATA);
+    cbs_receive(&d, in, 0xc, &o);
+    CHECK(o.count == 0);
+    cbs_put32(in, CBS_SWITCH_MODE); cbs_put32(in + 8, CBS_MODE_IMAGE_PENDING);
+    cbs_receive(&d, in, 0xc, &o);
+    CHECK(o.count == 1 && cbs_get32(o.data[0]) == CBS_HELLO && cbs_get32(o.data[0] + 20) == CBS_MODE_IMAGE_PENDING && d.state == CBS_WAIT_HELLO_RESP);
+    cbs_put32(in, CBS_HELLO_RESP); cbs_put32(in + 4, 0x30); cbs_put32(in + 20, CBS_MODE_IMAGE_PENDING);
+    cbs_receive(&d, in, 0x30, &o);
+    CHECK(o.count == 1 && cbs_get32(o.data[0]) == CBS_READ_DATA && cbs_get32(o.data[0] + 8) == 0x15 && d.state == CBS_WAIT_ELF);
+}
+
 static void test_control(void)
 {
     static struct cbc_state s;
@@ -305,6 +343,7 @@ int main(void)
 {
     test_qmux();
     test_sahara();
+    test_sahara_command();
     test_control();
     test_channels();
     return failures ? 1 : 0;

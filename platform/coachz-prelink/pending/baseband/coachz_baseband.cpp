@@ -188,6 +188,8 @@ static void bb_host_write(uint32_t channel, const uint8_t *data, uint32_t len)
       if (!used) break;
       at += used;
     }
+    if (bb_sahara.state != before && bb_sahara.state == CBS_COMMAND)
+      printf("COACHZ baseband: sahara command mode\n");
     if (bb_sahara.state != before && (bb_sahara.state == CBS_FINISHED || bb_sahara.state == CBS_FAILED || bb_sahara.state == CBS_WAIT_DONE))
       printf("COACHZ baseband: sahara %s, image %u of %u (id 0x%x), host mode %u status %u, last command %u, %u requests, %llu bytes\n",
              bb_sahara.state == CBS_FINISHED ? "finished" : bb_sahara.state == CBS_FAILED ? "failed" : "image read",
@@ -508,6 +510,9 @@ public:
   {
     if (!out) return kIOReturnBadArgument;
     *out = nullptr;
+    static uint32_t seen;
+    if (!(__atomic_fetch_or(&seen, 1u << fChannel, __ATOMIC_RELAXED) & (1u << fChannel)))
+      printf("COACHZ baseband: first user client on %s\n", cbh_published[fChannel]);
     AppleBasebandPCIUserClient *client = OSTypeAlloc(AppleBasebandPCIUserClient);
     if (!client) return kIOReturnNoMemory;
     client->setChannel(fChannel);
@@ -598,6 +603,8 @@ class AppleBasebandPCIControl : public IOService {
 public:
   IOReturn newUserClient(task_t t, void *s, UInt32 type, OSDictionary *p, IOUserClient **out) override
   {
+    static uint32_t seen;
+    if (!__atomic_exchange_n(&seen, 1, __ATOMIC_RELAXED)) printf("COACHZ baseband: first user client on AppleBasebandPCIControl\n");
     return bb_open<AppleBasebandPCIControlUserClient>(this, t, s, type, p, out);
   }
   IOReturn newUserClient(task_t t, void *s, UInt32 type, IOUserClient **out) override { return newUserClient(t, s, type, nullptr, out); }
@@ -796,8 +803,8 @@ extern "C" void coachz_baseband_report(unsigned second)
   uint32_t clients = 0, servers = 0;
   for (uint32_t i = 0; i < CBQ_MAX_CLIENTS; i++) clients += bb_qmux.client[i].used;
   for (uint32_t i = 0; i < CBQ_MAX_SERVERS; i++) servers += bb_qmux.server[i].present;
-  printf("COACHZ baseband: %u s: %u QMI services, %u clients, dropped %u/%u; sahara state %u, %u requests; board calls %u (%u unsupported)\n",
-         second, servers, clients, bb_qmux.dropped, bb_tx_dropped, bb_sahara.state, bb_sahara.requests, bb_control.calls, bb_control.unsupported);
+  printf("COACHZ baseband: %u s: %u QMI services, %u clients, dropped %u/%u; sahara state %u, %u executes, %u requests; board calls %u (%u unsupported)\n",
+         second, servers, clients, bb_qmux.dropped, bb_tx_dropped, bb_sahara.state, bb_sahara.executes, bb_sahara.requests, bb_control.calls, bb_control.unsupported);
   for (uint32_t c = 0; c < CBH_PUBLISHED; c++) {
     const bb_channel *ch = &bb_ch[c];
     if (ch->opens)

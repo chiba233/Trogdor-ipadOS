@@ -22,6 +22,8 @@
 
 ## 上机看什么
 
+`com.apple.telephony.abm` 子系统的 `%s` 消息默认是 `<private>`。`bsd/kern/kern_exec.c` 写 `/private/var/preferences/Logging/Subsystems/com.apple.telephony.abm.plist` 打开它。这些日志可能带设备标识，只留在本机。
+
 日志环里以 `COACHZ baseband:` 开头的行：
 - 服务发布了几个；
 - 固件文件写了几个、两处联合挂载到了哪一步（stage 5 才算成功）；

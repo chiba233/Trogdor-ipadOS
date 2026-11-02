@@ -1638,3 +1638,9 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 - **设置**：能打开，“蜂窝网络”页面能打开，提示需要更新才能使用蜂窝数据；“关于本机”的基带固件版本为空。
 - **基带启动**：ABM 启动基带失败 15 次后报 `Baseband is declared dead`。复位记录的原因是 `BBUpdater error 2 - Assertion failure ( fPhases.size() )`（`BBUConsoleFeedback.cpp:93`）。它之前的 20 多行 BBU 日志都是 `<private>`，还没有进程打开基带通道。
 
+## BBUpdater 能读到固件
+
+- **隐藏日志**：`/private/var/preferences/Logging/Subsystems/com.apple.telephony.abm.plist` 打开 `Enable-Private-Data` 后，BBU 的每一步都能看到。
+- **固件目录**：之前是指向 `/private/var/coachz` 的符号链接，BBU 报 `kBBUReturnFirmwareDataError`（`Miss images for bootupInternal`）。改成把目录 bind 挂载到 `/private/preboot/<hash>/usr/local/standalone/firmware/Baseband/Mav16` 后，restoreSBL1、SBL1、RPM、APPS、MBA、QDSP6SW、TZ、ACDB、BBCFG 都加载成功。
+- **下一步**：BBU 打开 `boot` 通道，`Connecting to Loader`、`Getting Version` 通过，读 PK hash 和 MSM ID 时方法 5 回 unsupported，报 `kBBUReturnGetChipIDFailure`。基带还没启动成功。
+
