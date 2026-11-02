@@ -1,0 +1,395 @@
+--- a/bsd/dev/coachz_wifi.c
++++ b/bsd/dev/coachz_wifi.c
+@@ -784,6 +784,8 @@
+     for (uint32_t i = 0; i < count && i < 8; i++) {
+         const uint8_t *entry = wifi_fw_header + 32 + 64 * i;
+         char name[17] = {0};
++        /* The cellular bridge's firmware: coachz_baseband_archive reads it, the modem never does. */
++        if (!strncmp((const char *)entry, "baseband.arc", 16)) continue;
+         uint8_t first[64] = {0}, digest[32];
+         uint64_t done = 0;
+         int error = 0;
+@@ -848,6 +850,59 @@
+ }
+ 
+ /*
++ * The cellular bridge's firmware, "baseband.arc" in the same blob (tools/linux_log.py --baseband): read whole and checked against its
++ * SHA-256, for kern_exec.c to put on the Data volume before launchd. The caller frees *data with kfree_data(*data, *allocated).
++ */
++int
++coachz_baseband_archive(uint8_t **data, uint64_t *bytes, size_t *allocated)
++{
++    const size_t chunk = 1u << 20;
++    vfs_context_t context = vfs_context_kernel();
++    uint64_t blob = WIFI_FW_BLOB_USB;
++    unsigned on_emmc = 0;
++    int error = ENOENT;
++    uint8_t *header = kalloc_data(4096, Z_WAITOK);
++
++    if (!header) return ENOMEM;
++    if (PE_parse_boot_argn("coachz-root-emmc", &on_emmc, sizeof(on_emmc)) && on_emmc == 1) blob = WIFI_FW_BLOB_EMMC;
++    for (unsigned which = 0; which < (unsigned)(sizeof(wifi_fw_disks) / sizeof(wifi_fw_disks[0])) && error == ENOENT; which++) {
++        vnode_t disk = NULLVP;
++        if (vnode_open(wifi_fw_disks[which], FREAD, 0, 0, &disk, context)) continue;
++        if (!wifi_fw_read(disk, context, header, 4096, blob) && !memcmp(header, "COACHZMODEMFW1", 14)) {
++            const uint32_t count = cw_u32(header + 16);
++            for (uint32_t i = 0; i < count && i < 8 && error == ENOENT; i++) {
++                const uint8_t *entry = header + 32 + 64 * i;
++                if (strncmp((const char *)entry, "baseband.arc", 16)) continue;
++                const uint64_t offset = cw_u64(entry + 16), size = cw_u64(entry + 24);
++                const size_t rounded = (size_t)((size + 511) & ~511ull);
++                uint8_t *copy = rounded ? kalloc_data(rounded, Z_WAITOK) : NULL, digest[32];
++                SHA256_CTX hash;
++                error = copy ? 0 : ENOMEM;
++                for (size_t done = 0; !error && done < rounded; done += chunk) {
++                    error = wifi_fw_read(disk, context, copy + done, rounded - done < chunk ? rounded - done : chunk, blob + offset + done);
++                }
++                if (!error) {
++                    SHA256_Init(&hash);
++                    SHA256_Update(&hash, copy, (size_t)size);
++                    SHA256_Final(digest, &hash);
++                    if (memcmp(digest, entry + 32, 32)) error = EINVAL;
++                }
++                if (error && copy) {
++                    kfree_data(copy, rounded);
++                } else if (!error) {
++                    *data = copy;
++                    *bytes = size;
++                    *allocated = rounded;
++                }
++            }
++        }
++        vnode_close(disk, FREAD, context);
++    }
++    kfree_data(header, 4096);
++    return error;
++}
++
++/*
+  * coachz-wifi=4: q6v5_mba_load for sc7180 (qcom_q6v5_mss.c with sc7180-trogdor.dtsi's qcom,sc7180-mss-pil node and the LTE SKU's
+  * 140 MiB mpss_mem), as soon as the MBA has been read and only when neither modem region touches XNU's memory or the framebuffer. The
+  * AOP is told the modem loads, cx/mx/mss go to their top level, the reset clocks (iface, bus, snoc_axi) are enabled, the AOSS
+@@ -1149,6 +1204,13 @@
+ extern void coachz_modem_qmi(int, uint32_t, uint32_t, const void *, uint32_t);
+ extern void coachz_modem_poll(void);
+ extern void coachz_modem_report(unsigned);
++/* The cellular bridge (drivers/RamBlock coachz_baseband.cpp, /chosen/coachz-baseband): ABM's QMUX clients as QRTR ports from 0x4100. */
++extern void coachz_baseband_configure(void (*)(uint32_t, uint32_t, uint32_t, const void *, uint32_t), void (*)(uint32_t));
++extern void coachz_baseband_new_server(uint32_t, uint32_t, uint32_t, uint32_t);
++extern void coachz_baseband_del_server(uint32_t, uint32_t, uint32_t);
++extern int coachz_baseband_qrtr(uint32_t, uint32_t, uint32_t, const void *, uint32_t);
++extern void coachz_baseband_poll(void);
++extern void coachz_baseband_report(unsigned);
+ 
+ static void
+ wifi_smp2p_kick(void)
+@@ -1936,6 +1998,20 @@
+     wq_send(cmd, WQ_CTRL, dst_node, WQ_CTRL, pkt, sizeof(pkt));
+ }
+ 
++/* The bridge's QMI clients: one local port each, as libqmi's QRTR backend opens one socket per client. Wi-Fi thread only. */
++static void
++wb_send(uint32_t local_port, uint32_t node, uint32_t port, const void *message, uint32_t length)
++{
++    wq_send(1, local_port, node, port, message, length);
++}
++
++/* af_qrtr.c qrtr_port_remove: a closed client is announced to the peer as DEL_CLIENT {node, port}. */
++static void
++wb_del_client(uint32_t local_port)
++{
++    wq_ctrl(6, WQ_NODE, local_port, 0, 0, wg.modem_node);
++}
++
+ /* QMI over QRTR (soc/qcom/qmi_interface.c): a 7-byte header (type, transaction, message, length) and TLVs (type, u16 length). */
+ static int
+ wr_tlv(const uint8_t *body, uint32_t n, uint8_t want, const uint8_t **value, uint16_t *len)
+@@ -5308,6 +5384,7 @@
+         if (dst_port == WQ_RMTFS_PORT) wr_request(src_node, src_port, body, size);
+         else if (dst_port == WL_PORT) wl_rx(body, size);
+         else if (dst_port == WM_SERVER_PORT || dst_port == WM_CLIENT_PORT) coachz_modem_qmi(dst_port == WM_CLIENT_PORT, src_node, src_port, body, size);
++        else if (coachz_baseband_qrtr(dst_port, src_node, src_port, body, size)) {}
+         else printf("COACHZ qrtr: data for port 0x%x from %u:0x%x\n", dst_port, src_node, src_port);
+         if (confirm) wq_send(7, dst_port, src_node, src_port, (const uint32_t[]){7, WQ_NODE, dst_port, 0, 0}, 20);
+         break;
+@@ -5328,9 +5405,11 @@
+             wl.known = 1;
+         }
+         coachz_modem_new_server(ctrl[1], ctrl[2], ctrl[3], ctrl[4]);
++        coachz_baseband_new_server(ctrl[1], ctrl[2], ctrl[3], ctrl[4]);
+         break;
+     case 5:
+         printf("COACHZ qrtr: server %u gone at %u:0x%x\n", ctrl[1], ctrl[3], ctrl[4]);
++        coachz_baseband_del_server(ctrl[1], ctrl[3], ctrl[4]);
+         break;
+     case 10:
+         printf("COACHZ qrtr: lookup for %u from %u:0x%x (remote lookups are ns.c's to refuse)\n", ctrl[1], src_node, src_port);
+@@ -5620,6 +5699,8 @@
+     if (wifi_smem_now(&now_layout)) wifi_glink_state(&wifi_smem_reader, &now_layout);
+     const int link = wg_start();
+     if (link) printf("COACHZ glink: not started (%d)\n", link);
++    /* QRTR is up: the cellular bridge publishes the services ABM looks for (nothing without /chosen/coachz-baseband). */
++    if (!link) coachz_baseband_configure(wb_send, wb_del_client);
+     for (unsigned second = 1;; second++) {
+         for (unsigned ms = 0; ms < 1000; ms++) {
+             if (!link) {
+@@ -5635,12 +5716,14 @@
+                 }
+             }
+             coachz_modem_poll();
++            if (!link) coachz_baseband_poll();
+             delay(1000);
+         }
+         if (!link && (second <= 120 ? !(second % 10) : !(second % 60))) {
+             wg_report(second);
+             wc_report(second);
+             coachz_modem_report(second);
++            coachz_baseband_report(second);
+         }
+         if (second > 60 && second % 10) continue;
+         const int64_t bits = wifi_modem_bits();
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8415,11 +8415,16 @@
+ /* launchd rewrites disabled.plist in its own XML form while it runs. Accept that form when the
+  * file stays root-owned, not group/other writable, and still maps com.apple.watchdogd to true.
+  */
++extern int coachz_baseband_enabled(void);
++
+ static bool
+ coachz_watchdog_policy_launchd_form(const char *path, vnode_t vnode, const struct vnode_attr *found,
+     vfs_context_t context)
+ {
+ 	static const char *const keys[] = {"<key>com.apple.watchdogd</key>", "<key>com.apple.fairplayd.A2</key>", "<key>com.apple.accessoryupdaterd</key>", "<key>com.apple.identityservicesd</key>", "<key>com.apple.CommCenter</key>"};
++	/* With the cellular bridge (/chosen/coachz-baseband) CommCenter runs: its key, the last, must not map to true. */
++	const bool baseband = coachz_baseband_enabled() != 0;
++	const unsigned required = sizeof(keys) / sizeof(keys[0]) - (baseband ? 1 : 0);
+ 	uint64_t size = found->va_data_size;
+ 	char *data, *at;
+ 	bool accepted = false;
+@@ -8434,7 +8439,7 @@
+ 	    &residual, vfs_context_proc(context)) && !residual) {
+ 		data[size] = 0;
+ 		accepted = true;
+-		for (unsigned i = 0; i < sizeof(keys) / sizeof(keys[0]) && accepted; i++) {
++		for (unsigned i = 0; i < required && accepted; i++) {
+ 			at = strnstr(data, keys[i], (size_t)size);
+ 			accepted = false;
+ 			if (at) {
+@@ -8445,6 +8450,13 @@
+ 				accepted = !strncmp(at, "<true/>", 7);
+ 			}
+ 		}
++		if (accepted && baseband && (at = strnstr(data, keys[4], (size_t)size))) {
++			at += strlen(keys[4]);
++			while (*at == ' ' || *at == '\t' || *at == '\n' || *at == '\r') {
++				at++;
++			}
++			accepted = strncmp(at, "<true/>", 7) != 0;
++		}
+ 	}
+ 	kfree_data(data, (size_t)size + 1);
+ 	if (accepted) {
+@@ -8888,8 +8900,174 @@
+ 	    COACHZ_SMALL "/Background-Light.jpg", &small_stage, &small_status);
+ 	printf("COACHZ gpu: wallpaper overlays: flat stage %d status %d, 834 stage %d status %d\n", native_gpu_addon3_stage, native_gpu_addon3_status, small_stage, small_status);
+ }
++
++/*
++ * The cellular bridge (/chosen/coachz-baseband, drivers/RamBlock coachz_baseband.cpp). BBUpdater serves the Mav16 firmware from a folder of the
++ * bbfw's files: capabilities::radio::personalizedFirmwarePath, MSU's personalized base (the preboot directory named after the boot manifest
++ * hash) plus /usr/local/standalone/firmware/Baseband/Mav16. The kernel partition carries those files (coachz_baseband_archive, tools/linux_log.py
++ * --baseband) in the GPU addon's layout under its own magic; each goes to /private/var/coachz/baseband/Mav16 when it differs. Read-only unions
++ * then show the folder as /private/preboot/<HASH>/usr/local/standalone/firmware/Baseband/Mav16 and /usr/standalone/firmware/Baseband/Mav16;
++ * ABM's log ("FW base path", "FW path ... exists") says which one it takes.
++ */
++extern int coachz_baseband_archive(uint8_t **, uint64_t *, size_t *);
++static volatile int coachz_baseband_files = -1, coachz_baseband_written, coachz_baseband_same, coachz_baseband_failed, coachz_baseband_error;
+ 
+ static void
++coachz_baseband_unpack(proc_t p, user_addr_t scratch, const uint8_t *archive, uint64_t bytes)
++{
++	uint64_t declared = 0, at = 24;
++	uint32_t count = 0;
++	if (bytes < 24 || memcmp(archive, "CZBBFW01", 8)) {
++		coachz_baseband_error = EINVAL;
++		return;
++	}
++	memcpy(&count, archive + 8, 4);
++	memcpy(&declared, archive + 16, 8);
++	if (declared != bytes || !count || count > 256) {
++		coachz_baseband_error = EINVAL;
++		return;
++	}
++	/* The whole archive is checked before anything is written. */
++	for (uint32_t i = 0; i < count; i++) {
++		uint32_t name_bytes = 0, mode = 0;
++		uint64_t size = 0, packed = 0;
++		if (bytes - at < 24) {
++			coachz_baseband_error = EINVAL;
++			return;
++		}
++		memcpy(&name_bytes, archive + at, 4);
++		memcpy(&mode, archive + at + 4, 4);
++		memcpy(&size, archive + at + 8, 8);
++		memcpy(&packed, archive + at + 16, 8);
++		at += 24;
++		const char *name = (const char *)(archive + at);
++		const uint64_t name_padded = (name_bytes + 7) & ~7ULL, data_padded = (packed + 7) & ~7ULL;
++		if (name_bytes < 2 || name_bytes > 120 || bytes - at < name_padded || name[name_bytes - 1] || strnlen(name, name_bytes) != name_bytes - 1 ||
++		    name[0] == '/' || strnstr(name, "..", name_bytes) || (mode & ~0777) || size > INT32_MAX || !packed || packed > INT32_MAX ||
++		    bytes - at - name_padded < data_padded) {
++			coachz_baseband_error = EINVAL;
++			return;
++		}
++		at += name_padded + data_padded;
++	}
++	if (at != bytes) {
++		coachz_baseband_error = EINVAL;
++		return;
++	}
++	coachz_baseband_files = (int)count;
++	vfs_context_t ctx = vfs_context_current();
++	char path[192];
++	at = 24;
++	for (uint32_t i = 0; i < count; i++) {
++		uint32_t name_bytes = 0, mode = 0;
++		uint64_t size = 0, packed = 0;
++		memcpy(&name_bytes, archive + at, 4);
++		memcpy(&mode, archive + at + 4, 4);
++		memcpy(&size, archive + at + 8, 8);
++		memcpy(&packed, archive + at + 16, 8);
++		at += 24;
++		const char *name = (const char *)(archive + at);
++		at += (name_bytes + 7) & ~7ULL;
++		snprintf(path, sizeof(path), "/private/var/coachz/baseband/Mav16/%s", name);
++		uint8_t *data = kalloc_data(size ? size : 1, Z_WAITOK);
++		int error = data ? native_gpu_addon_inflate(archive + at, packed, data, size) : ENOMEM;
++		if (!error) {
++			error = native_gpu_addon_write(path, data, size, mode, ctx);
++			if (error == ENOENT && !(error = native_gpu_addon_parents(p, scratch, path))) {
++				error = native_gpu_addon_write(path, data, size, mode, ctx);
++			}
++		}
++		if (data) {
++			kfree_data(data, size ? size : 1);
++		}
++		if (error < 0) {
++			coachz_baseband_same++;
++		} else if (error) {
++			coachz_baseband_failed++;
++			coachz_baseband_error = error;
++		} else {
++			coachz_baseband_written++;
++		}
++		at += (packed + 7) & ~7ULL;
++	}
++}
++
++static void
++coachz_baseband_install(proc_t p, user_addr_t scratch)
++{
++	uint8_t *archive = NULL;
++	uint64_t bytes = 0;
++	size_t allocated = 0;
++	const int error = coachz_baseband_archive(&archive, &bytes, &allocated);
++	if (error) {
++		coachz_baseband_error = error;
++		return;
++	}
++	coachz_baseband_unpack(p, scratch, archive, bytes);
++	kfree_data(archive, allocated);
++}
++
++/* `entry` names a symbolic link to /private/var/coachz/baseband/Mav16, made with its missing parents. */
++static int
++coachz_baseband_link(proc_t p, user_addr_t scratch, const char *entry)
++{
++	static const char target[] = "/private/var/coachz/baseband/Mav16";
++	int error = native_gpu_addon_parents(p, scratch, entry);
++	if (!error) {
++		struct symlink_args request = {.path = scratch + 0x200, .link = scratch + 0x300};
++		int32_t result = 0;
++		if (!(error = copyout(target, request.path, sizeof(target))) && !(error = copyout(entry, request.link, strlen(entry) + 1))) {
++			error = symlink(p, &request, &result);
++		}
++	}
++	return error == EEXIST ? 0 : error;
++}
++
++static void
++coachz_baseband_prepare(proc_t p, user_addr_t scratch)
++{
++	static volatile int preboot_stage, preboot_status = -1, standalone_stage, standalone_status = -1;
++	static const char preboot_source[] = "/private/var/coachz/baseband/preboot", preboot_point[] = "/private/preboot";
++	static const char standalone_source[] = "/private/var/coachz/baseband/standalone", standalone_point[] = "/usr/standalone/firmware";
++	char hash[97] = "", entry[192], own[224];
++	DTEntry chosen = NULL;
++	const void *value = NULL;
++	unsigned int value_size = 0;
++	int error;
++
++	if (!coachz_baseband_enabled()) {
++		return;
++	}
++	coachz_baseband_install(p, scratch);
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
++	    SecureDTGetProperty(chosen, "boot-manifest-hash", &value, &value_size) == kSuccess && value_size && value_size <= 48) {
++		for (unsigned i = 0; i < value_size; i++) {
++			snprintf(hash + 2 * i, 3, "%02X", ((const uint8_t *)value)[i]);
++		}
++	}
++	snprintf(entry, sizeof(entry), "%s/%s/usr/local/standalone/firmware/Baseband/Mav16", preboot_source, hash);
++	error = hash[0] ? coachz_baseband_link(p, scratch, entry) : ENOENT;
++	if (!error) {
++		snprintf(own, sizeof(own), "%s/%s/usr/local/standalone/firmware/Baseband/Mav16/Info.plist", preboot_point, hash);
++		native_gpu_addon_mount(p, scratch, 0x400, preboot_source, sizeof(preboot_source), preboot_point, sizeof(preboot_point),
++		    preboot_point, own, &preboot_stage, &preboot_status);
++	} else {
++		preboot_status = error;
++	}
++	error = coachz_baseband_link(p, scratch, "/private/var/coachz/baseband/standalone/Baseband/Mav16");
++	if (!error) {
++		native_gpu_addon_mount(p, scratch, 0x400, standalone_source, sizeof(standalone_source), standalone_point, sizeof(standalone_point),
++		    "/usr/standalone/firmware/SmartIOFirmwareT7000.bin", "/usr/standalone/firmware/Baseband/Mav16/Info.plist", &standalone_stage,
++		    &standalone_status);
++	} else {
++		standalone_status = error;
++	}
++	printf("COACHZ baseband: firmware files %d written %d same %d failed %d error %d; preboot %s stage %d status %d, standalone stage %d status %d\n",
++	    coachz_baseband_files, coachz_baseband_written, coachz_baseband_same, coachz_baseband_failed, coachz_baseband_error, hash[0] ? hash : "(no hash)",
++	    preboot_stage, preboot_status, standalone_stage, standalone_status);
++}
++
++static void
+ coachz_audio_prepare(proc_t p, user_addr_t scratch)
+ {
+ 	static const char *const directories[] = {"/private/var/coachz", "/private/var/coachz/audio", "/private/var/coachz/audio/CoachzAudio.driver",
+@@ -8965,6 +9143,10 @@
+ 	     * registered, so its first caller waits forever; identityservicesd and CommCenter are UniXNU's first-boot XPC wait
+ 	     * cycle; accessoryupdaterd keeps trustd checking certificates. A disabled job's clients get no answer at once. */
+ 	    "<plist version=\"1.0\"><dict><key>com.apple.watchdogd</key><true/><key>com.apple.fairplayd.A2</key><true/><key>com.apple.accessoryupdaterd</key><true/><key>com.apple.identityservicesd</key><true/><key>com.apple.CommCenter</key><true/></dict></plist>\n";
++	/* The cellular bridge (/chosen/coachz-baseband): the same without CommCenter, which then runs. */
++	const char cellular[] = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
++	    "<plist version=\"1.0\"><dict><key>com.apple.watchdogd</key><true/><key>com.apple.fairplayd.A2</key><true/><key>com.apple.accessoryupdaterd</key><true/><key>com.apple.identityservicesd</key><true/></dict></plist>\n";
++	const bool baseband = coachz_baseband_enabled() != 0;
+ 	int disable = 0;
+ 	int error;
+ 
+@@ -8972,7 +9154,7 @@
+ 		return 0;
+ 	}
+ 	error = coachz_watchdog_policy_file("/private/var/db/com.apple.xpc.launchd/disabled.plist",
+-	    policy, (int)sizeof(policy) - 1);
++	    baseband ? cellular : policy, baseband ? (int)sizeof(cellular) - 1 : (int)sizeof(policy) - 1);
+ 	if (!error) {
+ 		/* Prevent first-boot migration from replacing the deliberately installed override. */
+ 		error = coachz_watchdog_policy_file("/private/var/db/com.apple.xpc.launchd/disabled.migrated", "", 0);
+@@ -9282,6 +9464,7 @@
+ 		coachz_setup_prepare();
+ 		coachz_audio_prepare(p, scratch);
+ 		coachz_gpu_prepare(p, scratch);
++		coachz_baseband_prepare(p, scratch);
+ 	}
+ }
+ 

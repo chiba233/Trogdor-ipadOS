@@ -1613,3 +1613,13 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 - **温控**：38 个 HID 温度服务全部启动，读取超过 700 次，`thermalmonitord` 不再报 `no HID services`，也没有 `null event`。CLPC 和 PMGR 仍然找不到。
 - **连 Mac**：不识别，USB 设备模式没做。
 
+## 蜂窝桥接、USB-C 电压和主帧标记
+
+- **蜂窝桥接**：`COACHZ baseband: 5 of 5 services published`；17 个固件文件全部写入，`/private/preboot/<hash>` 和 `/usr/standalone/firmware` 两处联合挂载都到 stage 5；modem 的 37 个 QMI 服务同步进了桥。launchd 按 `/baseband` 节点启动蜂窝版 CommCenter，状态栏显示“正在搜索”，设置里出现“蜂窝网络”，点开打不开。之后每个周期都是 0 个客户端、sahara 0 次请求、0 次板级调用：没有进程打开基带通道。CommCenter 的日志是 `No CommandDriver dylib was loaded`、`'NullFactory' instantiated`，模式停在 `kNoBaseband`。
+- **USB-C 电压**：30 W 充电器在口 0 协商成 `11825 mV now, max 12000 mV 2500 mA`，`adapter 30 W 12000 mV 2500 mA` 的类型从 `usb charger` 变成 `pd charger`。
+- **U 盘**：两个口插入时 EC 都报 `Attached.SRC`（5 V，mux 0x1），内核没有枚举出存储设备，也没有新磁盘。键盘在这段时间重新枚举了一次（地址 2 到 6）。
+- **流畅度**：没有残影，还是卡。提交到完成平均 22.8 ms，帧 GPU 时间有长尾（256 ms 以内 185 帧、更长 9 帧）。
+- **翻转**：3001 次，0 次超时，平均等 7.8 ms，最大 17.2 ms。
+- **压缩路径**：`CZ frames made 0 private 0 shown 0 plain 3255`，`CZ seed 0 fail 0 refused 35`。`CZ tag row9216 alloc13713408 map13713408 at13713408`：主帧表面行距 9216、高 1488，像素正好占满最后一页，放不下标记。这一项仍然没有验证到。
+- **设备丢失**：`WidgetRenderer_Default` 的命令缓冲报 `DeviceLost`，之后以状态 0xb 退出。`backboardd` 这次没有退出，SpringBoard 没有重启。内核日志里没有 `gpu event ... VK` 行，CP、hang、SMMU 错误都是 0。
+- **Wi-Fi**：开机自动加入，DHCP 拿到地址，TCP 收发正常。

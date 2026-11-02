@@ -57,4 +57,4 @@ On hardware this passed: both rmnet_ipa0 lines matched, GSI channels 0 and 3 rea
 
 ## Next
 
-QMI control (SIM, registration, WDA data format, WDS bind mux and data call) and an XNU network interface for the rmnet data device.
+The acceptance target is the iPadOS cellular UI (status bar, Settings > Cellular, APN, SIM and eSIM), not a kernel-dialled bare interface. The route is a bridge that presents Apple's baseband interfaces (AppleBaseband and AppleBasebandPCIControl user clients) to AppleBasebandManager and CommCenter, carries their QMUX traffic to QMI over QRTR, answers Apple-private services, implements VINYL (eSIM) with UIM APDUs and turns rmnet into pdp_ip. Research notes and open questions: docs/plans/modem.md, section "iPadOS 蜂窝界面和 eSIM".

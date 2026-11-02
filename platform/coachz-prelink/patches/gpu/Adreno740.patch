@@ -75,7 +75,7 @@
 +}
  extern "C" {volatile uint32_t native_adreno_view_diag[6],native_adreno_view_kept;}   /* kept: BoCpuUnmap calls that left the view for another lease */
  }
- 
+
 @@ -133,7 +150,7 @@
   * the kernel buffers' fixed addresses and the GMEM window that each address space also maps, as msm's per-process VM
   * (adreno_private_vm_size: BIT(ias) - ADRENO_VM_START). A kernel connection (the board's self-test) maps where it likes. */
@@ -85,7 +85,7 @@
  /* The board's qcom_scm_set_gpu_smmu_aperture result ([0] availability, [1] the call's x0: 0 is success); [2] the CP switch check's
   * status, [3] the table mode in use. */
  extern "C" {volatile uint32_t native_adreno_cp_aperture[4];
-@@ -181,7 +198,46 @@
+@@ -181,6 +198,45 @@
      NativeAdrenoRestart restart=nullptr;
      void *restart_cookie=nullptr;
  } g;
@@ -127,11 +127,10 @@
 +    gCoachzGate[0]=gCoachzGate[0]+1;gCoachzGate[1]=gCoachzGate[1]+us;
 +    if(us>gCoachzGate[2])gCoachzGate[2]=us;
 +    if(timedOut)gCoachzGate[3]=gCoachzGate[3]+1;
- }
 +}
+ }
  /* GPU hangs (msm hangcheck, NativeAdrenoSubmit::hangCheck) and restarts: [0] hangs, [1] restarts, [2] failed restarts, [3] the last hung
   * fence, [4] the last restart's IOReturn, [5] submissions replayed so far, [6] hangs with a guilty job, [7] hangs of the kernel's own VM. */
- extern "C" {volatile uint32_t native_adreno_recovery[8];}
 @@ -659,6 +715,12 @@
          /* i e38a0b1eb: a BoFree held the lock up to 38 ms, unwiring and freeing a large BO's pages; they now go after the lock. */
          NativeAdrenoSystemPages freed{};
@@ -158,7 +157,25 @@
          if(method==NativeAdrenoMethodBoMap && !status && connection->live_ && !connection->kernel_)
              if(NativeAdrenoClientRecord *record=clientRecord(connection->name_))
                  if(connection->core_->windowPeak()>>20>record->peak_mib)record->peak_mib=uint32_t(connection->core_->windowPeak()>>20);
-@@ -1144,6 +1212,12 @@
+@@ -767,7 +835,16 @@
+         if(!input || input_size!=sizeof(NativeAdrenoAbiNote) || output_size)return kIOReturnBadArgument;
+         NativeAdrenoAbiNote note{};
+         memcpy(&note,input,sizeof(note));
+-        if((note.kind!=NativeAdrenoNotePass && note.kind!=NativeAdrenoNotePipeline) || note.count>NativeAdrenoNoteWords)return kIOReturnBadArgument;
++        if(note.count>NativeAdrenoNoteWords)return kIOReturnBadArgument;
++        if(note.kind==3) {
++            // Immediate driver errors and layout decisions must survive a short-lived client.
++            char text[91]={};const size_t bytes=note.count*sizeof(uint32_t);
++            memcpy(text,note.words,bytes<90?bytes:90);
++            for(unsigned i=0;i<90 && text[i];++i)if((unsigned char)text[i]<32 || (unsigned char)text[i]>126)text[i]=' ';
++            printf("COACHZ gpu event pid %d [%s]\n",proc_selfpid(),text);
++            return kIOReturnSuccess;
++        }
++        if(note.kind!=NativeAdrenoNotePass && note.kind!=NativeAdrenoNotePipeline)return kIOReturnBadArgument;
+         const bool pass=note.kind==NativeAdrenoNotePass;
+         volatile uint32_t *count=pass?&native_adreno_pass_count:&native_adreno_pipe_count;
+         volatile uint32_t *rows=noteRows(pass?&native_adreno_pass_log:&native_adreno_pipe_log);
+@@ -1144,6 +1221,12 @@
  }
  /* Publishes the service once. Everything passed in must outlive the system (the board probe keeps them in statics) and
   * the VM, submit object and ring must already be attached to the live GPU context. The core must not be open. */
@@ -246,16 +263,6 @@
      if(table && !reset)return poison();
 -    const uint32_t count=RingPrologueWords+(reset?RingResetWords:0)+(table?RingTableWords+(preempt_?RingTableSnapshotWords:0):0)+(stamps_?RingStampWords:0)+(preempt_?RingPseudoWords:0);
 -    size_t n=packet(words,0,RingThreadControl,&br,1);
--    if(reset) {
--        const uint64_t at4=fence_iova_+4;
--        const uint32_t wait[4]={0,(uint32_t)at4,(uint32_t)(at4>>32),seqno_},all=RingResetAll,lrz=RingLrzFlushInvalidate,
--            invalidate=RingCacheInvalidate;
--        if(n)n=packet(words,n,RingWaitTimestamp,wait,4);
--        if(n)n=packet(words,n,RingThreadControl,&syncBoth,1);
--        if(n)n=packet(words,n,RingResetContextState,&all,1);
--        if(n)n=packet(words,n,RingThreadControl,&syncBoth,1);
--        if(n)n=packet(words,n,RingFenceOpcode,&lrz,1);
--        if(n)n=packet(words,n,RingThreadControl,&br,1);
 +    const uint32_t count=RingPrologueWords+(reset?RingResetWords:0)+(table?RingTableWords:0)+(stamps_?RingStampWords:0);
 +    const uint32_t invalidate=RingCacheInvalidate,depth=RingCcuInvalidateDepth,color=RingCcuInvalidateColor,off=0,on=1;
 +    size_t n=0;
@@ -265,7 +272,22 @@
 +    }
 +    if(table) {
 +        n=packet(words,n,RingSetProtectedMode,&off,1);
-         if(n && AdrenoPM4Type4(RingPerfctrSramInit,1,&words[n])==AdrenoPM4Success) {words[n+1]=1;n+=2;} else n=0;
++        if(n && AdrenoPM4Type4(RingPerfctrSramInit,1,&words[n])==AdrenoPM4Success) {words[n+1]=1;n+=2;} else n=0;
++        const uint32_t update[4]={(uint32_t)table_,(uint32_t)(table_>>32),0,0};
++        if(n)n=packet(words,n,RingSmmuTableUpdate,update,4);
++        if(!n)return poison();
++    }
+     if(reset) {
+-        const uint64_t at4=fence_iova_+4;
+-        const uint32_t wait[4]={0,(uint32_t)at4,(uint32_t)(at4>>32),seqno_},all=RingResetAll,lrz=RingLrzFlushInvalidate,
+-            invalidate=RingCacheInvalidate;
+-        if(n)n=packet(words,n,RingWaitTimestamp,wait,4);
+-        if(n)n=packet(words,n,RingThreadControl,&syncBoth,1);
+-        if(n)n=packet(words,n,RingResetContextState,&all,1);
+-        if(n)n=packet(words,n,RingThreadControl,&syncBoth,1);
+-        if(n)n=packet(words,n,RingFenceOpcode,&lrz,1);
+-        if(n)n=packet(words,n,RingThreadControl,&br,1);
+-        if(n && AdrenoPM4Type4(RingPerfctrSramInit,1,&words[n])==AdrenoPM4Success) {words[n+1]=1;n+=2;} else n=0;
 -        if(table) {
 -            const uint32_t update[4]={(uint32_t)table_,(uint32_t)(table_>>32),0,0};
 -            if(n)n=packet(words,n,RingSmmuTableUpdate,update,4);
@@ -277,21 +299,13 @@
 -            if(n)n=packet(words,n,RingThreadControl,&br,1);
 -        }
 -        if(n)n=packet(words,n,RingFenceOpcode,&invalidate,1);
-+        const uint32_t update[4]={(uint32_t)table_,(uint32_t)(table_>>32),0,0};
-+        if(n)n=packet(words,n,RingSmmuTableUpdate,update,4);
-+        if(!n)return poison();
-+    }
-+    if(reset) {
 +        n=packet(words,n,RingFenceOpcode,&invalidate,1);
 +        if(!n)return poison();
 +    }
 +    if(table) {
          const uint32_t sram[6]={RingWaitWriteEq,RingPerfctrSramInitStatus,0,1,1,0};
 -        if(n)n=packet(words,n,RingWaitRegMem,sram,6);
-+        n=packet(words,n,RingWaitRegMem,sram,6);
-+        if(n)n=packet(words,n,RingSetProtectedMode,&on,1);
-+        if(!n)return poison();
-     }
+-    }
 -    const uint32_t flush=RingCacheFlush7,invalidate7=RingCacheInvalidate7;
 -    if(n)n=packet(words,n,RingFenceOpcode,&flush,1);
 -    if(n)n=packet(words,n,RingFenceOpcode,&invalidate7,1);
@@ -307,6 +321,10 @@
 -    }
 -    if(n)n=packet(words,n,RingThreadControl,&both,1);
 -    if(n)n=packet(words,n,RingSetMarker,&marker,1);
++        n=packet(words,n,RingWaitRegMem,sram,6);
++        if(n)n=packet(words,n,RingSetProtectedMode,&on,1);
++        if(!n)return poison();
++    }
 +    n=packet(words,n,RingFenceOpcode,&depth,1);
 +    if(n)n=packet(words,n,RingFenceOpcode,&color,1);
      if(n!=count)return poison();
@@ -342,6 +360,10 @@
 -    if(n && yield) {
 -        const uint32_t floor[4]={0,0,1,0};
 -        if(n)n=packet(words,n,RingContextSwitchYield,floor,4);
+-    }
+-    if(n!=total)return poison();
+-    for(uint32_t i=0;i<total;++i)ring_[(at+i)&mask]=words[i];
+-    *end=(at+total)&mask;return kIOReturnSuccess;
 +    /* a6xx_submit() ends with CP_SCRATCH(2) and CACHE_FLUSH_TS, nothing per thread; the end stamp waits for idle so that it marks the GPU done. */
 +    if(yield)return poison();   /* A618 does not preempt */
 +    if(stamps_) {
@@ -352,10 +374,7 @@
 +        if(n!=RingStampDoneWords)return poison();
 +        for(uint32_t i=0;i<RingStampDoneWords;++i)ring_[(at+i)&mask]=words[i];
 +        at=(at+RingStampDoneWords)&mask;
-     }
--    if(n!=total)return poison();
--    for(uint32_t i=0;i<total;++i)ring_[(at+i)&mask]=words[i];
--    *end=(at+total)&mask;return kIOReturnSuccess;
++    }
 +    return emitFence(at,seqno,end);
  }
  IOReturn NativeAdrenoRing::attach(const NativeAdrenoRingIo *io,const NativeAdrenoRingCache *cache,
@@ -380,16 +399,16 @@
      if(status)return status;
 --- a/NativeAdrenoSubmit.cpp
 +++ b/NativeAdrenoSubmit.cpp
-@@ -3,6 +3,9 @@
+@@ -2,6 +2,9 @@
+ #include "NativeAdrenoSubmit.h"
  #include "AdrenoPM4.h"
  #include <IOKit/IOLib.h>
- 
++
 +/* Coachz: set by the board code (CoachzGpu.cpp) once its runtime power management is ready. */
 +extern "C" {void (*volatile native_adreno_power_get)(void);}
-+
+
  /* CP_INDIRECT_BUFFER is opcode 0x3f with a 3-word payload: 64-bit GPU address
   * and IB_SIZE in dwords (bits 0..19), exactly as the pinned adreno_pm4.xml
-  * domain states and Linux msm_gem_submit.c converts the userspace byte size. */
 @@ -56,7 +59,8 @@
  /* [4] bus drains, [5] client halt acknowledge, [6] arbiter halt acknowledge, [7] the fence of the last drain, [8] drains after which that fence completed */
  extern "C" {volatile uint32_t native_adreno_unstick[15];}

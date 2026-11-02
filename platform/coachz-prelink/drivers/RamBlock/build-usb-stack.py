@@ -52,16 +52,18 @@ subprocess.run(['xcrun', 'clang', '-target', 'arm64-apple-ios17.0', '-Werror', '
 # The SDHCI driver's block devices subclass the same IOBlockStorageDevice: compiled with NativeRamBlock's own command
 # (build-arm-driver.py RamBlock wrote it), only the source and the object changed.
 ram_block_command = json.loads((driver / 'compile-command.json').read_text())
-mmc_command = [str(mmc / 'CoachzMmcBlock.cpp') if value.endswith('NativeRamBlock.cpp') else
-               str(driver / 'CoachzMmcBlock.o') if value.endswith('NativeRamBlock.o') else value for value in ram_block_command]
-if mmc_command == ram_block_command or str(mmc / 'CoachzMmcBlock.cpp') not in mmc_command:
-    raise SystemExit('NativeRamBlock compile command did not name its source and object')
 iokit_record = json.loads((ROOT / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/IOPlatformExpert.cpo.json')
                           .read_text().strip().rstrip(','))
-result = subprocess.run(mmc_command + ['-I', str(mmc)], cwd=iokit_record['directory'], capture_output=True, text=True)
-if result.returncode:
-    raise SystemExit('CoachzMmcBlock.cpp:\n' + (result.stdout + result.stderr)[-3500:])
+# The cellular bridge (pending/baseband) the same way: it subclasses IOService and IOUserClient and is pulled in by coachz_wifi.c and kern_exec.c.
+for source in (mmc / 'CoachzMmcBlock.cpp', HERE / 'baseband/coachz_baseband.cpp'):
+    command = [str(source) if value.endswith('NativeRamBlock.cpp') else
+               str(driver / (source.stem + '.o')) if value.endswith('NativeRamBlock.o') else value for value in ram_block_command]
+    if command == ram_block_command or str(source) not in command:
+        raise SystemExit('NativeRamBlock compile command did not name its source and object')
+    result = subprocess.run(command + ['-I', str(source.parent)], cwd=iokit_record['directory'], capture_output=True, text=True)
+    if result.returncode:
+        raise SystemExit(source.name + ':\n' + (result.stdout + result.stderr)[-3500:])
 (driver / 'libRamBlock.a').unlink(missing_ok=True)
-subprocess.run(['xcrun', 'ar', 'rcs', driver / 'libRamBlock.a', driver / 'NativeRamBlock.o', driver / 'CoachzMmcBlock.o',
+subprocess.run(['xcrun', 'ar', 'rcs', driver / 'libRamBlock.a', driver / 'NativeRamBlock.o', driver / 'CoachzMmcBlock.o', driver / 'coachz_baseband.o',
                 driver / 'original-bindings.o'], check=True)
 print(len(objects), 'USB stack objects archived')

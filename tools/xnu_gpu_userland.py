@@ -2,6 +2,7 @@
 """Pack the Metal plug-in and Turnip for coachz-gpu=9: the addon file the kernel installs on the Data volume, and the trust cache module for their code."""
 # SPDX-License-Identifier: BSD-2-Clause
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 from pathlib import Path
@@ -56,7 +57,48 @@ def make_prime_list(roots, output):
     print('prime list', len(paths), 'libraries')
 
 
+@contextmanager
+def gpu_stack_overlay():
+    """Keep the pinned checkout and its recorded Mesa/runtime patch sets intact."""
+    stack = ROOT / 'platform/coachz-prelink/patches/gpu/unixnu-gpu-stack.patch'
+    mesa = UNIXNU / '.cache/mesa-work'
+    runtime = UNIXNU / '.cache/gpu-reference/metal2vulkan'
+    mesa_patch = UNIXNU / 'patches/mesa/turnip-coachz-diagnostics.patch'
+    runtime_patch = UNIXNU / 'drivers/AdrenoMetal/bridge/patches/0026-coachz-copy-profile.patch'
+    def apply(tree, patch, reverse=False, check=False):
+        command = ['git', '-C', str(tree), 'apply']
+        if reverse:
+            command.append('--reverse')
+        if check:
+            command.append('--check')
+        return subprocess.run([*command, str(patch)], check=not check, capture_output=check)
+    # git apply is atomic: a rejected overlay leaves the tree as it was.
+    apply(UNIXNU, stack)
+    mesa_applied = False
+    try:
+        apply(mesa, mesa_patch)
+        mesa_applied = True
+        yield
+    finally:
+        # The bridge builder applies its exact recorded patch sequence. Remove this
+        # sequence's last patch only if the builder reached it, including on failure.
+        try:
+            if apply(runtime, runtime_patch, reverse=True, check=True).returncode == 0:
+                apply(runtime, runtime_patch, reverse=True)
+        finally:
+            try:
+                if mesa_applied:
+                    apply(mesa, mesa_patch, reverse=True)
+            finally:
+                apply(UNIXNU, stack, reverse=True)
+
+
 def build(prime_list=None):
+    with gpu_stack_overlay():
+        build_overlaid(prime_list)
+
+
+def build_overlaid(prime_list=None):
     # Turnip for the tablet and for the host (the plug-in build records Turnip's first submission on the host), then the plug-in. The Mesa work tree
     # (.cache/mesa-work) carries the pinned Mesa with the recorded patches; build-turnip-darwin.py checks both.
     for command in (['scripts/build-turnip-darwin.py', '--target', 'ios'], ['scripts/build-turnip-darwin.py', '--target', 'host']):
@@ -71,7 +113,7 @@ def build(prime_list=None):
     shutil.rmtree(target, ignore_errors=True)
     shutil.copytree(harness, target)
     # patches/gpu/unixnu-gpu-plugin.patch, applied only while the plug-in builds: the pinned plug-in does not build for iOS 17 as it is.
-    patch = ['patch', '--batch', '--silent', '--no-backup-if-mismatch', '-p1', '-d', str(UNIXNU / 'drivers/AdrenoMetal'), '-i',
+    patch = ['git', '-C', str(UNIXNU), 'apply', '--directory=drivers/AdrenoMetal',
              str(ROOT / 'platform/coachz-prelink/patches/gpu/unixnu-gpu-plugin.patch')]
     # The plug-in build embeds build/prime-list.txt in __DATA,__primelist when it exists (build-adreno-metal-plugin.py).
     embedded = UNIXNU / 'build/prime-list.txt'
@@ -83,7 +125,7 @@ def build(prime_list=None):
     try:
         subprocess.run(['python3', '-B', 'scripts/build-adreno-metal-plugin.py'], cwd=UNIXNU, check=True)
     finally:
-        subprocess.run([*patch, '-R'], check=True)
+        subprocess.run([*patch[:-1], '--reverse', patch[-1]], check=True)
 
 
 # The default wallpaper's image layers as JPEG instead of HEIC (no hardware HEVC decoder here), as UniXNU's scripts/make-wallpaper-overlay.py makes them:

@@ -128,3 +128,6 @@ coachz-prelink-staged-apps.patch
 coachz-prelink-rotation.patch
 coachz-prelink-cluster-mhz.patch
 coachz-prelink-smart-cover.patch
+
+# /chosen/coachz-baseband: the cellular bridge (pending/baseband): QRTR hooks in the Wi-Fi thread, its firmware on the Data volume, CommCenter running.
+coachz-prelink-baseband.patch

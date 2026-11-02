@@ -1,0 +1,48 @@
+# 基带桥接层
+
+让 iPadOS 自己的蜂窝栈（ABM、BBUpdater、CommCenter，设置里的蜂窝网络和 eSIM）把这台机器的 SC7180 modem 当成苹果机型上走 PCIe 的高通基带来用。逆向结论在 [docs/plans/modem.md](../../../../docs/plans/modem.md) 的三轮调研里。只在 ADT 有 `/chosen/coachz-baseband` 时启动，打包参数是 `tools/xnu_screen.py --baseband`，不加启动参数。
+
+## 文件
+
+- `coachz_bb_qmux.h`：qmux1/qmux2 上的 QMUX 与 modem 的 QRTR 互转。普通服务只去掉或加回 6 字节 QMUX 头；CTL 在这里应答（GetClientId 按通道和服务分配客户端号，每个客户端占一个本地 QRTR 端口，从 0x4100 起；ReleaseClientId 和 Sync 释放，释放的端口要发 DEL_CLIENT）。苹果私有服务（0xe1 到 0xea）的请求交回调用者，暂时一律回 `QMI_ERR_NOT_SUPPORTED`。
+- `coachz_bb_sahara.h`：sahara 通道上扮演 modem 的设备端。发 HELLO，按 ELF 头、程序头、各段请求列出的镜像，收到的数据丢弃，最后一个镜像的 DONE 应答报完成。
+- `coachz_bb_control.h`：`AppleBaseband` UserClient 的方法表。供电、复位、复用等只记录，不动 modem；管理器状态和基带状态原样存取；SPMI、GNSS、时间同步回 unsupported。
+- `coachz_bb_channels.h`：通道名表、匹配用的类名和属性键、两个通道 UserClient 的方法号和参数个数。
+- `coachz_baseband.cpp`：内核 IOKit。发布 `AppleBaseband`、`AppleBasebandPCIControl` 和三个 `AppleBasebandPCIInterface`（属性 `ABPInterfaceProtocol` 为 sahara、qmux1、qmux2），UserClient 用苹果的类名（`AppleBasebandUserClient`、`AppleBasebandPCIControlUserClient`、`AppleBasebandPCIUserClient`），沙盒按类名放行。读写分同步和异步两种，异步按 libIOABP 的约定完成：引用数组第 1 项是回调，第 2 项是 refcon，完成时带一个参数，为字节数。ABM 复位或给 modem 上电时，sahara 重新发 HELLO。调用方线程只排队；QRTR 收发都在 Wi-Fi 线程上。
+- `patches/xnu/coachz-prelink-baseband.patch`：两处内核改动。
+  - `bsd/dev/coachz_wifi.c`：GLINK 起来后调 `coachz_baseband_configure`，发布服务；本地端口 0x4100 起的 QRTR 数据交给桥；NEW_SERVER 和 DEL_SERVER 同步给桥；每毫秒调一次 `coachz_baseband_poll`，把排队的 QMI 请求和 DEL_CLIENT 发出去；周期报告里加一行桥的计数。`coachz_baseband_archive` 从磁盘读整个固件归档并核对 SHA-256。
+  - `bsd/kern/kern_exec.c`：有 `/chosen/coachz-baseband` 时，禁用任务清单不再包含 CommCenter。launchd 改写过的清单里 CommCenter 还是 true 就不接受，按新清单重装。在 launchd 之前，把内核分区里的固件文件写到 `/private/var/coachz/baseband/Mav16`，内容不同才写。再用只读联合挂载把它显示在两处：`/private/preboot/<boot-manifest-hash>/usr/local/standalone/firmware/Baseband/Mav16`（ABM 的个性化固件路径），以及 `/usr/standalone/firmware/Baseband/Mav16`。SystemOS 叠在 `/` 上，`/private/preboot` 是 OS 卷的空目录，所以挂载检查只查挂载点本身和固件目录。
+- `tools/xnu_screen.py --baseband`（已改）：
+  - 设 `/chosen/coachz-baseband`。
+  - 嫁接 J121AP 的 `/baseband` 节点（compatible `baseband,n41`、device_type、class、`euicc-chip-id = 2`；GPIO 功能和中断是 J121AP 的控制器，不带）和 `/product baseband-chipset = mav16`。机型身份不变。
+- `tools/linux_log.py --baseband`：从固定的 IPSW（`.tools/ipsw`）取出 Mav16 的 bbfw，把其中 17 个文件按 GPU 插件的布局打成魔数为 `CZBBFW01` 的归档（约 32 MiB），作为 `baseband.arc` 放进内核分区的固件块，排在 modem 固件之后。固件不加载它，所以签名容器不变大；内核分区用满 256 MiB。
+
+主机测试：`tests/test_baseband_bridge.py`。
+
+## 上机看什么
+
+日志环里以 `COACHZ baseband:` 开头的行：
+- 服务发布了几个；
+- 固件文件写了几个、两处联合挂载到了哪一步（stage 5 才算成功）；
+- 每 10 秒一行通道计数；
+- 第一次出现的私有 QMI 消息；
+- 不支持的方法号；
+- sahara 的结果。
+
+Data 卷的统一日志里看 ABM 和 BBUpdater：
+- `FW base path` 和 `FW path ... exists`：ABM 用的是哪个固件目录；
+- `Hello received boot mode`；
+- `request image ID`；
+- `item not found in item list`；
+- `All images transferred`。
+
+还要看 CommCenter 是否起来、是否还在等 identityservicesd：UniXNU 记录过这两个进程首启时会互相等 XPC。
+
+## 没核实的
+
+全部来自静态分析，没上机。
+- sahara 默认只请求 SBL1（镜像号 0x15）就报完成，主机是否接受未知；其余镜像（rpm、tz、apps、acdb、mba、qdsp6sw）按日志再加。
+- CTL 里除 GetClientId、ReleaseClientId、Sync、GetVersionInfo 以外的请求一律回成功。
+- 固件目录是按 MSU 的个性化路径规则推出来的，所以挂了两处。
+- 异步读写的回调参数个数是从 libIOABP 的调用处推出来的。
+- 时间事件从不发送；共享内存映射只回成功，不做实际映射。

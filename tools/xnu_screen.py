@@ -6,6 +6,8 @@ from pathlib import Path
 import re
 import struct
 import tomllib
+import zipfile
+import zlib
 
 from xnu_checkpoint import HEADER, MAGIC, adt_fields
 from xnu_init import ramdisk as init_ramdisk, trust_cache
@@ -123,6 +125,41 @@ FULL_SCREEN_IDENTITY = {
 COACHZ_UNIQUE_CHIP_ID = b'COACHZ\0\1'
 
 
+def baseband_tree(root):
+    """--baseband: the cellular parts of the IPSW's J121AP tree (iPad7,2) that iPadOS looks for, with the identity unchanged. /baseband is the
+    node AppleBasebandN71 matches on Apple's boards; its GPIO functions and interrupts name J121AP controllers and stay out. Nothing here
+    matches it: the bridge publishes the baseband services itself (pending/baseband)."""
+    node = root.child('baseband')
+    node.set('device_type', b'baseband\0')
+    node.set('compatible', b'baseband,n41\0')
+    node.set('class', struct.pack('<I', 3))
+    node.set('euicc-chip-id', struct.pack('<I', 2))
+    root.child('product').set('baseband-chipset', b'mav16\0')
+
+
+def baseband_firmware(ipsw=None):
+    """tools/linux_log.py --baseband: the Mav16 .bbfw of the pinned IPSW as the archive coachz_baseband_unpack reads (the GPU addon's layout under
+    the magic CZBBFW01: count, total size, then per file its name length, mode, size, zlib size, name and data, each padded to 8 bytes). The
+    kernel puts the files in /private/var/coachz/baseband/Mav16. Apple firmware: it only ever goes into the kernel partition, never the repository."""
+    if ipsw is None:
+        url = tomllib.loads(OS_PROFILE.read_text())['ipsw']['url']
+        ipsw = Path(__file__).resolve().parents[1] / '.tools/ipsw' / url.rsplit('/', 1)[1]
+    with zipfile.ZipFile(ipsw) as outer:
+        names = [n for n in outer.namelist() if re.fullmatch(r'Firmware/[^/]*Mav16[^/]*\.bbfw', n)]
+        if len(names) != 1:
+            raise ValueError('expected one Mav16 bbfw in the IPSW, found %d' % len(names))
+        with zipfile.ZipFile(outer.open(names[0])) as bbfw:
+            files = [(info.filename, bbfw.read(info)) for info in bbfw.infolist() if not info.is_dir()]
+    entries = b''
+    for name, data in files:
+        encoded = name.encode() + b'\0'
+        packed = zlib.compress(data, 9)
+        entries += struct.pack('<IIQQ', len(encoded), 0o644, len(data), len(packed))
+        entries += encoded + bytes(-len(encoded) % 8) + packed + bytes(-len(packed) % 8)
+    total = 24 + len(entries)
+    return b'CZBBFW01' + struct.pack('<IIQ', len(files), 0, total) + entries
+
+
 def apply_identity(node, table):
     """Apply a typed [adt] table of the OS profile: what the original components read."""
     for kind, values in table.items():
@@ -179,7 +216,7 @@ def smp_tree(root, count):
 
 
 def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=True, root_uuid=None, cpus=1,
-                 full_screen=False, gmu_firmware_size=0, sqe_firmware_size=0, gpu_addon_size=0, motion_probe=False, wifi_mac=None, gestalt_cache=None):
+                 full_screen=False, gmu_firmware_size=0, sqe_firmware_size=0, gpu_addon_size=0, motion_probe=False, wifi_mac=None, gestalt_cache=None, baseband=False):
     root = read_tree(adt)
     if cpus > 1:
         smp_tree(root, cpus)
@@ -196,6 +233,10 @@ def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=T
     if gestalt_cache:
         # MobileGestalt's cached answers: the kernel writes them before launchd (coachz-prelink-smart-cover.patch).
         root.child('chosen').set('coachz-mgcache', gestalt_cache)
+    if baseband:
+        # Starts the cellular bridge (pending/baseband). A /chosen property, because the boot command line has no room left.
+        root.child('chosen').set('coachz-baseband', struct.pack('<I', 1))
+        baseband_tree(root)
     if root_uuid:
         root.child('chosen').set('root-matching', root_matching(root_uuid))
         # mount -P 1 of the original launchd exits 66 without it. An identity of this unsigned image set,
@@ -254,7 +295,9 @@ def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=T
 
 def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=False, root_cache=None, root_device=None,
          root_uuid=None, data_seed=None, data_uuid=None, display=False, cpus=1, gpu=0, gmu_firmware=None, sqe_firmware=None, gpu_addon=None,
-         diagnostics=False, wifi_mac=None, root_emmc=False, gestalt_cache=None):
+         diagnostics=False, wifi_mac=None, root_emmc=False, gestalt_cache=None, baseband=False):
+    if baseband and not prelinked:
+        raise ValueError('the cellular bridge needs the prelinked kernel')
     if window & 0x1fffff or memory & 0x1fffff:
         raise ValueError('window base and size must be 2 MiB aligned')
     kernel = macho(data)
@@ -378,7 +421,7 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         ramdisk += bytes(-len(ramdisk) % 4096)
         # The restore volume, from memory or from disk, runs as the restore OS environment; the main OS does not.
         environment = 'restore' if root_cache and not root_uuid else None
-        adt = prelink_tree(adt, window, tree, ramdisk, cache, environment, wifi_mac=wifi_mac, gestalt_cache=gestalt_cache, ram_root=not disk_root or bool(data_seed),
+        adt = prelink_tree(adt, window, tree, ramdisk, cache, environment, wifi_mac=wifi_mac, gestalt_cache=gestalt_cache, baseband=baseband, ram_root=not disk_root or bool(data_seed),
                            root_uuid=root_uuid, cpus=cpus, full_screen=display,
                            gmu_firmware_size=len(gmu_firmware) if gmu_firmware else 0, sqe_firmware_size=len(sqe_firmware) if sqe_firmware else 0, gpu_addon_size=len(gpu_addon) if gpu_addon else 0, motion_probe=diagnostics)
         ramdisk = ramdisk + cache + bytes(-len(cache) % 4096)
@@ -426,7 +469,8 @@ def main():
     p.add_argument('--display', action='store_true', help='main OS: publish the firmware framebuffer through original MobileFramebuffer Legacy')
     p.add_argument('--smp', type=int, default=1, help='main OS: start CPU0..N-1 (up to 8) through PSCI')
     p.add_argument('--gpu', type=int, default=0, help='prelinked: Adreno 618 bring-up stage 1 to 8, or 9 for the driver (docs/plans/gpu.md)')
-    p.add_argument('--root-emmc', action='store_true', help='the system, Data and the log ring on the eMMC partitions the owner carved')
+    p.add_argument('--root-emmc', action='store_true', help='the system, Data and the log ring on the eMMC partitions')
+    p.add_argument('--baseband', action='store_true', help='prelinked: start the cellular bridge (pending/baseband): /chosen/coachz-baseband and the J121AP baseband nodes; its firmware comes with tools/linux_log.py --baseband')
     p.add_argument('--gestalt-cache', type=Path, help='a MobileGestalt cache plist the kernel writes before launchd; device data, keep it out of the repository')
     p.add_argument('--wifi-mac', type=Path, help='a file with 12 hex digits: the Wi-Fi address this image uses on every boot')
     p.add_argument('--gpu-addon', type=Path, help='with --gpu 9: the Metal plug-in addon from tools/xnu_gpu_userland.py')
@@ -451,7 +495,7 @@ def main():
                    sqe_firmware=a.sqe_firmware.read_bytes() if a.sqe_firmware else None,
                    gpu_addon=a.gpu_addon.read_bytes() if a.gpu_addon else None, diagnostics=a.diagnostics,
                    wifi_mac=a.wifi_mac.read_text().strip() if a.wifi_mac else None, root_emmc=a.root_emmc,
-                   gestalt_cache=a.gestalt_cache.read_bytes() if a.gestalt_cache else None)
+                   gestalt_cache=a.gestalt_cache.read_bytes() if a.gestalt_cache else None, baseband=a.baseband)
     a.output.parent.mkdir(parents=True, exist_ok=True)
     a.output.write_bytes(payload)
     print('Built screen-output XNU payload', hashlib.sha256(payload).hexdigest())

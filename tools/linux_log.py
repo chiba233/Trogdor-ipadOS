@@ -187,10 +187,12 @@ def compile_wrapper(out, kernel, memory, checkpoint=None, discovery=False, patte
 MODEM_BLOB = 144 << 20
 
 
-def modem_blob(image, kpart, directory, partition_end):
+def modem_blob(kpart, directory, baseband=None):
     """The MPSS firmware for the kernel to read from the disk (coachz-prelink-wifi.patch): a 4 KiB header (magic, count, then per file a
     16-byte name, offset from the header and size as u64, and its SHA-256), then each file at a 4 KiB boundary. It sits inside the kernel
-    partition after the signed container, which depthcharge reads by its own size, so the GPT and the signature stay as they are."""
+    partition after the signed container, which depthcharge reads by its own size, so the GPT and the signature stay as they are. The
+    cellular bridge's firmware archive comes last as baseband.arc: firmware never loads it and the kernel reads it once, before launchd.
+    Returns the pieces as (offset on the disk, bytes) and the offset where they end."""
     if (1 << 20) + kpart.stat().st_size > MODEM_BLOB:
         raise SystemExit('the kernel container reaches the modem firmware')
     # The modem's EFS images (rmtfs/modem_fs1, fs2, fsc, fsg; device data from the machine's own Linux, kept out of the repository) go
@@ -199,23 +201,16 @@ def modem_blob(image, kpart, directory, partition_end):
     # WLFW's board data (linux-firmware ath10k/WCN3990/hw1.0/board-2.bin) likewise when it is there.
     board = [directory / 'board-2.bin'] if (directory / 'board-2.bin').is_file() else []
     files = [directory / 'mba.mbn', *(efs if all(path.is_file() for path in efs) else []), *board, directory / 'qdsp6sw.mbn']
+    named = [(path.name, path.read_bytes()) for path in files] + ([('baseband.arc', baseband)] if baseband else [])
     header = bytearray(4096)
     header[:16] = b'COACHZMODEMFW1\0\0'
-    struct.pack_into('<I', header, 16, len(files))
-    at, body = 4096, []
-    for index, path in enumerate(files):
-        data = path.read_bytes()
-        struct.pack_into('<16sQQ32s', header, 32 + 64 * index, path.name.encode(), at, len(data), hashlib.sha256(data).digest())
-        body.append((at, data))
+    struct.pack_into('<I', header, 16, len(named))
+    at, pieces = 4096, []
+    for index, (name, data) in enumerate(named):
+        struct.pack_into('<16sQQ32s', header, 32 + 64 * index, name.encode(), at, len(data), hashlib.sha256(data).digest())
+        pieces.append((MODEM_BLOB + at, data))
         at = (at + len(data) + 4095) & ~4095
-    if MODEM_BLOB + at > partition_end:
-        raise SystemExit('the modem firmware does not fit the kernel partition')
-    with Path(image).open('r+b') as out:
-        out.seek(MODEM_BLOB)
-        out.write(header)
-        for offset, data in body:
-            out.seek(MODEM_BLOB + offset)
-            out.write(data)
+    return [(MODEM_BLOB, bytes(header)), *pieces], MODEM_BLOB + at
 
 
 def main():
@@ -232,6 +227,8 @@ def main():
                    help="with --xnu-screen: APFS container for a GPT partition after the kernel; repeat for more, in order")
     p.add_argument("--modem-firmware", type=Path,
                    help="with --xnu-screen: a directory with mba.mbn and qdsp6sw.mbn, stored after the kernel container at 144 MiB of the disk")
+    p.add_argument("--baseband", action="store_true",
+                   help="with --modem-firmware: the pinned IPSW's Mav16 firmware for the cellular bridge after the modem's files")
     p.add_argument("--xnu-kernel-only", action="store_true",
                    help="with --xnu-root-partition: an image of only the GPT and kernel partition, for a medium that has the containers")
     p.add_argument("--usb-read", action="store_true", help="read three known sectors of the USB medium through the libpayload stack, then Linux; issues no writes")
@@ -312,14 +309,22 @@ def main():
         p.error("signed command line differs from baseline")
     # The screen image never returns to Linux, and an unexplained panic can need a plain retry.
     # A prelinked kernel or a RAM disk root does not fit the usual 96 MiB partition; smaller images keep their exact layout.
-    disk_mib, kernel_mib = next(sizes for sizes in ((128, 96), (256, 224), (512, 480)) if kpart.stat().st_size <= sizes[1] << 20)
+    blob, blob_end = [], 0
+    if a.modem_firmware:
+        from xnu_screen import baseband_firmware
+        blob, blob_end = modem_blob(kpart, a.modem_firmware, baseband_firmware() if a.baseband else None)
+    disk_mib, kernel_mib = next(sizes for sizes in ((128, 96), (256, 224), (288, 256), (512, 480))
+                                if kpart.stat().st_size <= sizes[1] << 20 and blob_end <= (1 + sizes[1]) << 20)
     root_mib = sum(-(-root.stat().st_size // (1 << 20)) for root in a.xnu_root_partition)
     if root_mib:
         disk_mib = kernel_mib + root_mib + 4
     create_image(kpart, image, "EL1 probe Linux log", disk_mib=disk_mib, kernel_mib=kernel_mib, tries=15 if a.screen or a.usb_read else 1,
                  roots=a.xnu_root_partition, kernel_only=a.xnu_kernel_only)
-    if a.modem_firmware:
-        modem_blob(image, kpart, a.modem_firmware, (1 + kernel_mib) << 20)
+    if blob:
+        with Path(image).open('r+b') as disk:
+            for offset, data in blob:
+                disk.seek(offset)
+                disk.write(data)
     code_files = ("boot/entry.S", "boot/probe.c", "boot/fdt.c", "boot/checkpoint.c", "boot/chain.ld",
                   "tools/linux_log.py", "tools/fdt.py", "tools/build.py", "tools/artifacts.py",
                   "tools/sign.py", "tools/disk.py", "tools/read_probe.py", "tools/relocation_audit.py")

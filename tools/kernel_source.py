@@ -68,6 +68,7 @@ def patched_drivers(base, platform, out):
             usb_stack.extract(copy / 'usb', writable_storage=True)
             shutil.copytree(ROOT / 'boot/usb_compat', copy / 'usb/compat')
             shutil.copytree(ROOT / 'platform' / platform / 'pending/modem', copy / 'modem')
+            shutil.copytree(ROOT / 'platform' / platform / 'pending/baseband', copy / 'baseband')
     return options
 
 

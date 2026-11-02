@@ -546,7 +546,7 @@
 +			uint32_t now[3] = {(uint32_t)r[0] | (uint32_t)r[1] << 8 | (uint32_t)r[2] << 16, coachz_ec_le16(r + 4), (uint32_t)coachz_ec_le16(r + 8) | (uint32_t)coachz_ec_le16(r + 10) << 16};
 +			if (now[0] != lastPort[port][0] || now[1] != lastPort[port][1] || now[2] != lastPort[port][2] || !portsRead) {
 +				printf("COACHZ ec port %u: role %u type %u dual %u, %u mV now, max %u mV %u mA, limit %u mA, max %u uW\n", port, r[0], r[1], r[2],
-+				    coachz_ec_le16(r + 4), coachz_ec_le16(r + 6), coachz_ec_le16(r + 8), coachz_ec_le16(r + 10), coachz_ec_le32(r + 12));
++				    coachz_ec_le16(r + 6), coachz_ec_le16(r + 4), coachz_ec_le16(r + 8), coachz_ec_le16(r + 10), coachz_ec_le32(r + 12));
 +				lastPort[port][0] = now[0];
 +				lastPort[port][1] = now[1];
 +				lastPort[port][2] = now[2];
@@ -564,7 +564,7 @@
 +			view.powerRole = r[0];
 +			view.chargerType = r[1];
 +			view.dualRole = r[2];
-+			view.maxMillivolts = coachz_ec_le16(r + 6);
++			view.maxMillivolts = coachz_ec_le16(r + 4);
 +			view.maxMilliamps = coachz_ec_le16(r + 8);
 +			view.limitMilliamps = coachz_ec_le16(r + 10);
 +			if (!error && controlLength >= 3) {

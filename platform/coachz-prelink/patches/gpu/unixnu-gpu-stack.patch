@@ -1,0 +1,182 @@
+diff --git a/drivers/AdrenoMetal/bridge/patches/0026-coachz-copy-profile.patch b/drivers/AdrenoMetal/bridge/patches/0026-coachz-copy-profile.patch
+new file mode 100644
+--- /dev/null
++++ b/drivers/AdrenoMetal/bridge/patches/0026-coachz-copy-profile.patch
+@@ -0,0 +1,70 @@
++--- a/crates/metal2vulkan-runtime/src/shadow.rs
+++++ b/crates/metal2vulkan-runtime/src/shadow.rs
++@@ -3083,3 +3083,48 @@
++         copies
++     }
++ }
+++
+++// Coachz: planned payload bytes, not measured DRAM traffic or completed work.
+++// Unknown representations are counted rather than converted with an assumed bytes-per-pixel.
+++static COACHZ_COPIES: std::sync::Mutex<Vec<[u64; 8]>> = std::sync::Mutex::new(Vec::new());
+++pub(super) fn coachz_count_copy(copy: &ShadowCopy) {
+++    let backing = match copy.copies.backing {
+++        Backing::Image => 0, Backing::PrivateBuffer => 1, Backing::MappedBuffer => 2,
+++        Backing::HostPages => 3, Backing::AliasedHostPages => 4, Backing::Surface => 5,
+++    };
+++    let cause = match (&copy.step, copy.cause) {
+++        (Step::Back, _) => 0, (Step::Keep(_), _) => 1, (Step::Merge(_), _) => 2,
+++        (_, Some(CopyCause::First)) => 3, (_, Some(CopyCause::BeyondHeld)) => 4,
+++        (_, Some(CopyCause::Bounded)) => 5, (_, Some(CopyCause::Changed(Lost::OtherShadow))) => 6,
+++        (_, Some(CopyCause::Changed(Lost::TwoWays))) => 7,
+++        (_, Some(CopyCause::Changed(Lost::Written))) => 8,
+++        (_, Some(CopyCause::Changed(Lost::Within))) => 9,
+++        (_, Some(CopyCause::Changed(Lost::Dropped))) => 10, _ => 11,
+++    };
+++    let known = match copy.copies.target() {
+++        Some(ShadowTarget::Image { texel: Some(bpp), regions, .. }) => {
+++            let w = regions.iter().map(|r| r.image_extent.width).max().unwrap_or(0) as u64;
+++            let h = regions.iter().map(|r| r.image_extent.height).max().unwrap_or(0) as u64;
+++            (copy.texels_in().checked_mul(*bpp), copy.texels_back().checked_mul(*bpp), w, h)
+++        },
+++        _ => (None, None, 0, 0),
+++    };
+++    let Ok(mut rows) = COACHZ_COPIES.lock() else { return; };
+++    let index = match rows.iter().position(|r| r[0] == backing && r[1] == cause) {
+++        Some(i) => i,
+++        None if rows.len() < 96 => { rows.push([backing, cause, 0, 0, 0, 0, 0, 0]); rows.len() - 1 },
+++        None => return,
+++    };
+++    let r = &mut rows[index];r[2] += 1;
+++    match known {
+++        (Some(a), Some(b), w, h) if matches!(copy.step, Step::Into | Step::Back) => {
+++            r[3] = r[3].saturating_add(a);r[4] = r[4].saturating_add(b);
+++            if w * h > r[6] * r[7] { r[6] = w;r[7] = h; }
+++        },
+++        _ => r[5] += 1,
+++    }
+++}
+++pub(super) fn coachz_copy_profile() -> Vec<[u64; 8]> {
+++    let Ok(rows) = COACHZ_COPIES.lock() else { return Vec::new(); };
+++    let mut rows = rows.clone();rows.sort_by_key(|r| std::cmp::Reverse(r[3].saturating_add(r[4])));rows
+++}
++--- a/crates/metal2vulkan-runtime/src/encoder.rs
+++++ b/crates/metal2vulkan-runtime/src/encoder.rs
++@@ -1499,6 +1499,7 @@
++         let counts = &self.device().shared().counts;
++         counts.shadow_copies_planned(copies.len(), texels_in, texels_back);
++         for copy in copies {
+++            if crate::stage_trace::diagnostics() { crate::shadow::coachz_count_copy(copy); }
++             counts.shadow_copy_in_planned(copy);
++         }
++         let bounded = (copies.iter())
++--- a/crates/metal2vulkan-runtime/src/lib.rs
+++++ b/crates/metal2vulkan-runtime/src/lib.rs
++@@ -356,3 +356,6 @@
++ pub use work_counts::{CopySite, MemoryFrees, WorkCounts};
++ pub use wrapped_buffer::{VkBufferMemory, WrappedBufferProblem};
++ pub use ycbcr::{IoSurfaceYCbCr, SurfaceYCbCrMatrix};
+++
+++/// Coachz planned shadow-copy payload, grouped by backing and cause.
+++pub fn coachz_copy_profile() -> Vec<[u64; 8]> { shadow::coachz_copy_profile() }
+diff --git a/patches/mesa/turnip-coachz-diagnostics.patch b/patches/mesa/turnip-coachz-diagnostics.patch
+new file mode 100644
+--- /dev/null
++++ b/patches/mesa/turnip-coachz-diagnostics.patch
+@@ -0,0 +1,77 @@
++diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
++--- a/src/freedreno/vulkan/tu_knl_darwin.cc
+++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
++@@ -1517,6 +1517,15 @@
++       if (result != VK_SUCCESS)
++          return result;
++    }
+++   /* MSM_PARAM_FAULTS is a baseline, not an error simply because it is nonzero. */
+++   NativeAdrenoAbiStatus initial = {};
+++   kern_return_t initial_kr = dw_call(NativeAdrenoMethodGetStatus, NULL, 0, &initial, sizeof(initial));
+++   if (initial_kr != KERN_SUCCESS && initial_kr != kIOReturnUnsupported) {
+++      dw_close_connection();
+++      return vk_startup_errorf(dev->physical_device->instance, VK_ERROR_INITIALIZATION_FAILED,
+++                               "initial GPU status failed: 0x%x", initial_kr);
+++   }
+++   dev->fault_count = initial.faults;
++    struct darwin_retire_state *retire = (struct darwin_retire_state *)
++       vk_zalloc(&dev->vk.alloc, sizeof(*retire), 8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
++    if (!retire) {
++@@ -1592,8 +1601,10 @@
++    if (kr != KERN_SUCCESS)
++       return vk_device_set_lost(&device->vk, "error getting GPU status: 0x%x", kr);
++    if (reply.faults != device->fault_count) {
+++      const uint64_t before = device->fault_count;
++       device->fault_count = reply.faults;
++-      return vk_device_set_lost(&device->vk, "GPU faulted or hung");
+++      return vk_device_set_lost(&device->vk, "GPU faults changed %llu -> %llu (global + client VM)",
+++                                (unsigned long long)before, (unsigned long long)reply.faults);
++    }
++    return VK_SUCCESS;
++ }
++diff --git a/src/freedreno/vulkan/tu_image.cc b/src/freedreno/vulkan/tu_image.cc
++--- a/src/freedreno/vulkan/tu_image.cc
+++++ b/src/freedreno/vulkan/tu_image.cc
++@@ -510,6 +510,32 @@
++
++    return true;
++ }
+++
+++#ifdef TU_HAS_DARWIN
+++#include "util/simple_mtx.h"
+++extern "C" bool tu_darwin_note(uint32_t, const uint32_t *, uint32_t);
+++static void coachz_image_layout(const struct tu_image *image, const VkImageCreateInfo *info)
+++{
+++   if ((uint64_t)info->extent.width * info->extent.height < 2000000) return;
+++   static simple_mtx_t lock = SIMPLE_MTX_INITIALIZER;
+++   static uint64_t keys[32][7];
+++   static unsigned used;
+++   const VkImageFormatListCreateInfo *list = vk_find_struct_const(info->pNext, IMAGE_FORMAT_LIST_CREATE_INFO);
+++   const uint64_t key[7] = {info->format,info->extent.width,info->extent.height,info->usage,info->flags,
+++                           image->layout[0].tile_mode | (uint64_t)image->layout[0].ubwc << 32,
+++                           list ? list->viewFormatCount : 0};
+++   simple_mtx_lock(&lock);
+++   for (unsigned i=0; i<used; ++i) if (!memcmp(keys[i],key,sizeof key)) { simple_mtx_unlock(&lock); return; }
+++   if (used == 32) { simple_mtx_unlock(&lock); return; }
+++   memcpy(keys[used++],key,sizeof key);
+++   simple_mtx_unlock(&lock);
+++   char text[96] = {};
+++   snprintf(text,sizeof(text),"IMG f%u %ux%u u%x fl%x tile%u ubwc%u views%u",info->format,
+++      info->extent.width,info->extent.height,info->usage,info->flags,image->layout[0].tile_mode,
+++      image->layout[0].ubwc,list ? list->viewFormatCount : 0);
+++   uint32_t words[24];memcpy(words,text,sizeof(words));tu_darwin_note(3,words,24);
+++}
+++#endif
++
++ template <chip CHIP>
++ VkResult
++@@ -829,6 +855,9 @@
++          image->vk.array_layers * sizeof(struct tu_subsampled_metadata);
++    }
++
+++#ifdef TU_HAS_DARWIN
+++   coachz_image_layout(image, pCreateInfo);
+++#endif
++    return VK_SUCCESS;
++ }
++ TU_GENX(tu_image_init);
+diff --git a/scripts/build-adreno-metal-bridge.py b/scripts/build-adreno-metal-bridge.py
+--- a/scripts/build-adreno-metal-bridge.py
++++ b/scripts/build-adreno-metal-bridge.py
+@@ -67,7 +67,7 @@
+     # keep nothing. The stage ring also marks the steps inside a batch's submission (SubmitStep: placed, gathered, vkQueueSubmit, changes).
+     '0024-diagnostics-switch-and-submit-steps.patch',
+     # Preserve specialized link names and source definitions; share large indexed constants and expose Vulkan allocation sizes.
+-    '0025-specialized-links-shared-constants-and-allocation-size.patch']]
++    '0025-specialized-links-shared-constants-and-allocation-size.patch', '0026-coachz-copy-profile.patch']]
+ 
+ 
+ def git_tree(*steps):
+diff --git a/scripts/data/adreno-compiler-inputs.json b/scripts/data/adreno-compiler-inputs.json
+--- a/scripts/data/adreno-compiler-inputs.json
++++ b/scripts/data/adreno-compiler-inputs.json
+@@ -56,7 +56,8 @@
+     "patches/mesa/turnip-host-import-images.patch",
+     "patches/mesa/turnip-render-mode-for-attachment-memory.patch",
+     "patches/mesa/turnip-gmem-mutable-swap.patch",
+-    "patches/mesa/turnip-current-queue-priorities.patch"
++    "patches/mesa/turnip-current-queue-priorities.patch",
++    "patches/mesa/turnip-coachz-diagnostics.patch"
+   ],
+   "integer_fma_reference": {
+     "repository": "https://github.com/ucb-bar/berkeley-softfloat-3",
