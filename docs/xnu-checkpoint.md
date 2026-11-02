@@ -44,7 +44,7 @@ sudo python3 tools/read_probe.py --xnu-checkpoint
 
 ## 真机验收
 
-使用源码提交 `d323df8` 对应的签名镜像，经原厂开发者模式启动。原生 Linux 回来后，`read_probe.py --xnu-checkpoint` 校验完整 8192 字节属性成功，四个 XNU 字段均唯一且值为 1，同时满足 entry EL=2、current EL=1、stage=3、handoff EL=2。原始记录在本地私下保存，与目标属性独立计算的 SHA-256 相同。
+使用源码提交 `d323df8` 对应的签名镜像，经原厂开发者模式启动。原生 Linux 回来后，`read_probe.py --xnu-checkpoint` 校验完整 8192 字节属性成功，四个 XNU 字段均唯一且值为 1，同时满足 entry EL=2、current EL=1、stage=3、handoff EL=2。原始记录与目标属性独立计算的 SHA-256 相同。
 
 返回门在硬件上比较了 XNU 保存的参数指针、virtBase、physBase、memSize、bootFlags、页表物理地址，以及 EL1h 和 SCTLR_EL1 M/C/I；取回的返回 PC 和 boot_args 地址另与实际源码负载独立换算一致。因此可确认真实源码内核已在 EL1 执行该冷启动前缀，正确读取 boot_args，并成功返回 Linux。
 

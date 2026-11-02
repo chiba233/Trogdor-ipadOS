@@ -115,7 +115,7 @@ GPU 核心寄存器不能用 64 位写。很多寄存器不是 8 字节对齐，
 
 ## 第 6 阶段（mode 9）：常驻驱动和 GPU 合成
 
-机主决定把常驻内核驱动、Turnip、Metal 和合成器合并成一张镜像一起测。`coachz-gpu=9` 走完 mode 8 的 `hw_init` 就不再回滚，GPU_SET 一直保持，没有电源折叠，也没有中断（等待方轮询）。
+决定把常驻内核驱动、Turnip、Metal 和合成器合并成一张镜像一起测。`coachz-gpu=9` 走完 mode 8 的 `hw_init` 就不再回滚，GPU_SET 一直保持，没有电源折叠，也没有中断（等待方轮询）。
 
 内核这边：
 - `platform/coachz-prelink/package/CoachzGpu.cpp` 是板级代码。Adreno740 的框架（内存、地址空间、提交、IOUserClient）沿用，补丁在 `patches/gpu/Adreno740.patch`：内核对象移到 16 MiB 以上（A618 的 GMEM 在 1 MiB），ring 改成 `a6xx_submit` 的帧，关掉硬件读指针影子。

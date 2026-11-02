@@ -31,11 +31,11 @@
 | XNU SoC 属性诊断中点 | version9 真机 20 字段通过（2026-10-30） | 原生属性读取／缓存对象、CPU／PE／DT、活动帧、表池／AT／缓存返回通过；未访问 SoC MMIO 或验证完整平台返回，见 docs/xnu-soc-checkpoint.md |
 | 同步异常／返回失败诊断 | version10 主动异常传输已真机验收（2026-10-30） | 8192 字节日志通过 46 项必需字段读取，精确 BRK／向量／页表池／缓存传输门匹配并返回 Linux；version10 的 checkpoint=0 符合故障设计，后续 version9 正常 SoC 返回已验收，见 docs/xnu-diagnostics.md |
 | XNU WFE／单 CPU 拓扑 | version11 真机 40 字段通过（2026-10-31） | 原始 WFE 配置、完整单 CPU 拓扑与父帧／PE／表池／AT／缓存门通过；三个系统寄存器按入口值恢复，随后交接 Linux，见 [契约](xnu-topology-checkpoint.md) |
-| XNU 内核初始化 | 屏幕输出镜像已到达等待根设备 | 屏幕照片显示 VM、IOKit、BSD、网络栈初始化完成并打印 `Waiting on ... IOMedia`；无逐字段核对。定时器中断已确认，SMP 未确认，有一个未查明的随机 zone panic，见 [硬件记录](hardware-tests.md) |
-| 第一个用户态程序 | 屏幕输出镜像已从内存盘运行 PID 1（2026-10-31） | 屏幕照片显示 `/sbin/launchd` 加载和 `init running as PID 1`，即 EL0 执行及 `open`、`getpid`、`write` 系统调用可用；每 5 秒的 `select` 定时唤醒也已工作，说明定时器中断正常。程序是自写的静态测试程序，不是 launchd，见 [硬件记录](hardware-tests.md) |
-| 组件 prelink | 真机通过，运行自写 init（2026-10-31） | 屏幕照片显示 OS profile 的 Apple 原始组件参与启动（共 31 个，其中 `IOHIDEventDriver` 无代码），APFS、AppleImage4 等有加载输出，真实 AMFI 通过自建 trust cache 放行 init，tick 超过了之前 `AMFI: No PMGR?` 的 panic 位置；ADT 没有这些组件对应的硬件节点，多数驱动没有实际工作，见 [硬件记录](hardware-tests.md) |
-| Apple launchd 与恢复环境 | 真机运行（2026-10-31） | 屏幕照片显示 IPSW 的 Update 恢复内存盘以 APFS 根运行，原版 launchd、dyld、`restored_update` 在原版 trust cache 下执行，`restored_update` 因没有 IOWatchdog 服务按自身逻辑退出，随后等待 IONVRAM 和 NAND 服务，内核保持存活。这不是主系统，见 [硬件记录](hardware-tests.md) |
-| iPadOS 主系统从外接盘启动 | 进行中（2026-10-31） | 系统卷按 UUID 挂成只读根，SystemOS 挂在 `/private/preboot`，共享缓存映射通过，原版 launchd 通过 mount 阶段；无角色的内存 APFS 种子经 IOKit 发布并成功读写挂载到 `/private/var`，启动越过 tzinit；确认 watchdogd 在缺少 IOWatchdog 的原生分支主动 BRK 后，临时 launchd 禁用策略已让真机继续运行，周期采样仍输出；补齐 keybags 空目录后，原版初始化越过 persona.kb 的 ENOENT，进入加载前台用户 501 的流程，照片观察区间内未再捕获 usermanagerd 异常；SpringBoard 的 SIGABRT 现已捕获：Objective-C runtime 无法在普通路径加载 SystemOS 中的 libobjc-trampolines.dylib；原生 union 根视图与独立 8 GiB 外接 Data 的强制启动准备路径已由实机后续执行验证，文件持久性尚待单独读回；原版 IOMobileFramebufferLegacy 发布固件帧缓冲后越过主 CADisplay 断言；重建 MobileGestalt 缓存后越过显示模式校验，原版白色苹果标志及随后 SpringBoard 的 `Press home to upgrade` 界面经 CPU 后端显示；首个 SpringBoard 曾因同步等待 lsd 被 SIGKILL，尚无可用界面，只有屏幕证据，见 [硬件记录](hardware-tests.md) |
+| XNU 内核初始化 | 屏幕输出镜像已到达等待根设备 | 屏幕显示 VM、IOKit、BSD、网络栈初始化完成并打印 `Waiting on ... IOMedia`；无逐字段核对。定时器中断已确认，SMP 未确认，有一个未查明的随机 zone panic，见 [硬件记录](hardware-tests.md) |
+| 第一个 EL0 程序 | 屏幕输出镜像已从内存盘运行 PID 1（2026-10-31） | 屏幕显示 `/sbin/launchd` 加载和 `init running as PID 1`，即 EL0 执行及 `open`、`getpid`、`write` 系统调用可用；每 5 秒的 `select` 定时唤醒也已工作，说明定时器中断正常。程序是自写的静态测试程序，不是 launchd，见 [硬件记录](hardware-tests.md) |
+| 组件 prelink | 真机通过，运行自写 init（2026-10-31） | 屏幕显示 OS profile 的 Apple 原始组件参与启动（共 31 个，其中 `IOHIDEventDriver` 无代码），APFS、AppleImage4 等有加载输出，真实 AMFI 通过自建 trust cache 放行 init，tick 超过了之前 `AMFI: No PMGR?` 的 panic 位置；ADT 没有这些组件对应的硬件节点，多数驱动没有实际工作，见 [硬件记录](hardware-tests.md) |
+| Apple launchd 与恢复环境 | 真机运行（2026-10-31） | 屏幕显示 IPSW 的 Update 恢复内存盘以 APFS 根运行，原版 launchd、dyld、`restored_update` 在原版 trust cache 下执行，`restored_update` 因没有 IOWatchdog 服务按自身逻辑退出，随后等待 IONVRAM 和 NAND 服务，内核保持存活。这不是主系统，见 [硬件记录](hardware-tests.md) |
+| iPadOS 主系统从外接盘启动 | 进行中（2026-10-31） | 系统卷按 UUID 挂成只读根，SystemOS 挂在 `/private/preboot`，共享缓存映射通过，原版 launchd 通过 mount 阶段；无角色的内存 APFS 种子经 IOKit 发布并成功读写挂载到 `/private/var`，启动越过 tzinit；确认 watchdogd 在缺少 IOWatchdog 的原生分支主动 BRK 后，临时 launchd 禁用策略已让真机继续运行，周期采样仍输出；补齐 keybags 空目录后，原版初始化越过 persona.kb 的 ENOENT，进入加载前台账户 501 的流程，观察区间内未再捕获 usermanagerd 异常；SpringBoard 的 SIGABRT 现已捕获：Objective-C runtime 无法在普通路径加载 SystemOS 中的 libobjc-trampolines.dylib；原生 union 根视图与独立 8 GiB 外接 Data 的强制启动准备路径已由实机后续执行验证，文件持久性尚待单独读回；原版 IOMobileFramebufferLegacy 发布固件帧缓冲后越过主 CADisplay 断言；重建 MobileGestalt 缓存后越过显示模式校验，原版白色苹果标志及随后 SpringBoard 的 `Press home to upgrade` 界面经 CPU 后端显示；首个 SpringBoard 曾因同步等待 lsd 被 SIGKILL，尚无可用界面，只有屏幕证据，见 [硬件记录](hardware-tests.md) |
 | USB 主机与大容量存储 | 探针只读实验真机通过；XNU 从外接盘只读挂根屏幕确认（2026-10-31） | 探针用 libpayload 枚举到硬盘并读到 `EFI PART`、`CHROMEOS`，严格字段通过，见 [USB 只读实验](usb-read.md)。XNU 内核里的同一套栈经 IOKit 块设备、GPT 分区和 APFS 把恢复卷挂成只读根，`restored_update` 从外接盘运行；未封存根卷是放行而不是验证，只有屏幕证据，见 [硬件记录](hardware-tests.md)。既定路线：根文件系统先从外接盘启动，之后才考虑 eMMC |
 | SMP | 进行中（2026-10-31） | 六颗 A55 和两颗 A76 经 PSCI 启动，型号与 E／P 簇识别正确，SGI 能送达；所有核共用一个 pset，空闲核优先选 A76，大核已承担负载，但不是大小核调度；三个频率域固定在最高的非 boost 档，绑核计时测得 A55 1804、A76 2400 MHz，未被压频；升级页显示时系统合计只用约 0.37 颗核，没有动态调频和温控，见 [硬件记录](hardware-tests.md) |
 | 触摸 | 真机通过（2026-10-31） | GT7375P 经 GENI I2C、ShengHidInput 和内核 `IOHIDEventDriver` 接到 backboardd；上滑让 PreBoard 从 “Swipe up to upgrade” 进到 “Enter Passcode”，见[硬件记录](hardware-tests.md) |
@@ -44,7 +44,7 @@
 | 扬声器 | 测试音通过（2026-11-01） | LPASS 经 I2S 放一次 1 秒测试音；系统和 App 还没有音频输出 |
 | 音量键 | 驱动层通过（2026-11-01） | 报告进入 HID 且返回 0；屏幕上没有音量条 |
 | 背光 | 真机通过（2026-11-01） | 控制中心亮度滑块经 Chrome EC PWM 调亮度，读回一致；熄屏和睡眠联动没做 |
-| 键盘和触控板 | 真机通过 | Zed 底座键盘留在 report protocol（和 Linux 的 usbhid 一样），顶排亮度和音量键、触控板的指针和滚动方向都由机主确认；其他功能键未逐个确认 |
+| 键盘和触控板 | 真机通过 | Zed 底座键盘留在 report protocol（和 Linux 的 usbhid 一样），顶排亮度和音量键、触控板的指针和滚动方向都确认过；其他功能键未逐个确认 |
 | Adreno 618 | 前几级真机通过（2026-11-01） | 时钟和电源清点、CX + GMU 时钟窗口、GMU 固件写入 TCM 并读回、GPU SMMU 只读清点；GMU 处理器没有放开，GPU 没有执行命令，见 [路线](plans/gpu.md) |
 | 温度、加速度计 | 只读采样真机通过（2026-11-01） | TSENS 25 路和 EC 加速度计的读数写进日志；没有温控，也没有接 CoreMotion |
 | Wi-Fi | 第一步真机通过（2026-11-01） | 只读 SMEM 清点；基带没有启动，不能联网 |
@@ -72,7 +72,7 @@
 1. 已验证签名、body、GPT 和全部 128 MiB 介质回读 SHA-256。
 2. 已通过同次引导的 Linux 接收路径读取日志；不依赖跨复位内存保留，AP UART 未验证。
 3. 已从单独准备的可启动介质，经原厂开发者模式进入探针并交接原生 Linux。
-4. 已读取入口 EL、当前 EL、MIDR / MPIDR / CNTFRQ、FDT 内存与 Coreboot 表属性；原始地址与板级数据私下保存。
+4. 已读取入口 EL、当前 EL、MIDR / MPIDR / CNTFRQ、FDT 内存与 Coreboot 表属性；原始地址与板级数据不公开。
 5. 已确认 current EL = 1 且 stage = 3，handoff EL = 2；首轮正常路径未触发异常；后续 version10 已取得精确 BRK 的 ESR／ELR／FAR／SPSR 现场并通过异常回收验收，其他故障类别仍需分别验证。
 6. 后续已完成：源码 XNU 的运行时段装载与 pre-MMU boot_args 读取检查点，取得有效硬件日志。随后 MMU 开启、完整页表池和硬件 AT 检查点也已通过真机验收。随后高虚拟地址取指、C 入口栈帧调整与诊断栈读取也已取得硬件日志。早期 C 正文的原始栈保存、参数复制和缓存清理返回也已取得硬件日志。启动 CPU 对象的原始标量／SIMD 初始化也已通过硬件日志验收。原始平台状态、ADT 绑定及首次原生 arm-io 查找已通过完整 19 字段和独立清单核对。后续 version9 的 SoC 属性读取／缓存写入也已取得严格 20 字段硬件记录。随后 version7 的完整 PE 返回也已取得严格 22 字段硬件记录。version11 的 WFE 配置／单 CPU 拓扑解析返回也已取得完整 40 字段硬件记录。待完成：线程／VM、平台／中断／SMP 初始化、其余 ADT 消费、平台接口与显示恢复。
 

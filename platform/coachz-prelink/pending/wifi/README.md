@@ -1,6 +1,6 @@
 # Coachz WCN3990: pending platform inventory and WLFW wire code
 
-This directory is not consumed by the kernel build. Nothing here is in `series`, `board.toml`, `kernel_source.py` or the active loader. The owner will wire in and compile the candidate. No kernel or XNU object was compiled for this work, and there is no hardware result.
+This directory is not consumed by the kernel build. Nothing here is in `series`, `board.toml`, `kernel_source.py` or the active loader. The candidate is wired in and compiled separately. No kernel or XNU object was compiled for this work, and there is no hardware result.
 
 ## Implemented
 
@@ -24,7 +24,7 @@ The incoming SMP2P item is 435, from MODEM host 1 to APPS host 0 (smp2p.c reads 
 
 No hardware lock, SMEM allocation, GLINK negotiation, FIFO pointer update, mailbox write, SCM call, reset, power vote, radio MMIO or DMA is performed. The mapped SMEM range stays mapped for the kernel lifetime. The inventory runs once on the existing sampler thread.
 
-## Optional wiring, performed by the owner
+## Optional wiring
 
 1. Confirm the original Coachz FDT/SKU and SMEM range. Keep all remote-processor regions out of XNU allocations. The present inventory only reads SMEM; later boot/DMA stages must separately reserve MPSS, MBA, MSA, metadata and any host DMA pool.
 2. Copy `coachz-prelink-wifi.patch` to the XNU patch directory under the same name, then append that name to `series`. Its contexts are the accepted EC file registration and sampler's local `ticks` declaration, so it can be placed after the accepted battery/input patches. It does not depend on the optional GPU patch.
@@ -38,7 +38,7 @@ An illustrative loader call after explicitly importing the helper is:
 add_wifi_inventory(root, checked_smem_base, checked_smem_size)
 ```
 
-The helper does not reserve RAM or validate a live FDT. The owner must connect it at the correct pre-serialization point; there is deliberately no automatic loader patch or default boot argument here.
+The helper does not reserve RAM or validate a live FDT. It must be connected at the correct pre-serialization point; there is deliberately no automatic loader patch or default boot argument here.
 
 ## Expected diagnostics after integration
 

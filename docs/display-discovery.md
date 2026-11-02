@@ -72,7 +72,7 @@ Coreboot 表与 framebuffer／GPIO 元数据有效，13 次固定 MMIO 读取完
 
 **模型。** 用私有 Coreboot 内存表按上述逻辑重放分配，结果与真机 SSPP 基址逐位相等；payload `_end` 取多个值结果不变，DMA 大小改为 16 或 64 MiB 则不再相等。这支持当前路径符合锁定源码，不能证明已安装固件二进制与之相同。
 
-**硬件。** 从产生该日志的同一次启动读取设备树，其中的 probe-log 与私有记录逐字节相同。`/memory` 完整覆盖分配范围，并与按 Depthcharge [`update_memory`](https://chromium.googlesource.com/chromiumos/platform/depthcharge/+/719118f5e36ea312c33b8f005798b1488f9ec2d1/src/boot/fit.c) 从内存表推导的结果完全一致；10 个 reserved-memory 节点都不与它重叠，相对 FIT 内 DTB 只多固件加入的 ramoops；没有 simple-framebuffer 节点。Image、initrd 与 FDT 位于其下方，Coreboot 表与 CBMEM 位于其上方。
+**硬件。** 从产生该日志的同一次启动读取设备树，其中的 probe-log 与保存的记录逐字节相同。`/memory` 完整覆盖分配范围，并与按 Depthcharge [`update_memory`](https://chromium.googlesource.com/chromiumos/platform/depthcharge/+/719118f5e36ea312c33b8f005798b1488f9ec2d1/src/boot/fit.c) 从内存表推导的结果完全一致；10 个 reserved-memory 节点都不与它重叠，相对 FIT 内 DTB 只多固件加入的 ramoops；没有 simple-framebuffer 节点。Image、initrd 与 FDT 位于其下方，Coreboot 表与 CBMEM 位于其上方。
 
 **主机。** 以该设备树重建 FDT（memreserve 由上述模型生成），运行实际 C 范围门：未改动时返回假，与真机一致；仅在临时副本中移除整体排除后返回真。尾页预留、上下紧邻预留、静态节点、alloc-ranges、CBMEM、initrd、`/memory` 之外共八组反例结果符合预期。
 

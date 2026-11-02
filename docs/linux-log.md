@@ -18,7 +18,7 @@ Linux 保持从原厂 EL2 入口执行，避免把探针的最小 EL1 环境冒�
 
 Linux Image 嵌入 shim 后方的 2 MiB 对齐位置，要求其 text_offset=0、little-endian、支持任意 2 MiB 放置；不满足时拒绝构建。wrapper 的 Image memory size 覆盖其日志、栈以及 Linux image_size，不能只用 Linux 文件长度代替内存占用。Depthcharge 继续负责整个 wrapper 的定位和缓存交接。
 
-原有 16 MiB kernel 分区容不下该诊断负载。单独生成 128 MiB 普通 GPT 文件，包含一个 96 MiB kernel 分区；旧镜像格式保持默认参数不变。写入介质仍是独立、已明确授权且带目标盘保护的操作。
+原有 16 MiB kernel 分区容不下该诊断负载。单独生成 128 MiB 普通 GPT 文件，包含一个 96 MiB kernel 分区；旧镜像格式保持默认参数不变。写入介质仍是独立且带目标盘保护的操作。
 
 Linux 容器、完整 DTB、initrd 和实际日志仅保存在忽略目录，不进入公共仓库。公共代码只包含构建／校验逻辑和日志读取工具，不包含设备转储或 Linux 二进制。
 
@@ -62,7 +62,7 @@ python3 read_probe.py
 
 提交 `bb29e0e` 的外置镜像已交接原生 Linux，并读回完整 8192 字节日志。读取器确认 entry EL=2、current EL=1、stage=3、handoff EL=2；本地副本与运行中设备树属性的 SHA-256 一致。首阶段探针验收通过。镜像哈希、采集方式与证据边界见 [硬件记录](hardware-tests.md#2026-10-27原生-linux-接收成功)。
 
-原始日志私下保存。该结果不包含 XNU／iPadOS 装载，也不代表独立探针已恢复显示或验证异常日志通道。
+原始日志不公开。该结果不包含 XNU／iPadOS 装载，也不代表独立探针已恢复显示或验证异常日志通道。
 
 
 ## 独立显示发现模式

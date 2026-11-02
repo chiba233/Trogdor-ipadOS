@@ -30,7 +30,7 @@ LAN RX：`coachz_ipa_rx_proto.h` 是可主机测试的部分：缓冲和 TRE 布
 
 ## 交给接手者
 
-配置：Wi-Fi 补丁的 `wifi_ipa_power()` 之后调 `coachz_ipa_config(&ipa, zero_virt, zero_phys, wifi_qmp_send)`（8 KiB 设备可见内存；apps SMMU 处于旁路），主线是在 modem 启动之前的探测阶段做；MBA/PIL 开始启动 modem 时调 `coachz_ipa_modem_starting()` 并清掉我们的 SMP2P `ipa` 项（主线 `ipa_smp2p_notify_reset`）；GIC SPI 311 或轮询里调 `coachz_ipa_interrupt()`。另外 Wi-Fi 补丁打印 `ipa: setup ready` 时把 SHARED_MEM_SIZE 的高低 16 位读反了：主线 MEM_SIZE 在 15:0，MEM_BADDR 在 31:16，`mem_offset` = 8 × 高 16 位。
+配置：Wi-Fi 补丁的 `wifi_ipa_power()` 之后调 `coachz_ipa_config(&ipa, zero_virt, zero_phys, wifi_qmp_send)`（8 KiB 设备可见内存；apps SMMU 处于旁路），主线是在 modem 启动之前的探测阶段做；MBA/PIL 开始启动 modem 时调 `coachz_ipa_modem_starting()` 并清掉 AP 的 SMP2P `ipa` 项（主线 `ipa_smp2p_notify_reset`）；GIC SPI 311 或轮询里调 `coachz_ipa_interrupt()`。另外 Wi-Fi 补丁打印 `ipa: setup ready` 时把 SHARED_MEM_SIZE 的高低 16 位读反了：主线 MEM_SIZE 在 15:0，MEM_BADDR 在 31:16，`mem_offset` = 8 × 高 16 位。
 
 GSI：配置时一并调 `coachz_gsi_init(&gsi, ipa.gsi, ring_virt, ring_phys, bytes)`，给一块清零、64 KiB 对齐、写合并或非缓存、至少 40 KiB 的内存（主线也在 probe 时分配环）；收到 `ipa-setup-ready` 后，`ipa_setup` 第一步调 `coachz_gsi_setup()`。再调 `coachz_ipa_cmd_init(&cmd, &ipa, &gsi, virt, phys, bytes)`（至少 8448 字节、清零、128 字节对齐的 DMA 内存，64 KiB 环内存块从 0xc000 起还有空间）和 `coachz_ipa_setup_commands(&cmd)`。然后 `coachz_ipa_rx_init(&lan, &ipa, &gsi, CIPA_EP_AP_LAN_RX, virt, phys, bytes)`（128 字节对齐的写合并或非缓存内存；2 MiB 能挂满 251 个缓冲，和 Linux 一样，给得少就挂得少）和 `coachz_ipa_setup_lan_rx(&lan)`，`ipa_setup` 到此结束。`coachz_gsi_interrupt()` 在 `ieob_pending` 里标出 LAN RX 的事件环时，或者定时，调 `coachz_ipa_rx_poll(&lan)`。之后是 `ipa_qmi_setup`（握手），再往后是 `ipa_modem_start` 和 `rmnet_ipa0` 数据通路，还没写。
 

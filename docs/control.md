@@ -41,7 +41,7 @@ python3 tools/disk.py build/usb-control/reset-el1-no-reset.kpart \
 | reset-el1-no-reset.img SHA-256 | 03d8e18a0788ff9581d8da33f8e5748ba03d18c92655a30bfe0f7a2e6559fa0c |
 | reset-el1-no-reset.kpart SHA-256 | fd2cfa75379f9ac18b8375330d098744d104a7c80f09d2ed5e2d17d3f68ccc37 |
 
-21 项主机回归通过；独立检查确认只有上述四个 Image 字节变化，以及两处预期的 FIT 属性变化。签名／body 校验与容器、GPT 中的负载字节一致性检查通过。目标系统的 futility 再次验证签名与 body 成功，写入外置测试介质后的全部 64 MiB 回读 SHA-256 与上述镜像一致。硬件启动反馈为不自动重启，与会自动重启的原版形成对照。
+21 项主机回归通过；独立检查确认只有上述四个 Image 字节变化，以及两处预期的 FIT 属性变化。签名／body 校验与容器、GPT 中的负载字节一致性检查通过。目标系统的 futility 再次验证签名与 body 成功，写入外置测试介质后的全部 64 MiB 回读 SHA-256 与上述镜像一致。硬件启动不自动重启，与会自动重启的原版形成对照。
 
 ## 执行与解释
 

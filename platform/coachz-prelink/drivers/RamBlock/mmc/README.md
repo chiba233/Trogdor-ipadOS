@@ -30,7 +30,7 @@ Per slot, behind `coachz-emmc=1` (sdhc_1, 0x7c4000) and `coachz-sd=1` (sdhc_2, 0
 
 - Core clock only from XO and GPLL0 even, so at most 100 MHz. No HS200, HS400/HS400ES, DDR52, UHS-I, tuning, DLL/CDC calibration, CQE, ICE or SDIO probe. GPLL6 (192/384 MHz) and GPLL7 (202 MHz) are untouched.
 - No interconnect (BCM) bandwidth vote; the CX vote goes through the shared aggregator.
-- Writes need `coachz-emmc=2` or `coachz-sd=2`. On the eMMC they stay inside the GPT partition named `coachz-scratch` at its exact bounds, checked before any command; everything else is refused and counted. EXT_CSD is switched only for BUS_WIDTH and HS_TIMING, both lost at power-off. ERASE_GROUP_DEF, POWER_OFF_NOTIFICATION, HPI, CACHE_CTRL, CMDQ and POWER_CLASS are not switched, and a PART_CONFIG that selects a boot partition is reported and the card is not used, because rewriting PART_CONFIG rewrites its persistent boot bits. No write, erase, RPMB or boot partition access. eMMC writes need the owner's fresh consent.
+- Writes need `coachz-emmc=2` or `coachz-sd=2`. On the eMMC they stay inside the GPT partition named `coachz-scratch` at its exact bounds, checked before any command; everything else is refused and counted. EXT_CSD is switched only for BUS_WIDTH and HS_TIMING, both lost at power-off. ERASE_GROUP_DEF, POWER_OFF_NOTIFICATION, HPI, CACHE_CTRL, CMDQ and POWER_CLASS are not switched, and a PART_CONFIG that selects a boot partition is reported and the card is not used, because rewriting PART_CONFIG rewrites its persistent boot bits. No write, erase, RPMB or boot partition access. eMMC writes need a fresh decision.
 - SD: no hot-plug (card detect is read at start and before each read); SSR and the SD extension registers are not read.
 - Data commands use the maximum hardware timeout count (0xF, sdhci-msm's `max_timeout_count`) instead of `mmc_set_data_timeout`; busy commands use their own timeout.
 
@@ -54,4 +54,4 @@ Acceptance needs the hardware: IOKit publishing the eMMC's GPT (LBA 1 `EFI PART`
 
 ## Next stage (after the stage-1 hardware result)
 
-eMMC HS400ES at 384 MHz (GPLL6, CX nom, `sdhci_msm_hs400`/CM DLL SDC4 calibration, enhanced strobe), SD UHS-I (CMD11 voltage switch, GPLL7 202 MHz, tuning with CDR), interconnect votes, CQE, SD hot-plug from the GPIO69 interrupt (and the MPM regulator re-enable depthcharge's comment describes), then writes, which for the eMMC need a separate decision by the owner.
+eMMC HS400ES at 384 MHz (GPLL6, CX nom, `sdhci_msm_hs400`/CM DLL SDC4 calibration, enhanced strobe), SD UHS-I (CMD11 voltage switch, GPLL7 202 MHz, tuning with CDR), interconnect votes, CQE, SD hot-plug from the GPIO69 interrupt (and the MPM regulator re-enable depthcharge's comment describes), then writes, which for the eMMC need a separate decision.

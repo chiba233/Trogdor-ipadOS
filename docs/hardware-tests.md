@@ -44,7 +44,7 @@ EL1 尝试之后读取的 EC GET_UPTIME_INFO 返回 AP reset count=0，recent_ap
 
 ## 已执行：单指令匹配对照
 
-[匹配对照](control.md)的 Image 仅在 0x272c 将 SMC #0 的四个字节换为 NOP；其余 Image 字节及 FIT 的非内核数据／哈希属性相同。镜像 SHA-256 为 `03d8e18a0788ff9581d8da33f8e5748ba03d18c92655a30bfe0f7a2e6559fa0c`，签名／body 与全部 64 MiB 介质回读校验通过。硬件反馈为不重启。
+[匹配对照](control.md)的 Image 仅在 0x272c 将 SMC #0 的四个字节换为 NOP；其余 Image 字节及 FIT 的非内核数据／哈希属性相同。签名／body 与全部 64 MiB 介质回读校验通过。硬件不重启。
 
 这比普通 memory 对照更直接地隔离了最终复位调用。该对照的当轮里程碑是间接执行证据；后续直接日志见下一节。两者均不代表已有 XNU 或 iPadOS 运行结果。
 
@@ -61,7 +61,7 @@ stage=0x0000000000000003
 handoff EL=0x0000000000000002
 ```
 
-日志包含 phase-0 完成标记、入口 SCTLR／HCR、MIDR／MPIDR／CNTFRQ 以及 FDT 内存、initrd 和 Coreboot 表属性。完整原始日志仅私下保存；本地副本与运行中 Linux 属性的 SHA-256 一致，构建清单中的源文件哈希与提交源码一致。
+日志包含 phase-0 完成标记、入口 SCTLR／HCR、MIDR／MPIDR／CNTFRQ 以及 FDT 内存、initrd 和 Coreboot 表属性。完整原始日志不公开；本地副本与运行中 Linux 属性的 SHA-256 一致，构建清单中的源文件哈希与提交源码一致。
 
 这是原厂 EL2 入口→探针 EL1 诊断→受控 HVC 返回 EL2→原生 Linux 接收日志的直接硬件证据，首阶段探针验收通过。没有观测到异常路径，也没有加载 XNU 或 iPadOS。Linux 自身能恢复显示不等于独立探针已实现显示驱动。
 
@@ -481,7 +481,7 @@ version11 真机执行验收仍待进行，必须取得本轮精确边界和 `re
 
 WFE EVENTI=4，CNTKCTL 实际运行值符合当次入口值 OR 0x4f；两个 TPIDR 运行值符合唯一逻辑 CPU／cluster，交接前三个系统寄存器的实际回读均与入口一致。本次三个入口值均为零；不同非零初值的恢复仍是主机系统模型证据。该轮验证的是 WFE 配置与单 CPU 拓扑解析，不含睡眠唤醒、计时器中断、线程／VM 或其他核启动。缺失频率与缓存／PIO 属性仍按受限 ADT 缺省模型处理，不能据字段通过宣称设备驱动已支持。
 
-本轮仅读取并私下保存日志、更新脱敏记录；没有改写运行时、测试介质、固件或内置盘，没有自动重启。未修改代码或测试，不重复此前通过的 126 项主机回归。显示恢复仍只有独立源码审计，下一步优先限定 [显示探针范围](display-reuse-audit.md)。
+本轮仅读取日志、更新脱敏记录；没有改写运行时、测试介质、固件或内置盘，没有自动重启。未修改代码或测试，不重复此前通过的 126 项主机回归。显示恢复仍只有独立源码审计，下一步优先限定 [显示探针范围](display-reuse-audit.md)。
 
 
 ## 2026-10-31：独立只读显示发现介质准备
@@ -512,7 +512,7 @@ Coreboot 表与 framebuffer／GPIO 元数据有效，13 次固定 MMIO 读取完
 
 ## 2026-10-31：真实 scanout 分配与归属只读核实
 
-没有新的启动。在产生上述记录的同一次启动中，只读取设备树；其中的 probe-log 与私有记录逐字节相同。未使用 sudo，未写入设备、USB、固件或内置盘，没有自动重启。
+没有新的启动。在产生上述记录的同一次启动中，只读取设备树；其中的 probe-log 与保存的记录逐字节相同。未使用 sudo，未写入设备、USB、固件或内置盘，没有自动重启。
 
 候选为假的两个原因均已查明。1 MiB 基址门误读了锁定 libpayload：分配器对齐的是末端，基址只到 4 KiB；按该逻辑重放私有内存表的结果与真机 SSPP 基址逐位相等。整体排除带必然覆盖动态分配的 framebuffer，这道门对该对象不可能为真；仅移除该项的临时副本在重建 FDT 上返回真，八组反例符合预期，这是主机结果。
 
@@ -582,7 +582,7 @@ EC 协议 3 在第一次运行就工作：`EC_CMD_HELLO` 回复校验通过，`E
 
 ## 2026-10-31：XNU 第一次屏幕输出
 
-运行时 `9342745`、准备记录 `eadbb38`，使用前述同一镜像。手动启动后屏幕亮起，XNU 把启动过程直接画到屏幕上，结果来自屏幕照片，这张镜像不回 Linux，没有日志记录。
+运行时 `9342745`、准备记录 `eadbb38`，使用前述同一镜像。手动启动后屏幕亮起，XNU 把启动过程直接画到屏幕上，结果来自屏幕，这张镜像不回 Linux，没有日志记录。
 
 屏幕依次显示 `arm_init`、`cpu_data_init`、`PE_init_platform`、`ml_parse_cpu_topology`、`cpu_bootstrap`、`kernel_startup_bootstrap`、`cpu_init`、`arm_vm_init`（含屏幕别名映射、关闭 TTBR0、`pmap_bootstrap`）的完成标记，随后出现 `kprintf initialized` 和 `Serial mode specified`。这是 XNU 第一次在真机上越过 version11 的停止点并完成 VM 初始化，不再有检查点返回或逐字段核对，这些阶段的证据只是屏幕上的进度。
 
@@ -593,7 +593,7 @@ EC 协议 3 在第一次运行就工作：`EC_CMD_HELLO` 回复校验通过，`E
 
 ## 2026-10-31：XNU 屏幕输出越过 panic 区域问题
 
-运行时 `c807a9a`，镜像 SHA-256 `3cec4347877c4a94e718c79c3432d1c3a889c77b0ee97338f2f278864b528006`。启用设备树 panic 区域后，上一处外部中止消失。屏幕照片显示 `zone_init` 完成全部映射，并打印 `VM bootstrap done`，这是 XNU 第一次在真机上完成 VM 引导。
+运行时 `c807a9a`，镜像 SHA-256 `3cec4347877c4a94e718c79c3432d1c3a889c77b0ee97338f2f278864b528006`。启用设备树 panic 区域后，上一处外部中止消失。屏幕显示 `zone_init` 完成全部映射，并打印 `VM bootstrap done`，这是 XNU 第一次在真机上完成 VM 引导。
 
 随后内核 panic：`kalloc.c:1779 Assertion failed: n_zones_sig + n_zones_type + 1 <= 32`。这是 DEVELOPMENT 构建的断言。该函数按内核内类型统计把区域预算分给各大小类，默认预算 260；未接入组件 prelink 时类型分布偏向少数大小类，某一类超过 32。
 
@@ -604,7 +604,7 @@ EC 协议 3 在第一次运行就工作：`EC_CMD_HELLO` 回复校验通过，`E
 
 ## 2026-10-31：XNU 屏幕输出进入 IOKit
 
-运行时 `099c601`，镜像 SHA-256 `15012d323cdaf4c5227c875177b832bdac1f9376408abcb5e736b99b06423732`。`kt_fixed_zones=120` 后 kalloc 断言消失。屏幕照片显示调度器、firehose、遥测、BANK 与串行 KDP 初始化，随后进入 `PE_init_iokit`。
+运行时 `099c601`，镜像 SHA-256 `15012d323cdaf4c5227c875177b832bdac1f9376408abcb5e736b99b06423732`。`kt_fixed_zones=120` 后 kalloc 断言消失。屏幕显示调度器、firehose、遥测、BANK 与串行 KDP 初始化，随后进入 `PE_init_iokit`。
 
 panic 的调用栈为 `PE_init_iokit → InitIOKit → OSlibkernInit → OSRuntimeInitializeCPP → OSMetaClass::postModLoad`：`Kernel data abort`，ESR `0x96000006`（转换错误），PC `0xfffffff007834534`，正在沿父类链读取，地址在内核范围之外。静态扫描全部 C++ 静态构造后，只有 `__GLOBAL__sub_I_NativeAES.cpp` 的父类指针超出内核范围，且与现场寄存器值相同。SoftwareAES 的父类 `IOAESAccelerator` 属于只有 prelink 才能提供的组件。此前一轮同一阶段的 `not in the expected zone` panic 尚未单独解释，可能同源。
 
@@ -615,7 +615,7 @@ panic 的调用栈为 `PE_init_iokit → InitIOKit → OSlibkernInit → OSRunti
 
 运行时与配置见随本节提交，镜像 SHA-256 `2a41ced24e468ca9b4a31ab79b2ab886a9c0c6025ca48f48e5a0941955dfa7aa`。这一轮之前依次处理了三处依赖 prelink 的问题：关闭 `CONFIG_XNU_NATIVE_AES`；`CONFIG_XNU_CRYPTO_BOOTSTRAP` 改为 `source`，由内置 corecrypto 提供 `g_crypto_funcs`（否则 `kmem_crypto_init` 空指针）；关闭 `CONFIG_XNU_TRUST_CACHE_RUNTIME`（否则 panic `image4 interface not available`）。
 
-屏幕照片显示 corecrypto FIPS 自检 `all tests PASSED`，IOKit 与 NVRAM 初始化，BSD 版权行，MAC Framework、mbuf、DLIL 和 Skywalk 自检通过，`bsd_autoconf` 调用 `kmInit`，最后打印 `Waiting on <dict>...IOMedia...Apple_HFS...</dict>`，没有 panic。这是 XNU 第一次在 Coachz 真机上完成内核初始化并开始等待根设备。
+屏幕显示 corecrypto FIPS 自检 `all tests PASSED`，IOKit 与 NVRAM 初始化，BSD 版权行，MAC Framework、mbuf、DLIL 和 Skywalk 自检通过，`bsd_autoconf` 调用 `kmInit`，最后打印 `Waiting on <dict>...IOMedia...Apple_HFS...</dict>`，没有 panic。这是 XNU 第一次在 Coachz 真机上完成内核初始化并开始等待根设备。
 
 这只有屏幕证据。没有根文件系统、存储驱动、用户态、完整组件 prelink 或 iPadOS 启动。尚未确认计时器中断是否工作：XNU 约 60 秒后应打印 `Still waiting for root device`，这一轮未记录是否出现。
 
@@ -626,11 +626,11 @@ panic 的调用栈为 `PE_init_iokit → InitIOKit → OSlibkernInit → OSRunti
 
 运行时与配置见随本节提交，镜像 SHA-256 `526147c61b275f6324f05582e9e2c2646a3fb2b02ab5d782c5bce5b409dd7e84`。这一轮在屏幕镜像上增加了内存盘和 `rd=md0`，`IOService.cpp` 跳过了依赖 IOStorageFamily 的两处断言，并注册了内置 AMFI 接口。
 
-屏幕照片依次显示：`Added memory device md0/rmd0`、`BSD root: md0, major 1, minor 0`、`load_init_program: attempting to load /sbin/launchd`，然后是 `*** COACHZ userspace: init running as PID 1 ***`。这是第一次在 Coachz 真机上离开内核进入 EL0。这行文字由程序自己通过 `open("/dev/console")`、`getpid` 和 `write` 打印，因此这几个系统调用、devfs、mockfs、Mach-O 加载和内存盘读取都走通了。
+屏幕依次显示：`Added memory device md0/rmd0`、`BSD root: md0, major 1, minor 0`、`load_init_program: attempting to load /sbin/launchd`，然后是 `*** COACHZ userspace: init running as PID 1 ***`。这是第一次在 Coachz 真机上离开内核进入 EL0。这行文字由程序自己通过 `open("/dev/console")`、`getpid` 和 `write` 打印，因此这几个系统调用、devfs、mockfs、Mach-O 加载和内存盘读取都走通了。
 
 这只有屏幕证据，没有逐字段核对。运行的是自写的静态测试程序，不是 launchd，也没有 dyld、共享缓存或任何 iPadOS 用户态。`Failed to open swap file` 符合预期，内存盘根上没有可写文件系统。
 
-未确认：计时器中断。程序每 5 秒用 `select` 睡眠后应打印 `COACHZ init: timer tick N`，这张照片里 PID 那行之后还没有 tick，但拍摄时刻距启动多久未知，不能据此判断。`zone` 随机 panic 这一轮未出现，原因仍未查明。
+未确认：计时器中断。程序每 5 秒用 `select` 睡眠后应打印 `COACHZ init: timer tick N`，屏幕上 PID 那行之后还没有 tick，但那一刻距启动多久未知，不能据此判断。`zone` 随机 panic 这一轮未出现，原因仍未查明。
 
 
 ## 2026-10-31：定时器中断在真机上工作
@@ -639,7 +639,7 @@ panic 的调用栈为 `PE_init_iokit → InitIOKit → OSlibkernInit → OSRunti
 
 上一节的镜像停在 PID 1 那行，等了很久也没有 tick。真机设备树 `/timer` 写明虚拟定时器是 PPI 3，也就是 INTID 19，内核也确实使用虚拟定时器，而 ArmCpu 只使能并识别写死的 INTID 27，所以定时器中断从未到达内核。`platform/coachz-screen/patches/drivers/ArmCpu.patch` 改为 19，并增加两行屏幕诊断。
 
-屏幕照片依次显示 `COACHZ GIC: IGROUPR0=0 ISENABLER0=87eff GICD_CTLR=12 PMR=f0 IGRPEN1=1 SRE=7`、`COACHZ: first timer interrupt`、PID 1 那行，然后是 `COACHZ init: timer tick 1` 到 `4`。这说明定时器中断能从 GIC 到达 `rtclock_intr`，线程也能按定时被唤醒，`select` 超时后程序继续运行。这是屏幕证据，没有用外部时钟测量 tick 的实际间隔。
+屏幕依次显示 `COACHZ GIC: IGROUPR0=0 ISENABLER0=87eff GICD_CTLR=12 PMR=f0 IGRPEN1=1 SRE=7`、`COACHZ: first timer interrupt`、PID 1 那行，然后是 `COACHZ init: timer tick 1` 到 `4`。这说明定时器中断能从 GIC 到达 `rtclock_intr`，线程也能按定时被唤醒，`select` 超时后程序继续运行。这是屏幕证据，没有用外部时钟测量 tick 的实际间隔。
 
 `ISENABLER0` 的预期值是 `0x8ffff`，实际读回 `0x87eff`：第 19 位已置上，第 8 和第 15 位没有生效，`IGROUPR0` 也读回 0。原因未验证，可能是非安全访问看不到或被安全固件保留。内核目前只用到 SGI 0 和这个定时器。
 
@@ -652,7 +652,7 @@ panic 的调用栈为 `PE_init_iokit → InitIOKit → OSlibkernInit → OSRunti
 
 运行时与配置见随本节提交，镜像 SHA-256 `5d759e75eb57933c65c36d74751dba2d695d60746bd15b8c92dd86407512c391`。内核是 `platform/coachz-prelink`，合并了 iPadOS 17.7.11 kernelcache 里 OS profile 的组件：共 31 个，其中 `com.apple.iokit.IOHIDEventDriver` 是无代码组件。
 
-第一轮（只有 trust cache，没有 PMGR 补丁）的屏幕照片已经显示 `com.apple.AppleFSCompressionTypeZlib`、APFS、IOSurface、AppleImage4 的启动输出，`BSD root: md0`，以及 `init running as PID 1` 和 tick。init 不再依赖内置 AMFI 接口，而是由真实 AMFI 放行，判断依据是 init 的 cdhash 在自建 trust cache 里，并且这一版内核没有 `coachz_amfi.c`。约 5 个 tick 后出现 `panic: "AMFI: No PMGR?" @ConfigurationSettings.cpp:235`，调用栈经过 `thread_call_invoke`、`thread_call_thread`，即 AMFI 的后台线程等待 `ApplePMGRNub` 超时。
+第一轮（只有 trust cache，没有 PMGR 补丁）的屏幕已经显示 `com.apple.AppleFSCompressionTypeZlib`、APFS、IOSurface、AppleImage4 的启动输出，`BSD root: md0`，以及 `init running as PID 1` 和 tick。init 不再依赖内置 AMFI 接口，而是由真实 AMFI 放行，判断依据是 init 的 cdhash 在自建 trust cache 里，并且这一版内核没有 `coachz_amfi.c`。约 5 个 tick 后出现 `panic: "AMFI: No PMGR?" @ConfigurationSettings.cpp:235`，调用栈经过 `thread_call_invoke`、`thread_call_thread`，即 AMFI 的后台线程等待 `ApplePMGRNub` 超时。
 
 第二轮加入 `coachz-prelink-pmgr.patch`，发布一个没有 provider 的 `ApplePMGRNub`。屏幕文字回绕后可以看到 tick 依次走完 1 到 9，再到 0、1、2，也就是至少 12 个，超过了上一轮 panic 的位置，没有新的 panic。
 
@@ -674,7 +674,7 @@ panic 的调用栈为 `PE_init_iokit → InitIOKit → OSlibkernInit → OSRunti
 - `Searching for NAND service`，反复 `Waiting for NAND service to publish`。
 - `COACHZ alive: 177 s`，同时 `restored_update[3]` 的 `x16` 是 `0x14e`（`__semwait_signal`），即它在循环中睡眠。
 
-这说明 Apple 的 launchd、dyld 和恢复服务可以在这台机器上运行，内核在它们退出后仍然存活。这只有屏幕证据，没有逐字段核对。绿块左边的进度方块用户没有反馈，还没有确认。
+这说明 Apple 的 launchd、dyld 和恢复服务可以在这台机器上运行，内核在它们退出后仍然存活。这只有屏幕证据，没有逐字段核对。绿块左边的进度方块还没有确认。
 
 这不是主系统：没有主系统卷、共享缓存、界面或显示驱动。`restored_update` 没有走到等待电脑连接那一步，这一轮不打算补 IOWatchdog 和 NVRAM，因为恢复环境不是目标。`kpersona_find_by_type() failed` 的影响没有确认。
 
@@ -704,9 +704,9 @@ panic 的调用栈为 `PE_init_iokit → InitIOKit → OSlibkernInit → OSRunti
 
 修正：DMA 池缩到 1 MiB。探针真机成功那一轮堆最多用了 176 KiB，内核再加 64 KiB 传输缓冲区。池子的物理地址核对过真机设备树：在普通 RAM 段内，不与任何保留区重叠，也不在 XNU 的物理窗口内。
 
-第二轮：屏幕照片依次显示 `COACHZ USB: mapped 1 1`、`controller 1`、`disk 1 after 787 ms`，`USBSTS 0x18`（没有 HSE、HCE），`fatal 0`，池子用了 240168 字节。随后是 512 字节扇区、`speed 3`，三个扇区 `lba 0`、`lba 1`、`lba 2048` 都是 `ok 1`，分别读到 `55AA`、`EFI PART`、`CHROMEOS`。这是 XNU 第一次在真机上自己枚举 USB 设备并读到外接盘的真实内容。之后 APFS 加载、内存盘作根、launchd 照常运行。
+第二轮：屏幕依次显示 `COACHZ USB: mapped 1 1`、`controller 1`、`disk 1 after 787 ms`，`USBSTS 0x18`（没有 HSE、HCE），`fatal 0`，池子用了 240168 字节。随后是 512 字节扇区、`speed 3`，三个扇区 `lba 0`、`lba 1`、`lba 2048` 都是 `ok 1`，分别读到 `55AA`、`EFI PART`、`CHROMEOS`。这是 XNU 第一次在真机上自己枚举 USB 设备并读到外接盘的真实内容。之后 APFS 加载、内存盘作根、launchd 照常运行。
 
-只有屏幕证据。照片里没有出现每分钟一次的 `COACHZ media:` 行，IOKit 块设备、GPT 分区和 IOMedia 是否发布还没有确认。没有写外接盘、固件或内置盘。
+只有屏幕证据。屏幕上没有出现每分钟一次的 `COACHZ media:` 行，IOKit 块设备、GPT 分区和 IOMedia 是否发布还没有确认。没有写外接盘、固件或内置盘。
 
 未解决：根文件系统仍是内存盘。随机 zone panic 原因未查明。
 
@@ -721,7 +721,7 @@ panic 的调用栈为 `PE_init_iokit → InitIOKit → OSlibkernInit → OSRunti
 
 第二轮（镜像 SHA-256 `dcae41b0b501f20be8c40e92032b49db8ee4f2e3d57f81fa1132d7eec666f1fc`）：没有 panic。`restored_update` 从外接盘根运行，行为与内存盘时相同：`disable_watchdog failed`，`exit: pid 5 restored_update status 0x100`，`restored exited normally with status 1 - rebooting`，之后循环等待 `IONVRAM`，并开始反复打印 `Waiting for NAND service to publish`。内核在 140 秒时仍存活，挂根前和心跳时的 IOMedia 列表为：`disk0`（GUID_partition_scheme）、`disk0s1`（ChromeOS 内核分区）、`disk0s2`（APFS 分区）、`disk1`（APFS 容器）、`disk1s1`（APFS 卷）。
 
-只有屏幕证据。照片里没有拍到 `COACHZ root:` 那一行；没有 panic 且根上的程序开始运行，说明放行生效，这是推断。根是只读的，没有写外接盘、固件或内置盘。这仍是恢复环境，不是主系统。
+只有屏幕证据。屏幕上没有看到 `COACHZ root:` 那一行；没有 panic 且根上的程序开始运行，说明放行生效，这是推断。根是只读的，没有写外接盘、固件或内置盘。这仍是恢复环境，不是主系统。
 
 未解决：随机 zone panic 未解释。
 
@@ -779,7 +779,7 @@ panic 的调用栈为 `PE_init_iokit → InitIOKit → OSlibkernInit → OSRunti
 
 ## 2026-10-31：watchdogd 真机故障偏移确认与临时策略
 
-运行时 `0bab269`，使用前述同一诊断镜像。屏幕取得 `COACHZ critical watchdogd` 的 PC、LR、SP、FP、可执行文件头与寄存器；按头地址消除 ASLR 后，PC 相对主程序头的偏移为 `0xab0c`，与同版原始 watchdogd 的缺少 IOWatchdog 分支内 BRK 完全相符。信号仍是 SIGTRAP，服务查找分支对应的寄存器为零；这次把此前的离线分支判断与真机停止位置接上。原始进程地址和照片保持私有。
+运行时 `0bab269`，使用前述同一诊断镜像。屏幕取得 `COACHZ critical watchdogd` 的 PC、LR、SP、FP、可执行文件头与寄存器；按头地址消除 ASLR 后，PC 相对主程序头的偏移为 `0xab0c`，与同版原始 watchdogd 的缺少 IOWatchdog 分支内 BRK 完全相符。信号仍是 SIGTRAP，服务查找分支对应的寄存器为零；这次把此前的离线分支判断与真机停止位置接上。原始进程地址不公开。
 
 下一轮使用 launchd 已有的根域禁用策略，只临时禁用 `com.apple.watchdogd`，让启动继续暴露后续依赖。`coachz-disable-watchdogd=1` 仅由带内存 Data 种子的主系统打包路径加入；成功挂载内存 `/private/var` 后、launchd 执行前创建 root 所有且不可由组／其他人写入的 `disabled.plist` 与 `disabled.migrated`，全部随内存 Data 在重启时丢失。拒绝覆盖已有文件，失败明确报告。没有修改原版 launchd 或 watchdogd、没有伪装 VM，也没有禁用全局关键进程 panic；这不是看门狗硬件支持。
 
@@ -797,7 +797,7 @@ panic 的调用栈为 `PE_init_iokit → InitIOKit → OSlibkernInit → OSRunti
 
 ## 2026-10-31：越过 watchdogd，usermanagerd 重启循环
 
-运行时 `f98d3aa`，使用前述临时 watchdogd 策略镜像。屏幕照片显示启动继续推进，没有重现 watchdogd 关键进程退出 panic，并仍有周期性的进程／线程采样。`usermanagerd` 反复以 `status 0x6` 退出，按固定 XNU 的 wait 状态解码为 SIGABRT；`fairplayd` 反复以零状态退出，launchd 经 xpcproxy 创建新实例。递增的 PID 反映这些创建活动，不是存活进程数，也不证明后续服务初始化或界面成功。
+运行时 `f98d3aa`，使用前述临时 watchdogd 策略镜像。屏幕显示启动继续推进，没有重现 watchdogd 关键进程退出 panic，并仍有周期性的进程／线程采样。`usermanagerd` 反复以 `status 0x6` 退出，按固定 XNU 的 wait 状态解码为 SIGABRT；`fairplayd` 反复以零状态退出，launchd 经 xpcproxy 创建新实例。递增的 PID 反映这些创建活动，不是存活进程数，也不证明后续服务初始化或界面成功。
 
 只读对比发现当前内存 Data 种子缺少锁定 UniXNU 离线 Data 准备脚本创建的部分空目录，包括 dslocal、PersonaVolumes 和 keybags 的目录骨架。这是待核实的依赖差异，尚不能据此认定 SIGABRT 的原因。原版 usermanagerd 还包含会话创建断言；本轮不跳过该服务、不改变密钥包启动参数，也不先补目录来掩盖第一处失败。
 
@@ -815,16 +815,16 @@ panic 的调用栈为 `PE_init_iokit → InitIOKit → OSlibkernInit → OSRunti
 
 ## 2026-10-31：首版 usermanagerd 诊断未取得可见现场
 
-运行时 `da224a1`，使用前述首次 abort 诊断镜像。照片仍显示 usermanagerd 以 `0x6` 反复退出、fairplayd 零状态退出及周期线程采样，没有取得预期的 `COACHZ UM` 现场。不能把这个结果记为诊断验收通过，也不能由照片断定钩子一定没有执行。
+运行时 `da224a1`，使用前述首次 abort 诊断镜像。屏幕仍显示 usermanagerd 以 `0x6` 反复退出、fairplayd 零状态退出及周期线程采样，没有取得预期的 `COACHZ UM` 现场。不能把这个结果记为诊断验收通过，也不能由屏幕断定钩子一定没有执行。
 
-核对最终内核机器码确认 proc_prepareexit 内确实调用新增 helper，周期采样也确实调用 report；原版钩子同时要求目标是 current_proc 且 wait 状态为 SIGABRT，report 在没有捕获时静默返回。此外，屏幕控制台换行在行数边界循环回顶部覆盖，并非保留历史的滚动终端。这些实现使现有照片无法区分未命中、输出被覆盖与其他退出上下文，尚未确定 usermanagerd 的根因。
+核对最终内核机器码确认 proc_prepareexit 内确实调用新增 helper，周期采样也确实调用 report；原版钩子同时要求目标是 current_proc 且 wait 状态为 SIGABRT，report 在没有捕获时静默返回。此外，屏幕控制台换行在行数边界循环回顶部覆盖，并非保留历史的滚动终端。这些实现使屏幕上无法区分未命中、输出被覆盖与其他退出上下文，尚未确定 usermanagerd 的根因。
 
 本地修订的诊断 v2 去除状态和 current_proc 的过滤，只按目标名称观察首次退出，明确输出原始 wait 状态、处理者 PID、自身／其他上下文和 exit reason。只有自身退出才 copyin 当前用户栈；其他上下文仅保存目标任务最多三个线程的 PC／LR／x16 快照，不将其冒充故障线程或调用栈。完成记录后用 release/acquire 发布。采样每十秒显示 v2 标记或完整现场，捕获后暂停全量线程／介质日志，降低覆盖速度。原版进程、退出策略和 Data 种子不变。源码内核与 prelink 已构建，27 项既有基础回归通过；最终机器码中的退出与报告调用已核对。镜像 SHA-256 为 `b7306195702fdeaff77ecd67482548f2448f51a26522e2a23d7f0724af9ec48f`，实际内嵌内核、v2 字符串、清单、相同 GPT 与 Data 字节已核对；既有免密写盘器完成 225 MiB 前缀写入与全量回读并返回零。没有自动重启，真机诊断仍未验收，调试修改保持未提交。
 
 
 ## 2026-10-31：v2 捕获正常初始化任务，确认 keybags 目录缺失
 
-前述本地 v2 镜像的屏幕照片取得了 `COACHZ UM v2` 记录、保存的 EL0 状态和三帧用户栈链，可见性修订实际工作。这次记录的 wait 状态为零、自身上下文、reason 为零，属于正常退出的早期 usermanagerd 初始化任务，不是之后 daemon 的 SIGABRT；首个退出锁存使后续异常未被保留。
+前述本地 v2 镜像的屏幕上取得了 `COACHZ UM v2` 记录、保存的 EL0 状态和三帧 EL0 栈链，可见性修订实际工作。这次记录的 wait 状态为零、自身上下文、reason 为零，属于正常退出的早期 usermanagerd 初始化任务，不是之后 daemon 的 SIGABRT；首个退出锁存使后续异常未被保留。
 
 原版输出显示 Default persona 创建成功，随后原子写入 `/private/var/keybags/persona.kb` 的临时文件 `persona.kb.writing` 时，open_dprotected_np 返回错误 2／No such file or directory。结合之前对 Data 种子的只读目录核对，keybags 父目录确实缺失；这是已经取得的具体文件系统失败，尚不能单凭它断定后续 SIGABRT 的完整根因。
 
@@ -833,7 +833,7 @@ panic 的调用栈为 `PE_init_iokit → InitIOKit → OSlibkernInit → OSRunti
 
 ## 2026-10-31：补齐 keybags 目录后推进到 SpringBoard 进程
 
-使用上一节同一镜像，屏幕显示 v3 正常初始化退出计数为一，原版 UMD_INIT 在此前的 persona.kb 原子写入报错点之后继续输出已加载的 System／Default persona、选择用户 501、加载前台用户及普通模式会话设置；未再显示原先的目录不存在错误。在两个不同时间的照片中，v3 均仍等待异常退出，尚未捕获到 usermanagerd 的非零退出。这是本次观察区间内的结果，不代表所有用户管理功能或长期稳定性已验收。
+使用上一节同一镜像，屏幕显示 v3 正常初始化退出计数为一，原版 UMD_INIT 在此前的 persona.kb 原子写入报错点之后继续输出已加载的 System／Default persona、选择账户 501、加载前台账户及普通模式会话设置；未再显示原先的目录不存在错误。在两个不同时刻的屏幕上，v3 均仍等待异常退出，尚未捕获到 usermanagerd 的非零退出。这是本次观察区间内的结果，不代表所有账户管理功能或长期稳定性已验收。
 
 同次启动的屏幕出现 SpringBoard 的退出记录，wait 状态为 `0x6`／SIGABRT，证明启动已推进到该进程的退出路径；尚没有可见界面，也没有其真实故障 PC／调用栈。locationd、sharingd、chronod 等也出现 SIGABRT，liveactivitiesd 则为 SIGTRAP；不据相同信号断定相同根因。
 
@@ -848,10 +848,10 @@ panic 的调用栈为 `PE_init_iokit → InitIOKit → OSlibkernInit → OSRunti
 
 ## SpringBoard 首次异常：Objective-C trampoline 路径缺失
 
-独立的 SpringBoard 诊断已在真机照片中输出首个异常退出：`status 0x6`，
+独立的 SpringBoard 诊断已在真机屏幕上输出首个异常退出：`status 0x6`，
 `OS_REASON_OBJC`（namespace 8）、code 1。原始说明为无法 `dlopen`
 `/usr/lib/libobjc-trampolines.dylib`：普通路径不存在，亦不在 dyld cache 中。
-已取得可执行文件基址、cache slide、PC/LR 与 12 层用户栈；原始现场保留在私有记录中。
+已取得可执行文件基址、cache slide、PC/LR 与 12 层 EL0 栈；原始现场不公开。
 这确认了装载命名空间故障，不表示已进入正常图形界面，也不能由此判断 GPU 是否可用。
 
 只读检查同一 IPSW 的原始 OS 与 SystemOS：该文件不在 OS，却在 SystemOS 的 `usr/lib`
@@ -881,23 +881,23 @@ USB 写入，所有读写及真实 SCSI cache flush 共用一个锁。原厂 vbo
 
 ## 2026-10-31：原生 union 与外接 Data 启动路径越过缺库，进入主显示器断言
 
-同一四分区整盘镜像的本地写入与完整回读由操作者完成，摘要匹配，随后手动启动。
-照片中的 SpringBoard 首次异常已由此前 namespace 8/code 1 的缺库 SIGABRT 变为
+同一四分区整盘镜像的本地写入与完整回读摘要匹配，随后手动启动。
+屏幕上的 SpringBoard 首次异常已由此前 namespace 8/code 1 的缺库 SIGABRT 变为
 `status 0x5`、`OS_REASON_SIGNAL`（namespace 2）、code 5，且为自身退出上下文。
-照片包含本轮共享缓存 slide 与可读帧链。
+屏幕上有本轮共享缓存 slide 与可读帧链。
 
 使用本次 IPSW 原始缓存和 UUID 匹配的 local-symbol 文件独立符号化：PC 对应
 `-[FBSDisplayMonitor _initWithBookendObserver:transformer:] + 1148`，随后帧链经过
 FrontBoard 的 `+[FBDisplayManager sharedInstance]` block、libdispatch once 和
 `-[FBSystemShell _initWithOptions:]` block。原始缓存该 PC 的指令为 BRK；解析此
 故障块实际引用的 CFString 得到 `failed to find the main CADisplay`。此字符串是原始
-二进制的静态断言引用，并非照片捕获的运行时输出；原始地址和图像留在私有记录中。
+二进制的静态断言引用，并非运行时输出。
 `Too many corpses being created` 仍只是后续崩溃处理失败，不能取代这个故障位置。
 
 本镜像在 launchd 前强制验证 union 根关系及规范路径的 trampoline 文件，并在外接
 Data 的 GPT、cache sync、卷选择、挂载或目录／策略准备失败时停止。因此 SpringBoard
 到达新位置说明这些启动前检查已经通过，且已越过此前原版 Objective-C 缺库退出；这是
-根据确切镜像与强制路径作出的判断，照片没有保留所有早期成功行。恢复到 Debian 后，
+根据确切镜像与强制路径作出的判断，屏幕没有保留所有早期成功行。恢复到 Debian 后，
 只读分区检查确认第四分区为 8 GiB APFS。没有再次出现之前带 Data 角色的未加密卷拒绝。
 重启后的文件内容持久性尚未单独读回，不将分区存在等同于完整的持久性验收。
 
@@ -923,12 +923,12 @@ IOMobileFramebuffer/CADisplay 服务；此轮没有可见用户界面，也没�
 本轮只打包 225 MiB 内核前缀，主分区表与上一轮整盘镜像逐字节相同，写入边界恰好
 停在 OS 分区之前；不重写 OS、SystemOS 或 8 GiB Data。镜像参数选择同一 Data 卷，
 不带 RAM Data，包装器标量指令审计通过。既有目标端写盘器已更新此前核验的外接测试盘，
-完整 225 MiB 回读摘要匹配，未自动重启。测试仍需操作者手动启动并拍照确认。
+完整 225 MiB 回读摘要匹配，未自动重启。测试仍需手动启动。
 
 
 ## 2026-10-31：持久化 Data 的第二次启动在策略文件重复创建处停止
 
-显示实验首轮照片确认 SystemOS union 与外接 Data 的挂载返回 0，keybags 目录准备也
+显示实验首轮确认 SystemOS union 与外接 Data 的挂载返回 0，keybags 目录准备也
 返回 0；随后 watchdogd 禁用策略返回 17 并触发显式 panic。该错误来自 launchd 前的
 文件准备步骤，尚未运行新显示后端，不能据此判断显示驱动成败。
 
@@ -950,7 +950,7 @@ IOMobileFramebuffer/CADisplay 服务；此轮没有可见用户界面，也没�
 
 ## 2026-10-31：显示后端越过主 CADisplay 断言，停在显示模式校验
 
-k20 照片显示 SpringBoard 首个异常退出仍为 `status 0x5`／SIGTRAP，但 PC 已不在
+k20 屏幕显示 SpringBoard 首个异常退出仍为 `status 0x5`／SIGTRAP，但 PC 已不在
 `failed to find the main CADisplay`。用同版缓存和 UUID 匹配的本地符号符号化，调用链为
 `FBSDisplayMonitor` → `FBSDisplaySource` → `FBSDisplayConfiguration` →
 `-[FBSDisplayMode _initWithCADisplayMode:scale:rotation:]` →
@@ -963,9 +963,9 @@ k21 在 SpringBoard 诊断中加入断言现场 x19／x24／x25／x26 与 x19 �
 校验已有 `disabled.plist` 时返回 13（EACCES）并 panic。k22 在已有策略文件不一致时
 打印属主、权限、长度与开头内容，原样另存为 `<path>.coachz-prev`，再写回预期字节并
 恢复 root／0644；主机重放测试覆盖另存、写回、权限恢复和一致时不重写。k22 未再出现
-该 panic，k23 照片中两个策略文件校验均返回 0。
+该 panic，k23 屏幕上两个策略文件校验均返回 0。
 
-k22 照片取得模式对象：2160×1440、scaleOverride 0、**preferredScale 0.0**、刷新率
+k22 屏幕上取得模式对象：2160×1440、scaleOverride 0、**preferredScale 0.0**、刷新率
 60.0、gamut 1、hdr／rotation／virtual 为 0，确认失败项是 preferredScale。只读挂载
 Data 复制出的 MobileGestalt 缓存中，`main-screen-scale`、`main-screen-pitch`、
 `main-screen-class` 都属于存放在 CacheExtra 的键，却都不存在；该缓存由没有显示服务的
@@ -973,7 +973,7 @@ Data 复制出的 MobileGestalt 缓存中，`main-screen-scale`、`main-screen-p
 读不到时默认 0。
 
 k23 的 `coachz-prelink-mgcache-reset.patch` 仅在显示路线（`coachz-reset-mgcache=1`）
-于 launchd 前删除这一个缓存文件。照片显示删除返回 0，显示后端报告
+于 launchd 前删除这一个缓存文件。屏幕显示删除返回 0，显示后端报告
 `original Legacy active, mode 2160x1440 scale 2`，原版 launchd 正常启动；随后屏幕出现
 `COACHZ display: CPU transfer 1 status 0x0 bytes 12441600`（正好一帧 2160×1440×4）、
 `frame 2 kind 0 nonzero 41605`，中央显示原版白色苹果标志。这是原版 iPadOS 图形首次经
@@ -985,7 +985,7 @@ k23 的 `coachz-prelink-mgcache-reset.patch` 仅在显示路线（`coachz-reset-
 `_LSCopyServerStore`）中经 NSXPCConnection 同步等待 lsd 回复。谁发出 SIGKILL、lsd
 是否运行或卡住尚未确认。
 
-同次启动稍后的照片中，屏幕变为原版白色界面，下方显示 `Press home to upgrade`，
+同次启动稍后的屏幕上，屏幕变为原版白色界面，下方显示 `Press home to upgrade`，
 `CPU transfer 5 status 0x0 bytes 12441600`。屏幕文字控制台叠在帧缓冲上方，诊断仍保留
 首个 SIGKILL 现场；这表明后续重启的 SpringBoard 已绘制原版系统界面。这是等待用户按
 Home 继续升级／迁移的画面，与从未完成设置或迁移的 Data 卷相符；尚无触摸或按键输入，
@@ -994,7 +994,7 @@ Home 继续升级／迁移的画面，与从未完成设置或迁移的 Data 卷
 
 ## 2026-10-31：launchd 重写策略文件；稳定启动到升级界面
 
-k24 照片显示，已有 `disabled.plist` 与预期不一致：root 所有、0644、356 字节，开头为标准
+k24 屏幕显示，已有 `disabled.plist` 与预期不一致：root 所有、0644、356 字节，开头为标准
 XML plist 与 DOCTYPE。这是 launchd 在上一轮运行中按自身格式重写的结果。替换步骤报告
 成功，但随后复核仍返回 13：内核 `vnode_open` 不替调用者执行 `O_TRUNC`，短内容只覆盖了
 文件开头，长度仍为 356。主机测试的桩函数把 `O_TRUNC` 交给了 POSIX `open`，因此没有发现。
@@ -1008,7 +1008,7 @@ XML plist 与 DOCTYPE。这是 launchd 在上一轮运行中按自身格式重�
 随每 10 秒的报告打印。k25 真机启动没有 panic；SpringBoard（pid 27）于 110 秒启动，lsd 于
 123 秒按需启动。291 秒的报告记录 1 次 SIGKILL：`backboardd(57) -> SpringBoard(27)`，
 发生在 201 秒，同一秒新的 SpringBoard（pid 172）启动。被杀现场去掉 slide 后的 PC 与上一轮
-相同，仍是 LaunchServices 初始化中经 XPC 同步等待 lsd 回复。操作者确认屏幕已变为白底的
+相同，仍是 LaunchServices 初始化中经 XPC 同步等待 lsd 回复。屏幕已变为白底的
 `Press home to upgrade` 界面，随后被滚动的文字控制台覆盖。
 
 因此首个 SpringBoard 在约 91 秒未完成启动时被 backboardd 结束，第二个 SpringBoard 绘制界面；
@@ -1021,8 +1021,7 @@ k26 在显示后端启动时读取 CPU 标识并粗测主频，实现了原先�
 `native_legacy_copy_timing_observed`，并在启动诊断中于 SpringBoard 启动后约 45 秒、80 秒
 各记录一次 lsd 线程快照（状态、阻塞类型、PC/LR/x16，主线程用户栈）。
 
-照片显示 `midr 0x51df805e`（高通 Kryo Silver，基于 Cortex-A55）、`mpidr 0x81000000`
-（CPU0），计数器 19.2 MHz，2000 万次计数循环 13195 µs，约每微秒 1515 次。按每次一周期估算
+屏幕显示 MIDR 为高通 Kryo Silver（基于 Cortex-A55），运行在 CPU0，计数器 19.2 MHz，2000 万次计数循环 13195 µs，约每微秒 1515 次。按每次一周期估算
 约 1.5 GHz，与 SC7180 小核 1516 MHz 档位相符；这是粗测，不是调频寄存器读数。系统只运行在
 这一颗核上。
 
@@ -1051,7 +1050,7 @@ MPIDR.MT，核号位于 Aff1，原代码在无 `HAS_CLUSTER` 时只比较 Aff0�
 k27、k28 实际仍带 `cpus=1`：XNU 只解析启动核，ADT 中的其余 CPU 没有逻辑编号，ArmCpu
 跳过它们，k28 报告显示三颗从核均停在步骤 0。k27 观察到的“变快”因此与多核无关，原因未确定。
 
-k29 照片中的周期报告：`3 secondary running`，CPU1～3 均为步骤 7、PSCI 返回 0、无失败码；
+k29 屏幕上的周期报告：`3 secondary running`，CPU1～3 均为步骤 7、PSCI 返回 0、无失败码；
 开机 31 秒时四颗核的定时器中断计数分别约为 23171、22914、22821、22799。显示后端启动时的
 测速在 MPIDR 0x81000300（CPU3）上运行，报告测速在 CPU2 上运行，确认调度已使用从核。
 四颗核测速均约每微秒 757 次，与 k26 单核时的约 1515 次相比约为一半，与小核 768 MHz 档位
@@ -1075,7 +1074,7 @@ k33 的探测仍是 `grp1 0x0`。host 上的反汇编给出了原因：Mach-O �
 `"dsb ishst; msr icc_sgi1r_el1, %0; isb"` 只生成一条 `dsb`，所以 `signalCPU` 从未发出 SGI。
 内联汇编改用 `\n` 分隔后，k34 的 `signalCPU` 等四个函数都有这条写入。
 
-k34 的照片（开机 31 秒和 41 秒两次周期报告）：
+k34 的屏幕（开机 31 秒和 41 秒两次周期报告）：
 
 - `7 secondary running, 8 CPUs in 2 clusters`，八个核都是步骤 7、PSCI 返回 0、无失败码。
 - CPU0～5 显示 `p805 E`，CPU6、7 显示 `p804 P`。
@@ -1085,7 +1084,7 @@ k34 的照片（开机 31 秒和 41 秒两次周期报告）：
   只有 2 和 0 次。
 
 因此 IPI 已在真机上工作，但大核基本没有分到负载。计数循环在 CPU0 上约为每微秒 757 次，同样
-只是估算，不是调频寄存器读数。机主观察到 SpringBoard 的刷新仍然极慢、帧间隔很长，写合并映射
+只是估算，不是调频寄存器读数。SpringBoard 的刷新仍然极慢、帧间隔很长，写合并映射
 的效果还没有测到。
 
 
@@ -1101,7 +1100,7 @@ k35 在 k34 上改了四处：
 - USB 驱动的 `udelay` 改成原地等待，不再让线程睡眠。它现在真的按微秒计时，APFS 刷盘可能超过
   libpayload 的 5 秒处理上限，所以上限放宽到 60 秒。
 
-照片（屏幕证据）：
+屏幕：
 
 - 升级页从“Press home to upgrade”变成“Swipe up to upgrade”，底部出现 Home 指示条。
 - 第 7 次拷帧（2160×1440×4，12441600 字节）用了 16142 µs，距上一次 333 ms。此前未缓存映射、
@@ -1111,12 +1110,12 @@ k35 在 k34 上改了四处：
   静止画面，不出新帧本身不说明慢；同一块缓冲第 8 次比第 7 次慢十倍以上，原因未查。
 - `COACHZ freq`：A55 从第 6 档 1516 MHz 升到第 9 档（共 9 档）1804 MHz；A76 开机已在最高的
   第 13 档 2400 MHz；L3 从第 7 档 1209 MHz 升到第 10 档 1459 MHz。
-- 内核 `memcpy` 约 4511 MB/s（这一行在照片底部，只拍到一部分）。
+- 内核 `memcpy` 约 4511 MB/s（这一行只看到一部分）。
 - 八个核都是步骤 7、PSCI 返回 0、EL1；CPU0～5 为 `p805 E`，CPU6、7 为 `p804 P`；探测仍是
   `grp1 0xff`。CPU6、7 的定时器和 SGI 计数（7188／39708、11079／40661）是各核中最高的，
   A55 为 1373～3277／10934～18628，大核已经在承担负载。
 - 第一个 SpringBoard 仍以 SIGKILL 退出（namespace 2、code 9），退出时停在与 lsd 主线程相同的
-  等待处；之后启动的 SpringBoard 画出了升级页。这次照片里没有拍到发出 SIGKILL 的进程。
+  等待处；之后启动的 SpringBoard 画出了升级页。这次屏幕上看不到发出 SIGKILL 的进程。
 
 仍然没有输入设备，升级页无法继续。
 
@@ -1128,7 +1127,7 @@ cpufreq-hw 两个 CPU 域偏移 0x704 的当前投票；窗口内的拷帧统计
 出第一帧后屏幕控制台只用最上面 14 行（`coachz-console-band=14`），panic 时恢复整屏。
 
 第一版把 0x18323000 起只映射了 0x3000，A76 状态寄存器在 0x2800 + 0x920，越界后在 cpu 7 上 data abort；
-映射改为 0x4000 后正常。照片（屏幕证据）：
+映射改为 0x4000 后正常。屏幕：
 
 - 三次测量都是 CPU0～5 为 1804 MHz、CPU6、7 为 2399～2400 MHz，旧的 subs/b.ne 循环在每颗核上给出同样的数。
   k29 那次约 768 MHz 的读数是在拉高频率之前，当时的实际状态已无从确认。
@@ -1148,7 +1147,7 @@ cpufreq-hw 两个 CPU 域偏移 0x704 的当前投票；窗口内的拷帧统计
 
 k37 起报告还包括：每个 USB 块 I/O 的次数、字节、持锁和等锁时间；按内核栈分组的 backboardd、SpringBoard、
 lsd 等待线程（栈帧从线程的 `machine.kstackptr` 读，无栈时显示 continuation）；拷帧前用 `AT S1E1R` 读出的
-源缓冲区内存属性，以及拷贝前内容扫描的耗时。照片（屏幕证据）：
+源缓冲区内存属性，以及拷贝前内容扫描的耗时。屏幕：
 
 - k37：开机 101 秒的 10 秒窗口里，拷贝 15.5～170 ms，但拷贝前的两遍内容扫描用了 292 ms，源缓冲区属性
   为 0x44（不可缓存）。扫描和拷贝都在 backboardd 提交帧的线程里进行，这 10 秒 backboardd 用了 3.2 s CPU。
@@ -1171,17 +1170,17 @@ k40 在 launchd 之前向外接 Data 写入 UniXNU `scripts/seed-data-skip-setup
 后替换，mobile 0600）。kill 和页面都没变，这在意料之中，因为 kill 不是看门狗造成的。
 k41 按 ios-sweet NOTES.md 的结论给 `/chosen` 加上合成的 `unique-chip-id` 与 `chip-id`（0x8011）：
 XNU 只用它们生成 IOPlatformUUID，没有它，CurrentHost 偏好写不进去，迁移就记不住已完成。kill 和页面仍然一样。
-机主重启过，第二次开机结果相同。
+重启后第二次开机结果相同。
 
 这一页其实不是 SpringBoard 的锁屏，见下一节。偏好和芯片 ID 的效果仍未验证。
 
 ## 持久日志、触摸和 PreBoard（k42～k46）
 
-系统从未卡死。k37～k44 的照片时间相近（如 `now 101 s`），是因为机主在同一个故障阶段结束实验；曾把这个时间读成
+系统从未卡死。k37～k44 的屏幕时间相近（如 `now 101 s`），是因为实验都在同一个故障阶段结束；曾把这个时间读成
 “100～120 秒卡死”是错的，k44 据此加的 `coachz-diag` 开关只留作减少输出。屏幕和诊断文字一直在刷新。
 
 - k45 把屏幕控制台的全部输出每秒写进外接盘末尾 64 MiB 的日志区（分区和备份 GPT 之外，写入只来自内核的这一个线程），
-  Debian 上用只读脚本取回。真机读回 166 KB，内核心跳到 148 秒还在走。之后不用再靠照片读日志。
+  Debian 上用只读脚本取回。真机读回 166 KB，内核心跳到 148 秒还在走。之后不用再靠屏幕读日志。
 - k42 起 GENI I2C 通了：SE4 上读到 HID 描述符 `vid 27c6 pid 0e94`，报告描述符 1193 字节，与 Linux 一致；
   ShengHidInput 的数字化仪挂到 IOHIDResource 下，报告全部送进 HID，错误数 0。上滑时原始 y 从约 8600 减小，
   x 沿 2160 像素一边，方向不用翻转。
@@ -1191,7 +1190,7 @@ XNU 只用它们生成 IOPlatformUUID，没有它，CurrentHost 偏好写不进�
   `com.apple.AppleUserHIDDrivers.dext` 的 personality（`IOProbeScore` 1），由它接管设备，XNU 最多等 120 秒。
 - k46 在发布设备前把一条内核 `IOHIDEventDriver` personality 加进 IOCatalogue（`Transport` SPI、Digitizer/Touch
   Screen、不带 `IOMatchDefer`、`IOProbeScore` 1000）。真机日志：驱动是 `IOHIDEventDriver`，`user clients 1`，
-  没有 `DK:` 行；一次开机 141 秒内 210 帧。**机主从底边上滑，页面进入 “Enter Passcode” 并画出键盘（照片）。**
+  没有 `DK:` 行；一次开机 141 秒内 210 帧。**从底边上滑，页面进入 “Enter Passcode” 并画出键盘。**
 - 这一页来自 PreBoard：`PREBOARD_SWIPE_FOR_UPGRADE` = "Swipe up to upgrade" 在 `/Applications/PreBoard.app` 的
   字符串表里，它有 `_handleEdgeSwipe:` 和 `exiting as result of successful unlock`。日志里 PreBoard 启动后几行，
   backboardd 就杀了第一个 SpringBoard，并新起一个。backboardd 里有 `BKAlternateSystemApp`，据此推断这是在把系统界面切给
@@ -1210,7 +1209,7 @@ XNU 只用它们生成 IOPlatformUUID，没有它，CurrentHost 偏好写不进�
 - `datamigrator` 的字符串显示触发条件只有两个：哨兵 `/private/var/datamigrator/migrate` 存在，或
   `LastSystemVersion` 与当前版本不同。之前用 `DMUserDataDisposition` 判断偏好已写入，而这个键 DataMigration 自己也会写，
   所以 `LastSystemVersion` 很可能一直没写进去。
-- k48 改用 `LastSystemVersion` 判断，并在 launchd 之前删除哨兵。**机主照片：iPadOS 主屏幕、Dock 和状态栏都画出来了，
+- k48 改用 `LastSystemVersion` 判断，并在 launchd 之前删除哨兵。**iPadOS 主屏幕、Dock 和状态栏都画出来了，
   没有再跑进度条。** 日志确认 `com.apple.migration` 被改写（原文件确实没有 `LastSystemVersion`），哨兵文件本来就不存在。
 
 ## App（k49～k52）
@@ -1229,8 +1228,8 @@ XNU 只用它们生成 IOPlatformUUID，没有它，CurrentHost 偏好写不进�
   `-[PSGAboutController viewDidLoad]`**，停在 `_macAddress` 的 `dispatch_once` 上。所以 Settings 这条因果链成立，“关于本机”页还会卡住。
 - k51 把不缓存的 DRAM 从 Device-GRE 改成 Normal 非缓存，backboardd 仍在同一条 `dc zva` 上 SIGBUS，所以这一改动没有解决它。
   k52 在内核里接住这个错误、用普通写入清零并记录 MMU 属性（`@dczva`），还没有真机结果。
-- 机主报告 backboardd 崩溃重启后触摸没有反应。日志里报告仍在进 HID（`to HID 911`），`user clients 1`，SpringBoard 主线程空闲在 runloop，
-  所以断点在 backboardd 重启之后的上层，原因没查。k49 那次机主还看到过一次 panic，内容没有落盘；k50 起 panic 文字也写进日志区，这段写入还没有真机触发过。
+- backboardd 崩溃重启后触摸没有反应。日志里报告仍在进 HID（`to HID 911`），`user clients 1`，SpringBoard 主线程空闲在 runloop，
+  所以断点在 backboardd 重启之后的上层，原因没查。k49 那次还出现过一次 panic，内容没有落盘；k50 起 panic 文字也写进日志区，这段写入还没有真机触发过。
 - k52、k53 的 `@dczva` 记到 `attr 0x0`：IOSurface 的 `VM_WIMG_RT` 映射在这个配置下就是 Device-nGnRnE（没有 `HAS_UCNORMAL_MEM`，
   `CACHE_ATTRINDX_RT` 等于 `CACHE_ATTRINDX_DISABLE`），k51 改的分支没有走到。接住 `dc zva` 之后，backboardd 又在 CoreGraphics 的非对齐访问上 SIGBUS。
 - k54 让内核管理的内存（`pa_valid`）在这些不缓存映射下都用 Normal 非缓存。**真机日志：全程没有 `@crash`，`@dczva` 为 0，backboardd 和 SpringBoard
@@ -1241,10 +1240,10 @@ XNU 只用它们生成 IOPlatformUUID，没有它，CurrentHost 偏好写不进�
 
 驱动由另一个会话写好，说明在 `docs/plans/battery-speaker.md` 和 `docs/plans/input.md`。
 
-- 电池：`COACHZ battery: 97 % 8466 mV 0 mA 3474/3578 mAh flags 0xb ac 1`，随后 `published`，机主确认状态栏显示电量。同一时间 Debian 的
+- 电池：`COACHZ battery: 97 % 8466 mV 0 mA 3474/3578 mAh flags 0xb ac 1`，随后 `published`，状态栏显示电量。同一时间 Debian 的
   `sbs-12-000b` 读到 97%、8464 mV、0 mA、3474/3580 mAh，充电器在线。
 - 测试音：k53 失败在 `no contiguous DMA buffer`，因为内核内存全在 4 GiB 以上，而 LPASS DMA 只有 32 位。k54 把缓冲放到内核窗口外的低端 DRAM
-  `0x81200000`：`tone played: 2 periods, 0 errors, irq 0x8, 1001 ms`，**机主听到了声音**。这只是一次性测试音，系统和 App 还没有音频输出。
+  `0x81200000`：`tone played: 2 periods, 0 errors, irq 0x8, 1001 ms`，**能听到声音**。这只是一次性测试音，系统和 App 还没有音频输出。
 - 音量键：`EC buttons supported 0x7, enabled volume`，按键时 `buttons 0x4 -> report 0x8: 0x0`、`0x2 -> report 0x4: 0x0`，报告进了 HID 且返回 0。
   屏幕上没有出现音量条，可能因为系统还没有音频设备，未验证。
 
@@ -1253,9 +1252,9 @@ k54 起第一帧之后屏幕不再显示诊断文字（`coachz-console-band=0`�
 ## 背光和键盘（k55）
 
 - 背光（`coachz-backlight=1`，说明在 `docs/plans/backlight.md`）：`initial duty 52428`、`service conforms 1 attached 1 started 1`，
-  随后 269 行 `target … applied … readback …`，读回值和设定值只差量化误差，错误数 0。**机主确认控制中心的亮度滑块能调屏幕亮度。**
+  随后 269 行 `target … applied … readback …`，读回值和设定值只差量化误差，错误数 0。**控制中心的亮度滑块能调屏幕亮度。**
 - 键盘（`coachz-usb-keyboard=1`，`coachz_usb_hid.c`）：`keyboard at 2, vendor 18d1 product 504c, interface 0 ... protocol 0 idle -6 queue 1`。
-  SET_IDLE 失败（-6），打字不受影响。**机主确认键盘能用。** 开机早期有一行 `the keyboard device is not ready for report 0`，因为报告先于 HID 设备到达。
+  SET_IDLE 失败（-6），打字不受影响。**键盘能用。** 开机早期有一行 `the keyboard device is not ready for report 0`，因为报告先于 HID 设备到达。
 - 这次开机全程没有 panic 和 `@crash`，系统盘正常。
 
 ## Adreno 618 前几级（k56～k59）
@@ -1275,22 +1274,22 @@ k54 起第一帧之后屏幕不再显示诊断文字（`coachz-console-band=0`�
   开机时约 37 °C，有负载时 bank 0 峰值到约 55 °C。Debian 同一时期 `cpu*-thermal` 约 44～49 °C，量级一致，但两边没有逐路对照。这还没有接入温控，频率仍然固定在最高档。
 - Wi-Fi：`SMEM v12 inventory status 0`，14 个分区项，global 和 apps-modem 分区都解析到了。SMP2P 项 428、GLINK 项 478～480 都不存在，因为基带没有启动。没有启动 WCN3990，也没有发布网卡。
 - 加速度计：EC 枚举出 3 个传感器。传感器 0 是 BMI 加速度计，12.5 Hz、±4 g，静止时读数合成约 1 g，错误数 0。陀螺仪 ODR 为 0（未启用），传感器 2 的类型 5 这个驱动不支持。没有接 CoreMotion，屏幕不会自动旋转。转动机身时重力依次落到 +Y、+Z、-X 轴，幅值一直约 1 g。
-- 合盖（k62，`coachz-switches=1`，说明在 `docs/plans/switches.md`）：`supported 0xf raw 0x5`，bit 0（LID_OPEN）在 `0x5`、`0x4`、`0x5` 之间变化了一次，错误数 0。机主依次做了合盖和拆底座，而日志在开机 127 秒、这两次变化之后就停了，bit 2（BASE_ATTACHED）没有变化。所以不能认定 EC 漏报了底座；日志在拆底座前后为什么停止还没有查明。这只读取状态，不触发锁屏或睡眠。
+- 合盖（k62，`coachz-switches=1`，说明在 `docs/plans/switches.md`）：`supported 0xf raw 0x5`，bit 0（LID_OPEN）在 `0x5`、`0x4`、`0x5` 之间变化了一次，错误数 0。依次做了合盖和拆底座，而日志在开机 127 秒、这两次变化之后就停了，bit 2（BASE_ATTACHED）没有变化。所以不能认定 EC 漏报了底座；日志在拆底座前后为什么停止还没有查明。这只读取状态，不触发锁屏或睡眠。
 
 ## 系统音频（k63）
 
 `coachz-speaker=2`：内核启动 `CoachzAudio` 服务，launchd 之前把 `CoachzAudio.driver` 写到 Data 卷，并用 bindfs union 挂到 `/System/Library/Audio/Plug-Ins/HAL`。插件的 CDHash 放在单独的 trust cache 模块里，打包时用 `--root-trust-cache` 传入。
 
-- 机主反馈：系统声音正常，“声音完美”。这是听感判断，没有录音或频谱对照。
+- 系统声音听起来正常。这是听感判断，没有录音或频谱对照。
 - 日志：`plug-in mount stage 3 status 0`，host clock 请求返回 0，输出开关 5 次、累计约 11.8 秒，校正 0 次，没有 `@crash`，没有 panic。
-- k63 的路由显示为 “Speaker” 和音响图标。插件把设备报成 Thunderbolt，因为内置设备只能走 Apple 的端口描述，USB 设备又要带 HAL 不接受的位置信息（UniXNU-sheng 的结论）。k64 把设备名改成 “iPad” 后，机主确认名字变了，图标还是音响。
+- k63 的路由显示为 “Speaker” 和音响图标。插件把设备报成 Thunderbolt，因为内置设备只能走 Apple 的端口描述，USB 设备又要带 HAL 不接受的位置信息（UniXNU-sheng 的结论）。k64 把设备名改成 “iPad” 后，名字变了，图标还是音响。
 - 没验证：麦克风输入（输入环目前是静音）、音量条、耳机插孔、均衡和扬声器保护。
 
 ## 启动图（k64）
 
-探针加载内核时，在黑底上居中画 `boot/splash_data.h`（512×512，由 64×64 放大）。开始清内存窗口前只显示红色通道，内核段复制完叠加绿色，ADT 和 RAM 盘复制完叠加蓝色，变成全彩。机主确认实际按 R、G、B 的顺序显示。它取代了原来的绿角和三个彩色方块。
+探针加载内核时，在黑底上居中画 `boot/splash_data.h`（512×512，由 64×64 放大）。开始清内存窗口前只显示红色通道，内核段复制完叠加绿色，ADT 和 RAM 盘复制完叠加蓝色，变成全彩。实际按 R、G、B 的顺序显示。它取代了原来的绿角和三个彩色方块。
 
-图是机主 atm10-zh-cn 项目的资源包图标，已经带透明通道，叠到黑底上就是去掉背景。换图用 `tools/splash_image.py`，它也会把和边缘或透明区相连的近白色区域去掉，图内部的白色保留。
+图是 atm10-zh-cn 项目的资源包图标，已经带透明通道，叠到黑底上就是去掉背景。换图用 `tools/splash_image.py`，它也会把和边缘或透明区相连的近白色区域去掉，图内部的白色保留。
 
 ## GMU 固件启动（k65）
 
@@ -1346,7 +1345,7 @@ k68（改成两次 32 位写之后）：
 - k69：SMMU 工具包在路由 stream 时拒绝（全局配置不符），CP 没启动。同时预留 768 MiB，而 XNU 当时只配了 1 GiB，jetsam（namespace 1 code 4）杀光了进程，所以没进界面。插件 9 个文件写入，挂载成功。
 - k70：内存窗口 4 GiB，约 3.95 GiB 可用页，进桌面，没有 jetsam。SMMU 工具包还要求空闲 stream 组先 fault。CPU 继续合成。
 - k71：内存窗口 6 GiB，约 5.83 GiB 可用页。SMMU、ME_INIT、发布服务、`AGXAccelerator` 全部通过，基类地址和审计记录一致。合成器发现 Metal 后选了 `b3a8` 表面，显示驱动拒绝，帧计数为 0。
-- k72：ADT 改成 sRGB。**机主看到了界面，日志确认由 GPU 合成：** 开机约 112 秒内 ring 提交 400 次，fence 400/400；199 帧交给 GPU，198 帧完成，失败 0、放弃 0；CPU 拷贝帧数 0。RBBM、CP、protect 都是 0，bank 0 fsr 只有 FORMAT 字段，gfsr 0。没有 `@crash` 和 panic。
+- k72：ADT 改成 sRGB。**界面出来了，日志确认由 GPU 合成：** 开机约 112 秒内 ring 提交 400 次，fence 400/400；199 帧交给 GPU，198 帧完成，失败 0、放弃 0；CPU 拷贝帧数 0。RBBM、CP、protect 都是 0，bank 0 fsr 只有 FORMAT 字段，gfsr 0。没有 `@crash` 和 panic。
 
 k72 的性能数据（插件自己的统计，355 MHz）：
 - 提交到完成 374 次，平均 40 ms，最长 101 ms。
@@ -1356,7 +1355,7 @@ k72 的性能数据（插件自己的统计，355 MHz）：
 
 已知问题和没验证的：
 - 屏幕控制台的文字盖在界面上（跑码）。它靠第一帧 CPU 拷贝来静音，GPU 路径没有这一帧。
-- 机主反馈帧率不高。没有给内存发带宽投票，也没有动态调频。
+- 帧率不高。没有给内存发带宽投票，也没有动态调频。
 - 还没有确认 App 自己能用 Metal。放行的进程只有 backboardd、iconservicesagent、WidgetRenderer_Default 和 PosterBoard。
 - GPU 没有电源管理（GPU_SET 一直保持）、没有中断、没有复位和每进程页表。长时间稳定性没有验证。
 
@@ -1364,18 +1363,18 @@ k72 的性能数据（插件自己的统计，355 MHz）：
 
 k73：GPU 升到 650 MHz，GPU 路径接手时也静音屏幕控制台。k74：Turnip 每个 pass 都用系统内存渲染（`TU_DEBUG=sysmem`），另外加了 GPU 时钟/忙碌计数和 EC 的只读探针。两次都进桌面，没有 `@crash` 和 panic。
 
-- 跑码：机主确认已经消失。
+- 跑码：已经消失。
 - k73：ring 提交 1165 次，全部 fence；571 帧上屏，失败 0。提交到完成平均 32.0 ms（k72 在 355 MHz 下是 40.0 ms），最长 180 ms。
 - k74：ring 提交 1943 次，全部 fence；945 帧上屏，失败 0。提交到完成平均 28.2 ms，最长 330 ms。
 - 时钟：CP 的 always-count 计数器对 always-on 计数器，每秒都是 649～650 MHz，和设定一致。
 - 忙碌率：GMU 的 busy 计数器（Linux `a6xx_gpu_busy` 用的那个）最高 56%，GPU 将近一半时间空闲。
 - 重帧（插件 FA3）：间隔 58.8 ms，其中 GPU 段 34.1 ms（k73 是 39.0 ms），CPU 编码 25.8 ms（k73 是 25.9 ms）。渲染服务器编码完一帧就同步等它完成，再编码下一帧，两段是串行的，所以间隔约等于两者之和。每个命令缓冲从提交到被调度（运行时翻译成 Vulkan 再提交）要 5～8 ms，只有一次 blit 的也一样。
-- 画面：机主看到电池、时钟这类小图标偶尔会花。两次日志都有同一条警告：一张约 95×29 的 A8Unorm 纹理建在 no-copy buffer 上，运行时没法为它建线性图像。花屏是不是 sysmem 引起的，还不知道。
+- 画面：电池、时钟这类小图标偶尔会花。两次日志都有同一条警告：一张约 95×29 的 A8Unorm 纹理建在 no-copy buffer 上，运行时没法为它建线性图像。花屏是不是 sysmem 引起的，还不知道。
 - 内存（k73，开机 40 秒后在 CPU0 和 CPU6 上各测 32 MiB，循环和 Debian 上的基准相同）：XNU 比 Debian 慢 10～30%，没有数量级差别。
 
 EC 探针（k74，`coachz-battery=1`）每 10 秒读一次两个 PD 端口的 `EC_CMD_USB_PD_POWER_INFO`，再按 Linux `cros_ec_debugfs` 的方式读 EC 自己的控制台（`CONSOLE_SNAPSHOT` 加 `CONSOLE_READ`），全部写进日志环，不改 EC 的任何状态。
 
-- k73 里机主重新插拔充电器后，充电停了，灯也灭了。EC 的 PD 日志（Debian dmesg）：谈到 5V 3A 后约 60 ms 断开，之后 EC 把这个端口记成供电方，输入限流 512 mA，没再升到 12V。
+- k73 里重新插拔充电器后，充电停了，灯也灭了。EC 的 PD 日志（Debian dmesg）：谈到 5V 3A 后约 60 ms 断开，之后 EC 把这个端口记成供电方，输入限流 512 mA，没再升到 12V。
 - 同一个充电器在 Debian 下重新插拔，约 0.4 秒就到 12V 2.5A，开始充电，所以充电器和电池没有问题。
 - k74 里重新插拔一次，结果正常。EC 控制台依次是 `Attached.SNK`、5V 3A、请求 12V 2.5A、`PE_SNK_Ready`、`AC on`，前后约 0.2 秒，电池恢复充电。k73 那次的原因不明，没有复现。
 - EC 控制台还有 139 次 `MKBP not cleared within threshold, toggling`：XNU 只轮询按键状态，没有像 Linux 那样把 MKBP 事件取走。这次带着它照样正常充电。
@@ -1385,12 +1384,12 @@ EC 探针（k74，`coachz-battery=1`）每 10 秒读一次两个 PD 端口的 `E
 Turnip、metal2vulkan 运行时和 Metal 插件改从固定在新版本的 UniXNU 副本构建（`upstream.lock.json` 的 `unixnu-gpu`）。内核仍是 k74 那版 Adreno740 框架，补了新上层用的 `SetPriority`（只接收）和 `Note`（写进日志环）两个方法。sysmem 改由启动参数 `sheng-tu-debug=sysmem,nocb` 设置。
 
 - 进桌面，ring 提交 532 次全部 fence，252 帧上屏，失败 0；没有 `@crash` 和 panic。
-- 机主这次没有看到小图标花屏，也没觉得变快。
+- 这次没有看到小图标花屏，也没有变快。
 - GPU 忙碌率最高 72%（k74 是 56%），时钟仍是 650 MHz。
 - 新插件的分帧统计和 `Note` 都要 `sheng-diag=1` 才记录，这次没开，所以没有可比的帧分解。
 - 渲染服务器最忙的几条线程常在 A55 上运行，优先级多是 37。
 
-同一次的照片：主屏小组件是白色空块，壁纸全黑，图标压在小组件上。面板 EDID 是 2160×1440、233×155 mm（3:2，方形像素），而系统装扮成 11 英寸 iPad Pro（约 1.43:1），启动时的苹果标志被横向拉宽。
+同一次的屏幕：主屏小组件是白色空块，壁纸全黑，图标压在小组件上。面板 EDID 是 2160×1440、233×155 mm（3:2，方形像素），而系统装扮成 11 英寸 iPad Pro（约 1.43:1），启动时的苹果标志被横向拉宽。
 
 ## 屏幕方向、GPU 剖析、MPSS 前提（k76～k78）
 
@@ -1417,7 +1416,7 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 - k81 第一次构建为 modem 固件申请了带 `Z_NOFAIL` 的 1 MiB `kalloc_data`，开机即 panic；改成不带 `Z_NOFAIL` 的 256 KiB 并检查返回值后正常。固件块在内核分区 144 MiB 处：`mba.mbn` 283296 字节、`qdsp6sw.mbn` 65583404 字节，sha256 都对，ELF machine 164（Hexagon），入口 `0x4417000` 和 `0x86000000`。
 - k81，GPU DCVS 切档（`GMU_DCVS_PERF_SETTING` 加 HOST2GMU bit 23，等 GMU2HOST bit 31）：3、1、7 档分别在 60、60、28 µs 内应答，CP 周期计数器测得 354、179、799 MHz。800 MHz 比 650 MHz 没有更快，UCHE 延迟按周期数上升。
 - k81，频率表：A55 288～1804 MHz（596～868 mV），A76 652～2400 MHz（588～956 mV）。PSCI 1.1：CPU_SUSPEND 特性 2（支持 OS 发起），SYSTEM_SUSPEND 支持，SET_SUSPEND_MODE 和 CPU_DEFAULT_SUSPEND 不支持，SMCCC 1.2。
-- k82 让 Turnip 自选 tile 内存（`sheng-tu-debug=nocb`）：SP 忙从 48.6% 降到 26.9%，UCHE 延迟从 366 降到 274 周期，但提交到完成从 52.3 ms 升到 56.9 ms，所有颜色红蓝互换（照片）。UniXNU `porting/gpu` 的渲染模式一节早已记录同样的结论，k83 起回到 `sysmem,nocb`。
+- k82 让 Turnip 自选 tile 内存（`sheng-tu-debug=nocb`）：SP 忙从 48.6% 降到 26.9%，UCHE 延迟从 366 降到 274 周期，但提交到完成从 52.3 ms 升到 56.9 ms，所有颜色红蓝互换。UniXNU `porting/gpu` 的渲染模式一节早已记录同样的结论，k83 起回到 `sysmem,nocb`。
 - k82 第二次启动 panic：`kmem_alloc(…, 589824, …) failed with 3`。589824 字节是 MBA 第一段整块映射 GCC 的大小；ARM 的 io_submap 固定 8 MiB，`ml_io_map` 的映射不释放，已经被各驱动的寄存器窗口占满。
 - k82，温控自检：钳位时档位寄存器读回 A55 6、A76 9，GPU 上限 6；撤销后读回 9、13 和 7。0x704 寄存器始终是 2995 MHz，实际频率是否下降没有测。调频器在一个安静的秒里就从 800 降到 430 MHz。
 - k83，io_submap 扩到 32 MiB（同 x86），K44 行打印用量：开机后 7420 KiB，原来的 8 MiB 再放 576 KiB 必然失败。Wi‑Fi 代码改为共用一个 4 KiB 的 GCC 页。没有 panic。
@@ -1482,7 +1481,7 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 
 - 触摸改照主线 `i2c-hid-core.c` 和 `i2c-hid-of-goodix.c`：Goodix 的上电复位时序，读 HID 描述符，GPIO 9 电平中断经 TLMM 汇总线（GIC SPI 208）进来，SET_POWER ON 后等 60 ms，RESET 后等复位响应，再 SET_POWER ON，然后才读报告描述符；之后每次中断读一份完整报告，绝不在控制器没拉中断时读。这是这台机器上第一次用 GIC 外设中断。
 - k99 中断能进来，但线程用计数器判断中断是否到来，复位响应那一次正好漏掉，中断停在屏蔽状态。k100 改成中断置待处理标志、线程取走。
-- k101：复位握手完成，约 2480 次中断全部读出报告送进 HID，重度触摸时每秒 100 份，读错、意外复位、杂散中断都是 0。机主仍感到触摸后来“挂了”：那几秒里报告照常进 `IOHIDEventDriver`，屏幕没有新帧，SpringBoard、backboardd、设置的主线程都在等事件，GPU 送显正常。问题在 HID 之上；那段时间很多笔画从屏幕上沿开始。
+- k101：复位握手完成，约 2480 次中断全部读出报告送进 HID，重度触摸时每秒 100 份，读错、意外复位、杂散中断都是 0。触摸后来仍然“挂了”：那几秒里报告照常进 `IOHIDEventDriver`，屏幕没有新帧，SpringBoard、backboardd、设置的主线程都在等事件，GPU 送显正常。问题在 HID 之上；那段时间很多笔画从屏幕上沿开始。
 - WLFW：指示注册、主机能力、MSA 信息（wlan_mem 里两段：0x94100000+0x10000 安全区、0x94110000+0x1f0000）、MSA 就绪、能力查询（芯片 0x320、族 0x4001、板 0x67、SoC 0x400c0000、固件 WLAN.HL.3.2.2.c10-00754），用 `board-2.bin` 里 `bus=snoc,qmi-board-id=67` 的 26328 字节分 5 段下发板级数据，空校准报告，然后收到 FW ready。
 
 ## WMI 初始化完成，eMMC 第一阶段上线，多指后触摸失效可复现（k102～k104）
@@ -1494,41 +1493,41 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 - **HTC**：收到 READY（2 个 credit，每个 2184 字节），连上 HTT 和 WMI。k102 卡在 pktlog 连接超时：`ath10k_htc_pktlog_svc_supported` 要求服务表里上下行都有管道，snoc 的表只有下行，Linux 不会连这个服务，是我多发了请求；k103 起照 Linux 跳过。
 - **WMI**：service ready 的 ABI 匹配，2 条射频链，0 个主机内存请求。k103 发出 WMI_INIT 后 5 秒没等到 READY，原因是接收缓冲只有 64 字节；k104 放大后 INIT 之后 10 ms 收到 READY，status 0。READY 里 MAC 的前 3 字节全 0。还没有 vdev 和扫描。
 - **eMMC 和 microSD**：`COACHZ mmc` 日志显示 eMMC 主机寄存器可读、power 中断到来、卡识别完成（EXT_CSD rev 8），52 MHz、8 位、高速时序，只读块设备发布，k103 和 k104 都如此。microSD 槽当时没插卡，报告无卡，符合实际。分区发布没有日志能证实，读卡未测。没有写入。
-- **触摸**：五指搓屏后单指滑动失效，机主可稳定复现；此时音量键的提示仍流畅。
+- **触摸**：五指搓屏后单指滑动失效，可稳定复现；此时音量键的提示仍流畅。
   - k102 起 K45 行记录按下数和按住时长：失效后每秒 20～60 份报告继续进 HID，按下和抬起成对，`frames` 为 0。
-  - k103 照 `hid-multitouch` 改为按 contact count 组帧，加 confidence、同帧重复 ID 和 100 ms sticky 释放。机主确认问题没变；palms、continued、duplicates、sticky 计数全是 0，这块屏最多报 5 点。
-  - k104 把 ShengHidInput 未用的手指槽改用 ID 255，并统计交给 backboardd 的事件。机主确认问题没变。日志里 10 个可见的 `held` 有 9 个是 0，另一个是 4，当时确实有 4 指按着。K45 行太长被日志环截断，dup、hand、rebegin 等计数大多没留下，所以 HID 层是否完全干净还没有结论。
+  - k103 照 `hid-multitouch` 改为按 contact count 组帧，加 confidence、同帧重复 ID 和 100 ms sticky 释放。问题没变；palms、continued、duplicates、sticky 计数全是 0，这块屏最多报 5 点。
+  - k104 把 ShengHidInput 未用的手指槽改用 ID 255，并统计交给 backboardd 的事件。问题没变。日志里 10 个可见的 `held` 有 9 个是 0，另一个是 4，当时确实有 4 指按着。K45 行太长被日志环截断，dup、hand、rebegin 等计数大多没留下，所以 HID 层是否完全干净还没有结论。
   - K45 的 `frames` 只在打印时清零，安静的几秒之后的值是多秒累计（71、103 都是这样），不是每秒帧数。
 
 ## eMMC 写入、GPU 中断、电源键，触摸失效的线索指向路径编号（k105）
 
-一张镜像走完整启动，日志来自外接盘的日志环。机主实测：普通单指点滑正常，大面积手指乱搓才触发失灵；电源键正常。
+一张镜像走完整启动，日志来自外接盘的日志环。实测：普通单指点滑正常，大面积手指乱搓才触发失灵；电源键正常。
 
 - **eMMC 写入**：写入窗口只认 GPT 名字和起止都对得上的 `coachz-scratch`（1 GiB）。自检在窗口最后 2048 块进行：窗口外 5 次写全部拒绝，单块 8 块、多块 2040 块写入，读回 0 处不符；写 23317 KB/s，读 35560 KB/s。`previous image 0 of 2048` 说明这是第一次写，跨重启保留要看下一次启动。microSD 这次也没插卡。
 - **GPU 中断**：SPI 300 上 2312 次中断对应 2312 个 fence，AHB、ATB、CP、hang、UCHE、GMU、HFI 错误位全 0。等 fence 的线程不再自旋：这段时间睡了 10573 次，其中 8348 次到 1 ms 上限才醒，随后重新检查。
 - **电源键**：`enabled volume and power`，按下时 `buttons 0x1 -> report 0x2`，松开回到 0。休眠本身还没做。
 - **触摸**：K47 的 HID 计数这次完整。失灵前后 `hid out` 和 `fingers` 继续增长，`held` 回到 0，`dup`、`hand`、`rebegin`、`lone up`、`cancel` 全是 0，驱动的 palms、continued、duplicates、sticky 也都是 0。SpringBoard 和 backboardd 的线程采样前后没有差别，所以事件确实离开了内核，线程没有卡住。
-- **静态核对，不是真机结果**：`IOHIDEventDriver` 把 contact id 当路径编号（`kIOHIDEventFieldDigitizerIndex`）。backboardd 的反汇编里，`%d >= MAX_PATH_COUNT` 前面是 `cmp x0, #0x1e`，`addContact: pathIndex out of bounds` 前面是 `cmp x23, #0x1f`，还有 `_pathIndexTouchingMask` 这样的位掩码。这里传的是控制器 7 位的滚动 id（0..127）；主线 `mt_compute_slot` 用 `input_mt_get_slot_by_key` 映射成最小的空闲槽号，移植时漏了这一步。按这个解释，乱搓时新接触很多，id 很快超过 30，之后的单指被 backboardd 丢弃，id 回绕后又恢复。要等修正上机后由机主实测确认。
+- **静态核对，不是真机结果**：`IOHIDEventDriver` 把 contact id 当路径编号（`kIOHIDEventFieldDigitizerIndex`）。backboardd 的反汇编里，`%d >= MAX_PATH_COUNT` 前面是 `cmp x0, #0x1e`，`addContact: pathIndex out of bounds` 前面是 `cmp x23, #0x1f`，还有 `_pathIndexTouchingMask` 这样的位掩码。这里传的是控制器 7 位的滚动 id（0..127）；主线 `mt_compute_slot` 用 `input_mt_get_slot_by_key` 映射成最小的空闲槽号，移植时漏了这一步。按这个解释，乱搓时新接触很多，id 很快超过 30，之后的单指被 backboardd 丢弃，id 回绕后又恢复。要等修正上机后实测确认。
 
 ## 触摸失灵修好，键盘可拆装，eMMC 写入跨重启保留（k106）
 
-- **触摸**：移植 `input_mt_get_slot_by_key` 后，机主实测大面积手指乱搓不再失灵。这次启动有 162 个新接触，其中 104 个的原始 id 不小于 30（最高 120），槽位最多用到 5 个，没有溢出；这 104 个在旧内核上都会被 backboardd 按 `MAX_PATH_COUNT` 丢弃。HID 计数继续干净：`hid out` 1484，`fingers` 3759，`held` 回到 0，其余异常计数全 0。
-- **键盘拆装**：只轮询不在根盘路径上的 hub。机主在系统里把底座拆下、装回两次，日志是 `keyboard detached` 和新的 `keyboard at N` 交替，第二次之间收到 26 份报告；根盘没断，没有 panic。EC 开关状态同步在 `0x5`（底座在）和 `0x3`（底座离开，平板模式）之间变化了 4 次。之前那次日志停在 127 秒的现象这次没有复现，原因还是不明。
+- **触摸**：移植 `input_mt_get_slot_by_key` 后，实测大面积手指乱搓不再失灵。这次启动有 162 个新接触，其中 104 个的原始 id 不小于 30（最高 120），槽位最多用到 5 个，没有溢出；这 104 个在旧内核上都会被 backboardd 按 `MAX_PATH_COUNT` 丢弃。HID 计数继续干净：`hid out` 1484，`fingers` 3759，`held` 回到 0，其余异常计数全 0。
+- **键盘拆装**：只轮询不在根盘路径上的 hub。在系统里把底座拆下、装回两次，日志是 `keyboard detached` 和新的 `keyboard at N` 交替，第二次之间收到 26 份报告；根盘没断，没有 panic。EC 开关状态同步在 `0x5`（底座在）和 `0x3`（底座离开，平板模式）之间变化了 4 次。之前那次日志停在 127 秒的现象这次没有复现，原因还是不明。
 - **eMMC**：写入自检读到 `previous image 2048 of 2048`，上一次启动写的内容重启后还在。这次写 27044 KB/s。分区发布仍然没有日志能证实。
 - **GPU 中断**：1954 次中断对应 1954 个 fence，错误位全 0。
 - **Wi-Fi**：这张带了 HTT 和被动扫描的代码，但 `wl_step` 开头的 `wl.state >= 19` 把新状态都挡住了，没有执行。这是代码错误，不是固件的结果。
 
 ## 启动菜单、功能键、eMMC 分区发布、第一次被动扫描（k107）
 
-- **启动菜单**：机主确认音量键选择、电源键确认都可用，iPadOS 和 Debian 两项都能启动。选 Debian 时探针按 pattern 镜像验证过的顺序停掉背光和显示，再走已有的 `linux_handoff`。
+- **启动菜单**：音量键选择、电源键确认都可用，iPadOS 和 Debian 两项都能启动。选 Debian 时探针按 pattern 镜像验证过的顺序停掉背光和显示，再走已有的 `linux_handoff`。
 - **从菜单进的 Debian 没有网络**：桌面显示飞行模式，Wi-Fi 和 LTE 都没有；之后正常开机 `wlan0`、`rmnet_ipa0` 都在，没有留下后遗症。源码和布局推断，还没有日志证实：Depthcharge 把 Image 搬到第一段放得下的内存，也就是 `atf_mem` 之后（`get_kernel_reloc_addr`），Linux 排在 XNU 负载之后的偏移 `0x4000000`，占用的范围和 LTE 版的 `mpss_mem`（`0x86000000` 起）重叠；主线 `early_init_dt_reserve_memory` 遇到已保留的范围返回 `EBUSY`，这个 no-map 区域就保留失败，modem 起不来，而系统本身还能启动。下一张镜像把 Linux 排到最前面。
-- **功能键**：接口 0 留在 report 协议（主线 usbhid 就不切 boot 协议），12 字节报告前 8 字节不变，后面 18 个位按键盘描述符的 usage 顺序原样进 report 4。机主确认亮度和音量键完全正常，其他键没有逐个确认。
+- **功能键**：接口 0 留在 report 协议（主线 usbhid 就不切 boot 协议），12 字节报告前 8 字节不变，后面 18 个位按键盘描述符的 usage 顺序原样进 report 4。亮度和音量键完全正常，其他键没有逐个确认。
 - **eMMC 分区**：开机 30 秒列出所有 IOMedia：`disk0`（eMMC）的 `disk0s1`～`disk0s5` 都已发布，含 KernelA、KernelB 和 `coachz-scratch`；`disk1` 是外接盘。没有写入窗口以外的区域。
 - **Wi-Fi**：7 个 pdev 参数、监管域、22 个信道和 vdev 0 都发出。三轮被动扫描都正常结束（约 2.9 秒，67 个事件，22 个信道，原因 0），但 mgmt 帧计数是 0。HTT 版本请求没发出去（`wh_send` 返回 -1），HTT 还没有初始化，这是接下来要查的。
 
 ## 从菜单进的 Debian 有网络，被动扫描听到 beacon（k108）
 
-- **菜单进 Debian**：Linux 排到镜像最前面（`boot/xnu-screen.ld`，偏移 `0x200000`）后，机主确认有网络。这次启动的探针记录是 `Boot menu entry=1`，日志里 `mpss_mem` 保留成功（`nomap non-reusable`），`remoteproc` 启动 modem，ath10k 报告 WCN3990，`wlan0` 和 `rmnet_ipa0` 都在。k107 的现象因此归因于内核布局压到保留内存。
+- **菜单进 Debian**：Linux 排到镜像最前面（`boot/xnu-screen.ld`，偏移 `0x200000`）后，有网络。这次启动的探针记录是 `Boot menu entry=1`，日志里 `mpss_mem` 保留成功（`nomap non-reusable`），`remoteproc` 启动 modem，ath10k 报告 WCN3990，`wlan0` 和 `rmnet_ipa0` 都在。k107 的现象因此归因于内核布局压到保留内存。
 - **Wi-Fi 被动扫描**：k107 听不到帧，这张先照 `ath10k_core_start` 填好接收环，再发 HTT 版本请求（回复 3.87）、分片描述符、接收环配置和聚合配置。之后三轮扫描各听到 69、72、67 个 beacon 或 probe response，来自 45、43、41 个发射源（只数 BSSID 的散列，名称和地址都不记录），最好 SNR 55～56，信道最忙约 56%～67%。整个过程没有发射。日志里按频段的分类是错的（把信道号当成 MHz），已改正，这次的数字不能说明 5 GHz。
 - **GPU 中断**：9074 次中断对应 9074 个 fence。
 - **PosterBoard**：3 次 SIGTRAP，都在 `-[PBFModalRootViewController initWithScene:dataStore:behaviorAssertionProvider:]`，来自场景连接时的断言。原因没查，k107 里没有出现。
@@ -1539,55 +1538,55 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 - 写入窗口内的自检：上次写的 2048 块重启后完整，窗口外 5 次写全部拒绝，新写 2048 块读回 0 处不符。写 53989 KB/s，读 60190 KB/s，连续读 64 MiB 用 1288 ms（52089 KB/s）。
 - 按连续读算，每条 64 KiB 的命令约 1.26 ms，而总线上的数据只要约 0.16 ms，所以目前受每条命令约 1.1 ms 的开销限制，不是总线的上限。还没有带宽投票。
 - Wi-Fi 频段统计改正后，三轮扫描各听到 66、56、57 帧，2.4 GHz 和 5 GHz 大约各半。
-- 外接盘：这几次开机盘突然不见，机主确认是插充电线把 U 盘带松，不是驱动或 USB 栈的问题。
+- 外接盘：这几次开机盘突然不见，是插充电线把 U 盘带松，不是驱动或 USB 栈的问题。
 
 ## 键盘操作启动菜单，eMMC 单次传输加大（k110）
 
-- **菜单键盘**：探针在菜单期间跑 libpayload 的 xHCI 和 hub 栈（`boot/usb_menu.c`，没有大容量存储驱动，所以磁盘不会收到命令），键盘切到 boot 协议读 8 字节报告，退出前 `usb_exit()` 停掉控制器。机主确认键盘能操作菜单，之后 XNU 和根盘照常启动。
+- **菜单键盘**：探针在菜单期间跑 libpayload 的 xHCI 和 hub 栈（`boot/usb_menu.c`，没有大容量存储驱动，所以磁盘不会收到命令），键盘切到 boot 协议读 8 字节报告，退出前 `usb_exit()` 停掉控制器。键盘能操作菜单，之后 XNU 和根盘照常启动。
 - **eMMC**：单次传输从 64 KiB 加到 480 KiB，短等待先自旋 300 µs。以 64 KiB 为单位读刚写过的 1 MiB 从 60190 涨到 103973 KB/s，写从 53989 涨到 66775 KB/s。但连续读 64 MiB（窗口内从没写过的区域）仍是 50614 KB/s，单次传输加大七倍也没变，所以这里不是每条命令的开销。可能是这片区域本身慢，也可能是总线带宽没投票，还需要和 Debian 对比。
-- **电池**：开机时状态栏先显示未充电，过一会儿才显示充电（机主观察）。日志显示这是 EC 的真实状态：第 1 次读 `0xb`（充电，+100 mA），约 10 秒后 `0x7`（接着充电器但在放电，-62 mA），约 90 秒后回到 `0xb`（+21 mA）。当时充电器约 12 W（8.6 V、输入 1424 mA），开机负载比它大。
+- **电池**：开机时状态栏先显示未充电，过一会儿才显示充电。日志显示这是 EC 的真实状态：第 1 次读 `0xb`（充电，+100 mA），约 10 秒后 `0x7`（接着充电器但在放电，-62 mA），约 90 秒后回到 `0xb`（+21 mA）。当时充电器约 12 W（8.6 V、输入 1424 mA），开机负载比它大。
 
-- **Wi-Fi 系统接入**：`en0` 打开，网络栈被 IONetworkStack 打开，wifid 发了约 300 条 Apple80211 请求（不支持的类型 96、97、106、207、470、383、18、57、6、473 等返回 102），一轮扫描约 70 帧、40 多个发射源，2.4 和 5 GHz 各半。机主确认设置里出现 Wi-Fi 和网络列表；点击一个网络后设置卡住，只能杀掉重开。日志里没有类型 20（加入），请求没到驱动，卡在上层，原因未查明。还没有 Preferences 和 wifid 的线程采样，下一张加。
-- **GPU 电源管理**：空闲 66 ms 自动 slumber，13 次，每次约 1 ms，power state 0xf、status 0；恢复 status、ring、ME_INIT、wait 全 0，约 11 ms。机主确认按电源键熄屏再点亮后界面恢复。
+- **Wi-Fi 系统接入**：`en0` 打开，网络栈被 IONetworkStack 打开，wifid 发了约 300 条 Apple80211 请求（不支持的类型 96、97、106、207、470、383、18、57、6、473 等返回 102），一轮扫描约 70 帧、40 多个发射源，2.4 和 5 GHz 各半。设置里出现 Wi-Fi 和网络列表；点击一个网络后设置卡住，只能杀掉重开。日志里没有类型 20（加入），请求没到驱动，卡在上层，原因未查明。还没有 Preferences 和 wifid 的线程采样，下一张加。
+- **GPU 电源管理**：空闲 66 ms 自动 slumber，13 次，每次约 1 ms，power state 0xf、status 0；恢复 status、ring、ME_INIT、wait 全 0，约 11 ms。按电源键熄屏再点亮后界面恢复。
 - **eMMC 总线投票**：CN1、SN7、SN0 投票后共发出 6 个 BCM（列表有 7 个，其中一个不在 CMD DB 里，还没查是哪个）；读刚写过的 1 MiB 113322 KB/s，写 61095 KB/s，连续读没写过的 64 MiB 60362 KB/s（投票前 50614）。投票只解释了很小一部分差距。
-- **关于本机**：有了 `en0` 之后，“设置 → 关于本机”正常打开，显示版本、型号、容量和 Wi-Fi 地址（机主实测，照片）。之前卡住的 `_macAddress` 等待已经没有了。
+- **关于本机**：有了 `en0` 之后，“设置 → 关于本机”正常打开，显示版本、型号、容量和 Wi-Fi 地址。之前卡住的 `_macAddress` 等待已经没有了。
 
 ## 迁移到 UniXNU 当前的 GPU 框架
 
 - **CP 卡死的原因**：第一个进程提交一直停在 CP。诊断镜像记下 `CP_INTERRUPT_STATUS` 0x1（opcode error），IB 第 48–63 个字（字节 `0xC0`–`0xFF`，一条 64 字节缓存行）在提交时的 DRAM 和 CP 的 ROQ 里都是 0；`CP_ROQ_AVAIL_IB1` 剩 133 字，正好停在第 49 字。同一次启动的 8 个自测 IB（内核表和进程表、4 GiB 上下）全部完成，所以地址和页表都不是原因。
 - **修法**：VM 先经可缓存映射清零页，之后才批量改成写合并，而这版 XNU 的批量路径只清 RT 页。新分配的写合并 BO 现在先 clean + invalidate，主线 `get_pages` 对非缓存 BO 也这样做。机制来自源码，真机上卡死不再出现。
-- **结果**：6315 次提交全部完成，显示 3119 帧，所有错误计数为 0。机主确认界面能用，但觉得比上一版更卡、撕裂更明显，壁纸还是黑的。同一阶段的 GPU 自身执行时间没有明显变化（轻量帧约 2 ms），轻量帧提交到完成从 2–4 ms 变成 4–8 ms。
+- **结果**：6315 次提交全部完成，显示 3119 帧，所有错误计数为 0。界面能用，但比上一版更卡、撕裂更明显，壁纸还是黑的。同一阶段的 GPU 自身执行时间没有明显变化（轻量帧约 2 ms），轻量帧提交到完成从 2–4 ms 变成 4–8 ms。
 - **Wi-Fi 加入**：系统发起加入后，认证、关联和四次握手都完成，发出 262 帧全部被确认，收到 173 帧；没有拿到 IPv4 地址。离开后下一次加入时 wifid 抛异常退出（`PRIVATE_MAC_ADDRESS_VALUE` 为空），设置显示无法加入。
 - **充电显示**：那次用的是慢充（EC 输入限流 512 mA，电池约 -718 mA），系统显示未在充电是真实状态。
 
 ## 从 eMMC 启动
 
 - **存储**：外接盘拔掉后，内核、OS、SystemOS、Data 和日志都在 eMMC 上，启动进入主屏幕。Data 由 Debian 从外接盘逐字节拷贝，读回哈希一致；OS 卷逐字节一致；SystemOS 拷贝时哈希一致，事后复查在拔盘前的约 85% 内没有差异。它和 IPSW 原文件差 10 个 4 MiB 块，容器事务号从 14 变成 23，只读挂载为什么推进事务号还不知道。
-- **壁纸**：数据保护类保留后，8 个壁纸扩展第一次启动（Aegir、Collections、Emoji、Gradient、Hello、Kaleidoscope、Pride、Rhizome）；壁纸设置页能打开，机主手动选的壁纸能显示。不选的话默认壁纸还是黑的。Aegir、Collections、Kaleidoscope 各有一次状态 0x9 退出。
+- **壁纸**：数据保护类保留后，8 个壁纸扩展第一次启动（Aegir、Collections、Emoji、Gradient、Hello、Kaleidoscope、Pride、Rhizome）；壁纸设置页能打开，手动选的壁纸能显示。不选的话默认壁纸还是黑的。Aegir、Collections、Kaleidoscope 各有一次状态 0x9 退出。
 - **GPU 和图标**：`COACHZ grant` 记录 WebKit 经 kobject 过滤放行映射 GPU 内存。主屏图标画出来了，`@nullcall` 0 次。
-- **网络和时间**：EC RTC 校时后系统日期正确；照片上 Safari 打开 HTTPS 网页，日期和时间设置页正常。保存的密码还在，但开机后不会自动加入：wifid 启动后扫描一轮，取完结果不发起关联。
+- **网络和时间**：EC RTC 校时后系统日期正确；Safari 打开 HTTPS 网页，日期和时间设置页正常。保存的密码还在，但开机后不会自动加入：wifid 启动后扫描一轮，取完结果不发起关联。
 - **传感器**：加速度计量程 4 g，静止约 (-0.04, 0.93, 0.41) g；陀螺仪量程 1000 dps，静止读数约 (20, -21, 3)。两者 25 Hz；3 个 SPU HID 设备都被 IOHIDEventDriver 打开。这份日志里没有方向变化记录，无法判断转动时方向判断对不对。
 - **后台任务**：`fairplayd`、`identityservicesd`、`CommCenter`、`accessoryupdaterd` 不再启动；`bluetoothd` 启动 18 次，每次状态 0 退出。
-- **色阶**：机主拍到白色场景和弹窗阴影的一圈圈色阶。源码（pinned coreboot）在桥接芯片上写 18 bpp，Debian 读到 `0x5b` 为 0、`0x94` 为 0x20、`0x93` 为 0x34。固件状态下的值还没在真机上读过。
+- **色阶**：白色场景和弹窗阴影有一圈圈色阶。源码（pinned coreboot）在桥接芯片上写 18 bpp，Debian 读到 `0x5b` 为 0、`0x94` 为 0x20、`0x93` 为 0x34。固件状态下的值还没在真机上读过。
 
 ## 显示位深、转屏、自动加入和系统 App
 
-- **色阶**：固件状态读到 `0x5b` 为 1（18 bpp）、4 lane、1620 MHz，像素时钟 207792 kHz，24 bpp 需要 1558 MHz。停视频流、改位深、再开之后 `0x5b` 为 0，机主确认白色场景的色阶消失。
-- **转屏**：`/chosen/display-rotation` 设为 270，Apple logo 和主屏都是横向正的（照片）；转动机器时日志的方向判断在 1 和 3 之间变化，机主确认旋转正确。主屏网格是 6 列，小组件互相贴住，布局没有完全对。
-- **Wi-Fi**：`wifid` 不再报信道不支持和信号门槛；没有打开设置，开机后自己加入，-29 dBm，DHCP 正常；状态栏图标变实心（照片）。
-- **App**：`/Applications` 联合挂载阶段 5；28 个占位包移开后，Waiting 和云朵都不见了（照片）。时钟、备忘录、新闻小组件有内容，部分还是白块；`WidgetRenderer_Default` 和 `WeatherWidget` 各崩溃一次。LaunchServices 重建约 70 秒，标记写入成功（下次启动应跳过重建，未验证）。
-- **键盘和触控板**：开机后接上底座能用，滚动方向正确（机主实测）。
+- **色阶**：固件状态读到 `0x5b` 为 1（18 bpp）、4 lane、1620 MHz，像素时钟 207792 kHz，24 bpp 需要 1558 MHz。停视频流、改位深、再开之后 `0x5b` 为 0，白色场景的色阶消失。
+- **转屏**：`/chosen/display-rotation` 设为 270，Apple logo 和主屏都是横向正的；转动机器时日志的方向判断在 1 和 3 之间变化，旋转正确。主屏网格是 6 列，小组件互相贴住，布局没有完全对。
+- **Wi-Fi**：`wifid` 不再报信道不支持和信号门槛；没有打开设置，开机后自己加入，-29 dBm，DHCP 正常；状态栏图标变实心。
+- **App**：`/Applications` 联合挂载阶段 5；28 个占位包移开后，Waiting 和云朵都不见了。时钟、备忘录、新闻小组件有内容，部分还是白块；`WidgetRenderer_Default` 和 `WeatherWidget` 各崩溃一次。LaunchServices 重建约 70 秒，标记写入成功（下次启动应跳过重建，未验证）。
+- **键盘和触控板**：开机后接上底座能用，滚动方向正确。
 - **日志**：四个槽按启动轮换，上一次启动的日志保留。
-- **性能**：机主报告明显变卡。GPU 忙碌率高峰 79%，频率 800 MHz，单次提交平均 16.7 ms、排队 12.3 ms（之前两张 7.3–8.0 ms、4.0–6.7 ms）；提交到完成平均 30 ms，76 帧超过 256 ms；CPU 负载 12–40%。原因还没定位。
+- **性能**：明显变卡。GPU 忙碌率高峰 79%，频率 800 MHz，单次提交平均 16.7 ms、排队 12.3 ms（之前两张 7.3–8.0 ms、4.0–6.7 ms）；提交到完成平均 30 ms，76 帧超过 256 ms；CPU 负载 12–40%。原因还没定位。
 
 ## 基带 IPA、麦克风、USB-C 和解锁
 
 - **基带**：`ipa_config` 在 modem 启动之前运行，读到 `SHARED_MEM_SIZE 0x415`（`mem_offset` 0，`mem_size` 0x2000）、`FLAVOR_0 0x8090811`（8 TX、9 RX，从 8 起）；收到 `ipa-setup-ready` 后 `HW_PARAM_2 0xe4046b59`（11 通道、11 事件环），AP 通道 0-3 都到状态 1，替 modem 分配的通道 0xf；端点、命令通道、内存和路由表完成（`LOCAL_PKT_PROC_CNTXT 0x5f0`），LAN RX 端点 8 挂上 251 个缓冲，`ROUTE 0x1100050`。这些值都和 Debian 上主线驱动的真值一致。uC 报告已加载；INIT_DRIVER 发出时 `uc_loaded` 还是 0，modem 回答成功（ctrl 10、default 10、pending 1）；应答 0x20、0x35 后发出 INIT_COMPLETE。modem 之后发来 0x27、0x23 两个请求，没有应答。240 s 内 modem 一直运行，LAN RX 收到 0 个包，Wi-Fi 正常加入。数据通路和拨号还没做。
-- **麦克风**：开机自检启动成功，两路都有信号（峰值约 1350 和 1434，所有帧非零），67672 帧期间 23 次周期中断，速率对得上 48 kHz，约 1.4 s 后因为工作线程超过 64 ms 没取数据（错误 8）停止。机主用语音备忘录录音没有声音：`input on` 之后采集马上因同样原因停止（一次 0 帧，一次 1590 帧），之后没有重启。同时播放不受影响。
+- **麦克风**：开机自检启动成功，两路都有信号（峰值约 1350 和 1434，所有帧非零），67672 帧期间 23 次周期中断，速率对得上 48 kHz，约 1.4 s 后因为工作线程超过 64 ms 没取数据（错误 8）停止。用语音备忘录录音没有声音：`input on` 之后采集马上因同样原因停止（一次 0 帧，一次 1590 帧），之后没有重启。同时播放不受影响。
 - **USB-C**：`dwc3 ip 0x5533 revision 0x5533330a`，`qusb2 hstx trim 4, pll status 0x17`，内核初始化后 5 ms 就绪；键盘和触控板枚举正常。U 盘在两个口枚举没测。
 - **温控**：降频自检实测，加上限后 A55 1516 MHz、A76 1563 MHz；解除后 A55 1804 MHz，A76 48 ms 内升到 1732 MHz。
-- **解锁**：上一次解锁时 `swap_wait_gated` 等了 5 秒后调用未实现的 345 号槽，panic。345 号槽从日志格式串看是面板时序状态，现在答否。这次机主解锁和使用都没有 panic，但日志里没有 5 秒超时，这段代码没被走到，所以不能算修复得到验证。
-- **卡顿**：机主打开“降低透明度”和“减弱动态效果”后还是很卡，转屏和 Wi-Fi 正常。稳定使用时 8 核约 30–60% 忙，`backboardd` 每 10 秒占 5–7 秒 CPU，GPU 忙碌率 18–85%，提交到完成平均 24.5 ms。前端的压缩统计用 `NSLog` 写，系统日志里没有出现，这次没有拿到数据。
+- **解锁**：上一次解锁时 `swap_wait_gated` 等了 5 秒后调用未实现的 345 号槽，panic。345 号槽从日志格式串看是面板时序状态，现在答否。这次解锁和使用都没有 panic，但日志里没有 5 秒超时，这段代码没被走到，所以不能算修复得到验证。
+- **卡顿**：打开“降低透明度”和“减弱动态效果”后还是很卡，转屏和 Wi-Fi 正常。稳定使用时 8 核约 30–60% 忙，`backboardd` 每 10 秒占 5–7 秒 CPU，GPU 忙碌率 18–85%，提交到完成平均 24.5 ms。前端的压缩统计用 `NSLog` 写，系统日志里没有出现，这次没有拿到数据。
 - **同机 Debian 对照**（2160x1440 glmark2，texture/shadow FPS）：默认 760/378，`noubwc` 330/106，`nogmem,noubwc` 327/103，`notile` 337/126，`nogmem,notile` 338/121。差距在 UBWC，tile 内存和不压缩的 tile 布局都不提速。
 
 ## 基带数据通路和麦克风采集
@@ -1597,20 +1596,20 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 
 ## 磁吸盖和显示帧
 
-- **磁吸盖**：能力项 `hall-effect-sensor` 由内核写进 MobileGestalt 缓存的 `CacheExtra` 后，backboardd 建起 Smart Cover 处理器并来查询传感器。原版 `parseKeyboardElement` 不保留 `0xff09` 页，所以传感器元素在驱动启动后加入它的键盘元素表（数组已在 registry 中不可变，换一份副本），查询和事件都走这张表。两次失败都在这一步：改动不可变数组，以及匹配到没有值的集合元素。修好后机主确认合上熄屏、打开亮屏。
-- **显示帧**：转屏的目标面改成私有纹理后，机主确认方向和画面正确，Wi-Fi 也能自动连上；流畅度机主不确定。
+- **磁吸盖**：能力项 `hall-effect-sensor` 由内核写进 MobileGestalt 缓存的 `CacheExtra` 后，backboardd 建起 Smart Cover 处理器并来查询传感器。原版 `parseKeyboardElement` 不保留 `0xff09` 页，所以传感器元素在驱动启动后加入它的键盘元素表（数组已在 registry 中不可变，换一份副本），查询和事件都走这张表。两次失败都在这一步：改动不可变数组，以及匹配到没有值的集合元素。修好后合上熄屏、打开亮屏。
+- **显示帧**：转屏的目标面改成私有纹理后，方向和画面正确，Wi-Fi 也能自动连上；流畅度说不准。
 - **录音**：语音备忘录能录到波形，回放是炸麦声。
 
 ## iPad mini 排版、双缓冲翻转、麦克风、USB-C、电池和温控
 
-- **布局**：系统身份换成 iPad mini 6，模式 2266x1488，GPU 缩放到面板。机主确认主屏布局对了。
-- **流畅度**：机主觉得非常卡。这是新身份的首次开机，日志只有约 255 秒，其中约 74 到 145 秒 8 个核接近满载（SpringBoard、小组件进程和 `backboardd`），测试时间和这段重叠，日志分不开开机负载和稳定状态，但机主确认卡是真的，不能归到开机负载上。之后 CPU 总占用约 50% 到 310%。提交到完成平均 23.2 ms（上一张 20.3 ms），帧 GPU 时间仍有长尾。
+- **布局**：系统身份换成 iPad mini 6，模式 2266x1488，GPU 缩放到面板。主屏布局对了。
+- **流畅度**：非常卡。这是新身份的首次开机，日志只有约 255 秒，其中约 74 到 145 秒 8 个核接近满载（SpringBoard、小组件进程和 `backboardd`），测试时间和这段重叠，日志分不开开机负载和稳定状态。之后 CPU 总占用约 50% 到 310%。提交到完成平均 23.2 ms（上一张 20.3 ms），帧 GPU 时间仍有长尾。
 - **SpringBoard 重启**：136 秒时 `backboardd` 的命令缓冲报 `DeviceLost`，之后约 300 次 `Command buffer allocation failed`，不到一秒后它给自己发 SIGTERM，runningboardd 以 “backboardd respawn” 结束 SpringBoard。内核日志没有 CP、SMMU 或 hang 错误，原因没查明。之后 2 分钟没有再发生。
-- **翻转**：活动 CTL 是 0，管线原本扫描固件缓冲，1201 次翻转 0 次超时，平均等 7.5 ms，最大 17.5 ms。机主看不出撕裂了。
+- **翻转**：活动 CTL 是 0，管线原本扫描固件缓冲，1201 次翻转 0 次超时，平均等 7.5 ms，最大 17.5 ms。看不出撕裂了。
 - **压缩路径**：`CZ frames made 0`，一帧都没走上私有纹理，全部 `plain`。这一项没有验证到。
-- **麦克风**：机主确认录音好了。3.52 秒的录音峰值 8262，均值 −2.2，≥8 帧的零段 2 段，最长 17 帧；之前均值 +729，零段 18 段，最长 751 帧。录音期间重启 0 次，游标跳变 0 次。
-- **USB-C 和充电器**：机主确认充电器没问题。两个口都记录到接入、PD 协商和拔出，还记录到一次短暂的 `Attached.SRC`。`AdapterDetails` 的电压取到了实测值。
+- **麦克风**：录音回放正常。3.52 秒的录音峰值 8262，均值 −2.2，≥8 帧的零段 2 段，最长 17 帧；之前均值 +729，零段 18 段，最长 751 帧。录音期间重启 0 次，游标跳变 0 次。
+- **USB-C 和充电器**：充电器正常。两个口都记录到接入、PD 协商和拔出，还记录到一次短暂的 `Attached.SRC`。`AdapterDetails` 的电压取到了实测值。
 - **电池**：循环次数 68，和 Debian 一致；温度 31.2 到 31.5 °C，Debian 随后读到 31.4 °C。
 - **温控**：38 个 HID 温度服务全部启动，读取超过 700 次，`thermalmonitord` 不再报 `no HID services`，也没有 `null event`。CLPC 和 PMGR 仍然找不到。
-- **连 Mac**：不识别，USB 设备模式没做，这不是这张的回归。
+- **连 Mac**：不识别，USB 设备模式没做。
 

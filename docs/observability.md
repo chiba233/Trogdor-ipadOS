@@ -33,4 +33,4 @@ Coreboot console 在有效 CBMEM entry 被保留时可继续追加旧内容，�
 
 - [Coreboot CBMEM console](https://chromium.googlesource.com/chromiumos/third_party/coreboot/+/29f90de5f72c645a00146e04789896766f28e783/src/lib/cbmem_console.c)
 
-Linux 路线已取得 current EL、incoming EL、stage、CNTFRQ 和 FDT 交接属性；完整日志私下保存。异常路径的 ESR／ELR／FAR 输出仍需另行验证，显示路线也未实现。后续可以基于已取得的引导信息研究 XNU 装载与 ADT 接入。
+Linux 路线已取得 current EL、incoming EL、stage、CNTFRQ 和 FDT 交接属性；完整日志不公开。异常路径的 ESR／ELR／FAR 输出仍需另行验证，显示路线也未实现。后续可以基于已取得的引导信息研究 XNU 装载与 ADT 接入。
