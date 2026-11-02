@@ -57,13 +57,14 @@ void coachz_sdcc_write_selftest(int slot);
 /* A fixed pool below 4 GiB outside the XNU window, as the USB driver's (0x81000000, 1 MiB) and below the speaker ring
    (0x81200000). The apps SMMU is in bypass after firmware (docs/usb-read.md), and SDCC1/2 sit behind it (SID 0x60/0x80). */
 #define POOL_PA          0x81100000ul
-#define POOL_BYTES       0x30000ul
-#define SLOT_POOL        0x18000ul
+#define POOL_BYTES       0x100000ul    /* up to the speaker ring */
+#define SLOT_POOL        0x80000ul
 #define ADMA_OFF         0x0000ul
 #define ADMA_BYTES       0x1000ul
 #define SCRATCH_OFF      0x1000ul
 #define XFER_OFF         0x2000ul
-#define MAX_BLOCKS       128u          /* 64 KiB a request */
+#define MAX_BLOCKS       960u          /* 480 KiB a request: at HS400 most of a request's time is then the transfer, not its commands */
+#define TEST_BLOCKS_AT   128u          /* what the write test moves at a time */
 
 enum { PM_UNDEFINED, PM_OFF, PM_UP, PM_ON };
 
@@ -636,7 +637,14 @@ static int set_signal_voltage(struct sdcc *s, unsigned signal)
 /* ------------------------------------------------------------------ requests (sdhci_send_command, sdhci_irq) */
 static int wait_int(struct sdcc *s, uint32_t any, unsigned ms, uint32_t *status)
 {
-    const uint64_t end = now_us() + (uint64_t)ms * 1000u;
+    const uint64_t began = now_us(), end = began + (uint64_t)ms * 1000u;
+    /* A response or a short transfer ends within this; blocking at once costs a wakeup that took longer than the transfer (1.1 ms per
+       64 KiB at HS400, of which the bus took 0.16). Longer waits still sleep. */
+    while (now_us() - began < 300u) {
+        const uint32_t early = __atomic_load_n(&s->hc_status, __ATOMIC_ACQUIRE);
+        if (early & any) { *status = early; return 1; }
+        __asm__ volatile ("yield");
+    }
     for (;;) {
         uint32_t st = __atomic_load_n(&s->hc_status, __ATOMIC_ACQUIRE);
         if (st & any) { *status = st; return 1; }
@@ -1379,13 +1387,13 @@ void coachz_sdcc_write_selftest(int slot)
     if (slot != 0 || !write_requested(slot) || !coachz_sdcc_writable(slot)) return;
     struct sdcc *s = &slots[slot];
     const uint64_t start = s->write_start + s->write_blocks - TEST_BLOCKS;
-    static uint32_t want[128], chunk[128 * MAX_BLOCKS];
+    static uint32_t want[128], chunk[128 * TEST_BLOCKS_AT];
     void *data;
     uint32_t survived = 0, mismatches = 0, refused = 0, single = 0, multi = 0;
-    for (uint32_t b = 0; b < TEST_BLOCKS; b += MAX_BLOCKS) {
-        if (!coachz_sdcc_read(slot, start + b, MAX_BLOCKS, &data)) { printf("COACHZ mmc %s: test read failed\n", s->name); return; }
+    for (uint32_t b = 0; b < TEST_BLOCKS; b += TEST_BLOCKS_AT) {
+        if (!coachz_sdcc_read(slot, start + b, TEST_BLOCKS_AT, &data)) { printf("COACHZ mmc %s: test read failed\n", s->name); return; }
         __builtin_memcpy(chunk, data, sizeof(chunk));
-        for (uint32_t k = 0; k < MAX_BLOCKS; k++) {
+        for (uint32_t k = 0; k < TEST_BLOCKS_AT; k++) {
             test_block(start + b + k, want);
             if (!__builtin_memcmp(want, &chunk[128u * k], sizeof(want))) survived++;
         }
@@ -1406,7 +1414,7 @@ void coachz_sdcc_write_selftest(int slot)
         single++;
     }
     for (; b < TEST_BLOCKS; ) {
-        const uint32_t n = TEST_BLOCKS - b < MAX_BLOCKS ? TEST_BLOCKS - b : MAX_BLOCKS;
+        const uint32_t n = TEST_BLOCKS - b < TEST_BLOCKS_AT ? TEST_BLOCKS - b : TEST_BLOCKS_AT;
         for (uint32_t k = 0; k < n; k++) test_block(start + b + k, &chunk[128u * k]);
         if (!coachz_sdcc_write(slot, start + b, n, chunk)) goto failed;
         multi += n;
@@ -1414,7 +1422,7 @@ void coachz_sdcc_write_selftest(int slot)
     }
     const uint64_t wrote = now_us();
     for (b = 0; b < TEST_BLOCKS; ) {
-        const uint32_t n = TEST_BLOCKS - b < MAX_BLOCKS ? TEST_BLOCKS - b : MAX_BLOCKS;
+        const uint32_t n = TEST_BLOCKS - b < TEST_BLOCKS_AT ? TEST_BLOCKS - b : TEST_BLOCKS_AT;
         if (!coachz_sdcc_read(slot, start + b, n, &data)) goto failed;
         __builtin_memcpy(chunk, data, n * 512u);
         for (uint32_t k = 0; k < n; k++) {
@@ -1431,7 +1439,7 @@ void coachz_sdcc_write_selftest(int slot)
     /* A longer sequential read inside the window, without copying the buffer: the bus and the driver alone. */
     const uint64_t blocks = 64ull * 2048u;
     const uint64_t read_began = now_us();
-    for (uint64_t at = 0; at < blocks; at += MAX_BLOCKS) {
+    for (uint64_t at = 0; at + MAX_BLOCKS <= blocks; at += MAX_BLOCKS) {
         if (!coachz_sdcc_read(slot, start - blocks + at, MAX_BLOCKS, &data)) {
             printf("COACHZ mmc %s: read test stopped at block %llu\n", s->name, (unsigned long long)at);
             return;

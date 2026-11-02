@@ -461,8 +461,13 @@ class DisplayTests(unittest.TestCase):
         # Debian returns before anything is loaded or the framebuffer region of XNU is touched; the display stops first.
         self.assertLess(prepare.index('boot_menu(&display_video,freq)'),prepare.index('xnu_screen_load('))
         self.assertLess(prepare.index('display_release();'),prepare.index('xnu_screen_load('))
+        # The keyboard: Enter and the arrows map to the buttons' bits, the disk gets no driver, and the controller stops before any system.
+        keyboard=(ROOT/'boot/usb_menu.c').read_text();config=(ROOT/'boot/usb_compat/libpayload-config.h').read_text()
+        self.assertIn('if (report[i] == USAGE_UP) keys |= 2;',keyboard)
+        self.assertIn('#ifdef COACHZ_USB_MENU\n#define CONFIG_LP_USB_MSC 0',config)
+        self.assertLess(menu.index('usb_menu_stop();'),menu.index('return selected;'))
         # Without a usable EC the menu must end, or a broken EC would block the boot.
-        self.assertIn('if(++failures>=20)break;',menu)
+        self.assertIn('if(!answered && ++failures>=20)break;',menu)
 
     def test_hardware_verified_scanout_restart_order_is_unchanged(self):
         source=(ROOT/'boot/display.c').read_text()

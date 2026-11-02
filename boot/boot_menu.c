@@ -1,9 +1,13 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
-/* The boot choice, before the kernel load: the volume buttons move the selection and the power button confirms it. Depthcharge has
+/* The boot choice, before the kernel load: the volume buttons or the keyboard's arrows move the selection, the power button or Enter
+   confirms it. The keyboard is a USB device behind the board hub, so it only answers once the USB stack has enumerated it. Depthcharge has
    already loaded this whole partition, so both entries are in memory: iPadOS continues to the XNU load, Debian takes the wrapper's
    existing return to the Linux kernel of the same FIT. Without a press the first entry starts after five seconds; a failing EC does
    not block the boot. The caches are off, so only what changed is redrawn. Buttons as the EC reports them: power 0, up 1, down 2. */
 #include "display.h"
+void usb_menu_start(uint64_t);
+unsigned usb_menu_poll(void);
+void usb_menu_stop(void);
 #define ENTRIES 2
 #define ROW_WIDTH 800u
 #define ROW_HEIGHT 170u
@@ -69,14 +73,16 @@ unsigned boot_menu(const struct display_video *v,uint64_t freq) {
     uint32_t held=~0u,error=0;   /* a button already down when the menu appears does not count until it is released */
     for(unsigned entry=0;entry<ENTRIES;entry++)draw_row(v,entry,entry==selected);
     draw_bar(v,ROW_WIDTH);
+    usb_menu_start(freq);
     const uint64_t start=now(),limit=freq*WAIT_SECONDS;
     uint64_t drawn=ROW_WIDTH;
     for(;;) {
         uint32_t buttons=0;
-        if(!display_ec_buttons(freq,&buttons,&error)) {
-            if(++failures>=20)break;   /* no EC, no choice: boot the first entry rather than wait forever */
-        } else {
-            failures=0;
+        const int answered=display_ec_buttons(freq,&buttons,&error);
+        buttons|=usb_menu_poll();
+        if(!answered && ++failures>=20)break;   /* no EC, no choice: boot the first entry rather than wait forever */
+        if(answered)failures=0;
+        {
             const uint32_t pressed=buttons&~held;
             held=buttons;
             if(pressed&1)break;
@@ -97,6 +103,7 @@ unsigned boot_menu(const struct display_video *v,uint64_t freq) {
         }
         wait_ticks(freq*POLL_MS/1000);
     }
+    usb_menu_stop();
     /* The load draws its picture on black. */
     for(unsigned entry=0;entry<ENTRIES;entry++)fill(v,(v->width-ROW_WIDTH)/2,row_top(v,entry),ROW_WIDTH,ROW_HEIGHT,COLOR_BLACK);
     draw_bar(v,0);

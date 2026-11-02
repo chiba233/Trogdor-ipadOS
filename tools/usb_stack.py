@@ -70,16 +70,16 @@ def extract(tree, writable_storage=False):
         (tree / 'include/usb' / name).write_text(text)
 
 
-def build(zig, cpu, env, out):
+def build(zig, cpu, env, out, main='usb_read.c', defines=()):
     """Returns the objects to link and their relocation reports."""
     tree = out / 'libpayload-usb'
     extract(tree)
     flags = ['-target', 'aarch64-freestanding-none', '-mcpu=' + cpu, '-mgeneral-regs-only', '-ffreestanding',
              '-fno-builtin', '-fno-pic', '-fno-pie', '-fno-stack-protector', '-fno-unwind-tables',
              '-fno-asynchronous-unwind-tables', '-Os', '-g', '-I' + str(ROOT / 'boot/usb_compat'),
-             '-isystem', str(tree / 'include'), '-isystem', str(tree)]
+             '-isystem', str(tree / 'include'), '-isystem', str(tree), *defines]
     objects, reports = [], {}
-    for path, warnings in [(tree / name, ['-w']) for name in DRIVERS] + [(ROOT / 'boot/usb_read.c', ['-Wall', '-Wextra', '-Werror'])]:
+    for path, warnings in [(tree / name, ['-w']) for name in DRIVERS] + [(ROOT / 'boot' / main, ['-Wall', '-Wextra', '-Werror'])]:
         obj = tree / (path.stem + '.o')
         subprocess.run([str(zig), 'cc', *flags, *warnings, '-c', str(path), '-o', str(obj)], env=env, check=True)
         reports[path.name] = inspect_object(obj.read_bytes())

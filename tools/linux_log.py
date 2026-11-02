@@ -128,7 +128,8 @@ def compile_wrapper(out, kernel, memory, checkpoint=None, discovery=False, patte
         with assembly.open('a') as stream:
             stream.write('// payload sha256 ' + sha(checkpoint) + ' (the compiler cache does not track .incbin)\n.section .xnu_payload, "a"\n.balign 16\n.global _xnu_payload_start, _xnu_payload_end\n_xnu_payload_start:\n.incbin "' + quoted_xnu + '"\n_xnu_payload_end:\n')
     elf = out / "probe.elf"
-    usb_objects, usb_relocations = usb_stack.build(zig, CPU, env, out) if usb_read else ((), {})
+    usb_objects, usb_relocations = (usb_stack.build(zig, CPU, env, out) if usb_read else
+        usb_stack.build(zig, CPU, env, out, 'usb_menu.c', ('-DCOACHZ_USB_MENU=1',)) if screen else ((), {}))
     command = [str(zig), "cc", "-target", "aarch64-freestanding-none", "-mcpu=" + CPU,
                "-mgeneral-regs-only", "-ffreestanding", "-fno-builtin", "-fno-pic", "-fno-pie",
                "-fno-stack-protector", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables",
@@ -330,7 +331,7 @@ def main():
     if a.display_backlight:
         code_files += ("boot/display_ec.c",)
     if a.screen:
-        code_files += ("boot/xnu_screen.c", "boot/boot_menu.c", "boot/xnu-screen.ld", "tools/xnu_screen.py", "tools/xnu_init.py", "tools/coachz_init.S")
+        code_files += ("boot/xnu_screen.c", "boot/boot_menu.c", "boot/usb_menu.c", "boot/usb_compat/libpayload-config.h", "tools/usb_stack.py", "boot/xnu-screen.ld", "tools/xnu_screen.py", "tools/xnu_init.py", "tools/coachz_init.S")
     if a.usb_read:
         code_files += ("boot/usb_read.c", "tools/usb_stack.py", "boot/usb_compat/libpayload.h")
     report = {"schema": 1, "display_discovery": a.display_discovery, "display_pattern": a.pattern, "display_backlight": a.display_backlight, "xnu_screen": a.screen,

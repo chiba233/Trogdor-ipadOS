@@ -5,10 +5,15 @@
 #define CONFIG_LP_USB 1
 #define CONFIG_LP_USB_XHCI 1
 #define CONFIG_LP_USB_HUB 1
+/* The boot menu only needs the keyboard (boot/usb_menu.c), so the disk gets no command before the system starts. */
+#ifdef COACHZ_USB_MENU
+#define CONFIG_LP_USB_MSC 0
+#else
 #define CONFIG_LP_USB_MSC 1
+#endif
 #define CONFIG_LP_USB_GEN_HUB 1
 /* The kernel's USB stack carries the Zed keyboard (coachz_usb_hid.c); the probe's reader does not. */
-#ifdef COACHZ_USB_KERNEL
+#if defined(COACHZ_USB_KERNEL) || defined(COACHZ_USB_MENU)
 #define CONFIG_LP_USB_HID 1
 #else
 #define CONFIG_LP_USB_HID 0
