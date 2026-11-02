@@ -114,3 +114,6 @@ coachz-prelink-thread-sample.patch
 
 # coachz-cpufreq=4: CPU frequency by load on sheng's rules (UniXNU porting/power), bounded by the thermal clamp.
 coachz-prelink-cpufreq.patch
+
+# coachz-emmc=1 / coachz-sd=1: the read-only SDHCI driver (sdhci-msm stage 1, drivers/RamBlock/mmc), started with the others.
+coachz-prelink-mmc.patch

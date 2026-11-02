@@ -13,11 +13,12 @@
  	extern void coachz_battery_start(void);
 --- /dev/null
 +++ b/bsd/dev/coachz_wifi.c
-@@ -0,0 +1,2556 @@
+@@ -0,0 +1,3515 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/* WCN3990 / SC7180: the modem that hosts the WLAN firmware, started as mainline's qcom_q6v5_mss does (coachz-wifi=4), and the SMEM
-+ * inventory (coachz-wifi=1 plus an explicit /arm-io/coachz-wifi ADT node): the public table, the global partition and APPS<->MODEM.
-+ * Nothing here allocates shared items, sets up GLINK, accesses the radio, registers a MAC or claims WLAN readiness.
++ * inventory (coachz-wifi=1 plus an explicit /arm-io/coachz-wifi ADT node). With the modem up: SMP2P, GLINK over SMEM, QRTR and
++ * rmtfs, then ath10k's WLFW QMI sequence, the WCN3990's supplies, copy engines, HTC and WMI up to the firmware's READY. No network
++ * interface is registered with the system yet. Also the shared RPMh client (coachz_rpmh_iface.h) every Coachz driver votes through.
 + */
 +#include <sys/param.h>
 +#include <sys/systm.h>
@@ -36,6 +37,7 @@
 +#include "coachz_wifi_smem.h"
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
 +void coachz_wifi_start(void);
 +
 +struct wifi_mapping { uintptr_t base; };
@@ -366,6 +368,123 @@
 +    return 0;
 +}
 +
++/*
++ * The apps DRV's one vote per RPMh resource, shared by every Coachz driver (coachz_rpmh_iface.h, for the SDHCI driver and later
++ * others): cmd-db lookups, active-only writes through the TCS above, and cx.lvl as rpmhpd aggregates it, the highest corner any
++ * consumer asks for (a plain write by one would drop another's level). The modem's proxy vote is one such consumer.
++ */
++enum { COACHZ_CX_MSS_PROXY = 3, COACHZ_CX_CONSUMERS = 4 };
++static uint32_t coachz_cx_corner[COACHZ_CX_CONSUMERS], coachz_cx_written = 0xffffffffu;
++static volatile uint32_t coachz_cx_busy;
++static uint8_t coachz_aux[4][64];
++static char coachz_aux_name[4][9];
++static uint32_t coachz_aux_bytes[4];
++
++uint32_t coachz_cmd_db_address(const char *resource);
++int coachz_cmd_db_aux(const char *resource, const uint8_t **aux, uint32_t *bytes);
++int coachz_rpmh_write(const uint32_t *address, const uint32_t *data, unsigned count, int wait);
++int coachz_rpmh_cx_request(unsigned consumer, unsigned level);
++
++uint32_t
++coachz_cmd_db_address(const char *resource)
++{
++    const vm_offset_t db = wifi_cmd_db();
++    uint32_t address = 0, aux = 0, length = 0;
++    return db && resource && wifi_db_find(db, resource, &address, &aux, &length) ? address : 0;
++}
++
++/* cmd_db_read_aux_data: a copy in normal memory (the cmd-db window is device memory), kept for the kernel's life. */
++int
++coachz_cmd_db_aux(const char *resource, const uint8_t **aux, uint32_t *bytes)
++{
++    const vm_offset_t db = wifi_cmd_db();
++    uint32_t address = 0, at = 0, length = 0;
++    if (!db || !resource || !aux || !bytes || !wifi_db_find(db, resource, &address, &at, &length) || length > 64) return -1;
++    while (!__sync_bool_compare_and_swap(&coachz_cx_busy, 0u, 1u)) delay(100);
++    int slot = -1;
++    for (int i = 0; i < 4 && slot < 0; i++)
++        if (!coachz_aux_name[i][0] || !strncmp(coachz_aux_name[i], resource, 8)) slot = i;
++    if (slot >= 0 && !coachz_aux_name[slot][0]) {
++        for (uint32_t i = 0; i + 1 < length + 1; i += 2) {
++            const uint32_t v = wifi_db_u16(db, at + i);
++            coachz_aux[slot][i] = (uint8_t)v;
++            if (i + 1 < length) coachz_aux[slot][i + 1] = (uint8_t)(v >> 8);
++        }
++        coachz_aux_bytes[slot] = length;
++        strlcpy(coachz_aux_name[slot], resource, sizeof(coachz_aux_name[slot]));
++    }
++    __atomic_store_n(&coachz_cx_busy, 0u, __ATOMIC_RELEASE);
++    if (slot < 0) return -1;
++    *aux = coachz_aux[slot];
++    *bytes = coachz_aux_bytes[slot];
++    return 0;
++}
++
++/* rpmh_write / rpmh_write_async, active only. This TCS always waits for completion, which is the stricter of the two. */
++int
++coachz_rpmh_write(const uint32_t *address, const uint32_t *data, unsigned count, int wait)
++{
++    uint32_t status[16] = {0};
++    (void)wait;
++    if (!address || !data || !count || count > 16) return -1;
++    const int sent = wifi_rpmh_send(address, data, count, status);
++    if (sent < 0) return sent;
++    for (unsigned i = 0; i < count; i++)
++        if (!(status[i] & (1u << 16))) return -4;
++    return 0;
++}
++
++/* rpmhpd_update_level_mapping and rpmhpd_set_performance_state for cx: a level (RPMH_REGULATOR_LEVEL_*) to the first corner whose
++ * level reaches it, never below the first nonzero one; retention entries skipped and the zero padding dropped. */
++static uint32_t
++coachz_cx_corner_of(unsigned level)
++{
++    const uint8_t *aux = NULL;
++    uint32_t bytes = 0;
++    uint16_t lv[16] = {0};
++    unsigned count, enable = 0, i;
++    if (coachz_cmd_db_aux("cx.lvl", &aux, &bytes) || bytes < 2) return 0;
++    count = bytes / 2 > 16 ? 16 : bytes / 2;
++    for (i = 0; i < count; i++) {
++        const uint16_t value = (uint16_t)(aux[2 * i] | aux[2 * i + 1] << 8);
++        if (value == 16) continue;
++        lv[i] = value;
++        if (!lv[enable] && lv[i]) enable = i;
++        if (i > 0 && !lv[i]) { count = i; break; }
++    }
++    for (i = 0; i < count; i++)
++        if (level <= lv[i]) break;
++    if (i == count) i--;
++    return i < enable ? enable : i;
++}
++
++/* The highest corner over the consumers, written when it changes (a withdrawal by the only consumer writes 0). */
++static int
++coachz_cx_vote(unsigned consumer, uint32_t corner)
++{
++    if (consumer >= COACHZ_CX_CONSUMERS) return -1;
++    const uint32_t address = coachz_cmd_db_address("cx.lvl");
++    if (!address) return -2;
++    while (!__sync_bool_compare_and_swap(&coachz_cx_busy, 0u, 1u)) delay(100);
++    coachz_cx_corner[consumer] = corner;
++    uint32_t most = 0;
++    for (unsigned i = 0; i < COACHZ_CX_CONSUMERS; i++) if (coachz_cx_corner[i] > most) most = coachz_cx_corner[i];
++    int result = 0;
++    if (most != coachz_cx_written) {
++        result = coachz_rpmh_write(&address, &most, 1, 1);
++        if (!result) coachz_cx_written = most;
++    }
++    __atomic_store_n(&coachz_cx_busy, 0u, __ATOMIC_RELEASE);
++    return result;
++}
++
++int
++coachz_rpmh_cx_request(unsigned consumer, unsigned level)
++{
++    if (!consumer || consumer == COACHZ_CX_MSS_PROXY) return -1;
++    return coachz_cx_vote(consumer, level ? coachz_cx_corner_of(level) : 0);
++}
++
 +/* One BCM's share of bandwidth requests (kBps), as bcm-voter.c aggregates it: x = avg * width / (buswidth * channels) * 1000 / unit,
 + * y = peak * width / buswidth * 1000 / unit, a nonzero quotient under 1 counting as 1, both capped at 0x3fff; a mask BCM (ACV) votes
 + * y = its mask. Width and unit come from the BCM's CMD DB aux data, buswidth and channels from the node in mainline sc7180.c. */
@@ -552,7 +671,9 @@
 +static uint8_t wifi_fw_header[4096];
 +static uint8_t *volatile wifi_mba_image;
 +static size_t wifi_mba_bytes, wifi_mba_rounded;
-+static const char *const wifi_fw_disks[] = {"/dev/disk0", "/dev/disk1", "/dev/disk2", "/dev/disk3"};
++/* Whole disks to search for the blob: the eMMC and microSD block devices (drivers/RamBlock/mmc) may come before the USB drive. */
++static const char *const wifi_fw_disks[] = {"/dev/disk0", "/dev/disk1", "/dev/disk2", "/dev/disk3", "/dev/disk4", "/dev/disk5",
++    "/dev/disk6", "/dev/disk7", "/dev/disk8", "/dev/disk9"};
 +/* qdsp6sw.mbn once its SHA-256 matched: the disk, its byte offset there and its size; read again in place to load the modem. */
 +static volatile int wifi_mpss_disk = -1;
 +static uint64_t wifi_mpss_at, wifi_mpss_bytes;
@@ -592,7 +713,7 @@
 +    /* As soon as the USB disk opens: tried every 2 s for 2 minutes (there was a fixed 45 s wait). */
 +    for (unsigned attempt = 0; attempt < 60 && disk == NULLVP; attempt++) {
 +        if (attempt) delay(2 * 1000 * 1000);
-+        for (which = 0; which < 4; which++) {
++        for (which = 0; which < (unsigned)(sizeof(wifi_fw_disks) / sizeof(wifi_fw_disks[0])); which++) {
 +            if (vnode_open(disks[which], FREAD, 0, 0, &disk, context)) continue;
 +            if (!wifi_fw_read(disk, context, wifi_fw_header, sizeof(wifi_fw_header), WIFI_FW_BLOB) &&
 +                !memcmp(wifi_fw_header, "COACHZMODEMFW1", 14)) break;
@@ -812,7 +933,22 @@
 +static const struct { uint32_t offset; const char *name; } wifi_mss_clocks[5] = {
 +    {0x8a000, "iface"}, {0x8a154, "bus"}, {0x8a150, "snoc_axi"}, {0x8a004, "mnoc_axi"}, {0x8a00c, "nav"},
 +};
-+static const uint32_t wifi_mss_rails[3] = {0x30000, 0x30010, 0x30060};
++static const uint32_t wifi_mss_rails[3] = {0x30000, 0x30010, 0x30060};   /* cx.lvl, mx.lvl, mss.lvl in cmd-db */
++
++/* q6v5's proxy power domains: mx and mss written directly, cx through the shared aggregator, so that a withdrawal leaves the
++ * other consumers' cx (the SDHCI cores) in place. Statuses in the order of wifi_mss_rails; the result is the slowest wait. */
++static int
++wifi_mss_rails_vote(int on, uint32_t status[3])
++{
++    const uint32_t level = on ? 15 : 0, data[2] = {level, level};
++    uint32_t direct[2] = {0};
++    const int sent = wifi_rpmh_send(wifi_mss_rails + 1, data, 2, direct);
++    const int cx = coachz_cx_vote(COACHZ_CX_MSS_PROXY, level);
++    status[0] = cx ? 0 : 0x10101;
++    status[1] = direct[0];
++    status[2] = direct[1];
++    return sent < 0 ? sent : cx ? -10 + cx : sent;
++}
 +static const uint64_t wifi_mba_base = 0x94400000ull, wifi_mba_size = 0x200000ull;
 +/* mpss_mem of the LTE SKUs (sc7180-trogdor-lte-sku.dtsi, the same in the device tree Debian runs on this machine): 140 MiB. k85-k92
 + * gave the LTE MBA only the 32 MiB of sc7180-trogdor.dtsi, and it stopped after "Secure Device : 1" every time. */
@@ -1314,11 +1450,10 @@
 +static uint32_t
 +wifi_mba_attempt(const struct wifi_mba_maps *m, unsigned attempt)
 +{
-+    const uint32_t high[3] = {15, 15, 15}, off[3] = {0, 0, 0};
 +    volatile uint32_t *q6 = m->q6, *rmb = m->rmb, *restart = m->restart, *spare = m->spare, *pdc_sync = m->pdc_sync;
 +    uint32_t status[3] = {0}, before[5];
 +    const int state = wifi_qmp_send("{class: image, res: load_state, name: modem, val: on}");
-+    const int voted = wifi_rpmh_send(wifi_mss_rails, high, 3, status);
++    const int voted = wifi_mss_rails_vote(1, status);
 +    printf("COACHZ mba: load_state on %d; rails to level 15 after %d us, status 0x%x 0x%x 0x%x\n", state, voted, status[0], status[1], status[2]);
 +    for (unsigned i = 0; i < 5; i++) before[i] = *(volatile uint32_t *)(m->gcc + wifi_mss_clocks[i].offset);
 +    int clock_wait[5];
@@ -1468,7 +1603,7 @@
 +        mpss_reclaimed = wifi_xfer(wifi_mpss_base, wifi_mpss_size, &mpss_perm, 1, 0);
 +        printf("COACHZ mba: mpss_mem back to HLOS %lld (modem start %d)\n", (long long)mpss_reclaimed, modem);
 +    }
-+    const int restored = wifi_rpmh_send(wifi_mss_rails, off, 3, status);
++    const int restored = wifi_mss_rails_vote(0, status);
 +    const int unloaded = wifi_qmp_send("{class: image, res: load_state, name: modem, val: off}");
 +    printf("COACHZ mba: undone: clocks 0x%x 0x%x 0x%x 0x%x 0x%x, mss_restart %u pdc 0x%x spare 0x%x, rails 0 after %d us, load_state off %d\n",
 +        *(volatile uint32_t *)(m->gcc + wifi_mss_clocks[0].offset), *(volatile uint32_t *)(m->gcc + wifi_mss_clocks[1].offset),
@@ -1979,6 +2114,664 @@
 +    wl.bdf_seg++;
 +}
 +
++/*
++ * ath10k_hw_power_on before the QMI client starts: the WCN3990's five supplies (sc7180-trogdor.dtsi), as the regulator core and
++ * qcom-rpmh-regulator.c leave them on Debian here (read back there: these voltages, normal mode, enabled): the initial mode (HPM, 7)
++ * when the regulator registers, then at enable the cached voltage in mV and the enable bit, each an active-only VRM request waited for.
++ * The SoC has no "qdss" or "cxo_ref_clk_pin" clock on this node.
++ */
++static const struct { const char *name, *supply; uint32_t mv; } wl_supplies[5] = {
++    {"ldoa9", "vdd-0.8-cx-mx", 488}, {"ldoc1", "vdd-1.8-xo", 1616}, {"ldoc2", "vdd-1.3-rfa", 1168}, {"ldoc10", "vdd-3.3-ch0", 3000},
++    {"ldoc11", "vdd-3.3-ch1", 3000},
++};
++
++static int
++wl_power_on(void)
++{
++    const vm_offset_t db = wifi_cmd_db();
++    int failed = 0;
++    for (unsigned i = 0; i < 5; i++) {
++        uint32_t address = 0, aux = 0, length = 0;
++        if (!db || !wifi_db_find(db, wl_supplies[i].name, &address, &aux, &length)) {
++            printf("COACHZ wlan: %s (%s) not in cmd-db\n", wl_supplies[i].name, wl_supplies[i].supply);
++            failed++;
++            continue;
++        }
++        const uint32_t reg[3] = {address + 8, address, address + 4}, value[3] = {7, wl_supplies[i].mv, 1};
++        uint32_t status[3] = {0};
++        int sent[3];
++        for (unsigned j = 0; j < 3; j++) sent[j] = wifi_rpmh_send(&reg[j], &value[j], 1, &status[j]);
++        printf("COACHZ wlan: %s (%s) at 0x%x: mode HPM %d us, %u mV %d us, enabled %d us (status 0x%x 0x%x 0x%x)\n", wl_supplies[i].name,
++            wl_supplies[i].supply, address, sent[0], wl_supplies[i].mv, sent[1], sent[2], status[0], status[1], status[2]);
++        if (sent[0] < 0 || sent[1] < 0 || sent[2] < 0) failed++;
++    }
++    return failed;
++}
++
++/*
++ * The WCN3990's copy engines (ath10k ce.c with snoc.c's tables and hw.c's wcn3990 registers; hw_params target_64bit, shadow_reg_support,
++ * rri_on_ddr). Twelve CEs at membase + 0x240000 + 0x1000 * id, 16-byte descriptors {address with bits 32-34 in the second word,
++ * length, flags with the HTC endpoint in bits 4-15, hash}. The firmware writes every ring's read indices to a host array (RRI); source
++ * write indices go to the shadow registers at membase + 0x32000, destination write indices to the CE. Linux's coherent DMA memory (no
++ * dma-coherent on this node) is a write-combining (Normal non-cacheable) window in low DRAM outside the kernel's: the apps SMMU is
++ * disabled here (sCR0 CLIENTPD), so the device sees these physical addresses.
++ */
++#define WC_COUNT 12
++#define WC_MEMBASE 0x18800000ull
++#define WC_MEM_PA 0x81800000ull          /* ordinary RAM in Debian's tree, outside every reserved-memory node */
++#define WC_MEM_BYTES 0x800000u
++#define WC_DIS_INTR 8u                   /* CE_ATTR_DIS_INTR */
++#define WC_CTRL1 0x18u
++#define WC_HOST_IE 0x2cu
++#define WC_STATUS 0x30u
++#define WC_MISC_IE 0x34u
++#define WC_SR_WRITE 0x3cu
++#define WC_DR_WRITE 0x40u
++#define WC_SR_READ 0x44u
++#define WC_DR_READ 0x48u
++#define WC_SRC_WM 0x4cu
++#define WC_DST_WM 0x50u
++
++/* host_ce_config_wlan: flags, source entries and maximum, destination entries, callbacks (1 send, 2 receive). */
++static const struct { uint32_t flags, src_n, src_max, dst_n, cb; } wc_host[WC_COUNT] = {
++    {0, 16, 2048, 0, 1}, {0, 0, 2048, 512, 2}, {0, 0, 2048, 64, 2}, {0, 32, 2048, 0, 1}, {WC_DIS_INTR, 2048, 256, 0, 1},
++    {0, 0, 512, 512, 2}, {0, 0, 0, 0, 0}, {0, 2, 2048, 2, 0}, {0, 0, 2048, 128, 0}, {0, 0, 2048, 512, 2}, {0, 0, 2048, 512, 2},
++    {0, 0, 2048, 512, 2},
++};
++/* target_ce_config_wlan: pipe, direction (1 in, 2 out, 3 both), entries, maximum bytes, flags. */
++static const uint32_t wc_target[WC_COUNT][5] = {
++    {0, 2, 32, 2048, 0}, {1, 1, 32, 2048, 0}, {2, 1, 64, 2048, 0}, {3, 2, 32, 2048, 0}, {4, 2, 256, 256, WC_DIS_INTR},
++    {5, 2, 1024, 64, WC_DIS_INTR}, {6, 3, 32, 16384, 0}, {7, 4, 0, 0, WC_DIS_INTR}, {8, 1, 32, 2048, 0}, {9, 1, 32, 2048, 0},
++    {10, 1, 32, 2048, 0}, {11, 1, 32, 2048, 0},
++};
++/* target_service_to_ce_map_wlan, its terminating zero entry included (Linux sends the whole array). */
++static const uint32_t wc_services[21][3] = {
++    {0x104, 2, 3}, {0x104, 1, 2}, {0x102, 2, 3}, {0x102, 1, 2}, {0x101, 2, 3}, {0x101, 1, 2}, {0x103, 2, 3}, {0x103, 1, 2},
++    {0x100, 2, 3}, {0x100, 1, 2}, {0x001, 2, 0}, {0x001, 1, 2}, {0xfe00, 2, 0}, {0xfe00, 1, 2}, {0x300, 2, 4}, {0x300, 1, 1},
++    {0xfe00, 2, 5}, {0x301, 1, 9}, {0x302, 1, 10}, {0x600, 1, 11}, {0, 0, 0},
++};
++/* target_shadow_reg_cfg_map: CE and the register the firmware shadows. */
++static const uint16_t wc_shadow[12][2] = {
++    {0, 0x3c}, {3, 0x3c}, {4, 0x3c}, {5, 0x3c}, {7, 0x3c}, {1, 0x40}, {2, 0x40}, {7, 0x40}, {8, 0x40}, {9, 0x40}, {10, 0x40}, {11, 0x40},
++};
++
++struct wc_ring { uint32_t n, mask, sw, write, hw; uint8_t *desc; uint64_t desc_pa; uint8_t *buf; uint64_t buf_pa; };
++static struct {
++    volatile uint8_t *regs, *shadow;
++    uint8_t *mem;
++    uint32_t used;
++    volatile uint32_t *rri;
++    uint64_t rri_pa;
++    struct wc_ring src[WC_COUNT], dst[WC_COUNT];
++    volatile uint32_t pending, masked;
++    volatile uint32_t *gicd;
++    int window_clear, up, irq;
++    uint32_t repeats[WC_COUNT];
++    uint64_t irqs[WC_COUNT], rx[WC_COUNT], tx[WC_COUNT], tx_done[WC_COUNT], rx_bad;
++} wc;
++
++static inline uint32_t wc_r(unsigned id, uint32_t reg) { return *(volatile uint32_t *)(wc.regs + 0x1000u * id + reg); }
++static inline void wc_w(unsigned id, uint32_t reg, uint32_t v) { *(volatile uint32_t *)(wc.regs + 0x1000u * id + reg) = v; }
++
++static uint8_t *
++wc_alloc(uint32_t bytes, uint64_t *pa)
++{
++    const uint32_t at = (wc.used + 63u) & ~63u;
++    if (at > WC_MEM_BYTES || bytes > WC_MEM_BYTES - at) return NULL;
++    wc.used = at + bytes;
++    *pa = WC_MEM_PA + at;
++    return wc.mem + at;
++}
++
++/* ath10k_ce_src_ring_read_index_get / dest: from the RRI array for DIS_INTR pipes, else the CE's current read index register. */
++static uint32_t
++wc_src_read(unsigned id)
++{
++    return (wc_host[id].flags & WC_DIS_INTR) ? (wc.rri[id] & 0xffffu) : wc_r(id, WC_SR_READ);
++}
++
++static uint32_t
++wc_dst_read(unsigned id)
++{
++    return (wc_host[id].flags & WC_DIS_INTR) ? ((wc.rri[id] >> 16) & 0xffffu) : wc_r(id, WC_DR_READ);
++}
++
++/* ath10k_snoc_hif_power_up after wlan_enable: the register windows and rings, ath10k_ce_alloc_rri, ath10k_ce_init_pipe for every CE
++ * and ath10k_ce_enable_interrupts (copy complete on for the CEs with a callback and without DIS_INTR, watermarks off). */
++static int
++wc_power_up(void)
++{
++    if (!wc.window_clear) return -1;
++    if (!wc.regs) wc.regs = (volatile uint8_t *)ml_io_map((vm_offset_t)(WC_MEMBASE + 0x240000u), 0xd000);
++    if (!wc.shadow) wc.shadow = (volatile uint8_t *)ml_io_map((vm_offset_t)(WC_MEMBASE + 0x32000u), 0x1000);
++    if (!wc.mem) wc.mem = (uint8_t *)ml_io_map_wcomb((vm_offset_t)WC_MEM_PA, WC_MEM_BYTES);
++    if (!wc.regs || !wc.shadow || !wc.mem) return -2;
++    wc.used = 0;
++    bzero(wc.mem, WC_MEM_BYTES);
++    wc.rri = (volatile uint32_t *)wc_alloc(WC_COUNT * 4u, &wc.rri_pa);
++    for (unsigned id = 0; id < WC_COUNT; id++) {
++        struct wc_ring *s = &wc.src[id], *d = &wc.dst[id];
++        bzero(s, sizeof(*s));
++        bzero(d, sizeof(*d));
++        if (wc_host[id].src_n) {
++            s->n = wc_host[id].src_n;
++            s->desc = wc_alloc(16u * s->n, &s->desc_pa);
++            if (wc_host[id].cb & 1) s->buf = id == 4 ? NULL : wc_alloc(s->n * wc_host[id].src_max, &s->buf_pa);
++        }
++        if (wc_host[id].dst_n) {
++            d->n = wc_host[id].dst_n;
++            d->desc = wc_alloc(16u * d->n, &d->desc_pa);
++            if (wc_host[id].src_max) d->buf = wc_alloc(d->n * wc_host[id].src_max, &d->buf_pa);
++        }
++        if ((s->n && !s->desc) || (d->n && (!d->desc || (wc_host[id].src_max && !d->buf)))) return -3;
++        s->mask = s->n ? s->n - 1 : 0;
++        d->mask = d->n ? d->n - 1 : 0;
++    }
++    __asm__ volatile ("dsb sy" ::: "memory");
++    wc_w(0, 0xc004u, (uint32_t)wc.rri_pa);   /* ce_rri_low and high: membase + 0x24c004 / 0x24c008 */
++    wc_w(0, 0xc008u, (uint32_t)(wc.rri_pa >> 32) & 0x1fu);
++    for (unsigned id = 0; id < WC_COUNT; id++) wc_w(id, WC_CTRL1, wc_r(id, WC_CTRL1) | 0x80000u);
++    for (unsigned id = 0; id < WC_COUNT; id++) {
++        struct wc_ring *s = &wc.src[id], *d = &wc.dst[id];
++        if (s->n) {
++            s->sw = wc_src_read(id) & s->mask;
++            s->hw = s->sw;
++            s->write = wc_r(id, WC_SR_WRITE) & s->mask;
++            wc_w(id, 0x00, (uint32_t)s->desc_pa);
++            wc_w(id, 0x04, (uint32_t)(s->desc_pa >> 32) & 0x1fu);
++            wc_w(id, 0x08, s->n);
++            wc_w(id, WC_CTRL1, (wc_r(id, WC_CTRL1) & ~0xffffu) | (wc_host[id].src_max & 0xffffu));
++            wc_w(id, WC_CTRL1, wc_r(id, WC_CTRL1) & ~(1u << 17));
++            wc_w(id, WC_SRC_WM, wc_r(id, WC_SRC_WM) & ~0xffff0000u);
++            wc_w(id, WC_SRC_WM, (wc_r(id, WC_SRC_WM) & ~0xffffu) | (s->n & 0xffffu));
++        }
++        if (d->n) {
++            d->sw = wc_dst_read(id) & d->mask;
++            d->write = wc_r(id, WC_DR_WRITE) & d->mask;
++            wc_w(id, 0x0c, (uint32_t)d->desc_pa);
++            wc_w(id, 0x10, (wc_r(id, 0x10) & ~0x1fu) | ((uint32_t)(d->desc_pa >> 32) & 0x1fu));
++            wc_w(id, 0x14, d->n);
++            wc_w(id, WC_CTRL1, wc_r(id, WC_CTRL1) & ~(1u << 18));
++            wc_w(id, WC_DST_WM, wc_r(id, WC_DST_WM) & ~0xffff0000u);
++            wc_w(id, WC_DST_WM, (wc_r(id, WC_DST_WM) & ~0xffffu) | (d->n & 0xffffu));
++        }
++    }
++    for (unsigned id = 0; id < WC_COUNT; id++) {
++        const uint32_t ie = wc_r(id, WC_HOST_IE);
++        wc_w(id, WC_HOST_IE, (!(wc_host[id].flags & WC_DIS_INTR) && wc_host[id].cb) ? ie | 1u : ie & ~1u);
++        wc_w(id, WC_HOST_IE, wc_r(id, WC_HOST_IE) & ~0x1eu);
++    }
++    wc.up = 1;
++    return 0;
++}
++
++/* __ath10k_ce_rx_post_buf_64 for every free entry (ath10k_snoc_rx_post_pipe): entry i always holds buffer slot i. */
++static void
++wc_rx_post(unsigned id)
++{
++    struct wc_ring *d = &wc.dst[id];
++    if (!d->n || !d->buf) return;
++    for (uint32_t free = ((d->sw - 1u) - d->write) & d->mask; free; free--) {
++        uint8_t *desc = d->desc + 16u * d->write;
++        const uint64_t address = (d->buf_pa + (uint64_t)d->write * wc_host[id].src_max) & ((1ull << 35) - 1);
++        memcpy(desc, &address, 8);
++        desc[8] = desc[9] = 0;
++        d->write = (d->write + 1u) & d->mask;
++        __asm__ volatile ("dsb st" ::: "memory");
++        wc_w(id, WC_DR_WRITE, d->write);
++    }
++}
++
++/* _ath10k_ce_send_nolock_64 of one buffer (no gather): copied into the slot of the write index, the index then written to the CE's
++ * shadow register. */
++static int
++wc_send(unsigned id, const void *data, uint32_t bytes, uint32_t transfer_id)
++{
++    static const uint32_t shadow[WC_COUNT] = {0x00, 0, 0, 0x0c, 0x10, 0x14, 0, 0x1c, 0, 0, 0, 0};
++    struct wc_ring *s = &wc.src[id];
++    if (!wc.up || !s->n || !s->buf || bytes > wc_host[id].src_max) return -1;
++    const uint32_t sw = wc.rri[id] & 0xffffu;
++    if (!(((sw - 1u) - s->write) & s->mask)) return -2;   /* ring full (ENOSR) */
++    const uint64_t pa = s->buf_pa + (uint64_t)s->write * wc_host[id].src_max;
++    memcpy(s->buf + (uint64_t)s->write * wc_host[id].src_max, data, bytes);
++    uint8_t *desc = s->desc + 16u * s->write;
++    const uint32_t words[2] = {(uint32_t)pa, (uint32_t)(pa >> 32) & 0x1fu};
++    const uint16_t length = (uint16_t)bytes, flags = (uint16_t)((transfer_id << 4) & 0xfff0u);
++    memcpy(desc, words, 8);
++    memcpy(desc + 8, &length, 2);
++    memcpy(desc + 10, &flags, 2);
++    s->write = (s->write + 1u) & s->mask;
++    __asm__ volatile ("dsb st" ::: "memory");
++    *(volatile uint32_t *)(wc.shadow + shadow[id]) = s->write;
++    wc.tx[id]++;
++    return 0;
++}
++
++static void wh_rx(unsigned pipe, const uint8_t *data, uint32_t bytes);
++
++/* ath10k_ce_per_engine_service: the copy complete and watermark status cleared, completed receives handed to HTC and their entries
++ * posted again (_ath10k_ce_completed_recv_next_nolock_64: a zero length is not done yet), completed sends retired
++ * (_ath10k_ce_completed_send_next_nolock_64). */
++static void
++wc_service(unsigned id)
++{
++    wc_w(id, WC_STATUS, 0x1u | 0x1eu);
++    struct wc_ring *d = &wc.dst[id], *s = &wc.src[id];
++    if (wc_host[id].cb & 2) {
++        for (;;) {
++            uint8_t *desc = d->desc + 16u * d->sw;
++            uint16_t bytes;
++            memcpy(&bytes, desc + 8, 2);
++            if (!bytes) break;
++            desc[8] = desc[9] = 0;
++            const uint8_t *data = d->buf + (uint64_t)d->sw * wc_host[id].src_max;
++            d->sw = (d->sw + 1u) & d->mask;
++            wc.rx[id]++;
++            if (bytes > wc_host[id].src_max) { wc.rx_bad++; continue; }
++            wh_rx(id, data, bytes);
++        }
++        wc_rx_post(id);
++    }
++    if (wc_host[id].cb & 1) {
++        for (;;) {
++            if (s->hw == s->sw) {
++                const uint32_t read = wc_src_read(id);
++                if (read == 0xffffffffu) break;
++                s->hw = read & s->mask;
++            }
++            if ((wc_src_read(id) & s->mask) == s->sw) break;
++            s->desc[16u * s->sw + 8] = s->desc[16u * s->sw + 9] = 0;
++            s->sw = (s->sw + 1u) & s->mask;
++            wc.tx_done[id]++;
++        }
++    }
++}
++
++/* ath10k_ce_per_engine_handler_adjust, and ath10k_ce_disable_interrupt (copy complete, errors and watermarks off). */
++static void
++wc_enable(unsigned id)
++{
++    const uint32_t ie = wc_r(id, WC_HOST_IE);
++    wc_w(id, WC_HOST_IE, (!(wc_host[id].flags & WC_DIS_INTR) && wc_host[id].cb) ? ie | 1u : ie & ~1u);
++    wc_w(id, WC_HOST_IE, wc_r(id, WC_HOST_IE) & ~0x1eu);
++}
++
++/* ath10k_snoc_per_engine_handler: SPI 414 + CE, level high. The CE's interrupts go off and the service loop takes it, as NAPI does.
++ * Not in Linux: a line that keeps firing while its CE is still pending (its interrupt enables did not silence it) is masked at the
++ * GIC after 1000 repeats and reported, so it cannot hold a core. */
++static void
++wc_irq(void *context)
++{
++    const unsigned id = (unsigned)(uintptr_t)context;
++    if (id >= WC_COUNT || !wc.up) return;
++    wc_w(id, WC_HOST_IE, wc_r(id, WC_HOST_IE) & ~1u);
++    wc_w(id, WC_MISC_IE, wc_r(id, WC_MISC_IE) & ~0x3e0u);
++    wc_w(id, WC_HOST_IE, wc_r(id, WC_HOST_IE) & ~0x1eu);
++    wc.irqs[id]++;
++    const uint32_t before = __atomic_fetch_or(&wc.pending, 1u << id, __ATOMIC_ACQ_REL);
++    if (!(before & (1u << id))) { wc.repeats[id] = 0; return; }
++    if (++wc.repeats[id] >= 1000 && wc.gicd) {
++        const uint32_t intid = 32u + 414u + id;
++        wc.gicd[(0x180u + (intid / 32u) * 4u) / 4u] = 1u << (intid % 32u);   /* GICD_ICENABLER */
++        __atomic_or_fetch(&wc.masked, 1u << id, __ATOMIC_RELEASE);
++    }
++}
++
++/* ath10k_snoc_hif_start: the twelve CE interrupts (requested with IRQF_NO_AUTOEN, enabled here) and every receive ring filled. */
++static void
++wc_start(void)
++{
++    extern int armcpu_spi_attach(uint32_t, bool, void (*)(void *), void *, uint32_t *, uint64_t *);   /* ArmCpu.cpp, IOReturn */
++    unsigned attached = 0;
++    if (!wc.gicd) wc.gicd = (volatile uint32_t *)ml_io_map(0x17a00000, 0x1000);
++    for (unsigned id = 0; id < WC_COUNT; id++) {
++        uint32_t readback = 0;
++        uint64_t router = 0;
++        const int status = armcpu_spi_attach(32u + 414u + id, false, wc_irq, (void *)(uintptr_t)id, &readback, &router);
++        if (!status) attached++;
++        else printf("COACHZ wlan: CE%u interrupt (SPI %u) not attached: 0x%x\n", id, 414u + id, status);
++    }
++    wc.irq = attached == WC_COUNT;
++    for (unsigned id = 0; id < WC_COUNT; id++) wc_rx_post(id);
++    printf("COACHZ wlan: copy engines up, %u of 12 interrupts, %u KiB of ring and buffer memory at 0x%llx\n", attached, wc.used >> 10,
++        (unsigned long long)WC_MEM_PA);
++}
++
++/* The service loop's share (ath10k_snoc_napi_poll): every CE whose interrupt fired, serviced and its interrupt enabled again; all of
++ * them when an interrupt could not be attached, or when ath10k_htc_wait_target's workaround forces it. */
++static void
++wc_poll(int all)
++{
++    if (!wc.up) return;
++    const uint32_t pending = all || !wc.irq ? (1u << WC_COUNT) - 1u : __atomic_exchange_n(&wc.pending, 0u, __ATOMIC_ACQUIRE);
++    for (unsigned id = 0; id < WC_COUNT; id++) {
++        if (!(pending & (1u << id))) continue;
++        wc_service(id);
++        if (wc.irq) wc_enable(id);
++    }
++}
++
++/*
++ * HTC (htc.c) on those pipes: an 8-byte header {endpoint, flags, payload length, trailer length or sequence, padding}; endpoint 0 is
++ * the control service (connected locally to pipes 0 and 2, without credit flow), the WMI control service alone has credit flow and all
++ * of the target's credits (use_fw_tx_credits is false for WCN3990: one), credit reports arrive in trailers.
++ */
++#define WH_EPS 9
++static struct {
++    struct { uint16_t service, max_len; uint8_t ul, dl, flow, seq; int credits; uint64_t rx, tx; } ep[WH_EPS];
++    uint8_t ctl[256];
++    uint32_t ctl_len;
++    volatile int ctl_new;
++    uint16_t credit_count, credit_size, alt_credit_size;
++    uint8_t max_eps, bundle;
++    int total_credits, htt, wmi, log;
++    uint32_t wmi_events, htt_messages, log_messages, unsolicited, dropped;
++    uint32_t last_wmi, last_wmi_len;
++    uint8_t svc_rdy[2048], svc_avail[256], rdy[512];
++    uint32_t svc_rdy_len, svc_avail_len, rdy_len;
++    int service_ready, service_available, ready_event;
++    uint32_t wmi_ids[8], wmi_lens[8];
++} wh;
++
++static int
++wh_map(uint16_t service, uint8_t *ul, uint8_t *dl)
++{
++    int up = 0, down = 0;
++    for (unsigned i = 0; i < 21; i++) {
++        if (wc_services[i][0] != service) continue;
++        if (wc_services[i][1] == 1 || wc_services[i][1] == 3) { *dl = (uint8_t)wc_services[i][2]; down = 1; }
++        if (wc_services[i][1] == 2 || wc_services[i][1] == 3) { *ul = (uint8_t)wc_services[i][2]; up = 1; }
++    }
++    return up && down ? 0 : -1;
++}
++
++/* ath10k_htc_init: endpoint states reset, the pseudo control service connected. */
++static void
++wh_init(void)
++{
++    bzero(&wh, sizeof(wh));
++    for (unsigned e = 0; e < WH_EPS; e++) wh.ep[e].flow = 1;
++    wh.htt = wh.wmi = wh.log = -1;
++    wh.ep[0].service = 0x0001;
++    wh.ep[0].max_len = 256;
++    wh.ep[0].flow = 0;
++    (void)wh_map(0x0001, &wh.ep[0].ul, &wh.ep[0].dl);
++}
++
++/* ath10k_htc_send: credits consumed on a flow-controlled endpoint, the header put before the payload, one CE send on the endpoint's
++ * uplink pipe with the endpoint as transfer id. */
++static int
++wh_send(unsigned eid, const void *payload, uint32_t bytes)
++{
++    static uint8_t m[2048];   /* the service thread's only */
++    if (eid >= WH_EPS || bytes + 8u > sizeof(m)) return -1;
++    if (wh.ep[eid].flow) {
++        if (!wh.credit_size) return -3;
++        const int need = (int)((bytes + 8u + wh.credit_size - 1u) / wh.credit_size);
++        if (wh.ep[eid].credits < need) return -2;
++        wh.ep[eid].credits -= need;
++    }
++    m[0] = (uint8_t)eid;
++    m[1] = wh.ep[eid].flow ? 1 : 0;   /* ATH10K_HTC_FLAG_NEED_CREDIT_UPDATE */
++    m[2] = (uint8_t)bytes;
++    m[3] = (uint8_t)(bytes >> 8);
++    m[4] = 0;
++    m[5] = wh.ep[eid].seq++;
++    m[6] = m[7] = 0;
++    memcpy(m + 8, payload, bytes);
++    const int sent = wc_send(wh.ep[eid].ul, m, bytes + 8u, eid);
++    if (!sent) wh.ep[eid].tx++;
++    return sent;
++}
++
++/* ath10k_htc_rx_completion_handler with the trailer's credit reports (ath10k_htc_process_trailer), then the endpoint's handler. */
++static void
++wh_rx(unsigned pipe, const uint8_t *d, uint32_t n)
++{
++    (void)pipe;
++    if (n < 8) { wh.dropped++; return; }
++    const uint8_t eid = d[0], flags = d[1];
++    const uint32_t len = (uint32_t)(d[2] | d[3] << 8);
++    if (eid >= WH_EPS || !wh.ep[eid].service || len + 8u > 4096u || n - 8u < len) { wh.dropped++; return; }
++    uint32_t trailer = 0;
++    if (flags & 2) {
++        trailer = d[4];
++        if (trailer < 4 || trailer > len) { wh.dropped++; return; }
++        const uint8_t *r = d + 8 + len - trailer;
++        for (int left = (int)trailer; left > 0;) {
++            if (left < 4 || r[1] > left) { wh.dropped++; return; }
++            if (r[0] == 1)
++                for (unsigned k = 0; k + 4u <= r[1]; k += 4) {
++                    if (r[4 + k] >= WH_EPS) break;
++                    wh.ep[r[4 + k]].credits += r[5 + k];
++                }
++            left -= 4 + r[1];
++            r += 4 + r[1];
++        }
++    }
++    if ((int)len - (int)trailer <= 0) return;
++    const uint8_t *p = d + 8;
++    const uint32_t bytes = len - trailer;
++    wh.ep[eid].rx++;
++    if (eid == 0) {
++        const uint16_t id = bytes >= 2 ? (uint16_t)(p[0] | p[1] << 8) : 0;
++        if (id == 1 || id == 3) {
++            wh.ctl_len = bytes < sizeof(wh.ctl) ? bytes : sizeof(wh.ctl);
++            memcpy(wh.ctl, p, wh.ctl_len);
++            wh.ctl_new = 1;
++        } else {
++            wh.unsolicited++;
++        }
++    } else if ((int)eid == wh.wmi) {
++        /* WMI-TLV: a 32-bit header with the event id in bits 0-23, then TLVs {length, tag}. */
++        uint32_t header = 0;
++        if (bytes >= 4) memcpy(&header, p, 4);
++        wh.last_wmi = header & 0xffffffu;
++        wh.last_wmi_len = bytes;
++        if (wh.wmi_events < 8) { wh.wmi_ids[wh.wmi_events] = wh.last_wmi; wh.wmi_lens[wh.wmi_events] = bytes; }
++        wh.wmi_events++;
++        /* WMI_TLV_SERVICE_READY_EVENTID 1, READY 2, SERVICE_AVAILABLE 3: kept whole (without the header) for the sequence. */
++        if (wh.last_wmi == 1 && !wh.service_ready && bytes - 4 <= sizeof(wh.svc_rdy)) {
++            wh.svc_rdy_len = bytes - 4;
++            memcpy(wh.svc_rdy, p + 4, wh.svc_rdy_len);
++            wh.service_ready = 1;
++        } else if (wh.last_wmi == 3 && !wh.service_available && bytes - 4 <= sizeof(wh.svc_avail)) {
++            wh.svc_avail_len = bytes - 4;
++            memcpy(wh.svc_avail, p + 4, wh.svc_avail_len);
++            wh.service_available = 1;
++        } else if (wh.last_wmi == 2 && !wh.ready_event && bytes - 4 <= sizeof(wh.rdy)) {
++            wh.rdy_len = bytes - 4;
++            memcpy(wh.rdy, p + 4, wh.rdy_len);
++            wh.ready_event = 1;
++        }
++    } else if ((int)eid == wh.htt) {
++        wh.htt_messages++;
++    } else if ((int)eid == wh.log) {
++        wh.log_messages++;
++    }
++}
++
++/* ath10k_htc_connect_service's request: the service, its credit allocation and the flow-control flag. */
++static int
++wh_connect(uint16_t service)
++{
++    const uint8_t alloc = service == 0x0100 ? (uint8_t)wh.total_credits : 0;
++    const uint16_t flags = (uint16_t)(alloc << 8) | (service != 0x0100 ? 1u << 3 : 0);
++    const uint8_t m[8] = {2, 0, (uint8_t)service, (uint8_t)(service >> 8), (uint8_t)flags, (uint8_t)(flags >> 8), 0, 0};
++    wh.ctl_new = 0;
++    return wh_send(0, m, sizeof(m));
++}
++
++/* Its response: the endpoint set up (service, credits, flow control, pipes); the endpoint, or a negative status. */
++static int
++wh_connected(uint16_t service)
++{
++    if (wh.ctl_len < 8 || (wh.ctl[0] | wh.ctl[1] << 8) != 3 || (wh.ctl[2] | wh.ctl[3] << 8) != service) return -1;
++    const uint8_t status = wh.ctl[4], eid = wh.ctl[5];
++    const uint16_t max_len = (uint16_t)(wh.ctl[6] | wh.ctl[7] << 8);
++    printf("COACHZ htc: service 0x%x status %u endpoint %u max message %u\n", service, status, eid, max_len);
++    if (status || eid >= WH_EPS || !max_len || wh.ep[eid].service) return -2;
++    wh.ep[eid].service = service;
++    wh.ep[eid].max_len = max_len;
++    wh.ep[eid].credits = service == 0x0100 ? wh.total_credits : 0;
++    wh.ep[eid].flow = service == 0x0100;
++    if (wh_map(service, &wh.ep[eid].ul, &wh.ep[eid].dl)) return -3;
++    return eid;
++}
++
++/*
++ * WMI-TLV (wmi-tlv.c). Messages are a 32-bit header holding the command or event id in bits 0-23, then TLVs {length, tag} padded
++ * to 4 bytes. Tags: ARRAY_UINT32 16, ARRAY_STRUCT 18, SERVICE_READY_EVENT 32, HAL_REG_CAPABILITIES 33, WLAN_HOST_MEM_REQ 34,
++ * READY_EVENT 35, INIT_CMD 74, RESOURCE_CONFIG 75, WLAN_HOST_MEMORY_CHUNK 76.
++ */
++#define WM_ABI_VER0 0x01000000u   /* major 1, minor 0 */
++#define WM_ABI_VER1 53u
++#define WM_ABI_NS0 0x5f414351u
++#define WM_ABI_NS1 0x00004c4du
++static const uint8_t *
++wm_tlv(const uint8_t *m, uint32_t n, uint16_t tag, unsigned nth, uint16_t *len)
++{
++    for (uint32_t at = 0; at + 4 <= n;) {
++        const uint16_t l = (uint16_t)(m[at] | m[at + 1] << 8), t = (uint16_t)(m[at + 2] | m[at + 3] << 8);
++        if (at + 4 + l > n) return NULL;
++        if (t == tag && !nth--) { *len = l; return m + at + 4; }
++        at += 4 + ((l + 3u) & ~3u);
++    }
++    return NULL;
++}
++static uint32_t wm_u32(const uint8_t *v, unsigned word) { uint32_t x; memcpy(&x, v + 4 * word, 4); return x; }
++
++static struct {
++    uint32_t chunks, chunk_id[16], chunk_pa[16], chunk_bytes[16];
++    int rx_full_reorder, ack_rssi, extend_address;
++} wm;
++
++/* ath10k_wmi_tlv_op_pull_svc_rdy_ev and ath10k_wmi_event_service_ready_work: the ABI check, the service map (four services per
++ * 32-bit word in this bitmap), and host memory for each request (num_units from the vdev/peer counts when its flags say so, one
++ * chunk of num_units * unit_size rounded to 4), here from the copy engines' window. 0 when WMI init may be sent. */
++static int
++wm_service_ready(void)
++{
++    uint16_t lev = 0, lreg = 0, lmem = 0, lsvc = 0;
++    const uint8_t *ev = wm_tlv(wh.svc_rdy, wh.svc_rdy_len, 32, 0, &lev), *reg = wm_tlv(wh.svc_rdy, wh.svc_rdy_len, 33, 0, &lreg),
++                  *mem = NULL, *svc = wm_tlv(wh.svc_rdy, wh.svc_rdy_len, 16, 0, &lsvc);
++    /* ath10k_wmi_tlv_svc_rdy_parse keeps the last ARRAY_STRUCT as the memory requests and the first ARRAY_UINT32 as the services. */
++    for (unsigned nth = 0;; nth++) {
++        uint16_t l = 0;
++        const uint8_t *a = wm_tlv(wh.svc_rdy, wh.svc_rdy_len, 18, nth, &l);
++        if (!a) break;
++        mem = a;
++        lmem = l;
++    }
++    if (!ev || lev < 4 * 21 || !reg || lreg < 4 * 9 || !mem || !svc) {
++        printf("COACHZ wmi: service ready incomplete (event %d, reg %d, mem %d, services %d)\n", ev != NULL, reg != NULL, mem != NULL, svc != NULL);
++        return -1;
++    }
++    const int abi = wm_u32(ev, 1) == WM_ABI_VER0 && wm_u32(ev, 3) == WM_ABI_NS0 && wm_u32(ev, 4) == WM_ABI_NS1 && !wm_u32(ev, 5) && !wm_u32(ev, 6);
++    const unsigned svc_words = lsvc / 4u;
++    wm.rx_full_reorder = 65u / 4u < svc_words && (wm_u32(svc, 65u / 4u) >> (65u % 4u) & 1u);
++    printf("COACHZ wmi: service ready: fw build 0x%x abi 0x%x/%u ns 0x%x 0x%x %s, phy 0x%x frag %u rf chains %u ht 0x%x vht 0x%x mcs 0x%x tx power %u..%u, "
++        "sys 0x%x, %u mem requests, %u scan channels, board %u; regdomain 0x%x 2 GHz %u..%u 5 GHz %u..%u; %u service words, rx full reorder %d\n",
++        wm_u32(ev, 0), wm_u32(ev, 1), wm_u32(ev, 2), wm_u32(ev, 3), wm_u32(ev, 4), abi ? "matches" : "differs", wm_u32(ev, 7), wm_u32(ev, 8),
++        wm_u32(ev, 9), wm_u32(ev, 10), wm_u32(ev, 11), wm_u32(ev, 12), wm_u32(ev, 13), wm_u32(ev, 14), wm_u32(ev, 15), wm_u32(ev, 18),
++        wm_u32(ev, 19), wm_u32(ev, 20), wm_u32(reg, 0), wm_u32(reg, 5), wm_u32(reg, 6), wm_u32(reg, 7), wm_u32(reg, 8), svc_words,
++        wm.rx_full_reorder);
++    if (!abi) return -2;
++    /* Extended services (128 and up) from SERVICE_AVAILABLE, 32 a word: TX_DATA_MGMT_ACK_RSSI 174, SUPPORT_EXTEND_ADDRESS 179. */
++    if (wh.service_available && wh.svc_avail_len >= 8) {
++        /* Its one TLV (SERVICE_AVAILABLE_EVENT): the word count, then the words. */
++        const uint16_t l = (uint16_t)(wh.svc_avail[0] | wh.svc_avail[1] << 8);
++        const uint8_t *v = wh.svc_avail + 4;
++        if (l >= 8 && 4u + l <= wh.svc_avail_len) {
++            const uint32_t count = wm_u32(v, 0), words = (l - 4u) / 4u;
++            const unsigned ack = 174 - 128, ext = 179 - 128;
++            wm.ack_rssi = ack / 32 < count && ack / 32 < words && (wm_u32(v, 1 + ack / 32) >> (ack % 32) & 1u);
++            wm.extend_address = ext / 32 < count && ext / 32 < words && (wm_u32(v, 1 + ext / 32) >> (ext % 32) & 1u);
++        }
++    }
++    const uint32_t requests = wm_u32(ev, 18);
++    wm.chunks = 0;
++    for (unsigned i = 0; i < requests && i < 16; i++) {
++        uint16_t lr = 0;
++        const uint8_t *r = wm_tlv(mem, lmem, 34, i, &lr);
++        if (!r || lr < 16) { printf("COACHZ wmi: mem request %u missing\n", i); return -3; }
++        const uint32_t id = wm_u32(r, 0), unit = wm_u32(r, 1), info = wm_u32(r, 2);
++        uint32_t units = wm_u32(r, 3);
++        if (info & 4) units = 33 + 1;        /* NUM_UNITS_IS_NUM_ACTIVE_PEERS: no active peers, max_num_peers + 1 */
++        else if (info & 2) units = 33 + 1;   /* NUM_UNITS_IS_NUM_PEERS */
++        else if (info & 1) units = 4 + 1;    /* NUM_UNITS_IS_NUM_VDEVS */
++        const uint64_t bytes = (uint64_t)units * ((unit + 3u) & ~3u);
++        uint64_t pa = 0;
++        uint8_t *va = bytes && bytes < WC_MEM_BYTES ? wc_alloc((uint32_t)bytes, &pa) : NULL;
++        printf("COACHZ wmi: mem request %u: id %u unit %u info 0x%x units %u -> %llu bytes %s\n", i, id, unit, info, units,
++            (unsigned long long)bytes, va ? "allocated" : "not available");
++        if (!va) return -4;
++        bzero(va, (size_t)bytes);
++        wm.chunk_id[wm.chunks] = id;
++        wm.chunk_pa[wm.chunks] = (uint32_t)pa;
++        wm.chunk_bytes[wm.chunks] = (uint32_t)bytes;
++        wm.chunks++;
++    }
++    return 0;
++}
++
++/* ath10k_wmi_tlv_op_gen_init with WCN3990's parameters (hw_params num_peers 33, ast_skid_limit 16, num_wds_entries 2; TLV
++ * firmware: 4 vdevs, 1056 MSDU descriptors, native wifi decap; no wow patterns before mac registration), sent on the WMI endpoint
++ * (ath10k_wmi_cmd_send: the header, then one HTC send that takes a credit). */
++static int
++wm_send_init(void)
++{
++    static uint8_t m[4 + 4 + 28 + 4 + 46 * 4 + 4 + 16 * 20];
++    uint32_t at = 0;
++    const uint32_t header = 0x1;   /* WMI_TLV_INIT_CMDID */
++#define WM_PUT32(v) do { const uint32_t w_ = (v); memcpy(m + at, &w_, 4); at += 4; } while (0)
++#define WM_TLV(tag, len) do { const uint16_t l_ = (uint16_t)(len), t_ = (uint16_t)(tag); memcpy(m + at, &l_, 2); memcpy(m + at + 2, &t_, 2); at += 4; } while (0)
++    WM_PUT32(header);
++    WM_TLV(74, 28);
++    WM_PUT32(WM_ABI_VER0); WM_PUT32(WM_ABI_VER1); WM_PUT32(WM_ABI_NS0); WM_PUT32(WM_ABI_NS1); WM_PUT32(0); WM_PUT32(0);
++    WM_PUT32(wm.chunks);
++    const uint32_t cfg[46] = {
++        4, 33, wm.rx_full_reorder ? 4u : 0u, wm.rx_full_reorder ? 4u : 0u, 2, 66, 16, 0x7, 0x7, 0x64, 0x64, 0x64, 0x28,
++        1, 4, 4, 4, 8, 0, 0, 0, 0x400, 2, 0, 0, 0, 0, 2, 1056, 2, 1, 0x20, 2, 5, 0, 6, 0, 1, 1, 0, 0, 0, 0,
++        (1u << 9) | (wm.ack_rssi ? 1u << 18 : 0u), 0, 0,
++    };
++    /* The structure's order: num_vdevs, num_peers, offload peers and reorder buffers, peer keys, tids, ast_skid_limit, tx and rx
++     * chain masks, rx_timeout_pri[4], rx_decap_mode, scan_max_pending_reqs, bmiss and roam offload vdevs, roam AP profiles, mcast
++     * groups and table elements, mcast2ucast, tx_dbg_log_size, num_wds_entries, dma_burst_size, mac_aggr_delim, defrag check,
++     * vow_config, gtk offload vdevs, num_msdu_desc, max_frag_entries, tdls vdevs and table entries, beacon offload vdevs, multicast
++     * filters, wow filters, keep alive patterns and size, tdls sleep and buffer sta, wmi_send_separate, ocb vdevs, channels and
++     * schedules, host_capab: 44 words. */
++    WM_TLV(75, 44 * 4);
++    for (unsigned i = 0; i < 44; i++) WM_PUT32(cfg[i]);
++    WM_TLV(18, wm.chunks * 20);
++    for (unsigned i = 0; i < wm.chunks; i++) {
++        WM_TLV(76, 16);
++        WM_PUT32(wm.chunk_id[i]); WM_PUT32(wm.chunk_pa[i]); WM_PUT32(wm.chunk_bytes[i]);
++        WM_PUT32(wm.extend_address ? 0u : 0u);   /* upper 32 bits: the window is below 4 GiB */
++    }
++#undef WM_PUT32
++#undef WM_TLV
++    printf("COACHZ wmi: init: %u bytes, %u host memory chunks, rx full reorder %d, ack rssi %d, extended addresses %d\n", at, wm.chunks,
++        wm.rx_full_reorder, wm.ack_rssi, wm.extend_address);
++    return wh_send((unsigned)wh.wmi, m, at);
++}
++
++static void
++wc_report(unsigned second)
++{
++    if (!wc.up) return;
++    char line[400];
++    size_t used = 0;
++    for (unsigned id = 0; id < WC_COUNT; id++)
++        if (wc.irqs[id] || wc.rx[id] || wc.tx[id])
++            used += snprintf(line + used, sizeof(line) - used, " ce%u %llu/%llu/%llu/%llu", id, (unsigned long long)wc.irqs[id],
++                (unsigned long long)wc.rx[id], (unsigned long long)wc.tx[id], (unsigned long long)wc.tx_done[id]);
++    printf("COACHZ wlan at %u s: interrupts/received/sent/completed%s; bad %llu, masked 0x%x; htc ready %u, eps htt %d wmi %d log %d, wmi events %u "
++        "(last 0x%x, %u bytes), htt %u, log %u, unsolicited %u, dropped %u, wmi credits %d\n", second, used ? line : " none",
++        (unsigned long long)wc.rx_bad, wc.masked, wh.credit_size ? 1u : 0u, wh.htt, wh.wmi, wh.log, wh.wmi_events, wh.last_wmi, wh.last_wmi_len,
++        wh.htt_messages, wh.log_messages, wh.unsolicited, wh.dropped, wh.wmi >= 0 ? wh.ep[wh.wmi].credits : -1);
++}
++
 +/* One step of the sequence, every millisecond from the watch loop. */
 +static void
 +wl_step(void)
@@ -1987,8 +2780,9 @@
 +    uint32_t at = 0;
 +    uint16_t error = 0;
 +    int result = 0;
-+    if (wl.failed || !wl.known || !wg.open_acked || wl.state >= 10) return;
-+    if (wl.state && wl.state != 6 && wl.state != 9 && !wl.resp_ready) {
++    if (wl.failed || !wl.known || !wg.open_acked || wl.state >= 19) return;
++    const int awaiting = (wl.state >= 1 && wl.state <= 8 && wl.state != 6) || wl.state == 11 || wl.state == 12;
++    if (awaiting && !wl.resp_ready) {
 +        if (++wl.waited_ms >= 30000) {
 +            printf("COACHZ wlfw: no response to 0x%x in 30 s (state %d)\n", wl.want_id, wl.state);
 +            wl.failed = 1;
@@ -2123,11 +2917,168 @@
 +        break;
 +    case 9:
 +        if (wl.fw_ready) {
-+            printf("COACHZ wlfw: WLAN firmware ready; WLAN mode and the copy engines are next\n");
++            printf("COACHZ wlfw: WLAN firmware ready\n");
 +            wl.state = 10;
 +        } else if (++wl.waited_ms >= 30000) {
 +            printf("COACHZ wlfw: no FW ready indication in 30 s\n");
 +            wl.failed = 1;
++        }
++        break;
++    case 10: {
++        /* ath10k_snoc_wlan_enable -> ath10k_qmi_cfg_send_sync_msg: no host version, the target CE table, the service map and the
++         * shadow registers, each a length byte and its structures. */
++        static uint8_t cfg[600], value[300];
++        uint32_t v = 0;
++        value[v++] = WC_COUNT;
++        for (unsigned i = 0; i < WC_COUNT; i++) { memcpy(value + v, wc_target[i], 20); v += 20; }
++        at = wr_put(cfg, 0, 0x11, value, (uint16_t)v);
++        v = 0;
++        value[v++] = 21;
++        for (unsigned i = 0; i < 21; i++) { memcpy(value + v, wc_services[i], 12); v += 12; }
++        at = wr_put(cfg, at, 0x12, value, (uint16_t)v);
++        v = 0;
++        value[v++] = 12;
++        for (unsigned i = 0; i < 12; i++) { memcpy(value + v, wc_shadow[i], 4); v += 4; }
++        at = wr_put(cfg, at, 0x13, value, (uint16_t)v);
++        wl_request(0x23, cfg, at);
++        wl.state = 11;
++        break;
++    }
++    case 11: {
++        printf("COACHZ wlfw: WLAN configuration %d/%u\n", result, error);
++        if (result) { wl.failed = 1; break; }
++        const uint32_t mission = 0;   /* QMI_WLFW_MISSION_V01, with hw_debug present and 0 */
++        const uint8_t debug = 0;
++        at = wr_put(t, at, 0x01, &mission, 4);
++        at = wr_put(t, at, 0x10, &debug, 1);
++        wl_request(0x22, t, at);
++        wl.state = 12;
++        break;
++    }
++    case 12: {
++        printf("COACHZ wlfw: WLAN mode mission %d/%u\n", result, error);
++        if (result) { wl.failed = 1; break; }
++        /* The rest of ath10k_snoc_hif_power_up, then ath10k_core_start's htc_init and hif_start. */
++        const int up = wc_power_up();
++        if (up) {
++            printf("COACHZ wlan: copy engines not set up (%d)\n", up);
++            wl.failed = 1;
++            break;
++        }
++        wh_init();
++        wc_start();
++        wl.state = 13;
++        wl.waited_ms = 0;
++        break;
++    }
++    case 13:
++        /* ath10k_htc_wait_target: 1 s for the target's READY, then every CE serviced once by force and 1 s more. */
++        if (!wh.ctl_new) {
++            if (++wl.waited_ms == 1000) {
++                printf("COACHZ htc: no control response in 1 s, polling\n");
++                wc_poll(1);
++            } else if (wl.waited_ms >= 2000) {
++                printf("COACHZ htc: target never sent READY\n");
++                wl.failed = 1;
++            }
++            break;
++        }
++        if (wh.ctl_len < 8 || (wh.ctl[0] | wh.ctl[1] << 8) != 1) {
++            printf("COACHZ htc: invalid READY (%u bytes, message 0x%x)\n", wh.ctl_len, wh.ctl[0] | wh.ctl[1] << 8);
++            wl.failed = 1;
++            break;
++        }
++        wh.credit_count = (uint16_t)(wh.ctl[2] | wh.ctl[3] << 8);
++        wh.credit_size = (uint16_t)(wh.ctl[4] | wh.ctl[5] << 8);
++        wh.max_eps = wh.ctl[6];
++        wh.total_credits = 1;
++        if (wh.ctl_len >= 12) {
++            wh.alt_credit_size = (uint16_t)((wh.ctl[10] | wh.ctl[11] << 8) & 0xfffu);
++            wh.bundle = wh.ctl[9] < 32 ? wh.ctl[9] : 32;
++        }
++        printf("COACHZ htc: target ready after %u ms: %u credits (1 used) of %u bytes, %u endpoints, %u bytes%s, version %u bundle %u alt size %u\n",
++            wl.waited_ms, wh.credit_count, wh.credit_size, wh.max_eps, wh.ctl_len, wh.ctl_len >= 12 ? " (extended)" : "",
++            wh.ctl_len >= 12 ? wh.ctl[8] : 0, wh.bundle, wh.alt_credit_size);
++        if (!wh.credit_size) { wl.failed = 1; break; }
++        /* ath10k_htt_connect */
++        if (wh_connect(0x0300)) { printf("COACHZ htc: HTT connect not sent\n"); wl.failed = 1; break; }
++        wl.state = 14;
++        wl.waited_ms = 0;
++        break;
++    case 14:
++    case 15:
++    case 16: {
++        static const uint16_t services[3] = {0x0300, 0x0100, 0x0600};
++        static const char *const names[3] = {"HTT data", "WMI control", "pktlog"};
++        const unsigned k = (unsigned)wl.state - 14u;
++        if (!wh.ctl_new) {
++            if (++wl.waited_ms >= 1000) { printf("COACHZ htc: %s connect timeout\n", names[k]); wl.failed = 1; }
++            break;
++        }
++        const int eid = wh_connected(services[k]);
++        if (eid < 0) { printf("COACHZ htc: %s connect failed (%d)\n", names[k], eid); wl.failed = 1; break; }
++        if (k == 0) {
++            wh.htt = eid;
++            if (wh_connect(0x0100)) { wl.failed = 1; break; }   /* ath10k_wmi_connect */
++        } else if (k == 1) {
++            /* ath10k_htc_start: SETUP_COMPLETE_EX (no SDIO bundling), then pktlog only if the service map has both of its pipes
++             * (ath10k_htc_pktlog_svc_supported); snoc's has only the downlink one, so Linux does not connect it here. */
++            static const uint8_t setup[12] = {5, 0};
++            uint8_t ul = 0, dl = 0;
++            wh.wmi = eid;
++            const int sent = wh_send(0, setup, sizeof(setup));
++            if (sent) { printf("COACHZ htc: setup complete not sent (%d)\n", sent); wl.failed = 1; break; }
++            if (wh_map(0x0600, &ul, &dl)) {
++                printf("COACHZ htc: started; HTT endpoint %d, WMI %d (%d credits), no pktlog uplink in the map\n", wh.htt, wh.wmi,
++                    wh.ep[wh.wmi].credits);
++                wl.state = 17;
++                wl.waited_ms = 0;
++                break;
++            }
++            if (wh_connect(0x0600)) { wl.failed = 1; break; }
++        } else {
++            wh.log = eid;
++            printf("COACHZ htc: started; HTT endpoint %d, WMI %d (%d credits), pktlog %d\n", wh.htt, wh.wmi, wh.ep[wh.wmi].credits, wh.log);
++        }
++        wl.state++;
++        wl.waited_ms = 0;
++        break;
++    }
++    case 17:
++        /* ath10k_wmi_wait_for_service_ready: 5 s, then the service ready work and ath10k_wmi_cmd_init. */
++        if (wh.service_ready) {
++            printf("COACHZ wmi: service ready after %u ms (%u bytes; events so far 0x%x 0x%x 0x%x 0x%x)\n", wl.waited_ms, wh.svc_rdy_len,
++                wh.wmi_ids[0], wh.wmi_ids[1], wh.wmi_ids[2], wh.wmi_ids[3]);
++            const int ready = wm_service_ready();
++            if (ready) { printf("COACHZ wmi: init not sent (%d)\n", ready); wl.state = 19; break; }
++            const int sent = wm_send_init();
++            if (sent) { printf("COACHZ wmi: init send failed (%d)\n", sent); wl.state = 19; break; }
++            wl.state = 18;
++            wl.waited_ms = 0;
++        } else if (++wl.waited_ms >= 5000) {
++            printf("COACHZ wmi: no service ready in 5 s (%u events, last 0x%x)\n", wh.wmi_events, wh.last_wmi);
++            wl.state = 19;
++        }
++        break;
++    case 18:
++        /* ath10k_wmi_wait_for_unified_ready: 5 s. The READY event's MAC address is a device identifier: only its OUI is printed. */
++        if (wh.ready_event) {
++            uint16_t l = 0;
++            const uint8_t *r = wm_tlv(wh.rdy, wh.rdy_len, 35, 0, &l);
++            if (r && l >= 36) {
++                printf("COACHZ wmi: ready after %u ms: sw 0x%x abi %u, status %u, MAC %02x:%02x:%02x:xx:xx:xx\n", wl.waited_ms, wm_u32(r, 0),
++                    wm_u32(r, 1), wm_u32(r, 8), r[24], r[25], r[26]);
++            } else {
++                printf("COACHZ wmi: ready event without its structure (%u bytes)\n", wh.rdy_len);
++            }
++            printf("COACHZ wmi: firmware initialised; vdev creation and scanning are next\n");
++            wl.state = 19;
++        } else if (++wl.waited_ms >= 5000) {
++            printf("COACHZ wmi: no ready event in 5 s after init (%u events, last 0x%x, wmi credits %d):", wh.wmi_events, wh.last_wmi,
++                wh.ep[wh.wmi].credits);
++            for (unsigned i = 0; i < 8 && i < wh.wmi_events; i++) printf(" 0x%x/%u", wh.wmi_ids[i], wh.wmi_lens[i]);
++            printf("\n");
++            wl.state = 19;
 +        }
 +        break;
 +    }
@@ -2415,6 +3366,11 @@
 +        printf("COACHZ mba: not started, a modem region is not known to be free\n");
 +        return;
 +    }
++    /* The copy engines' window likewise, and clear of the modem's regions. */
++    wc.window_clear = known && cw_disjoint(WC_MEM_PA, WC_MEM_BYTES, args->physBase, args->memSize) && cw_disjoint(WC_MEM_PA, WC_MEM_BYTES, fb, fb_size);
++    for (unsigned i = 0; i < 4; i++) wc.window_clear = wc.window_clear && cw_disjoint(WC_MEM_PA, WC_MEM_BYTES, regions[i][0], regions[i][1]);
++    /* ath10k probes at boot, before the modem starts: its supplies go on first (ath10k_hw_power_on). */
++    if (mpss) printf("COACHZ wlan: WCN3990 supplies on, %d failed; copy engine window clear %d\n", wl_power_on(), wc.window_clear);
 +    /* Mainline's proxy clock "xo" (RPMH_CXO_CLK, ARC xo.lvl on = 3), active only and kept. */
 +    {
 +        const vm_offset_t db = wifi_cmd_db();
@@ -2465,11 +3421,15 @@
 +        for (unsigned ms = 0; ms < 1000; ms++) {
 +            if (!link) {
 +                wg_poll();
++                wc_poll(0);
 +                wl_step();
 +            }
 +            delay(1000);
 +        }
-+        if (!link && (second <= 120 ? !(second % 10) : !(second % 60))) wg_report(second);
++        if (!link && (second <= 120 ? !(second % 10) : !(second % 60))) {
++            wg_report(second);
++            wc_report(second);
++        }
 +        if (second > 60 && second % 10) continue;
 +        const int64_t bits = wifi_modem_bits();
 +        if (bits != seen || !(second % 60)) {
@@ -2478,9 +3438,8 @@
 +            seen = bits;
 +        }
 +        if (bits >= 0 && (bits & 4) && !handed) {
-+            const uint32_t off[3] = {0, 0, 0};
 +            uint32_t status[3] = {0};
-+            const int sent = wifi_rpmh_send(wifi_mss_rails, off, 3, status);
++            const int sent = wifi_mss_rails_vote(0, status);
 +            handed = 1;
 +            printf("COACHZ mpss: handover at %u s; proxy rails to 0 after %d us, status 0x%x 0x%x 0x%x\n", second, sent, status[0], status[1], status[2]);
 +        }
@@ -2488,7 +3447,7 @@
 +        if (bits >= 0 && (bits & 1)) {
 +            printf("COACHZ mpss: fatal error at %u s\n", second);
 +            wifi_modem_reason();
-+            if (!link) wg_report(second);
++            if (!link) { wg_report(second); wc_report(second); }
 +            return;
 +        }
 +    }

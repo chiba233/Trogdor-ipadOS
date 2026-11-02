@@ -1,0 +1,67 @@
+--- a/NativeHidInput.cpp
++++ b/NativeHidInput.cpp
+@@ -61,7 +61,7 @@
+ // stores the child, int-163 skipped every finger by comparing it), so each child is an IOHIDEvent by its class instead.
+ namespace edge {
+ enum {kSlots=256,kDispatch=198,kGetType=18,kGetInteger=23,kSetInteger=24,kGetFixed=25,kContacts=256};
+-enum : uint32_t {kDigitizer=11,kX=0xB0000,kY=0xB0001,kIndex=0xB0005,kMask=0xB0007,kTouch=0xB0009,kMaskTouch=2,kFromEdgeTip=0x800};
++enum : uint32_t {kDigitizer=11,kX=0xB0000,kY=0xB0001,kType=0xB0004,kIndex=0xB0005,kMask=0xB0007,kTouch=0xB0009,kMaskTouch=2,kFromEdgeTip=0x800};
+ // 48 panel pixels of 3048 x 2032 (the sweet reference uses 48 px), in the driver's normalised IOFixed coordinates.
+ static const int32_t kEdgeX=48*65536/3048,kEdgeY=48*65536/2032;
+ static uintptr_t originalDispatch;
+@@ -90,7 +90,42 @@
+     if(!touch && (mask&kMaskTouch))fromEdge[index]=false;   // the lift keeps the bit; the next contact with this index starts fresh
+     return edged;
+ }
++// Coachz: what this driver hands backboardd, per collection event, before the original dispatch: [0] collections, [1] finger
++// children, [2] identifiers held touched now, [3] an identifier twice in one collection, [4] hand (no confidence) children,
++// [5] touch begun while already touched, [6] untouch while not touched, [7] cancels. The touch thread prints them each second.
++extern "C" {volatile uint32_t coachz_hid_observed[8];}
++static bool touchedIndex[kContacts];
++static void observe(OSObject *event) {
++    if(!event || call<uint32_t,IOOptionBits>(event,kGetType,0)!=kDigitizer)return;
++    OSArray *children=*reinterpret_cast<OSArray **>(reinterpret_cast<uint8_t *>(event)+24);
++    coachz_hid_observed[0]=coachz_hid_observed[0]+1;
++    if(!children || !OSDynamicCast(OSArray,children))return;
++    bool seen[kContacts]={};
++    for(unsigned i=0;i<children->getCount();++i) {
++        OSObject *child=children->getObject(i);
++        if(!child || !child->metaCast("IOHIDEvent") || call<uint32_t,IOOptionBits>(child,kGetType,0)!=kDigitizer)continue;
++        coachz_hid_observed[1]=coachz_hid_observed[1]+1;
++        const uint32_t index=(uint32_t)call<int32_t,uint32_t,IOOptionBits>(child,kGetInteger,kIndex,0);
++        if(index>=kContacts)continue;
++        const uint32_t mask=(uint32_t)call<int32_t,uint32_t,IOOptionBits>(child,kGetInteger,kMask,0);
++        const uint32_t type=(uint32_t)call<int32_t,uint32_t,IOOptionBits>(child,kGetInteger,kType,0);
++        const bool touch=call<int32_t,uint32_t,IOOptionBits>(child,kGetInteger,kTouch,0)!=0;
++        if(seen[index])coachz_hid_observed[3]=coachz_hid_observed[3]+1;
++        seen[index]=true;
++        if(type==3)coachz_hid_observed[4]=coachz_hid_observed[4]+1;   // kIOHIDDigitizerTransducerTypeHand
++        if(mask&0x80)coachz_hid_observed[7]=coachz_hid_observed[7]+1;   // kIOHIDDigitizerEventCancel
++        if(mask&kMaskTouch) {
++            if(touch && touchedIndex[index])coachz_hid_observed[5]=coachz_hid_observed[5]+1;
++            if(!touch && !touchedIndex[index])coachz_hid_observed[6]=coachz_hid_observed[6]+1;
++            touchedIndex[index]=touch;
++        }
++    }
++    unsigned held=0;
++    for(unsigned i=0;i<kContacts;++i)held+=touchedIndex[i];
++    coachz_hid_observed[2]=held;
++}
+ static void dispatch(IOService *self,OSObject *event,IOOptionBits options) {
++    observe(event);
+     if(event && call<uint32_t,IOOptionBits>(event,kGetType,0)==kDigitizer) {
+         OSArray *children=*reinterpret_cast<OSArray **>(reinterpret_cast<uint8_t *>(event)+24);
+         if(children && OSDynamicCast(OSArray,children) && children->getCount()) {
+@@ -197,6 +232,12 @@
+             if(j<downCount){self->prevX[j]=nextX[j];self->prevY[j]=nextY[j];}
+         }
+         if(!slot)return;
++        // Coachz: slots past the contacts name an identifier no finger has. IOHIDEventDriver keys its transducer state by the contact
++        // identifier and handles every finger collection whose elements changed, so an emptied slot left at zero read as a contact 0
++        // lifting: after a five-finger report the next single-finger contact 0 was touched and untouched in the same collection
++        // (createDigitizerTransducerEventForReport), and its stroke never reached the interface. Identifier 255 (the controller's are
++        // 7-bit) is never touched, so IOHIDEventDriver drops its repeated untouch.
++        for(unsigned j=slot;j<TOUCH_FINGERS;++j)report[1+j*6+1]=0xff;
+         report[1+TOUCH_FINGERS*6]=(unsigned char)slot;
+         IOBufferMemoryDescriptor *buffer=IOBufferMemoryDescriptor::withBytes(report,sizeof(report),kIODirectionNone);
+         IOReturn result=buffer?self->handleReport(buffer,0,0):kIOReturnNoMemory;

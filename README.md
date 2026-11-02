@@ -37,7 +37,7 @@ flowchart TB
         direction LR
         D1["显示<br/>GopFramebuffer"]
         D2["输入<br/>触摸、USB 键盘、音量键"]
-        D3["存储<br/>USB xHCI、大容量存储"]
+        D3["存储<br/>USB xHCI、大容量存储、eMMC（只读）"]
         D4["音频<br/>LPASS、HAL 插件"]
         D5["电源<br/>Chrome EC：电池、背光"]
         D6["GPU<br/>见下图"]
@@ -112,9 +112,10 @@ flowchart LR
 | XNU 内核初始化走完，第一个程序和定时器中断 | 通过 | 屏幕照片 |
 | prelink 31 个 Apple 组件（其中 1 个无代码，另加 tmpfs），原版 AMFI 放行 | 通过 | 屏幕照片 |
 | XNU 里的 USB 存储驱动，经 GPT 和 APFS 挂载根卷 | 通过 | 屏幕和日志；未封存的根卷是放行，不是验证 |
+| eMMC、microSD | 部分 | 照主线 `sdhci-msm` 移植的只读第一阶段：eMMC 以 52 MHz、8 位总线识别并发布只读块设备；没插卡时 microSD 槽报告无卡，读卡未测；分区发布未确认；不写入 |
 | 从外接盘启动主系统，进入主屏幕和 Dock | 通过 | 屏幕照片 |
 | 外接 Data 卷可写 | 通过 | 日志；跨重启的持久性有实际使用，没有单独验收 |
-| 触摸 | 通过，界面有时不响应 | 照主线 `i2c-hid` 和 Goodix 驱动移植：GPIO 9 的电平中断经 TLMM 汇总线进 GIC，复位握手后每次中断读一份报告，经内核 `IOHIDEventDriver` 接到 backboardd；实测每秒 100 份报告全部送进 HID、0 错误；界面不响应时报告照常进 HID、各进程主线程都在等事件，问题在 HID 之上，还在查 |
+| 触摸 | 部分，多指操作后界面不响应 | 照主线 `i2c-hid`、Goodix 和 `hid-multitouch` 移植：GPIO 9 的电平中断经 TLMM 汇总线进 GIC，复位握手后每次中断读一份报告，按 contact count 组帧，经内核 `IOHIDEventDriver` 接到 backboardd；单指正常。五指搓屏后单指滑动失效可稳定复现：此时报告照常进 HID，按下和抬起成对，驱动里没有留下按着的手指，音量键的提示仍流畅，原因还在查 |
 | App | 部分 | Safari 和设置能启动；带云朵的 App 是占位符；小组件显示为白块；“设置 → 关于本机”打不开 |
 | 电池、背光、Zed 键盘 | 通过 | 状态栏电量和 Debian 一致，亮度滑块和键盘可用 |
 | 音量键 | 部分 | 按键能到 HID；音量条还没确认 |
@@ -127,7 +128,7 @@ flowchart LR
 | GPU 启动和命令执行 | 通过 | CP 经 SMMU 从 ring 和 IB 写内存，fence 到达，所有故障寄存器为 0 |
 | GPU 合成界面（Metal、Turnip） | 通过，还不够流畅 | 提交到完成平均约 18–23 ms，每次提交都完成、无故障；送显时 GPU 把一帧拷进帧缓冲平均约 8–10 ms（每个线程搬 4 个像素，原来 24 ms），其中 GPU 执行只有约 2 ms，其余在用户态的编码和提交上；还没有直接扫描输出；GPU 进程崩溃时释放缓冲区的 panic 已修；App 自己用 Metal 还没确认，没有 GPU 中断和电源管理 |
 | GPU 调频 | 通过 | 档位切换实测应答 18–60 µs、测得 179–800 MHz；按 UniXNU 的规则让 GPU 约一半时间忙碌，触摸后用最高档 |
-| Wi-Fi、蜂窝网络 | 部分 | 照主线 `qcom_q6v5_mss` 启动 modem，经 SMP2P 报告 ready；AP 这边有 GLINK、QRTR 和 rmtfs（EFS 在内存里），modem 一直运行；照 ath10k 和 WLAN 固件服务握手到固件就绪（板级数据从 `board-2.bin` 下发）；WLAN 模式和 copy engine 还没开，没有网络 |
+| Wi-Fi、蜂窝网络 | 部分 | 照主线 `qcom_q6v5_mss` 启动 modem，经 SMP2P 报告 ready；AP 这边有 GLINK、QRTR 和 rmtfs（EFS 在内存里），modem 一直运行；照 ath10k 走完 WLAN 固件握手（板级数据从 `board-2.bin` 下发）、WCN3990 供电、WLAN 模式、12 个 copy engine、HTC 和 WMI 初始化，固件报告 READY；还没有 vdev、扫描和系统网络接口，没有网络 |
 
 屏幕照片阶段没有逐字段核对。有一个原因不明的随机 zone panic，没有解决；长时间稳定性没有验证。详情见 [状态](docs/status.md) 和 [硬件记录](docs/hardware-tests.md)。
 

@@ -303,6 +303,8 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         command_line += ' coachz-thermal=1 coachz-wifi=4 coachz-motion=1 coachz-switches=1'
         # The MPSS firmware tools/linux_log.py --modem-firmware stores in the kernel partition, read back and hashed for coachz-wifi=4.
         command_line += ' coachz-modem-fw=1'
+        # The read-only SDHCI driver (sdhci-msm stage 1, platform/coachz-prelink/drivers/RamBlock/mmc): eMMC and microSD block devices.
+        command_line += ' coachz-emmc=1 coachz-sd=1'
     if gpu:
         # Adreno 618 bring-up stages (docs/plans/gpu.md): 1 inventory, 2 CX + GMU clock window, 3 also the GMU firmware into TCM,
         # 4 the window with a read-only GPU SMMU inventory.

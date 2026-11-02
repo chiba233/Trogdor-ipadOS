@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile the libpayload USB stack and coachz_usb.c with the kernel's own compile record."""
+"""Compile the libpayload USB stack, coachz_usb.c and the SDHCI driver (mmc/) with the kernel's own compile records."""
 import json
 from pathlib import Path
 import subprocess
@@ -11,7 +11,8 @@ out = ROOT / 'build/coachz-usb'
 out.mkdir(parents=True, exist_ok=True)
 objects = []
 stack = HERE / 'usb'
-for source in sorted(stack.glob('*.c')) + [HERE / 'coachz_usb.c', HERE / 'coachz_usb_hid.c']:
+mmc = HERE / 'mmc'
+for source in sorted(stack.glob('*.c')) + [HERE / 'coachz_usb.c', HERE / 'coachz_usb_hid.c', mmc / 'coachz_sdcc.c']:
     destination = out / (source.stem + '.o')
     command, index, arguments = [], 0, record['arguments']
     while index < len(arguments):
@@ -26,10 +27,16 @@ for source in sorted(stack.glob('*.c')) + [HERE / 'coachz_usb.c', HERE / 'coachz
         elif value not in ('-MD', '-MP') and not value.startswith('-DMOCKFS') and value != '-Werror':
             command.append(value)
         index += 1
-    command[1:1] = ['-w', '-DCOACHZ_USB_KERNEL=1', '-I', str(stack / 'compat'), '-isystem', str(stack / 'include'), '-isystem', str(stack)]
+    if source.parent == mmc:
+        # Our own code: warnings stay on (but do not fail the archive), and no USB compatibility headers.
+        command[1:1] = ['-I', str(mmc)]
+    else:
+        command[1:1] = ['-w', '-DCOACHZ_USB_KERNEL=1', '-I', str(stack / 'compat'), '-isystem', str(stack / 'include'), '-isystem', str(stack)]
     result = subprocess.run(command, cwd=record['directory'], capture_output=True, text=True)
     if result.returncode:
         raise SystemExit(source.name + ':\n' + result.stderr[-3500:])
+    if source.parent == mmc and result.stderr.strip():
+        print(source.name + ' warnings:\n' + result.stderr[-3500:])
     objects.append(destination)
 archive = out / 'libCoachzUsb.a'
 archive.unlink(missing_ok=True)
@@ -39,6 +46,19 @@ subprocess.run(['xcrun', 'ar', 'rcs', archive, *objects], check=True)
 driver = ROOT / 'build/ram-block'
 subprocess.run(['xcrun', 'clang', '-target', 'arm64-apple-ios17.0', '-Werror', '-Wno-incompatible-sysroot', '-c',
                 HERE / 'storage-original-bindings.S', '-o', driver / 'original-bindings.o'], check=True)
+# The SDHCI driver's block devices subclass the same IOBlockStorageDevice: compiled with NativeRamBlock's own command
+# (build-arm-driver.py RamBlock wrote it), only the source and the object changed.
+ram_block_command = json.loads((driver / 'compile-command.json').read_text())
+mmc_command = [str(mmc / 'CoachzMmcBlock.cpp') if value.endswith('NativeRamBlock.cpp') else
+               str(driver / 'CoachzMmcBlock.o') if value.endswith('NativeRamBlock.o') else value for value in ram_block_command]
+if mmc_command == ram_block_command or str(mmc / 'CoachzMmcBlock.cpp') not in mmc_command:
+    raise SystemExit('NativeRamBlock compile command did not name its source and object')
+iokit_record = json.loads((ROOT / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/IOPlatformExpert.cpo.json')
+                          .read_text().strip().rstrip(','))
+result = subprocess.run(mmc_command + ['-I', str(mmc)], cwd=iokit_record['directory'], capture_output=True, text=True)
+if result.returncode:
+    raise SystemExit('CoachzMmcBlock.cpp:\n' + (result.stdout + result.stderr)[-3500:])
 (driver / 'libRamBlock.a').unlink(missing_ok=True)
-subprocess.run(['xcrun', 'ar', 'rcs', driver / 'libRamBlock.a', driver / 'NativeRamBlock.o', driver / 'original-bindings.o'], check=True)
+subprocess.run(['xcrun', 'ar', 'rcs', driver / 'libRamBlock.a', driver / 'NativeRamBlock.o', driver / 'CoachzMmcBlock.o',
+                driver / 'original-bindings.o'], check=True)
 print(len(objects), 'USB stack objects archived')

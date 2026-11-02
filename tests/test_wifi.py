@@ -41,6 +41,13 @@ class WifiTests(unittest.TestCase):
         finally:
             sys.path.pop(0)
 
+    def test_wmi_ready_route(self):
+        wifi = (ROOT / 'platform/coachz-prelink/patches/xnu/coachz-prelink-wifi.patch').read_text()
+        self.assertIn('+            if (wh_map(0x0600, &ul, &dl)) {', wifi)   # snoc has no pktlog uplink: Linux does not connect it
+        self.assertIn('rdy[512]', wifi)                                        # the READY event is larger than its fixed structure
+        self.assertIn('COACHZ wmi: ready after %u ms', wifi)
+        self.assertNotIn('wifi_rpmh_send(wifi_mss_rails,', wifi)               # cx.lvl only through the aggregator
+
     def test_candidate_patch_applies_and_matches_sources(self):
         patch = shutil.which('patch')
         self.assertIsNotNone(patch)

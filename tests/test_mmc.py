@@ -1,0 +1,77 @@
+"""Host checks for the SDHCI (eMMC/microSD) driver. Never builds or boots a kernel."""
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import unittest
+
+ROOT = Path(__file__).resolve().parents[1]
+PENDING = ROOT / 'platform/coachz-prelink/drivers/RamBlock/mmc'
+
+# Just enough of the XNU kernel interfaces for a syntax and type check of coachz_sdcc.c on the host.
+STUBS = {
+    'sys/param.h': '#include <stdbool.h>\n#include <stddef.h>\n#include <stdint.h>\n',
+    'sys/systm.h': 'int printf(const char *, ...);\n',
+    'sys/errno.h': ''.join(f'#define {name} {value}\n' for name, value in [
+        ('EIO', 5), ('ENOMEM', 12), ('EFAULT', 14), ('ENODEV', 19), ('EINVAL', 22), ('EAGAIN', 35), ('ETIMEDOUT', 60),
+        ('ENOSYS', 78), ('EILSEQ', 92), ('EBADMSG', 94), ('EOPNOTSUPP', 102)]),
+    'kern/clock.h': '#define NSEC_PER_MSEC 1000000ull\n#define NSEC_PER_SEC 1000000000ull\n'
+                    'void clock_interval_to_deadline(uint32_t, uint32_t, uint64_t *);\n'
+                    'void absolutetime_to_nanoseconds(uint64_t, uint64_t *);\nuint64_t mach_absolute_time(void);\n',
+    'kern/thread.h': 'typedef struct thread *thread_t;\ntypedef int wait_result_t;\ntypedef int kern_return_t;\n'
+                     '#define KERN_SUCCESS 0\ntypedef void (*thread_continue_t)(void *, wait_result_t);\n'
+                     'kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);\n'
+                     'void thread_deallocate(thread_t);\n',
+    'kern/sched_prim.h': '#define THREAD_UNINT 0\n#define THREAD_CONTINUE_NULL ((thread_continue_t)0)\n'
+                         'wait_result_t assert_wait_deadline(void *, int, uint64_t);\n'
+                         'wait_result_t thread_block(thread_continue_t);\nvoid thread_wakeup(void *);\n',
+    'machine/machine_routines.h': 'typedef uintptr_t vm_offset_t;\ntypedef uintptr_t vm_size_t;\n',
+    'pexpert/pexpert.h': 'int PE_parse_boot_argn(const char *, void *, int);\n',
+}
+
+
+class MmcTests(unittest.TestCase):
+    def compiler(self):
+        cc = shutil.which('cc')
+        self.assertIsNotNone(cc, 'a host C compiler is required for the fixtures')
+        return cc
+
+    def test_portable_model(self):
+        with tempfile.TemporaryDirectory(prefix='coachz-mmc-host-') as directory:
+            binary = Path(directory) / 'mmc-model'
+            subprocess.run([self.compiler(), '-std=c11', '-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined',
+                            '-I', str(PENDING), str(ROOT / 'tests/coachz_mmc_model_test.c'), '-o', str(binary)], check=True)
+            result = subprocess.run([str(binary)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout.count('PASS '), 10, result.stdout)
+
+    def test_kernel_file_type_checks_against_stubs(self):
+        with tempfile.TemporaryDirectory(prefix='coachz-mmc-stubs-') as directory:
+            stubs = Path(directory)
+            for name, text in STUBS.items():
+                (stubs / name).parent.mkdir(parents=True, exist_ok=True)
+                (stubs / name).write_text(text)
+            result = subprocess.run([self.compiler(), '-std=gnu11', '-fsyntax-only', '-Wall', '-Wextra', '-Werror',
+                                     '-Wno-unused-function', '-I', str(stubs), '-I', str(PENDING), str(PENDING / 'coachz_sdcc.c')],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_in_the_build(self):
+        series = (ROOT / 'platform/coachz-prelink/patches/xnu/series').read_text().split()
+        self.assertIn('coachz-prelink-mmc.patch', series)
+        self.assertIn('coachz_mmc_start();', (ROOT / 'platform/coachz-prelink/patches/xnu/coachz-prelink-mmc.patch').read_text())
+        build = (ROOT / 'platform/coachz-prelink/drivers/RamBlock/build-usb-stack.py').read_text()
+        self.assertIn("mmc / 'coachz_sdcc.c'", build)
+        self.assertIn("'CoachzMmcBlock.o'", build)
+        self.assertIn("' coachz-emmc=1 coachz-sd=1'", (ROOT / 'tools/xnu_screen.py').read_text())
+        # The shared RPMh client of coachz_rpmh_iface.h lives in the Wi-Fi patch, with cx aggregated over its consumers.
+        wifi = (ROOT / 'platform/coachz-prelink/patches/xnu/coachz-prelink-wifi.patch').read_text()
+        for name in ('coachz_cmd_db_address', 'coachz_cmd_db_aux', 'coachz_rpmh_write', 'coachz_rpmh_cx_request'):
+            self.assertIn('+' + name + '(', wifi, name)
+        self.assertIn('coachz_cx_vote(COACHZ_CX_MSS_PROXY', wifi)
+        self.assertNotIn('wifi_rpmh_send(wifi_mss_rails,', wifi)
+        # Seventeen interrupt lines (touch, twelve copy engines, two cores' host and power lines) need more than 16 slots.
+        self.assertIn('#define ARMCPU_SPI_SLOTS 32', (ROOT / 'platform/coachz-prelink/patches/drivers/ArmCpu.patch').read_text())
+
+if __name__ == '__main__':
+    unittest.main()

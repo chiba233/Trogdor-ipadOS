@@ -1484,3 +1484,19 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 - k99 中断能进来，但线程用计数器判断中断是否到来，复位响应那一次正好漏掉，中断停在屏蔽状态。k100 改成中断置待处理标志、线程取走。
 - k101：复位握手完成，约 2480 次中断全部读出报告送进 HID，重度触摸时每秒 100 份，读错、意外复位、杂散中断都是 0。机主仍感到触摸后来“挂了”：那几秒里报告照常进 `IOHIDEventDriver`，屏幕没有新帧，SpringBoard、backboardd、设置的主线程都在等事件，GPU 送显正常。问题在 HID 之上；那段时间很多笔画从屏幕上沿开始。
 - WLFW：指示注册、主机能力、MSA 信息（wlan_mem 里两段：0x94100000+0x10000 安全区、0x94110000+0x1f0000）、MSA 就绪、能力查询（芯片 0x320、族 0x4001、板 0x67、SoC 0x400c0000、固件 WLAN.HL.3.2.2.c10-00754），用 `board-2.bin` 里 `bus=snoc,qmi-board-id=67` 的 26328 字节分 5 段下发板级数据，空校准报告，然后收到 FW ready。
+
+## WMI 初始化完成，eMMC 第一阶段上线，多指后触摸失效可复现（k102～k104）
+
+三张镜像都走完整启动，日志来自外接盘的日志环。
+
+- **WCN3990 供电**：照 `ath10k_hw_power_on` 和 `qcom-rpmh-regulator` 在 modem 启动前投票，电压取 Debian 上读到的值（ldoa9 488 mV，ldoc1 1616 mV，ldoc2 1168 mV，ldoc10、ldoc11 3000 mV，HPM），五路都完成。
+- **WLAN 和 copy engine**：`WLAN_CFG`、`WLAN_MODE`（mission）都返回成功；12 个 CE、RRI 和 12 条中断起来，内存是 `0x81800000` 起的低端 DRAM。apps SMMU 处于旁路（sCR0 CLIENTPD），设备看到的就是物理地址。
+- **HTC**：收到 READY（2 个 credit，每个 2184 字节），连上 HTT 和 WMI。k102 卡在 pktlog 连接超时：`ath10k_htc_pktlog_svc_supported` 要求服务表里上下行都有管道，snoc 的表只有下行，Linux 不会连这个服务，是我多发了请求；k103 起照 Linux 跳过。
+- **WMI**：service ready 的 ABI 匹配，2 条射频链，0 个主机内存请求。k103 发出 WMI_INIT 后 5 秒没等到 READY，原因是接收缓冲只有 64 字节；k104 放大后 INIT 之后 10 ms 收到 READY，status 0。READY 里 MAC 的前 3 字节全 0。还没有 vdev 和扫描。
+- **eMMC 和 microSD**：`COACHZ mmc` 日志显示 eMMC 主机寄存器可读、power 中断到来、卡识别完成（EXT_CSD rev 8），52 MHz、8 位、高速时序，只读块设备发布，k103 和 k104 都如此。microSD 槽当时没插卡，报告无卡，符合实际。分区发布没有日志能证实，读卡未测。没有写入。
+- **触摸**：五指搓屏后单指滑动失效，机主可稳定复现；此时音量键的提示仍流畅。
+  - k102 起 K45 行记录按下数和按住时长：失效后每秒 20～60 份报告继续进 HID，按下和抬起成对，`frames` 为 0。
+  - k103 照 `hid-multitouch` 改为按 contact count 组帧，加 confidence、同帧重复 ID 和 100 ms sticky 释放。机主确认问题没变；palms、continued、duplicates、sticky 计数全是 0，这块屏最多报 5 点。
+  - k104 把 ShengHidInput 未用的手指槽改用 ID 255，并统计交给 backboardd 的事件。机主确认问题没变。日志里 10 个可见的 `held` 有 9 个是 0，另一个是 4，当时确实有 4 指按着。K45 行太长被日志环截断，dup、hand、rebegin 等计数大多没留下，所以 HID 层是否完全干净还没有结论。
+  - K45 的 `frames` 只在打印时清零，安静的几秒之后的值是多秒累计（71、103 都是这样），不是每秒帧数。
+

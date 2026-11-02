@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
@@ -69,6 +70,40 @@ def patched_drivers(base, platform, out):
     return options
 
 
+def patched_feeds(base, platform, out):
+    """Components the build fetches as feeds (not submodules), patched by platform/<platform>/patches/feeds/<id>.patch: the
+    revision components.toml pins, on its own clean reference checkout, copied and patched; returns --local-module options."""
+    patches = sorted((ROOT / 'platform' / platform / 'patches/feeds').glob('*.patch'))
+    if not patches:
+        return []
+    catalog = {entry['id']: entry for entry in tomllib.loads((base / 'components.toml').read_text())['component']}
+    options = []
+    for patch in patches:
+        entry = catalog[patch.stem]
+        revision, reference = entry['revision'], out / 'reference' / patch.stem
+        if not reference.exists():
+            preparing = reference.with_name(patch.stem + '.preparing')
+            shutil.rmtree(preparing, ignore_errors=True)
+            preparing.mkdir(parents=True)
+            try:
+                subprocess.run(['git', 'init', '--quiet', str(preparing)], check=True)
+                subprocess.run(['git', '-C', str(preparing), 'fetch', '--quiet', '--no-tags', '--depth=1', entry['repository'], revision], check=True)
+                subprocess.run(['git', '-C', str(preparing), 'checkout', '--quiet', '--detach', revision], check=True)
+                preparing.rename(reference)
+            finally:
+                shutil.rmtree(preparing, ignore_errors=True)
+        if subprocess.check_output(['git', '-C', str(reference), 'rev-parse', 'HEAD'], text=True).strip() != revision:
+            raise ValueError(patch.stem + ' reference differs from its pinned revision')
+        if subprocess.check_output(['git', '-C', str(reference), 'status', '--porcelain'], text=True):
+            raise ValueError(patch.stem + ' reference must remain clean')
+        patched = out / 'reference' / (patch.stem + '-patched')
+        shutil.rmtree(patched, ignore_errors=True)
+        shutil.copytree(reference, patched, ignore=shutil.ignore_patterns('.git'))
+        subprocess.run(['patch', '--batch', '--silent', '-p1', '-d', str(patched), '-i', str(patch)], check=True)
+        options += ['--local-module', 'driver:' + patch.stem + '=' + str(patched)]
+    return options
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--build', action='store_true', help='also compile the source kernel; no prelink or boot')
@@ -121,6 +156,7 @@ def main():
                 subprocess.run(['patch', '--batch', '--silent', '-p1', '-d', str(patched), '-i', str(patch)], check=True)
             display_source = patched
         display_options = ['--local-module', 'driver:GopFramebuffer=' + str(display_source)]
+    display_options += patched_feeds(base, a.platform, out)
     # Use only the selected source components. The normal CLI also initializes all
     # unrelated module submodules and prelinks/downloads IPSW input after a build.
     sys.path.insert(0, str(base / 'scripts'))

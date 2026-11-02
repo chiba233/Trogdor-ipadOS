@@ -1,0 +1,8 @@
+--- a/bsd/dev/coachz_sample.c
++++ b/bsd/dev/coachz_sample.c
+@@ -46,3 +46,5 @@
+ 	coachz_wifi_start();   /* optional, read-only SMEM inventory (coachz-wifi=1) */
++	extern void coachz_mmc_start(void);
++	coachz_mmc_start();    /* optional read-only eMMC (coachz-emmc=1) and microSD (coachz-sd=1): drivers/RamBlock/mmc */
+ 	extern void coachz_cpufreq_start(void);
+ 	coachz_cpufreq_start(); /* CPU frequency by load (coachz-cpufreq=4) */

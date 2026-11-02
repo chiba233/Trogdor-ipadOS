@@ -10,7 +10,7 @@
  bsd/dev/unix_startup.c			standard
 --- a/bsd/dev/coachz_touch.c
 +++ b/bsd/dev/coachz_touch.c
-@@ -0,0 +1,762 @@
+@@ -0,0 +1,881 @@
 +/*
 + * Coachz touchscreen (coachz-touch=1): the Goodix GT7375P on QUPv3 wrap0 SE4 as HID over I2C.
 + * The device side is a port of Linux's drivers/hid/i2c-hid: i2c-hid-of-goodix.c's power-up for this part (reset asserted, 10 ms,
@@ -152,11 +152,13 @@
 +}
 +
 +/*
-+ * Report 1 of this controller's descriptor (read from the part): five fingers of eight bytes, each tip switch in bit 0 of its first
-+ * byte, contact identifier in bits 7:1 of the second, X (0..12960) and Y (0..8640) little endian, then width and height, and a
-+ * contact count. 12960 x 8640 is six times the 2160 x 1440 panel.
++ * Report 1 of this controller's descriptor (read from the part, the same 1193 bytes Debian's sysfs shows): five contacts of eight bytes,
++ * each tip switch in bit 0 and pressure in bits 7:1 of its first byte, confidence in bit 0 and the contact identifier in bits 7:1 of the
++ * second, X (0..12960) and Y (0..8640) little endian, width and height; then the contact count. 12960 x 8640 is six times the 2160 x 1440
++ * panel. No scan time and no in-range usage.
 + */
 +#define REPORT_FINGERS 5
++#define FRAME_CONTACTS 10
 +/*
 + * coachz-touch-flip: bit 0 mirrors x, bit 1 mirrors y, bit 2 swaps the axes (applied after mirroring), so the panel orientation
 + * can be matched from a boot argument alone. The stroke record keeps raw controller coordinates for that decision.
@@ -165,27 +167,109 @@
 +static uint32_t stroke_count, stroke_frames;
 +static int stroke_first[2] = { -1, -1 }, stroke_last[2] = { -1, -1 };
 +char coachz_touch_stroke[160];
++/* What the latest frame left down: the contacts with their tip switch set, since when, and when a report last arrived. When the
++ * interface stops answering, these say whether the controller still reports a finger down (one never lifted) or nothing at all. */
++static volatile uint32_t touch_down_now, touch_down_most;
++static volatile uint64_t touch_down_since, touch_report_at;
++
++/*
++ * Frames as hid-multitouch.c assembles them for this part's class (Debian binds hid-multitouch with quirks 0x51c10, MT_CLS_WIN_8:
++ * ALWAYS_VALID, IGNORE_DUPLICATES, HOVERING, CONTACT_CNT_ACCURATE, STICKY_FINGERS, WIN8_PTP_BUTTONS; mt_touch_input_mapping adds
++ * CONFIDENCE for a Win8 touch screen with a confidence usage). mt_touch_report: a nonzero contact count is the number of contacts the
++ * frame holds; a zero count continues the frame (more than five contacts come in several reports); only that many slots are contacts
++ * (the rest of a report is not), a contact identifier seen twice in a frame is skipped, and the frame is synced once all arrived, every
++ * contact it did not report being up (INPUT_MT_DROP_UNUSED). A contact without confidence is a palm (MT_TOOL_PALM): userspace ignores
++ * it, so it is not a finger of the digitizer here. With a contact down and no report for 100 ms every contact is released.
++ */
++static struct { int id; unsigned x, y; } frame_contact[FRAME_CONTACTS];
++static unsigned frame_count, frame_expected, frame_received;
++static uint8_t frame_seen[128], touch_active[128];
++static uint32_t frame_palms, frame_continued, frame_duplicates, frame_sticky;
++
++static void publish_frame(void);
 +
 +static void
-+publish_fingers(const uint8_t *input)
++touch_report(const uint8_t *input)
 +{
-+	if (le16_at(input) < 3 + REPORT_FINGERS * 8 || input[2] != 1) {
++	if (le16_at(input) < 3 + REPORT_FINGERS * 8 + 1 || input[2] != 1) {
 +		return;
 +	}
-+	unsigned count = 0;
-+	int xs[REPORT_FINGERS], ys[REPORT_FINGERS], ids[REPORT_FINGERS];
++	touch_report_at = mach_absolute_time();
++	const unsigned contact_count = input[3 + REPORT_FINGERS * 8];
++	if (contact_count > 0) {
++		frame_expected = contact_count;
++	} else if (frame_received) {
++		frame_continued++;
++	}
 +	for (unsigned finger = 0; finger < REPORT_FINGERS; finger++) {
++		if (frame_received >= frame_expected) {
++			break;
++		}
 +		const uint8_t *f = input + 3 + finger * 8;
++		const unsigned id = f[1] >> 1;
++		if (frame_seen[id]) {
++			frame_duplicates++;
++			continue;
++		}
++		frame_seen[id] = 1;
++		frame_received++;
++		touch_active[id] = f[0] & 1;
 +		if (!(f[0] & 1)) {
 +			continue;
 +		}
-+		unsigned rx = le16_at(f + 2), ry = le16_at(f + 4);
-+		if (rx > 12960) {
-+			rx = 12960;
++		if (!(f[1] & 1)) {
++			frame_palms++;
++			continue;
 +		}
-+		if (ry > 8640) {
-+			ry = 8640;
++		if (frame_count < FRAME_CONTACTS) {
++			unsigned rx = le16_at(f + 2), ry = le16_at(f + 4);
++			frame_contact[frame_count].id = (int)id;
++			frame_contact[frame_count].x = rx > 12960 ? 12960 : rx;
++			frame_contact[frame_count].y = ry > 8640 ? 8640 : ry;
++			frame_count++;
 +		}
++	}
++	if (frame_received >= frame_expected) {
++		for (unsigned id = 0; id < 128; id++) {
++			if (!frame_seen[id]) {
++				touch_active[id] = 0;
++			}
++		}
++		publish_frame();
++		frame_count = frame_received = 0;
++		bzero(frame_seen, sizeof(frame_seen));
++	}
++}
++
++/* mt_release_contacts, from the sticky-fingers timer: an empty frame. */
++static void
++touch_release_all(void)
++{
++	frame_count = frame_received = 0;
++	bzero(frame_seen, sizeof(frame_seen));
++	bzero(touch_active, sizeof(touch_active));
++	frame_sticky++;
++	publish_frame();
++}
++
++static int
++touch_any_active(void)
++{
++	for (unsigned id = 0; id < 128; id++) {
++		if (touch_active[id]) {
++			return 1;
++		}
++	}
++	return 0;
++}
++
++static void
++publish_frame(void)
++{
++	unsigned count = 0;
++	int xs[FRAME_CONTACTS], ys[FRAME_CONTACTS], ids[FRAME_CONTACTS];
++	for (unsigned c = 0; c < frame_count; c++) {
++		const unsigned rx = frame_contact[c].x, ry = frame_contact[c].y;
 +		if (!count) {
 +			if (stroke_first[0] < 0) {
 +				stroke_first[0] = (int)rx;
@@ -197,7 +281,7 @@
 +			stroke_frames++;
 +		}
 +		unsigned ux = (touch_flip & 1) ? 12960 - rx : rx, uy = (touch_flip & 2) ? 8640 - ry : ry;
-+		ids[count] = f[1] >> 1;
++		ids[count] = frame_contact[c].id;
 +		if (touch_flip & 4) {
 +			xs[count] = (int)(uy * 30480u / 8640u);
 +			ys[count] = (int)(ux * 20320u / 12960u);
@@ -207,10 +291,18 @@
 +		}
 +		count++;
 +	}
++	const uint64_t at = mach_absolute_time();
++	if (count && !touch_down_now) {
++		touch_down_since = at;
++	}
++	if (count > touch_down_most) {
++		touch_down_most = count;
++	}
++	touch_down_now = count;
 +	if (!count && stroke_first[0] >= 0) {
 +		stroke_count++;
 +		snprintf(coachz_touch_stroke, sizeof(coachz_touch_stroke),
-+		    "K43 stroke %u: raw first %d,%d last %d,%d over %u reports (x 0..12960 along 2160 px, y 0..8640), flip %u",
++		    "K43 stroke %u: raw first %d,%d last %d,%d over %u frames (x 0..12960 along 2160 px, y 0..8640), flip %u",
 +		    stroke_count, stroke_first[0], stroke_first[1], stroke_last[0], stroke_last[1], stroke_frames, touch_flip);
 +		stroke_first[0] = -1;
 +	}
@@ -575,7 +667,7 @@
 +	}
 +	if (st.started && length > 2) {
 +		coachz_touch_reports++;
-+		publish_fingers(st.input);
++		touch_report(st.input);
 +	}
 +}
 +
@@ -702,10 +794,14 @@
 +	coachz_hid_touch_start();
 +	/* Every interrupt: one report read, then unmasked (the line, still low, interrupts again). A line per second with input. */
 +	extern volatile uint64_t native_gop_gpu_completions __attribute__((weak));
++	/* ShengHidInput (patches/feeds): what its event driver handed backboardd (collections, fingers, identifiers held touched,
++	 * duplicates, hands, touches begun twice, untouches without a touch, cancels). */
++	extern volatile uint32_t coachz_hid_observed[8] __attribute__((weak));
 +	uint32_t irqs_last = st.irqs, reports_last = coachz_touch_reports, hid_last = native_touch_hid_reports, spurious_last = st.spurious;
 +	unsigned errors_last = 0, unasked_last = 0, short_last = 0, quiet = 0;
 +	uint64_t frames_last = &native_gop_gpu_completions ? native_gop_gpu_completions : 0, second_start = mach_absolute_time(), one_second;
-+	uint64_t heartbeat = second_start, interval;
++	uint64_t heartbeat = second_start, interval, sticky;
++	nanoseconds_to_absolutetime(100 * NSEC_PER_MSEC, &sticky);
 +	nanoseconds_to_absolutetime(NSEC_PER_SEC, &one_second);
 +	nanoseconds_to_absolutetime(10 * NSEC_PER_SEC, &interval);
 +	for (;;) {
@@ -714,16 +810,31 @@
 +			irq_unmask();
 +		}
 +		const uint64_t now = mach_absolute_time();
++		/* MT_QUIRK_STICKY_FINGERS: a contact down and no report for 100 ms. */
++		if (now - touch_report_at >= sticky && touch_any_active()) {
++			touch_release_all();
++		}
 +		if (now - second_start >= one_second) {
 +			const uint32_t irqs = st.irqs - irqs_last, reports = coachz_touch_reports - reports_last;
 +			const unsigned problems = (input_errors - errors_last) + (resets_unasked - unasked_last) + (short_reads - short_last) +
 +			    (st.spurious - spurious_last);
 +			if (irqs || problems || !quiet) {
 +				const uint64_t frames = &native_gop_gpu_completions ? native_gop_gpu_completions : 0;
++				uint64_t held = 0;
++				if (touch_down_now) {
++					absolutetime_to_nanoseconds(now - touch_down_since, &held);
++				}
 +				printf("K45 touch 1s: interrupts %u, reports %u to HID %u, frames %llu, read errors %u, unasked resets %u, bad lengths %u, "
-+				    "spurious %u%s, line %s, intr cfg %x\n", irqs, reports, native_touch_hid_reports - hid_last, frames - frames_last,
-+				    input_errors - errors_last, resets_unasked - unasked_last, short_reads - short_last, st.spurious - spurious_last,
-+				    st.storm ? " (storm: interrupt disabled)" : "", (rd(st.north, GPIO_IO(9)) & 1u) ? "high" : "low", rd(st.north, GPIO_INTR_CFG(9)));
++				    "spurious %u%s, line %s, intr cfg %x, down %u for %llu ms (most %u), strokes %u, palms %u continued %u duplicates %u "
++				    "sticky %u | hid out %u fingers %u held %u dup %u hand %u rebegin %u lone up %u cancel %u\n", irqs, reports,
++				    native_touch_hid_reports - hid_last, frames - frames_last, input_errors - errors_last, resets_unasked - unasked_last,
++				    short_reads - short_last, st.spurious - spurious_last, st.storm ? " (storm: interrupt disabled)" : "",
++				    (rd(st.north, GPIO_IO(9)) & 1u) ? "high" : "low", rd(st.north, GPIO_INTR_CFG(9)), touch_down_now, held / NSEC_PER_MSEC,
++				    touch_down_most, stroke_count, frame_palms, frame_continued, frame_duplicates, frame_sticky,
++				    &coachz_hid_observed ? coachz_hid_observed[0] : 0, &coachz_hid_observed ? coachz_hid_observed[1] : 0,
++				    &coachz_hid_observed ? coachz_hid_observed[2] : 0, &coachz_hid_observed ? coachz_hid_observed[3] : 0,
++				    &coachz_hid_observed ? coachz_hid_observed[4] : 0, &coachz_hid_observed ? coachz_hid_observed[5] : 0,
++				    &coachz_hid_observed ? coachz_hid_observed[6] : 0, &coachz_hid_observed ? coachz_hid_observed[7] : 0);
 +				frames_last = frames;
 +			}
 +			quiet = !irqs && !problems;
@@ -742,6 +853,14 @@
 +			absolutetime_to_nanoseconds(heartbeat, &ns);
 +			printf("K44 alive %llu s, touch reports %u, interrupts %u, io_submap %llu KiB\n", ns / NSEC_PER_SEC, coachz_touch_reports,
 +			    st.irqs, coachz_io_submap_bytes / 1024);
++			if (touch_down_now) {
++				/* Reports stopped with a contact down: the digitizer still holds that touch. */
++				uint64_t held = 0, quiet_ns = 0;
++				absolutetime_to_nanoseconds(now - touch_down_since, &held);
++				absolutetime_to_nanoseconds(now - touch_report_at, &quiet_ns);
++				printf("K45 touch: %u contacts down for %llu ms, last report %llu ms ago, line %s\n", touch_down_now, held / NSEC_PER_MSEC,
++				    quiet_ns / NSEC_PER_MSEC, (rd(st.north, GPIO_IO(9)) & 1u) ? "high" : "low");
++			}
 +		}
 +		const uint8_t *p = st.input;
 +		snprintf(s2, 160, "K42 touch: reports %u interrupts %u errors %u resets %u/%u, to HID %u fingers %u: %02x%02x %02x %02x%02x%02x%02x",

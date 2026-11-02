@@ -34,6 +34,10 @@ extern "C" IOService *native_adreno_accelerator_allocate(void);
 extern "C" unsigned native_adreno_accelerator_instance_size(void);
 extern "C" kern_return_t OSKextLoadKextWithIdentifier(const char *);
 extern "C" void native_adreno_metal_report(void);
+// NativeAdrenoPublish.cpp's per-process table (first eight process names that opened the plug-in type) and its latest mount failure:
+// [0] 1 no free slot, 2 the core's open, 3 the window scope; [1] IOReturn; [2] slot; [3] failures so far.
+extern "C" struct NativeAdrenoClientRecord {char name[20]; uint32_t opens, refused, closes, slot, peak_mib, last_refusal;} native_adreno_client_log[8];
+extern "C" volatile uint32_t native_adreno_mount_fail[4];
 extern "C" volatile uint64_t native_gop_gpu_offers, native_gop_gpu_completions, native_gop_gpu_failures, native_gop_gpu_abandoned;
 extern "C" void *memprobe_cpu_to_processor(int) __asm__("_cpu_to_processor");
 extern "C" void *memprobe_thread_bind(void *) __asm__("_thread_bind");
@@ -155,9 +159,18 @@ void stampReport() {
 
 // Every ten seconds, what reached the driver: whether the plug-in opened it, what it reports, what the CP has run and what reached the screen.
 void reportThread(void *, wait_result_t) {
-    for (;;) {
+    for (unsigned round = 1;; round++) {
         IOSleep(10000);
         native_adreno_metal_report();
+        // Once a minute, which processes have a GPU connection slot (four in this framework) and which were refused.
+        if (!(round % 6)) {
+            for (const NativeAdrenoClientRecord &r : native_adreno_client_log)
+                if (r.name[0])
+                    printf("COACHZ gpu clients: %.19s opens %u refused %u closes %u slot %d peak %u MiB last refusal 0x%x\n", r.name, r.opens,
+                        r.refused, r.closes, r.slot == 0xff ? -1 : int(r.slot), r.peak_mib, r.last_refusal);
+            printf("COACHZ gpu clients: mount failures %u, latest reason %u status 0x%x slot %u\n", native_adreno_mount_fail[3],
+                native_adreno_mount_fail[0], native_adreno_mount_fail[1], native_adreno_mount_fail[2]);
+        }
         printf("COACHZ gpu9: ring submissions %u fence %u/%u, frames offered %llu shown %llu failed %llu abandoned %llu\n", gRing.submissions(), gRing.completedFence(),
             gRing.lastSubmitted(), static_cast<unsigned long long>(native_gop_gpu_offers), static_cast<unsigned long long>(native_gop_gpu_completions),
             static_cast<unsigned long long>(native_gop_gpu_failures), static_cast<unsigned long long>(native_gop_gpu_abandoned));
