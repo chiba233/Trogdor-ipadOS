@@ -12,7 +12,9 @@ out.mkdir(parents=True, exist_ok=True)
 objects = []
 stack = HERE / 'usb'
 mmc = HERE / 'mmc'
-for source in sorted(stack.glob('*.c')) + [HERE / 'coachz_usb.c', HERE / 'coachz_usb_hid.c', mmc / 'coachz_sdcc.c']:
+usbsoc = HERE / 'usbsoc'
+modem = HERE / 'modem'
+for source in sorted(stack.glob('*.c')) + [HERE / 'coachz_usb.c', HERE / 'coachz_usb_hid.c', mmc / 'coachz_sdcc.c', usbsoc / 'coachz_usb_soc.c', modem / 'coachz_ipa_config.c', modem / 'coachz_gsi.c', HERE / 'coachz_modem.c']:
     destination = out / (source.stem + '.o')
     command, index, arguments = [], 0, record['arguments']
     while index < len(arguments):
@@ -27,15 +29,16 @@ for source in sorted(stack.glob('*.c')) + [HERE / 'coachz_usb.c', HERE / 'coachz
         elif value not in ('-MD', '-MP') and not value.startswith('-DMOCKFS') and value != '-Werror':
             command.append(value)
         index += 1
-    if source.parent == mmc:
+    own = source.name == 'coachz_modem.c' or source.parent in (mmc, usbsoc, modem)
+    if own:
         # Our own code: warnings stay on (but do not fail the archive), and no USB compatibility headers.
-        command[1:1] = ['-I', str(mmc)]
+        command[1:1] = ['-I', str(modem if source.name == 'coachz_modem.c' else source.parent)]
     else:
         command[1:1] = ['-w', '-DCOACHZ_USB_KERNEL=1', '-I', str(stack / 'compat'), '-isystem', str(stack / 'include'), '-isystem', str(stack)]
     result = subprocess.run(command, cwd=record['directory'], capture_output=True, text=True)
     if result.returncode:
         raise SystemExit(source.name + ':\n' + result.stderr[-3500:])
-    if source.parent == mmc and result.stderr.strip():
+    if own and result.stderr.strip():
         print(source.name + ' warnings:\n' + result.stderr[-3500:])
     objects.append(destination)
 archive = out / 'libCoachzUsb.a'

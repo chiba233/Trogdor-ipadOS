@@ -130,11 +130,18 @@ int coachz_usb_keyboard_enabled(void) {
 }
 
 /* The system on the eMMC: no disk to wait for; the controller, the hubs and the keyboard behind them. */
+extern int coachz_usb_soc_init(void);
+
 int coachz_usb_open_keyboard(void) {
     xhci_va = ml_io_map(XHCI_BASE, XHCI_BYTES);
     pool_va = ml_io_map_wcomb(POOL_BASE, POOL_BYTES);
     if (!xhci_va || !pool_va) return 0;
     memset((void *)pool_va, 0, POOL_BYTES);
+    /* The controller from this kernel's own bring-up, not firmware's leftovers. A failure must not reach xhci_init(). */
+    if (!coachz_usb_soc_init()) {
+        kprintf("COACHZ USB: SoC bring-up failed, the controller stays off\n");
+        return 0;
+    }
     transfer = coachz_usb_memalign(4096, MAX_BLOCKS * 512);
     hci_t *controller = xhci_init(XHCI_BASE);
     kprintf("COACHZ USB: controller %d for the keyboard, USBSTS 0x%x\n", controller != NULL, usbsts());

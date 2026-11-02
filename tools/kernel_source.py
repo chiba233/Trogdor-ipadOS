@@ -67,6 +67,7 @@ def patched_drivers(base, platform, out):
         if (overlay / 'coachz_usb.c').is_file():
             usb_stack.extract(copy / 'usb', writable_storage=True)
             shutil.copytree(ROOT / 'boot/usb_compat', copy / 'usb/compat')
+            shutil.copytree(ROOT / 'platform' / platform / 'pending/modem', copy / 'modem')
     return options
 
 

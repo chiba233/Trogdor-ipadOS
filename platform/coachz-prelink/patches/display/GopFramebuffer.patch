@@ -1,6 +1,14 @@
 --- a/NativeLegacyDisplay.cpp
 +++ b/NativeLegacyDisplay.cpp
-@@ -32,6 +32,8 @@
+@@ -13,6 +13,7 @@
+ #include <libkern/c++/OSData.h>
+ #include <pexpert/pexpert.h>
+ extern "C" __attribute__((noreturn)) void native_legacy_backend_guard(unsigned,void *,void *);
++extern "C" void native_legacy_timing_asked(void *);
+ extern "C" IOService *native_legacy_display_allocate(void);
+ extern "C" bool native_legacy_gop_mapping_observed(IOService *,IOMemoryMap *,uint32_t,uint32_t);
+ extern "C" void native_legacy_registration_observed(IOService *);
+@@ -32,6 +33,8 @@
  extern "C" bool native_legacy_prepare_scanout(void);
  extern "C" void native_legacy_transfer_observed(IOReturn,const void *,uint64_t);
  extern "C" void native_legacy_copy_timing_observed(uint64_t ticks,uint64_t bytes);
@@ -9,7 +17,7 @@
  extern "C" void native_legacy_retirement_observed(IOService *);
  // GPU hand-off (boot-arg sheng-fb-gpu=1): the frame is offered to the privileged GPU client instead of being copied; the swap retires when the
  // client reports the GPU copy done (native_legacy_gpu_complete). A refused offer or a failed copy uses the CPU copy below and is counted.
-@@ -57,7 +59,9 @@
+@@ -57,7 +60,9 @@
  class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
      OSDeclareDefaultStructors(NativeLegacyDisplay)
      IOMemoryMap *bootMapping=nullptr;
@@ -20,7 +28,7 @@
      void *shadow=nullptr;uint64_t shadowBytes=0;bool shadowValid=false;
      bool primary=false;
      bool logicalPM=false;
-@@ -318,6 +322,7 @@
+@@ -318,6 +323,7 @@
              OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
          }
          // The two content scans read every pixel again; they only describe the first frames (the probe keeps 32).
@@ -28,7 +36,7 @@
          if(scanBudget) {
              --scanBudget;
              uint64_t scan[5];
-@@ -327,6 +332,8 @@
+@@ -327,6 +333,8 @@
              if(native_legacy_frame_colors(reinterpret_cast<const void *>(source->getVirtualAddress()),source->getLength(),sourceStride,width,height,colors,counts,&other))
                  native_legacy_frame_colors_observed(colors,counts,other);
          }
@@ -37,7 +45,7 @@
          if(!native_legacy_prepare_scanout()) {
              OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
          }
-@@ -495,7 +502,8 @@
+@@ -495,7 +503,8 @@
             !video.v_width || !video.v_height || video.v_depth!=32 || video.v_rotate ||
             video.v_width>16384 || video.v_height>16384 || video.v_rowBytes<video.v_width*4 ||
             video.v_rowBytes>UINT64_MAX/video.v_height)return false;
@@ -47,3 +55,18 @@
          if(!mapping)return false;
          bool valid=mapping->getVirtualAddress() && mapping->getPhysicalAddress()==video.v_baseAddr &&
                     mapping->getLength()==video.v_rowBytes*video.v_height;
+@@ -517,8 +526,13 @@
+     LEAF(306)
+     LEAF(307)
+     LEAF(338)
+-    LEAF(345)
+ #undef LEAF
++    // Coachz: slot 345 is the panel timing's state. swap_wait_gated prints it when a swap has waited 5 s, before cancelling the swaps, and two
++    // family paths call slot 339 only when it answers true. This port runs no display pipe of its own, so the answer is no.
++    bool timingEnabled() override {
++        native_legacy_timing_asked(__builtin_return_address(0));
++        return false;
++    }
+ };
+ OSDefineMetaClassAndStructors(NativeLegacyDisplay,IOMobileFramebufferLegacy)
+ IOService *native_legacy_display_allocate(void) {return new NativeLegacyDisplay;}

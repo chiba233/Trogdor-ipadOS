@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from coachz_late_init import stage_initializer
 
 KIT = ROOT / 'kits/coachz'
+MIC = KIT.resolve().parent / 'pending/microphone'   # the capture engine, kept in its hand-off directory
 OUT = ROOT / 'build/coachz-audio'
 OUT.mkdir(parents=True, exist_ok=True)
 
@@ -37,7 +38,7 @@ with tempfile.TemporaryDirectory() as directory:
     headers.mkdir()
     for name in ('AudioServerPlugIn.h', 'AudioHardwareBase.h', 'AudioHardware.h'):
         (headers / name).symlink_to(Path(mac) / 'System/Library/Frameworks/CoreAudio.framework/Headers' / name)
-    run(['xcrun', 'clang', '-target', 'arm64-apple-ios17.0', '-isysroot', ios, '-I', directory, '-I', KIT, '-O2', '-Wall', '-Wextra', '-Werror',
+    run(['xcrun', 'clang', '-target', 'arm64-apple-ios17.0', '-isysroot', ios, '-I', directory, '-I', KIT, '-I', MIC, '-O2', '-Wall', '-Wextra', '-Werror',
          '-bundle', '-fvisibility=hidden', '-framework', 'CoreFoundation', '-framework', 'IOKit', KIT / 'CoachzAudioPlugIn.c',
          '-o', bundle / 'CoachzAudio'])
 shutil.copy(KIT / 'CoachzAudioPlugIn.plist', bundle / 'Info.plist')
@@ -73,7 +74,7 @@ while index < len(arguments):
     elif not value.startswith('-W'):
         command.append(value)
     index += 1
-command += ['-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter', '-Wno-unnecessary-virtual-specifier', '-Wno-c99-designator',
+command += ['-I', str(MIC), '-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter', '-Wno-unnecessary-virtual-specifier', '-Wno-c99-designator',
             '-Wno-reorder-init-list', '-Wno-deprecated-enum-enum-conversion']
 run(command, cwd=record['directory'])
 late = OUT / 'CoachzAudio.late.o'

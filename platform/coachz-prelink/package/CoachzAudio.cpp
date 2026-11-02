@@ -14,6 +14,7 @@
 #include <kern/thread_call.h>
 #include <mach/kmod.h>
 #include "CoachzAudioAbi.h"
+#include "CoachzMicXnu.hpp"
 
 extern kmod_info_t g_kernel_kmod_info;
 extern "C" {
@@ -23,6 +24,7 @@ vm_offset_t phystokv(uint64_t pa);
 uint64_t pmap_find_pa(void *pmap, uint64_t va);
 void coachz_audio_static_init(void) __asm__("__GLOBAL__sub_I_CoachzAudio.cpp");
 void coachz_audio_start(void);
+int coachz_rpmh_vreg_request(unsigned consumer, const char *resource, uint32_t mv, int hpm, int enable);
 }
 
 namespace {
@@ -40,6 +42,12 @@ const uint32_t kInputBytes = COACHZ_AUDIO_RING_FRAMES * 2;
 // Ahead of the DMA, for the audio server's late IO cycles on this CPU. There is no queue behind it, so this is all of the latency.
 const uint32_t kLeadFrames = 2400;
 const uint32_t kTickMs = 10;
+// The capture DMA (Primary MI2S into WRDMA5, CoachzMicCore.hpp): low DRAM like the ring, in no pool and no reserved-memory node. The apps
+// SMMU is in bypass (sCR0 CLIENTPD), so LPASS's capture stream sees it at this physical address. The speaker's RDMA1 stays as it is.
+const uint64_t kMicDmaPa = 0x81300000;
+const unsigned kMicRailConsumer = 3;                 // coachz_rpmh_vreg_request's identity for this rail vote
+// One short capture at boot, before any client: a second after the service starts, for three seconds. Only counters and peaks are kept.
+const uint32_t kMicTestStartTick = 100, kMicTestStopTick = 400;
 
 struct Page {uint64_t pa; vm_offset_t va;};
 Page pages[8];
@@ -83,6 +91,57 @@ bool anchored;
 uint32_t outputOn;
 uint32_t badReads, adjustments;
 
+CoachzMic::XnuBinding *microphone;
+CoachzMicShared *micStatus;
+void *micOwner;
+uint32_t micTicks;
+
+// ADAU7002's IOVDD, pp1800_l15a. A refused enable takes its own vote back, so the rail is not left counted for this consumer.
+int micSupply(void *, bool on) {
+	const int result = coachz_rpmh_vreg_request(kMicRailConsumer, "ldoa15", 1800, 1, on);
+	if (result && on) {
+		const int rollback = coachz_rpmh_vreg_request(kMicRailConsumer, "ldoa15", 1800, 1, 0);
+		if (rollback) {
+			printf("COACHZ mic: rail vote rollback failed (%d)\n", rollback);
+		}
+	}
+	return result;
+}
+
+void micReport(const char *why) {
+	printf("COACHZ mic: %s: state %u error %u generation %u frames %llu first %llu written %llu peak %u/%u nonzero %u/%u irq %u/%u misses %u\n",
+	    why, micStatus->state, micStatus->error, micStatus->generation, micStatus->frames_copied, micStatus->first, micStatus->written,
+	    micStatus->peak[0], micStatus->peak[1], micStatus->nonzero[0], micStatus->nonzero[1], micStatus->irq_periods, micStatus->irq_faults,
+	    reinterpret_cast<CoachzAudioDiag *>(reinterpret_cast<uint8_t *>(control) + COACHZ_AUDIO_DIAG_OFFSET)->in_misses);
+}
+
+void micState(bool running) {
+	if (running) {
+		__atomic_fetch_or(&control->state, (uint32_t)CoachzAudioInputRunning, __ATOMIC_RELAXED);
+	} else {
+		__atomic_fetch_and(&control->state, ~(uint32_t)CoachzAudioInputRunning, __ATOMIC_RELAXED);
+	}
+}
+
+// The first run with no client: cursor rate, signal and clean stop, whatever the audio server later does.
+void micSelfTest(uint64_t now) {
+	static uint64_t began;
+	if (micOwner || !microphone->ready()) {
+		return;
+	}
+	if (micTicks == kMicTestStartTick) {
+		began = now;
+		const int started = microphone->start(0);
+		printf("COACHZ mic: self test start %d, DMA at 0x%llx, ring %u frames\n", started, kMicDmaPa, COACHZ_MIC_DMA_FRAMES);
+	} else if (micTicks == kMicTestStopTick) {
+		micReport("self test");
+		const uint64_t frames = micStatus->frames_copied, ticks = now - began;
+		printf("COACHZ mic: self test %llu frames over %llu ms from the codec's 80 ms wake-up on\n", frames, ticks / (ticksPerFrame * 48));
+		const int stopped = microphone->stop();
+		printf("COACHZ mic: self test stop %d, state %u\n", stopped, micStatus->state);
+	}
+}
+
 // The play position from the DMA, the clearing behind it, and the one timeline's anchor, corrected only when it has really moved.
 void tick(thread_call_param_t, thread_call_param_t) {
 	const uint64_t now = mach_absolute_time();
@@ -113,8 +172,31 @@ void tick(thread_call_param_t, thread_call_param_t) {
 			ring[cleared % COACHZ_AUDIO_RING_FRAMES] = 0;
 		}
 		control->out_frames = position;
-		control->in_frames = position;
-		control->in_written = position;   // the input ring stays silent
+		// The input timeline shares the playback anchor; the capture's own valid range is in CoachzMicShared.
+		if (microphone) {
+			if (micTicks <= kMicTestStopTick) {
+				micSelfTest(now);
+				micTicks++;
+			}
+			const int polled = microphone->poll(mach_absolute_time(), control->out_anchor_host, ticksPerFrame);
+			static int lastPolled;
+			if (polled != lastPolled) {
+				lastPolled = polled;
+				micReport(polled ? "capture failed" : "capture recovered");
+				if (polled) {
+					micState(false);
+				}
+			}
+			control->in_frames = micStatus->frames_copied;
+			control->in_written = micStatus->written;
+			if (micOwner && micStatus->state == CoachzMicRunning) {
+				micState(true);
+				static uint32_t reportTicks;
+				if (!(++reportTicks % 1000)) {
+					micReport("running");
+				}
+			}
+		}
 	} else if (!badReads++) {
 		printf("COACHZ audio: DMA position 0x%x outside the ring\n", current);
 	}
@@ -190,9 +272,14 @@ public:
 		return true;
 	}
 	IOReturn clientClose() override {
-		// The plug-in's process went away or closed: nothing plays from its ring any more.
+		// The plug-in's process went away or closed: nothing plays from its ring any more, and nothing captures for it.
 		outputOn = 0;
 		amplifier(false);
+		if (microphone && micOwner == this) {
+			microphone->stop();
+			micOwner = nullptr;
+			micState(false);
+		}
 		terminate();
 		return kIOReturnSuccess;
 	}
@@ -223,6 +310,34 @@ public:
 				control->state = on ? control->state | CoachzAudioOutputRunning : control->state & ~(uint32_t)CoachzAudioOutputRunning;
 				printf("COACHZ audio: output %s at frame %llu, %u adjustments\n", on ? "on" : "off", control->out_frames, adjustments);
 			}
+		}
+		if (selector == CoachzAudioStartInput) {
+			if (!microphone || !microphone->ready()) {
+				return kIOReturnUnsupported;
+			}
+			if (micOwner && micOwner != this) {
+				return kIOReturnBusy;
+			}
+			if (micOwner == this) {
+				return kIOReturnSuccess;
+			}
+			const int started = microphone->start(0);
+			printf("COACHZ mic: input on: %d, state %u\n", started, micStatus->state);
+			if (started) {
+				micReport("start refused");
+				return kIOReturnError;
+			}
+			micOwner = this;   // InputRunning follows once the 80 ms wake-up has passed
+			return kIOReturnSuccess;
+		}
+		if (selector == CoachzAudioStopInput) {
+			if (micOwner == this) {
+				micReport("input off");
+				microphone->stop();
+				micOwner = nullptr;
+				micState(false);
+			}
+			return kIOReturnSuccess;
 		}
 		return kIOReturnSuccess;
 	}
@@ -283,7 +398,17 @@ extern "C" void coachz_audio_start(void) {
 	wr(kIrqEn, 0);                                  // polled by the timer
 	wr(kBitBranch, 1);
 	wr(kI2sCtl, rd(kI2sCtl) | kSpkrEn);
-	control->state = CoachzAudioOutputReady | CoachzAudioInputReady;
+	control->state = CoachzAudioOutputReady;
+	// LPASS has power and its clocks run: the capture's resources can be taken. A failure leaves playback alone and Ready unset.
+	microphone = new CoachzMic::XnuBinding;
+	micStatus = reinterpret_cast<CoachzMicShared *>(reinterpret_cast<uint8_t *>(control) + COACHZ_MIC_CONTROL_OFFSET);
+	if (microphone && microphone->prepare(kMicDmaPa, COACHZ_MIC_DMA_BYTES, true, true, micStatus, static_cast<int16_t *>(inputMemory->getBytesNoCopy()),
+	    COACHZ_AUDIO_RING_FRAMES, micSupply, nullptr)) {
+		control->state = CoachzAudioOutputReady | CoachzAudioInputReady;
+	} else {
+		printf("COACHZ mic: not prepared\n");
+		microphone = nullptr;
+	}
 	tick(nullptr, nullptr);
 	// Registered now rather than at boot, like the other late classes here.
 	const OSSymbol *name = OSSymbol::withCString("CoachzAudio");

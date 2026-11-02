@@ -1,0 +1,97 @@
+--- a/osfmk/arm64/coachz_thread.c
++++ b/osfmk/arm64/coachz_thread.c
+@@ -763,7 +763,7 @@
+ extern void coachz_early_band(uint32_t rows);
+ static unsigned coachz_compact;
+ 
+-#define COACHZ_TOP 5
++#define COACHZ_TOP 8
+ struct coachz_usage {
+ 	int key;
+ 	uint64_t total, delta;
+@@ -837,6 +837,34 @@
+ 	}
+ 	*loop2 = 2000000 * hz / ((end - start) * 1000000);
+ 	return 32 * 200000 * hz / (chain * 1000000);
++}
++
++/*
++ * What the clusters really run at under load, for the thermal clamp's test: one A55 and one A76 spin past the governor's 16 ms windows,
++ * then the dependent add chain times them. The caller must be a thread that can block.
++ */
++void
++coachz_cluster_mhz(const char *why)
++{
++	static const unsigned cores[2] = { 0, 6 };
++	uint64_t mhz[2] = { 0 }, loop2 = 0;
++	int where[2] = { -1, -1 };
++	for (unsigned index = 0; index < 2; index++) {
++		if ((unsigned)ml_get_cpu_count() <= cores[index] || !processor_array[cores[index]]) {
++			continue;
++		}
++		thread_bind(processor_array[cores[index]]);
++		thread_block(THREAD_CONTINUE_NULL);
++		where[index] = cpu_number();
++		uint64_t until;
++		clock_interval_to_deadline(48, NSEC_PER_MSEC, &until);
++		while (mach_absolute_time() < until) {
++		}
++		mhz[index] = coachz_core_mhz(&loop2);
++	}
++	thread_bind(PROCESSOR_NULL);
++	thread_block(THREAD_CONTINUE_NULL);
++	printf("COACHZ thermal: %s: measured A55 %llu MHz on %d, A76 %llu MHz on %d\n", why, mhz[0], where[0], mhz[1], where[1]);
+ }
+ 
+ /*
+@@ -1086,6 +1114,8 @@
+ 
+ 	{
+ 		struct coachz_usage top[COACHZ_TOP] = { 0 };
++		uint64_t all = 0;
++		unsigned count = 0;
+ 		task_t task;
+ 		lck_mtx_lock(&tasks_threads_lock);
+ 		queue_iterate(&tasks, task, task_t, tasks) {
+@@ -1095,13 +1125,16 @@
+ 			uint64_t delta = coachz_usage_delta(coachz_tasks_seen, &coachz_tasks_count,
+ 			    sizeof(coachz_tasks_seen) / sizeof(coachz_tasks_seen[0]), pid, times.rtm_user + times.rtm_system);
+ 			coachz_top_insert(top, bsd ? proc_name_address(bsd) : "kernel", pid, delta);
++			all += delta;
++			count += delta != 0;
+ 		}
+ 		lck_mtx_unlock(&tasks_threads_lock);
+ 		printf("K36 top ms:");
+ 		for (unsigned index = 0; index < COACHZ_TOP && top[index].delta; index++) {
+ 			printf(" %s(%d) %llu", top[index].name, top[index].key, coachz_ms(top[index].delta));
+-		}
+-		printf("\n");
++			all -= top[index].delta;
++		}
++		printf(" rest %llu in %u tasks\n", coachz_ms(all), count > COACHZ_TOP ? count - COACHZ_TOP : 0);
+ 	}
+ 
+ 	{
+--- a/bsd/dev/coachz_thermal.c
++++ b/bsd/dev/coachz_thermal.c
+@@ -42,6 +42,7 @@
+ static vm_offset_t thermal_cpufreq;
+ static uint32_t thermal_saved[2];
+ static int thermal_clamped, thermal_polls;
++extern void coachz_cluster_mhz(const char *why);
+ 
+ static void
+ thermal_clamp(int on)
+@@ -88,10 +89,12 @@
+         thermal_clamp(1);
+         delay(20000);
+         thermal_clamp_report("test on");
++        coachz_cluster_mhz("clamp on");
+         delay(2000000);
+         thermal_clamp(0);
+         delay(20000);
+         thermal_clamp_report("test off");
++        coachz_cluster_mhz("clamp off");
+     }
+     if (!thermal_clamped && peak > 80000) {
+         thermal_clamp(1);

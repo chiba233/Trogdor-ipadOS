@@ -178,3 +178,67 @@
 +!27 = !{!28, !29, !25, !24}
 +!28 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"uint4", !"air.arg_name", !"src"}
 +!29 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"uint4", !"air.arg_name", !"dst"}
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -2983,9 +2983,24 @@
+  gBlits++;encodedWork.blits++;
+  NmbCommandBuffer *handle=_handle;
+  return [self encoder:[NBBlitEncoder new] make:^{return nmb_blit_encoder_new(handle);} what:@"blitCommandEncoder"];
+ }
++// Coachz: what could be compressed. A618 compresses (UBWC) only tiled images, which IOSurfaces and textures over buffers are not, and on
++// Debian compression is what separates 760 FPS from 330 on this GPU. The first colour attachment of every pass, counted per process.
++static std::atomic<uint64_t> gCoachzPasses,gCoachzPrivate,gCoachzSurface,gCoachzBuffer;
++static void coachzPassTally(MTLRenderPassDescriptor *d) {
++ id<MTLTexture> t=d.colorAttachments[0].texture;
++ while([t isKindOfClass:[NBTexture class]] && ((NBTexture *)t).parent)t=((NBTexture *)t).parent;
++ if(![t isKindOfClass:[NBTexture class]])return;
++ NBTexture *texture=(NBTexture *)t;
++ const uint64_t pixels=(uint64_t)texture.width*texture.height;
++ (texture.surface?gCoachzSurface:texture.buffer?gCoachzBuffer:gCoachzPrivate)+=pixels;
++ const uint64_t passes=++gCoachzPasses;
++ if(!(passes%4096))NSLog(@"native-metal: coachz passes %llu, colour MPix private %llu surface %llu buffer %llu",(unsigned long long)passes,
++  (unsigned long long)gCoachzPrivate.load()/1000000,(unsigned long long)gCoachzSurface.load()/1000000,(unsigned long long)gCoachzBuffer.load()/1000000);
++}
+ - (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {
++ coachzPassTally(d);
+  NmbRenderPassDescriptor pass={};
+  std::vector<SingleSampleCopy> resolveCopies;
+  _dumpPasses++;
+  if(dumpMaybe(self)) {
+@@ -4146,10 +4161,26 @@
+  gNoCopyAll++;if(context)gNoCopyMade++;
+  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;buffer.wrapped=pointer;
+  return (id<MTLBuffer>)buffer;
+ }
++// Coachz: each kind of texture this process asks for, once: usage and storage decide whether Turnip can tile and compress it.
++static void coachzTextureKind(const char *kind,MTLTextureDescriptor *d) {
++ static std::atomic<uint64_t> seen[48];
++ const uint64_t key=(uint64_t)d.pixelFormat<<32|(uint64_t)d.usage<<8|(uint64_t)d.storageMode<<4|(kind[0]=='s');
++ for(auto &slot:seen) {
++  uint64_t held=slot.load();
++  if(held==key)return;
++  if(!held && slot.compare_exchange_strong(held,key)) {
++   NSLog(@"native-metal: coachz texture %s fmt %lu usage 0x%lx storage %lu %lux%lu",kind,(unsigned long)d.pixelFormat,(unsigned long)d.usage,
++    (unsigned long)d.storageMode,(unsigned long)d.width,(unsigned long)d.height);
++   return;
++  }
++  if(slot.load()==key)return;
++ }
++}
+ - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
+  NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
++ coachzTextureKind("private",d);
+  NmbTexture *handle=nmb_texture_new(gDevice,&descriptor);noteFormat((uint32_t)descriptor.format,handle!=nullptr);
+  if(gLogTextures && textureLogTurn())
+   GLOG(@"native-metal: texture-log %llu texture %llux%llu fmt %llu type %llu levels %llu usage %llx options %llx %s",
+         (unsigned long long)gTexturesLogged.load(),(unsigned long long)descriptor.width,(unsigned long long)descriptor.height,
+@@ -4162,8 +4193,9 @@
+ }
+ // The surface's pages are the texels: its mapping in this process is imported without a copy (pinned by the kernel, mapped into the GPU's
+ // 4 KiB context by Turnip), so every process that imports the surface renders and samples the same memory.
+ - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane {
++ if(d)coachzTextureKind("surface",d);
+  // A planar surface (Apple's lossless-compressed BGRA spelling has one plane, video formats two) is imported whole; the texture starts at
+  // the plane's own address and rows. Only a plain surface has no planes, and then only plane 0 exists.
+  const size_t planes=surface?IOSurfaceGetPlaneCount(surface):0;
+  if(!surface || !d || (planes?plane>=planes:plane!=0)){refuseSurface(1,surface,d,plane,0,0);return nil;}

@@ -17,6 +17,7 @@
 #include <string.h>
 #include <os/log.h>
 #include "CoachzAudioAbi.h"
+#include "CoachzMicHal.h"
 
 enum {kPlugIn = kAudioObjectPlugInObject, kDevice = 2, kOutStream = 3, kInStream = 4, kVolume = 5};
 #define kPlugInBundleID "org.trogdor.coachz.audio"
@@ -38,6 +39,8 @@ static io_connect_t gConnect;
 static CoachzAudioControl *gControl;
 static int16_t *gOut, *gIn;
 static UInt32 gIoUsers;
+static UInt32 gInputActive = 1;   // the input stream's kAudioStreamPropertyIsActive; the audio server turns streams it does not use off (i530)
+static int gInputOn;              // the capture was asked for
 static Float32 gVolume = 1.0f;   // the volume control's scalar (slider position)
 static Float64 gHostTicksPerFrame;
 static void setHostClock(void);
@@ -69,6 +72,17 @@ static int connectService(void) {
     return 0;
 }
 static kern_return_t call(uint32_t selector) {return gConnect ? IOConnectCallScalarMethod(gConnect, selector, NULL, 0, NULL, NULL) : KERN_FAILURE;}
+// The capture runs while IO runs and the input stream is on. A refused start leaves playback running and the input silent (gLock held).
+static void syncInput(void) {
+    const int want = gIoUsers > 0 && gInputActive;
+    if (want == gInputOn) return;
+    const kern_return_t result = call(want ? CoachzAudioStartInput : CoachzAudioStopInput);
+    if (want && result != KERN_SUCCESS) {
+        os_log_error(OS_LOG_DEFAULT, "CoachzAudio: input start refused 0x%x", result);
+        return;
+    }
+    gInputOn = want;
+}
 
 // CoreAudio's host clock frequency is a constant of 24 MHz (Apple's timer) that its IO clock and IO thread read directly; this board's timer
 // runs at 19.2 MHz, so the audio server's IO cycles came 25 % late (i546), and each recording fell silent from about 1.0 to 1.8 s until its
@@ -189,8 +203,17 @@ static OSStatus setProperty(AudioObjectID o, const AudioObjectPropertyAddress *a
     }
     if (o == kDevice && a->mSelector == kAudioDevicePropertyNominalSampleRate)
         return size >= sizeof(Float64) && *(const Float64 *)data == kRate ? 0 : kAudioDeviceUnsupportedFormatError;
-    // The audio server turns streams it does not use off and on (i530); both streams stay running, so this only acknowledges it.
-    if ((o == kOutStream || o == kInStream) && a->mSelector == kAudioStreamPropertyIsActive) return size >= sizeof(UInt32) ? 0 : kAudioHardwareBadPropertySizeError;
+    // The audio server turns streams it does not use off and on (i530). The output keeps running; the capture follows the input stream.
+    if ((o == kOutStream || o == kInStream) && a->mSelector == kAudioStreamPropertyIsActive) {
+        if (size < sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
+        if (o == kInStream) {
+            pthread_mutex_lock(&gLock);
+            gInputActive = *(const UInt32 *)data != 0;
+            syncInput();
+            pthread_mutex_unlock(&gLock);
+        }
+        return 0;
+    }
     return kAudioHardwareUnknownPropertyError;
 }
 
@@ -336,7 +359,7 @@ static OSStatus propertyData(AudioObjectID o, const AudioObjectPropertyAddress *
         case kAudioObjectPropertyOwner: REPLY(AudioObjectID, kDevice);
         case kAudioObjectPropertyName: if (o == kOutStream) REPLY_STR("Speaker"); REPLY_STR("Microphone");
         case kAudioObjectPropertyOwnedObjects: *outDataSize = 0; return 0;
-        case kAudioStreamPropertyIsActive: REPLY(UInt32, 1);
+        case kAudioStreamPropertyIsActive: REPLY(UInt32, o == kInStream ? gInputActive : 1);
         case kAudioStreamPropertyDirection: REPLY(UInt32, o == kInStream);
         case kAudioStreamPropertyTerminalType: REPLY(UInt32, o == kOutStream ? kAudioStreamTerminalTypeSpeaker : kAudioStreamTerminalTypeMicrophone);
         case kAudioStreamPropertyStartingChannel: REPLY(UInt32, 1);
@@ -529,14 +552,13 @@ static OSStatus StartIO(AudioServerPlugInDriverRef d, AudioObjectID o, UInt32 cl
             setHostClock();   // again: the shared page may have been read back from disk since
             if (call(CoachzAudioStartOutput) != KERN_SUCCESS) r = kAudioHardwareNotRunningError;
             else {
-                call(CoachzAudioStartInput);
                 const uint64_t host = mach_absolute_time(), anchor = gControl->out_anchor_host;
                 gZeroOrigin = host > anchor ? (uint64_t)((Float64)(host - anchor) / gHostTicksPerFrame) : 0;
                 gZeroSeed++;
             }
         }
     }
-    if (!r) gIoUsers++;
+    if (!r) {gIoUsers++; syncInput();}
     pthread_mutex_unlock(&gLock);
     return r;
 }
@@ -544,7 +566,7 @@ static OSStatus StopIO(AudioServerPlugInDriverRef d, AudioObjectID o, UInt32 cli
     (void)d; (void)client;
     if (o != kDevice) return kAudioHardwareBadObjectError;
     pthread_mutex_lock(&gLock);
-    if (gIoUsers && --gIoUsers == 0) {call(CoachzAudioStopOutput); call(CoachzAudioStopInput);}
+    if (gIoUsers && --gIoUsers == 0) {call(CoachzAudioStopOutput); syncInput();}
     pthread_mutex_unlock(&gLock);
     return 0;
 }
@@ -650,10 +672,15 @@ static OSStatus DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID o, Aud
         if (!diag->behind_max || behind < diag->behind_min) diag->behind_min = behind;
         if (behind > diag->behind_max) diag->behind_max = behind;
         Float32 *dst = main;
-        uint64_t t = (uint64_t)info->mInputTime.mSampleTime;
-        const uint64_t written = gControl->in_written;
-        if (t + frames > written) diag->in_misses += 1;
-        for (UInt32 i = 0; i < frames; ++i, ++t) dst[i] = t < written ? gIn[t % COACHZ_AUDIO_RING_FRAMES] / 32768.0f : 0.0f;
+        const CoachzMicShared *mic = (const CoachzMicShared *)((const uint8_t *)gControl + COACHZ_MIC_CONTROL_OFFSET);
+        const Float64 time = info->mInputTime.mSampleTime;
+        if (!(time >= 0.0 && time < 9007199254740992.0)) {   // NaN or out of range reads as silence
+            for (UInt32 i = 0; i < frames; ++i) dst[i] = 0.0f;
+            return 0;
+        }
+        const uint64_t t = (uint64_t)time;
+        if (t + frames > __atomic_load_n(&mic->written, __ATOMIC_RELAXED)) diag->in_misses += 1;
+        coachz_mic_read(mic, gIn, t, frames, dst);
     }
     return 0;
 }

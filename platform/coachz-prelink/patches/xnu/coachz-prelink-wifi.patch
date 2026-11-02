@@ -13,7 +13,7 @@
  	extern void coachz_battery_start(void);
 --- /dev/null
 +++ b/bsd/dev/coachz_wifi.c
-@@ -0,0 +1,5663 @@
+@@ -0,0 +1,5767 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/* WCN3990 / SC7180: the modem that hosts the WLAN firmware, started as mainline's qcom_q6v5_mss does (coachz-wifi=4), and the SMEM
 + * inventory (coachz-wifi=1 plus an explicit /arm-io/coachz-wifi ADT node). With the modem up: SMP2P, GLINK over SMEM, QRTR and
@@ -376,7 +376,7 @@
 + * others): cmd-db lookups, active-only writes through the TCS above, and cx.lvl as rpmhpd aggregates it, the highest corner any
 + * consumer asks for (a plain write by one would drop another's level). The modem's proxy vote is one such consumer.
 + */
-+enum { COACHZ_CX_MSS_PROXY = 3, COACHZ_CX_CONSUMERS = 4 };
++enum { COACHZ_CX_MSS_PROXY = 3, COACHZ_CX_CONSUMERS = 5 };   /* 1, 2 SDCC; 4 usb_1 */
 +static uint32_t coachz_cx_corner[COACHZ_CX_CONSUMERS], coachz_cx_written = 0xffffffffu;
 +static volatile uint32_t coachz_cx_busy;
 +static uint8_t coachz_aux[4][64];
@@ -486,6 +486,62 @@
 +{
 +    if (!consumer || consumer == COACHZ_CX_MSS_PROXY) return -1;
 +    return coachz_cx_vote(consumer, level ? coachz_cx_corner_of(level) : 0);
++}
++
++/*
++ * A regulator with more than one consumer, as the regulator core and qcom-rpmh-regulator.c treat it: on while any consumer
++ * enabled it, at the highest millivolts of those, the device tree's initial mode (HPM) sent once, the voltage before the enable,
++ * both acknowledged. ldoa4 also feeds the DSI PLL, CSI, UFS and refgen, so a plain write from one driver could lower what they use;
++ * until the display's vote is known here the voltage is only ever raised. Returns 0 on success.
++ */
++int coachz_rpmh_vreg_request(unsigned consumer, const char *resource, uint32_t mv, int hpm, int enable);
++static struct coachz_vreg { const char *name; uint32_t address, voted[4], written; uint8_t on[4], enabled, mode; } coachz_vregs[6];
++static volatile uint32_t coachz_vreg_busy;
++
++int
++coachz_rpmh_vreg_request(unsigned consumer, const char *resource, uint32_t mv, int hpm, int enable)
++{
++    enum { VOLTAGE = 0x0, ENABLE = 0x4, MODE = 0x8, PMIC5_LDO_HPM = 7 };
++    if (!resource || consumer >= 4) return -1;
++    while (!__sync_bool_compare_and_swap(&coachz_vreg_busy, 0u, 1u)) delay(100);
++    int result = -2;
++    struct coachz_vreg *r = NULL;
++    for (unsigned i = 0; i < sizeof(coachz_vregs) / sizeof(coachz_vregs[0]) && !r; i++) {
++        if (!coachz_vregs[i].name) {
++            const uint32_t address = coachz_cmd_db_address(resource);
++            if (!address) break;
++            coachz_vregs[i].name = resource;
++            coachz_vregs[i].address = address;
++            r = &coachz_vregs[i];
++        } else if (!strcmp(coachz_vregs[i].name, resource)) {
++            r = &coachz_vregs[i];
++        }
++    }
++    if (r) {
++        uint32_t most = 0, any = 0;
++        r->on[consumer] = enable ? 1 : 0;
++        r->voted[consumer] = mv;
++        for (unsigned i = 0; i < 4; i++) if (r->on[i]) { any = 1; if (r->voted[i] > most) most = r->voted[i]; }
++        result = 0;
++        if (hpm && !r->mode) {
++            const uint32_t address = r->address + MODE, data = PMIC5_LDO_HPM;
++            result = coachz_rpmh_write(&address, &data, 1, 1);
++            if (!result) r->mode = 1;
++        }
++        if (!result && any && most > r->written) {
++            const uint32_t address = r->address + VOLTAGE;
++            result = coachz_rpmh_write(&address, &most, 1, 1);
++            if (!result) r->written = most;
++        }
++        if (!result && any != r->enabled) {
++            const uint32_t address = r->address + ENABLE;
++            result = coachz_rpmh_write(&address, &any, 1, 1);
++            if (!result) r->enabled = (uint8_t)any;
++        }
++        printf("COACHZ rpmh: %s consumer %u %u mV enable %d: voted %u mV on %u, result %d\n", resource, consumer, mv, enable, r->written, r->enabled, result);
++    }
++    __atomic_store_n(&coachz_vreg_busy, 0u, __ATOMIC_RELEASE);
++    return result;
 +}
 +
 +/* One BCM's share of bandwidth requests (kBps), as bcm-voter.c aggregates it: x = avg * width / (buswidth * channels) * 1000 / unit,
@@ -1099,6 +1155,16 @@
 +#define WIFI_SMP2P_MAGIC 0x504d5324u
 +static uint32_t wifi_smp2p_out;   /* SMEM offset of item 428, 0 until made */
 +static int wifi_smp2p_negotiated, wifi_smp2p_ssr, wifi_smp2p_ack, wifi_smp2p_ipa_answered;
++static uint32_t wifi_smp2p_ipa_seen;
++static volatile int wifi_ipa_setup_ready;
++/* drivers/RamBlock/coachz_modem.c: mainline's ipa_config, ipa_setup and IPA QMI handshake. */
++extern int coachz_modem_configure(int (*)(const char *), int (*)(int, uint32_t, uint32_t, const void *, uint32_t));
++extern void coachz_modem_starting(void);
++extern int coachz_modem_setup(void);
++extern void coachz_modem_new_server(uint32_t, uint32_t, uint32_t, uint32_t);
++extern void coachz_modem_qmi(int, uint32_t, uint32_t, const void *, uint32_t);
++extern void coachz_modem_poll(void);
++extern void coachz_modem_report(unsigned);
 +
 +static void
 +wifi_smp2p_kick(void)
@@ -1182,6 +1248,17 @@
 +        }
 +        const uint32_t value = *wifi_smem_word(in + 36 + 20 * e);
 +        if (!strcmp(name, "slave-kernel")) bits = value;
++        /* What mainline's ipa_smp2p waits for: bit 1 is ipa-setup-ready, which the modem raises after loading GSI. coachz_modem_setup runs from
++         * the watch loop, as mainline's threaded interrupt runs ipa_setup. */
++        if (!strcmp(name, "ipa") && value != wifi_smp2p_ipa_seen) {
++            static int reported;
++            wifi_smp2p_ipa_seen = value;
++            printf("COACHZ smp2p: modem ipa entry 0x%x\n", value);
++            if ((value & 2) && !reported) {
++                reported = 1;
++                wifi_ipa_setup_ready = 1;
++            }
++        }
 +        if (out && !strcmp(name, "ipa") && (value & 1) && !wifi_smp2p_ipa_answered) {
 +            *wifi_smem_word(out + 36 + 20 * 1) = 3;   /* our "ipa" entry: clock enabled-valid and enabled */
 +            wifi_smp2p_kick();
@@ -1856,6 +1933,16 @@
 +    const uint32_t padded = (len + 3) & ~3u;
 +    bzero(packet + 32 + len, padded - len);
 +    wg_send(packet, 32 + padded);
++}
++
++/* The IPA QMI service and client (drivers/RamBlock/coachz_modem.c, which holds the handshake). */
++#define WM_SERVER_PORT 0x4002u
++#define WM_CLIENT_PORT 0x4003u
++static int
++wm_send(int client, uint32_t node, uint32_t port, const void *message, uint32_t length)
++{
++    wq_send(1, client ? WM_CLIENT_PORT : WM_SERVER_PORT, node, port, message, length);
++    return 0;
 +}
 +
 +static void
@@ -5236,6 +5323,7 @@
 +    case 1:
 +        if (dst_port == WQ_RMTFS_PORT) wr_request(src_node, src_port, body, size);
 +        else if (dst_port == WL_PORT) wl_rx(body, size);
++        else if (dst_port == WM_SERVER_PORT || dst_port == WM_CLIENT_PORT) coachz_modem_qmi(dst_port == WM_CLIENT_PORT, src_node, src_port, body, size);
 +        else printf("COACHZ qrtr: data for port 0x%x from %u:0x%x\n", dst_port, src_node, src_port);
 +        if (confirm) wq_send(7, dst_port, src_node, src_port, (const uint32_t[]){7, WQ_NODE, dst_port, 0, 0}, 20);
 +        break;
@@ -5255,6 +5343,7 @@
 +            wl.port = ctrl[4];
 +            wl.known = 1;
 +        }
++        coachz_modem_new_server(ctrl[1], ctrl[2], ctrl[3], ctrl[4]);
 +        break;
 +    case 5:
 +        printf("COACHZ qrtr: server %u gone at %u:0x%x\n", ctrl[1], ctrl[3], ctrl[4]);
@@ -5522,6 +5611,12 @@
 +    /* IPA power before the start, as ipa_modem.c takes it on QCOM_SSR_BEFORE_POWERUP (the modem loads the IPA's GSI firmware). */
 +    const int ipa = wifi_ipa_power();
 +    printf("COACHZ mba attempt 1: IPA %s\n", ipa ? "vote failed" : "powered");
++    /* ipa_config at probe in mainline, before the modem boots; the uC proxy vote and our cleared "ipa" entry as its start begins. */
++    if (!ipa && !coachz_modem_configure(wifi_qmp_send, wm_send)) {
++        coachz_modem_starting();
++        if (wifi_smp2p_out) *wifi_smem_word(wifi_smp2p_out + 36 + 20 * 1) = 0;
++        wifi_smp2p_ipa_answered = 0;
++    }
 +    const uint32_t outcome = wifi_mba_attempt(&maps, 1);
 +    printf("COACHZ mba attempt 1 result: status 0x%x%s%s\n", outcome & 0xff, (outcome & 0xff) == 1 || (outcome & 0xff) == 2 ? ", MBA ready" : "",
 +        outcome & 0x100 ? ", modem running" : "");
@@ -5548,11 +5643,20 @@
 +                wc_poll(0);
 +                wl_step();
 +            }
++            if (wifi_ipa_setup_ready) {
++                wifi_ipa_setup_ready = 0;
++                if (coachz_modem_setup() && !link) {
++                    /* ipa_qmi_setup: our IPA service for the modem's requests; INIT_DRIVER follows the modem's own service. */
++                    wq_ctrl(4, 0x31, 1 | 1 << 8, WQ_NODE, WM_SERVER_PORT, wg.modem_node);
++                }
++            }
++            coachz_modem_poll();
 +            delay(1000);
 +        }
 +        if (!link && (second <= 120 ? !(second % 10) : !(second % 60))) {
 +            wg_report(second);
 +            wc_report(second);
++            coachz_modem_report(second);
 +        }
 +        if (second > 60 && second % 10) continue;
 +        const int64_t bits = wifi_modem_bits();

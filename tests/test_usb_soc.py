@@ -1,4 +1,4 @@
-"""Host checks for the pending usb_1 SoC bring-up (DWC3, QUSB2, QMP). Never builds or boots a kernel."""
+"""Host checks for the usb_1 SoC bring-up (DWC3, QUSB2, QMP). Never builds or boots a kernel."""
 from pathlib import Path
 import re
 import shutil
@@ -9,9 +9,9 @@ import unittest
 from test_mmc import STUBS as MMC_STUBS
 
 ROOT = Path(__file__).resolve().parents[1]
-PENDING = ROOT / 'platform/coachz-prelink/pending/usb'
+PENDING = ROOT / 'platform/coachz-prelink/drivers/RamBlock/usbsoc'
 STUBS = dict(MMC_STUBS)
-STUBS['sys/systm.h'] = 'int printf(const char *, ...);\n__attribute__((noreturn)) void panic(const char *, ...);\n'
+STUBS['sys/systm.h'] = '#include <stddef.h>\nint printf(const char *, ...);\n__attribute__((noreturn)) void panic(const char *, ...);\n'
 
 
 class UsbSocTests(unittest.TestCase):
@@ -49,14 +49,18 @@ class UsbSocTests(unittest.TestCase):
         self.assertEqual(len(entries), text.count('}, /*'))
         self.assertTrue(all(name.startswith(('QSERDES_V3_', 'QPHY_V3_PCS_')) for *_, name in entries))
 
-    def test_not_in_the_active_build(self):
-        series = (ROOT / 'platform/coachz-prelink/patches/xnu/series').read_text()
-        self.assertNotIn('usb-soc', series)
-        for path in [ROOT / 'tools/xnu_screen.py', ROOT / 'platform/coachz-prelink/drivers/RamBlock/build-usb-stack.py',
-                     ROOT / 'platform/coachz-prelink/drivers/RamBlock/coachz_usb.c']:
-            text = path.read_text()
-            self.assertNotIn('coachz-usb-soc', text, path)
-            self.assertNotIn('coachz_usb_soc', text, path)
+    def test_bring_up_precedes_xhci_on_the_emmc_route(self):
+        usb = (ROOT / 'platform/coachz-prelink/drivers/RamBlock/coachz_usb.c').read_text()
+        route = usb[usb.index('int coachz_usb_open_keyboard(void)'):usb.index('int coachz_usb_open(uint64_t')]
+        # A failed bring-up must not reach xhci_init(), and the pool has to be mapped before the event buffer is taken from it.
+        self.assertLess(route.index('pool_va = ml_io_map_wcomb'), route.index('coachz_usb_soc_init()'))
+        self.assertLess(route.index('coachz_usb_soc_init()'), route.index('xhci_init(XHCI_BASE)'))
+
+    def test_event_buffer_stays_out_of_the_root_disk_pool(self):
+        # A fixed 0x81130000 fell inside the eMMC's transfer buffer once its requests grew to 480 KiB.
+        soc = (PENDING / 'coachz_usb_soc.c').read_text()
+        self.assertIn('coachz_usb_memalign(0x1000, 0x1000)', soc)
+        self.assertNotIn('0x8113', soc)
 
 
 if __name__ == '__main__':

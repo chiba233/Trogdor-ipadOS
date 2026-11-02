@@ -16,7 +16,7 @@
  * After it returns 0 the xHCI at 0x0a600000 is ready for its driver's HCRST. Not done here (stage limits): the wake
  * interrupts and suspend paths of the glue, interconnect bandwidth votes, Type-C (cros-ec-typec) and DisplayPort.
  *
- * Boot argument: coachz-usb-soc=1. Without it coachz_usb_soc_init() returns 1 at once and firmware's state is used.
+ * Runs when the root is on the eMMC; coachz-usb-soc=1 or 0 overrides that. Otherwise it returns 1 at once and firmware's state is used.
  */
 #include <sys/param.h>
 #include <sys/systm.h>
@@ -29,12 +29,12 @@
 #include "coachz_usb_rpmh.h"
 
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
-extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
 int coachz_usb_soc_init(void);
 
-/* The event buffer: one page below 4 GiB outside the XNU window, after the SDHCI pool (0x81100000 + 0x30000) and below
-   the speaker ring (0x81200000). The core only writes it in device mode; dwc3_core_init programs it regardless. */
-#define EVT_PA 0x81130000ul
+/* The event buffer comes from the USB stack's own DMA pool: the core only writes it in device mode, but dwc3_core_init
+   programs it regardless, and the SDHCI pool that follows belongs to the root disk's transfers. */
+extern void *coachz_usb_memalign(size_t, size_t);
+extern unsigned long coachz_usb_v2p(const void *);
 
 static vm_offset_t dwc, qscratch, qusb2, qmp, qfprom, gpio, evt;
 /* GCC is mapped page by page: the registers used here are spread over 0x5000-0x8c010. */
@@ -191,8 +191,11 @@ static uint32_t dwc_read32(void *ctx, uint32_t offset) { return rd((vm_offset_t)
 /* ------------------------------------------------------------------ the whole sequence */
 int coachz_usb_soc_init(void)
 {
-    unsigned enabled = 0;
-    if (!PE_parse_boot_argn("coachz-usb-soc", &enabled, sizeof(enabled)) || enabled != 1) return 1;
+    /* Only with the root on the eMMC: this resets the controller a USB root disk would hang from. coachz-usb-soc=0 turns it off. */
+    unsigned enabled = 0, emmc = 0;
+    if (!PE_parse_boot_argn("coachz-usb-soc", &enabled, sizeof(enabled)))
+        enabled = PE_parse_boot_argn("coachz-root-emmc", &emmc, sizeof(emmc)) && emmc == 1;
+    if (enabled != 1) return 1;
     const uint64_t start = now_us();
     for (unsigned i = 0; i < sizeof(gcc_pages) / sizeof(gcc_pages[0]); i++)
         if (!(gcc_va[i] = ml_io_map(CU_GCC_PA + gcc_pages[i], 0x1000))) return 0;
@@ -202,7 +205,7 @@ int coachz_usb_soc_init(void)
     qmp = ml_io_map(CU_QMP_PA, 0x3000);
     qfprom = ml_io_map(CU_QFPROM_PA, 0x1000);
     gpio = ml_io_map(CU_TLMM_WEST_PA + 0x1000u * CU_HUB_GPIO, 0x1000);
-    evt = ml_io_map_wcomb(EVT_PA, 0x1000);
+    evt = (vm_offset_t)coachz_usb_memalign(0x1000, 0x1000);
     if (!dwc || !qscratch || !qusb2 || !qmp || !qfprom || !gpio || !evt) { printf("COACHZ usb: map failed\n"); return 0; }
 
     /* pp3300_hub: the fixed regulator's enable GPIO (en_pp3300_hub pin state), high */
@@ -254,8 +257,9 @@ int coachz_usb_soc_init(void)
     wr(dwc, CU_DWC3_GCTL, cu_gctl_setup(rd(dwc, CU_DWC3_GCTL), hw0, hw1, &ver));
     /* no suspend clock, frame length, reference period, INCR burst or bus property in the device tree */
     __builtin_memset((void *)evt, 0, 0x1000);
-    wr(dwc, CU_DWC3_GEVNTADRLO, (uint32_t)EVT_PA);
-    wr(dwc, CU_DWC3_GEVNTADRHI, (uint32_t)((uint64_t)EVT_PA >> 32));
+    const uint64_t evt_pa = coachz_usb_v2p((const void *)evt);
+    wr(dwc, CU_DWC3_GEVNTADRLO, (uint32_t)evt_pa);
+    wr(dwc, CU_DWC3_GEVNTADRHI, (uint32_t)(evt_pa >> 32));
     wr(dwc, CU_DWC3_GEVNTSIZ, CU_EVENT_BUFFER_BYTES & 0xffffu);
     wr(dwc, CU_DWC3_GEVNTCOUNT, rd(dwc, CU_DWC3_GEVNTCOUNT));
     wr(dwc, CU_DWC3_GUCTL2, cu_guctl2(rd(dwc, CU_DWC3_GUCTL2), &ver));

@@ -122,6 +122,10 @@ bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *memory,uint64_t s
     return true;
 }
 void native_legacy_gpu_fallback_observed(int status) { kprintf("COACHZ display: GPU offer unsupported %d\n",status); }
+void native_legacy_timing_asked(void *caller) {
+    static uint32_t asked;
+    if(asked++<8)printf("COACHZ display: timing state asked by %p after %llu frames, %llu transfers (status %x)\n",caller,frames,transfers,lastTransfer);
+}
 __attribute__((noreturn)) void native_legacy_backend_guard(unsigned slot,void *,void *caller) {
     panic("Coachz display: unqualified slot %u caller %p stage %u registrations %u clients %u frames %llu transfers %llu status %x retire %llu vsync %llu",
         slot,caller,stage,registrations,clients,frames,transfers,lastTransfer,retirements,vsyncs);

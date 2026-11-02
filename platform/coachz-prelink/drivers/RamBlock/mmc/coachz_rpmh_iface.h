@@ -19,6 +19,7 @@
 
 #include <stdint.h>
 
+/* 3 is the modem's proxy vote and 4 usb_1 (usbsoc/coachz_usb_rpmh.h). */
 enum { COACHZ_CX_SDCC1 = 1, COACHZ_CX_SDCC2 = 2 };
 
 uint32_t coachz_cmd_db_address(const char *resource);

@@ -1,6 +1,6 @@
 # USB-C（usb_1：DWC3、QUSB2、QMP）
 
-2026-11-02：第一阶段 SoC bring-up 已写好，放在待接入目录，尚未编译进 XNU，也没有实机结果。入口：[实现与接入说明](../../platform/coachz-prelink/pending/usb/README.md)，[固定源码](../../platform/coachz-prelink/pending/usb/SOURCES.md)。
+2026-11-02：第一阶段 SoC bring-up 已写好，放在待接入目录，尚未编译进 XNU，也没有实机结果。入口：[实现与接入说明](../../platform/coachz-prelink/drivers/RamBlock/usbsoc/README.md)，[固定源码](../../platform/coachz-prelink/drivers/RamBlock/usbsoc/SOURCES.md)。
 
 ## 硬件和路线
 

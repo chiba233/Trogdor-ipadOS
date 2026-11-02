@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 /*
  * What the USB bring-up needs from the shared RPMh client (drivers/RamBlock/mmc/coachz_rpmh_iface.h, implemented in
- * coachz-prelink-wifi.patch). Two additions, both NOT implemented here:
+ * coachz-prelink-wifi.patch). Two additions, both implemented there:
  *
  *  COACHZ_CX_USB              a fifth CX consumer (usb_1 required-opps nom); COACHZ_CX_CONSUMERS becomes 5.
  *  coachz_rpmh_vreg_request   a per-consumer regulator vote with the regulator core's aggregation: the LDO is enabled
