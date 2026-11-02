@@ -1658,4 +1658,5 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 - **界面**：识别到 SIM 卡，“关于本机”显示调制解调器固件。IMEI、ICCID 没有显示。
 - **未实现**：苹果私有服务 0xe1、0xe2、0xe4、0xe5、0xe7 的消息回不支持；注册网络和蜂窝数据没有验证。
 - **GPU**：读回 `0xae10` 在 GMU 投票和电源状态都正常时仍触发同步外部错误，两次 panic 都在这里。去掉读回后这次运行没有 panic。
+- **IMEI**：modem 进入 `kOnline`，DMS 的序列号查询（0x25）有应答，但 CommCenter 报 `MEID(ready=1) and IMEI(ready=0)` 和 `Evaluator does not support (1) SIMs, num of IMEIs (0)`，不启用这张 SIM。Debian 上 `qmicli --dms-get-ids` 也是 `IMEI: 'unknown'`、`MEID: 'unknown'`：modem 的 EFS 来自 Debian 的 `/lib/firmware/rmtfs`，内容全 0。
 
