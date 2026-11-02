@@ -115,4 +115,4 @@ b9 用 drivers/RamBlock/coachz_modem.c 按上面的顺序接入，在 Wi-Fi 线�
 
 打包是 `tools/xnu_screen.py --baseband`（设 `/chosen/coachz-baseband`、嫁接 J121AP 的 `/baseband` 节点和 `baseband-chipset`）加 `tools/linux_log.py --baseband`（把 Mav16 固件放到内核分区里 modem 固件之后）。launchd 按 `/baseband` 选 `com.apple.CommCenter.plist`（`_LimitLoadToDeviceTree`），没有这个节点时用 `-noncellular` 那份。
 
-真机上服务、固件和两处挂载都通过，蜂窝版 CommCenter 起来，状态栏显示“正在搜索”，设置里的“蜂窝网络”打不开。CommCenter 没有加载命令驱动（`No CommandDriver dylib`、`NullFactory`），停在 `kNoBaseband`，所以没有进程打开基带通道：下一步先查它按什么条件加载驱动。之后才轮到 sahara 要请求哪些镜像、固件目录用哪一处、哪些私有消息必须实现，然后接 `pdp_ip` 和 VINYL（eSIM）。
+真机上服务、固件和两处挂载都通过。`compatible` 用 J121AP 后 CommCenter 走高通分支并启动 ABM，状态栏显示搜信号，但 ABM 拿到空的 `ApplePDPHelperInterface` 后崩溃（`AppleIPAppender` 不存在）。要发布这个服务和 `AppleBasebandPCIMAVPDPManager`。之后才轮到 sahara 要请求哪些镜像、固件目录用哪一处、哪些私有消息必须实现，然后接 `pdp_ip` 和 VINYL（eSIM）。

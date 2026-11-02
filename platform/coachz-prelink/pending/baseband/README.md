@@ -8,12 +8,13 @@
 - `coachz_bb_sahara.h`：sahara 通道上扮演 modem 的设备端。发 HELLO，按 ELF 头、程序头、各段请求列出的镜像，收到的数据丢弃，最后一个镜像的 DONE 应答报完成。
 - `coachz_bb_control.h`：`AppleBaseband` UserClient 的方法表。供电、复位、复用等只记录，不动 modem；管理器状态和基带状态原样存取；SPMI、GNSS、时间同步回 unsupported。
 - `coachz_bb_channels.h`：通道名表、匹配用的类名和属性键、两个通道 UserClient 的方法号和参数个数。
-- `coachz_baseband.cpp`：内核 IOKit。发布 `AppleBaseband`、`AppleBasebandPCIControl` 和三个 `AppleBasebandPCIInterface`（属性 `ABPInterfaceProtocol` 为 sahara、qmux1、qmux2），UserClient 用苹果的类名（`AppleBasebandUserClient`、`AppleBasebandPCIControlUserClient`、`AppleBasebandPCIUserClient`），沙盒按类名放行。读写分同步和异步两种，异步按 libIOABP 的约定完成：引用数组第 1 项是回调，第 2 项是 refcon，完成时带一个参数，为字节数。ABM 复位或给 modem 上电时，sahara 重新发 HELLO。调用方线程只排队；QRTR 收发都在 Wi-Fi 线程上。
+- `coachz_baseband.cpp`：内核 IOKit。发布 `AppleBaseband`、`AppleBasebandPCIControl` 和多个 `AppleBasebandPCIInterface`（属性 `ABPInterfaceProtocol` 为 sahara、qmux1、qmux2，以及目前没有后端的 diag、refs、at、trace、boot：能打开、写入只计数、读不到数据，第一次打开时记一行日志），UserClient 用苹果的类名（`AppleBasebandUserClient`、`AppleBasebandPCIControlUserClient`、`AppleBasebandPCIUserClient`），沙盒按类名放行。读写分同步和异步两种，异步按 libIOABP 的约定完成：引用数组第 1 项是回调，第 2 项是 refcon，完成时带一个参数，为字节数。ABM 复位或给 modem 上电时，sahara 重新发 HELLO。调用方线程只排队；QRTR 收发都在 Wi-Fi 线程上。
 - `patches/xnu/coachz-prelink-baseband.patch`：两处内核改动。
   - `bsd/dev/coachz_wifi.c`：GLINK 起来后调 `coachz_baseband_configure`，发布服务；本地端口 0x4100 起的 QRTR 数据交给桥；NEW_SERVER 和 DEL_SERVER 同步给桥；每毫秒调一次 `coachz_baseband_poll`，把排队的 QMI 请求和 DEL_CLIENT 发出去；周期报告里加一行桥的计数。`coachz_baseband_archive` 从磁盘读整个固件归档并核对 SHA-256。
   - `bsd/kern/kern_exec.c`：有 `/chosen/coachz-baseband` 时，禁用任务清单不再包含 CommCenter。launchd 改写过的清单里 CommCenter 还是 true 就不接受，按新清单重装。在 launchd 之前，把内核分区里的固件文件写到 `/private/var/coachz/baseband/Mav16`，内容不同才写。再用只读联合挂载把它显示在两处：`/private/preboot/<boot-manifest-hash>/usr/local/standalone/firmware/Baseband/Mav16`（ABM 的个性化固件路径），以及 `/usr/standalone/firmware/Baseband/Mav16`。SystemOS 叠在 `/` 上，`/private/preboot` 是 OS 卷的空目录，所以挂载检查只查挂载点本身和固件目录。
-- `tools/xnu_screen.py --baseband`（已改）：
+- `tools/xnu_screen.py --baseband`：
   - 设 `/chosen/coachz-baseband`。
+  - 把根节点 `compatible` 换成 `J121AP`。`HWModelStr` 取自它，`libTelephonyUtilDynamic` 按它查基带表（`__TelephonyRadiosDetermineRadio`）：J120 不在表里，CommCenter 走 `NoBBRadioModule`；J121 是 radio 3、高通，固件正好是这份 IPSW 的 Mav16。`model`、`target-type`、`artwork-device-subtype` 不变，屏幕布局不受影响。
   - 嫁接 J121AP 的 `/baseband` 节点（compatible `baseband,n41`、device_type、class、`euicc-chip-id = 2`；GPIO 功能和中断是 J121AP 的控制器，不带）和 `/product baseband-chipset = mav16`。机型身份不变。
 - `tools/linux_log.py --baseband`：从固定的 IPSW（`.tools/ipsw`）取出 Mav16 的 bbfw，把其中 17 个文件按 GPU 插件的布局打成魔数为 `CZBBFW01` 的归档（约 32 MiB），作为 `baseband.arc` 放进内核分区的固件块，排在 modem 固件之后。固件不加载它，所以签名容器不变大；内核分区用满 256 MiB。
 

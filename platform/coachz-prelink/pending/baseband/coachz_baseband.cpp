@@ -195,6 +195,7 @@ static void bb_host_write(uint32_t channel, const uint8_t *data, uint32_t len)
              bb_sahara.host_status, bb_sahara.last_command, bb_sahara.requests, bb_sahara.bytes);
     return;
   }
+  if (channel != CBH_QMUX1 && channel != CBH_QMUX2) return;   // counted above, nothing behind it yet
   const uint32_t qmux = channel == CBH_QMUX1 ? 0 : 1;
   const struct cbq_result r = cbq_from_host(&bb_qmux, qmux, data, len, bb_out, sizeof bb_out);
   switch (r.kind) {
@@ -460,7 +461,7 @@ IOReturn AppleBasebandPCIUserClient::externalMethod(uint32_t selector, IOExterna
     const bool free_channel = !ch->owner || ch->owner == this;
     if (free_channel) {
       ch->owner = this;
-      ch->opens++;
+      if (!ch->opens++) printf("COACHZ baseband: %s opened\n", cbh_published[fChannel]);
       if (fChannel == CBH_SAHARA) bb_sahara_restart();
     }
     IOLockUnlock(bb_lock);
@@ -678,8 +679,7 @@ extern "C" void coachz_baseband_configure(void (*send)(uint32_t, uint32_t, uint3
   made += provider && bb_publish<AppleBasebandPCIControl>(provider);
   for (uint32_t c = 0; c < CBH_PUBLISHED; c++) made += provider && bb_publish<AppleBasebandPCIInterface>(provider, c);
   bb_published = 1;
-  printf("COACHZ baseband: %d of %u services published (AppleBaseband, AppleBasebandPCIControl, sahara, qmux1, qmux2)\n", made,
-         2u + CBH_PUBLISHED);
+  printf("COACHZ baseband: %d of %u services published (AppleBaseband, AppleBasebandPCIControl and %u channels)\n", made, 2u + CBH_PUBLISHED, CBH_PUBLISHED);
 }
 
 extern "C" void coachz_baseband_new_server(uint32_t service, uint32_t version_instance, uint32_t node, uint32_t port)

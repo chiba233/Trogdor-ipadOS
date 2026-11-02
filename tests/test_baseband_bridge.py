@@ -95,6 +95,7 @@ class BasebandBridgeTests(unittest.TestCase):
                          (b'baseband,n41\0', b'baseband\0', struct.pack('<I', 2)))
         self.assertNotIn('interrupts', node)
         self.assertEqual(dict((k, v) for k, _, v in out.child('product').props)['baseband-chipset'], b'mav16\0')
+        self.assertEqual(dict((k, v) for k, _, v in out.props)['compatible'], b'J121AP\0')   # HWModelStr: the telephony table's cellular model
         self.assertNotIn('CoachzBaseband', [key for key, _, _ in out.child('chosen').child('memory-map').props])
         plain = screen.read_tree(screen.prelink_tree(root.write(), window, tree, ramdisk, cache))
         self.assertNotIn('baseband', [child.name() for child in plain.children])

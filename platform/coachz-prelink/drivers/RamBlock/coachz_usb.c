@@ -82,8 +82,14 @@ int coachz_usb_gettimeofday(struct timeval *tv, void *zone) {
 void usb_poll_prepare(void) {}
 void usb_generic_create(usbdev_t *dev) { (void)dev; }
 void usb_generic_remove(usbdev_t *dev) { (void)dev; }
-void usbdisk_create(usbdev_t *dev) { if (!disk) disk = dev; }
-void usbdisk_remove(usbdev_t *dev) { if (disk == dev) disk = NULL; }
+void usbdisk_create(usbdev_t *dev) {
+    kprintf("COACHZ USB: mass storage at %d on controller %p%s\n", dev->address, dev->controller, disk ? ", a disk is already known" : "");
+    if (!disk) disk = dev;
+}
+void usbdisk_remove(usbdev_t *dev) {
+    kprintf("COACHZ USB: mass storage at %d removed\n", dev->address);
+    if (disk == dev) disk = NULL;
+}
 
 static uint32_t usbsts(void) {
     uint32_t caplength = read32((void *)xhci_va) & 0xff;

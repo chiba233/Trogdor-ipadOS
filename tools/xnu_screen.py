@@ -106,7 +106,7 @@ def read_tree(adt):
 
 
 # The Coachz has no Home button, so the display route presents a full-screen 11-inch iPad Pro (UniXNU guide/mobilegestalt).
-# Root compatible stays J120AP: original platform code and this IPSW's per-model resources key on it.
+# Root compatible stays J120AP (J121AP with --baseband, baseband_tree): original platform code and this IPSW's per-model resources key on it.
 FULL_SCREEN_IDENTITY = {
     'root': {'string': {'model': 'iPad14,1', 'target-type': 'J310'}},
     'product': {'string': {'product-name': 'iPad mini (6th generation)', 'product-description': 'iPad mini (6th generation)',
@@ -128,7 +128,9 @@ COACHZ_UNIQUE_CHIP_ID = b'COACHZ\0\1'
 def baseband_tree(root):
     """--baseband: the cellular parts of the IPSW's J121AP tree (iPad7,2) that iPadOS looks for, with the identity unchanged. /baseband is the
     node AppleBasebandN71 matches on Apple's boards; its GPIO functions and interrupts name J121AP controllers and stay out. Nothing here
-    matches it: the bridge publishes the baseband services itself (pending/baseband)."""
+    matches it: the bridge publishes the baseband services itself (pending/baseband). HWModelStr comes from the root compatible, and
+    libTelephonyUtil's table of hardware models has no J120 (Wi-Fi), so CommCenter would run NoBBRadioModule: J121 is Qualcomm Mav16, this IPSW's firmware."""
+    root.set('compatible', b'J121AP\0')
     node = root.child('baseband')
     node.set('device_type', b'baseband\0')
     node.set('compatible', b'baseband,n41\0')

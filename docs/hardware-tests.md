@@ -1623,3 +1623,12 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 - **压缩路径**：`CZ frames made 0 private 0 shown 0 plain 3255`，`CZ seed 0 fail 0 refused 35`。`CZ tag row9216 alloc13713408 map13713408 at13713408`：主帧表面行距 9216、高 1488，像素正好占满最后一页，放不下标记。这一项仍然没有验证到。
 - **设备丢失**：`WidgetRenderer_Default` 的命令缓冲报 `DeviceLost`，之后以状态 0xb 退出。`backboardd` 这次没有退出，SpringBoard 没有重启。内核日志里没有 `gpu event ... VK` 行，CP、hang、SMMU 错误都是 0。
 - **Wi-Fi**：开机自动加入，DHCP 拿到地址，TCP 收发正常。
+
+## J121AP 和 ABM 启动
+
+- **基带分支**：根节点 `compatible` 换成 J121AP 后，CommCenter 不再报 `No CommandDriver dylib`，走 `C2KRadioModule`，ABM 启动。状态栏出现搜信号的条。
+- **CommCenter 崩溃**：启动 ABM 后立即 SIGSEGV（`far 8`），循环重启，每轮都调用 `AppleBaseband` 的方法 6（断电重启）和 15，都回了 unsupported。崩溃点是 `ApplePDPHelperInterface::enableMetadataTrailer`，`this` 为空：`getInstance` 找不到 `AppleIPAppender` 服务时返回空。
+- **设置**：`Preferences` 打不开，等 CommCenter 时被 SIGKILL。
+- **基带通道**：还没有进程打开通道，sahara 0 次请求，崩溃在这之前。
+- **U 盘**：两个口插入后，`COACHZ USB: mass storage at N` 都记录到内核的 USB 栈枚举 U 盘，拔出后也有记录。系统里还没有发布成磁盘。
+
