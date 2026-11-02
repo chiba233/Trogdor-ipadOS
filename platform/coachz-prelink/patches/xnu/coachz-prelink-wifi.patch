@@ -13,7 +13,7 @@
  	extern void coachz_battery_start(void);
 --- /dev/null
 +++ b/bsd/dev/coachz_wifi.c
-@@ -0,0 +1,3767 @@
+@@ -0,0 +1,3883 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/* WCN3990 / SC7180: the modem that hosts the WLAN firmware, started as mainline's qcom_q6v5_mss does (coachz-wifi=4), and the SMEM
 + * inventory (coachz-wifi=1 plus an explicit /arm-io/coachz-wifi ADT node). With the modem up: SMP2P, GLINK over SMEM, QRTR and
@@ -2256,7 +2256,7 @@
 +        if (wc_host[id].src_n) {
 +            s->n = wc_host[id].src_n;
 +            s->desc = wc_alloc(16u * s->n, &s->desc_pa);
-+            if (wc_host[id].cb & 1) s->buf = id == 4 ? NULL : wc_alloc(s->n * wc_host[id].src_max, &s->buf_pa);
++            if (wc_host[id].cb & 1) s->buf = wc_alloc(s->n * wc_host[id].src_max, &s->buf_pa);
 +        }
 +        if (wc_host[id].dst_n) {
 +            d->n = wc_host[id].dst_n;
@@ -2349,6 +2349,7 @@
 +
 +static void wh_rx(unsigned pipe, const uint8_t *data, uint32_t bytes);
 +static void ws_scan_event(const uint8_t *m, uint32_t n);
++static void ws_chan_info(const uint8_t *m, uint32_t n);
 +static void ws_mgmt_rx(const uint8_t *m, uint32_t n);
 +/* Past READY (ws_next and the wl_step states from 20). Addresses are only hashed to count them; names are never read. */
 +static struct {
@@ -2357,6 +2358,9 @@
 +    uint8_t htt_version, htt_major, htt_minor, started, completed;
 +    uint32_t events, channels, last_mhz, reason, last_type;
 +    uint32_t mgmt, beacons, band2, band5, bad, snr_best, bss, bss_hash[64];
++    uint32_t chan_infos, htt_types[32], wmi_ids[12], wmi_counts[12];
++    int32_t noise_low, noise_high;
++    uint32_t busy_most;
 +} ws;
 +
 +/* ath10k_ce_per_engine_service: the copy complete and watermark status cleared, completed receives handed to HTC and their entries
@@ -2579,6 +2583,13 @@
 +        wh.last_wmi = header & 0xffffffu;
 +        wh.last_wmi_len = bytes;
 +        if (wh.wmi_events < 8) { wh.wmi_ids[wh.wmi_events] = wh.last_wmi; wh.wmi_lens[wh.wmi_events] = bytes; }
++        for (unsigned i = 0; i < 12; i++) {
++            if (!ws.wmi_ids[i] || ws.wmi_ids[i] == wh.last_wmi) {
++                ws.wmi_ids[i] = wh.last_wmi;
++                ws.wmi_counts[i]++;
++                break;
++            }
++        }
 +        wh.wmi_events++;
 +        /* WMI_TLV_SERVICE_READY_EVENTID 1, READY 2, SERVICE_AVAILABLE 3: kept whole (without the header) for the sequence. */
 +        if (wh.last_wmi == 1 && !wh.service_ready && bytes - 4 <= sizeof(wh.svc_rdy)) {
@@ -2593,6 +2604,8 @@
 +            wh.rdy_len = bytes - 4;
 +            memcpy(wh.rdy, p + 4, wh.rdy_len);
 +            wh.ready_event = 1;
++        } else if (wh.last_wmi == 0x4002 && bytes >= 4) {   /* WMI_TLV_CHAN_INFO_EVENTID */
++            ws_chan_info(p + 4, bytes - 4);
 +        } else if (wh.last_wmi == 0x3001 && bytes >= 4) {   /* WMI_TLV_SCAN_EVENTID */
 +            ws_scan_event(p + 4, bytes - 4);
 +        } else if (wh.last_wmi == 0x7001 && bytes >= 4) {   /* WMI_TLV_MGMT_RX_EVENTID */
@@ -2600,6 +2613,7 @@
 +        }
 +    } else if ((int)eid == wh.htt) {
 +        wh.htt_messages++;
++        if (bytes && p[0] < 32) ws.htt_types[p[0]]++;
 +        /* ath10k_htt_t2h_msg_handler: VERSION_CONF is message 0 in every map, then minor and major. */
 +        if (bytes >= 3 && p[0] == 0) {
 +            ws.htt_minor = p[1];
@@ -2784,10 +2798,82 @@
 +#define WS_PUT32(v) do { const uint32_t w_ = (v); memcpy(m + at, &w_, 4); at += 4; } while (0)
 +#define WS_TLV(tag, len) do { const uint16_t l_ = (uint16_t)(len), t_ = (uint16_t)(tag); memcpy(m + at, &l_, 2); memcpy(m + at + 2, &t_, 2); at += 4; } while (0)
 +
++/* ath10k_htt_rx_alloc and ath10k_htt_rx_ring_refill: a ring of 64-bit buffer addresses (target_64bit) and the index the firmware reads
++ * for how many are posted. Half a ring, HTT_RX_RING_FILL_LEVEL: the 8 MiB window has no room for this chip's larger level. */
++#define WS_RX_RING 2048u
++#define WS_RX_FILL 1023u
++#define WS_RX_BUF 2048u
++#define WS_FRAG_DESCS 1056u   /* TARGET_TLV_NUM_MSDU_DESC */
++#define WS_FRAG_DESC 72u      /* sizeof(struct htt_msdu_ext_desc_64) */
++static uint64_t ws_ring_pa, ws_index_pa, ws_frag_pa;
++
++static int
++ws_htt_prepare(void)
++{
++    uint64_t buffers_pa = 0;
++    uint8_t *ring = wc_alloc(WS_RX_RING * 8u, &ws_ring_pa), *index = wc_alloc(4, &ws_index_pa), *buffers = wc_alloc(WS_RX_FILL * WS_RX_BUF, &buffers_pa),
++            *frags = wc_alloc(WS_FRAG_DESCS * WS_FRAG_DESC, &ws_frag_pa);
++    if (!ring || !index || !buffers || !frags) return -1;
++    memset(ring, 0, WS_RX_RING * 8u);
++    memset(buffers, 0, WS_RX_FILL * WS_RX_BUF);
++    memset(frags, 0, WS_FRAG_DESCS * WS_FRAG_DESC);
++    for (uint32_t i = 0; i < WS_RX_FILL; i++) {
++        const uint64_t pa = buffers_pa + (uint64_t)i * WS_RX_BUF;
++        memcpy(ring + 8u * i, &pa, 8);
++    }
++    const uint32_t posted = WS_RX_FILL;
++    memcpy(index, &posted, 4);
++    __asm__ volatile ("dsb st" ::: "memory");
++    return 0;
++}
++
++/* ath10k_htt_setup past the version: ath10k_htt_send_frag_desc_bank_cfg_64, ath10k_htt_send_rx_ring_cfg_64, ath10k_htt_h2t_aggr_cfg_msg_v2. */
++static int
++ws_htt_next(unsigned step)
++{
++    uint8_t m[64];
++    uint32_t bytes = 0;
++    memset(m, 0, sizeof(m));
++    if (step == 0) {
++        m[0] = 6;               /* HTT_H2T_MSG_TYPE_FRAG_DESC_BANK_CFG */
++        m[2] = 1;               /* one bank; info 0: no peer flow control, so no queue state */
++        m[3] = WS_FRAG_DESC;
++        memcpy(m + 4, &ws_frag_pa, 8);
++        const uint16_t last = WS_FRAG_DESCS - 1u;
++        memcpy(m + 4 + 32 + 2, &last, 2);
++        m[4 + 32 + 16 + 8] = 1;   /* q_state.record_size, HTT_TX_Q_STATE_ENTRY_SIZE */
++        bytes = 4 + 32 + 16 + 12;
++    } else if (step == 1) {
++        /* rx desc offsets in 4-byte units, from struct htt_rx_desc_v2 compiled with Linux's rx_desc.h: header, payload, PPDU start and end,
++         * MPDU start and end, MSDU start and end, attention, frag info. */
++        static const uint16_t offsets[10] = {74, 90, 27, 37, 4, 26, 7, 12, 1, 2};
++        const uint16_t values[4] = {WS_RX_RING, WS_RX_BUF, 0xffff /* every HTT_RX_RING_FLAGS_ */, WS_RX_FILL};
++        m[0] = 2;               /* HTT_H2T_MSG_TYPE_RX_RING_CFG */
++        m[1] = 1;               /* one ring */
++        memcpy(m + 4, &ws_index_pa, 8);
++        memcpy(m + 12, &ws_ring_pa, 8);
++        memcpy(m + 20, values, sizeof(values));
++        memcpy(m + 28, offsets, sizeof(offsets));
++        bytes = 48;
++    } else {
++        m[0] = 5;               /* HTT_H2T_MSG_TYPE_AGGR_CFG */
++        m[1] = 64;              /* ATH10K_HTT_MAX_NUM_AMPDU_DEFAULT */
++        m[2] = 3;               /* ATH10K_HTT_MAX_NUM_AMSDU_DEFAULT */
++        bytes = 4;
++    }
++    return wh_send((unsigned)wh.htt, m, bytes);
++}
++
 +/* The next command before the scan: 0 sent, 1 when none is left, otherwise wh_send's error (-2 waits for credits). */
 +static int
 +ws_next(void)
 +{
++    if (ws.step < 3) {
++        const int sent = ws_htt_next(ws.step);
++        if (!sent) ws.step++;
++        return sent;
++    }
++    const unsigned command = ws.step - 3u;
 +    static const struct { uint32_t id, value; } param[] = {
 +        {0x22, 1},   /* PMF_QOS */
 +        {0x0a, 1},   /* DYNAMIC_BW */
@@ -2800,13 +2886,13 @@
 +    const unsigned params = sizeof(param) / sizeof(param[0]);
 +    static uint8_t m[4 + 8 + 4 + WS_CHANS * 28];
 +    uint32_t at = 0;
-+    if (ws.step < params) {
++    if (command < params) {
 +        WS_PUT32(0x4003);   /* WMI_TLV_PDEV_SET_PARAM_CMDID */
 +        WS_TLV(0x52, 12);
 +        WS_PUT32(0);
-+        WS_PUT32(param[ws.step].id);
-+        WS_PUT32(param[ws.step].value);
-+    } else if (ws.step == params) {
++        WS_PUT32(param[command].id);
++        WS_PUT32(param[command].value);
++    } else if (command == params) {
 +        /* ath10k_regd_update: service ready's 0x406c is the world SKU pair 0x6c, without a conformance test limit (NO_CTL). */
 +        WS_PUT32(0x4001);   /* WMI_TLV_PDEV_SET_REGDOMAIN_CMDID */
 +        WS_TLV(0x51, 24);
@@ -2816,7 +2902,7 @@
 +        WS_PUT32(0x6c);
 +        WS_PUT32(0xff);
 +        WS_PUT32(0xff);
-+    } else if (ws.step == params + 1) {
++    } else if (command == params + 1) {
 +        WS_PUT32(0x3003);   /* WMI_TLV_SCAN_CHAN_LIST_CMDID */
 +        WS_TLV(0x4f, 4);
 +        WS_PUT32(WS_CHANS);
@@ -2831,7 +2917,7 @@
 +            WS_PUT32(40u << 8 | 40u << 16);   /* min 0, max and regulatory 20 dBm in half dB: the world entries of Debian's iw reg get */
 +            WS_PUT32(6u | 40u << 8);          /* antenna 6 dBi, max tx */
 +        }
-+    } else if (ws.step == params + 2) {
++    } else if (command == params + 2) {
 +        /* A locally administered address for this boot, not the device's. */
 +        const uint64_t now = mach_absolute_time();
 +        ws.mac[0] = 0x02;
@@ -2911,6 +2997,24 @@
 +    if (type == 2 || type == 0x40) { ws.completed = 1; ws.reason = wm_u32(e, 1); }
 +}
 +
++/* ath10k_wmi_event_chan_info: the noise floor and how busy the channel was, which only a listening radio can report. */
++static void
++ws_chan_info(const uint8_t *m, uint32_t n)
++{
++    uint16_t l = 0;
++    const uint8_t *e = wm_tlv(m, n, 0x26, 0, &l);
++    if (!e || l < 24) { ws.bad++; return; }
++    const int32_t noise = (int32_t)wm_u32(e, 3);
++    const uint32_t clear = wm_u32(e, 4), cycles = wm_u32(e, 5);
++    if (!ws.chan_infos || noise < ws.noise_low) ws.noise_low = noise;
++    if (!ws.chan_infos || noise > ws.noise_high) ws.noise_high = noise;
++    if (cycles) {
++        const uint32_t busy = (uint32_t)((uint64_t)clear * 100u / cycles);
++        if (busy > ws.busy_most) ws.busy_most = busy;
++    }
++    ws.chan_infos++;
++}
++
 +/* ath10k_wmi_event_mgmt_rx: counts beacons and probe responses per band and their distinct transmitters. */
 +static void
 +ws_mgmt_rx(const uint8_t *m, uint32_t n)
@@ -2922,8 +3026,8 @@
 +    const uint8_t type = f[0] & 0xfc;
 +    if (type != 0x80 && type != 0x50) return;
 +    ws.beacons++;
-+    const uint32_t mhz = wm_u32(h, 0);
-+    if (mhz < 3000) ws.band2++; else ws.band5++;
++    /* The header's channel is the IEEE number: ath10k_wmi_event_mgmt_rx takes 1..14 as 2.4 GHz. */
++    if (wm_u32(h, 0) <= 14) ws.band2++; else ws.band5++;
 +    if (wm_u32(h, 1) > ws.snr_best) ws.snr_best = wm_u32(h, 1);
 +    uint32_t hash = 2166136261u;
 +    for (unsigned b = 16; b < 22; b++) hash = (hash ^ f[b]) * 16777619u;
@@ -3260,10 +3364,16 @@
 +        }
 +        break;
 +    case 20: {
-+        /* ath10k_htt_setup begins with the version request (HTT_H2T_MSG_TYPE_VERSION_REQ). */
++        /* ath10k_core_start refills the ring, then ath10k_htt_setup begins with the version request (HTT_H2T_MSG_TYPE_VERSION_REQ). */
 +        static const uint8_t version_req[4] = {0, 0, 0, 0};
++        const int prepared = ws_htt_prepare();
++        if (prepared) {
++            printf("COACHZ wifi: no room for the HTT rings (%u of %u bytes used)\n", wc.used, WC_MEM_BYTES);
++            wl.state = 19;
++            break;
++        }
 +        const int sent = wh.htt >= 0 ? wh_send((unsigned)wh.htt, version_req, sizeof(version_req)) : -1;
-+        if (sent) printf("COACHZ wifi: HTT version request not sent (%d)\n", sent);
++        printf("COACHZ wifi: %u rx buffers posted, %u of %u bytes used, HTT version request %d\n", WS_RX_FILL, wc.used, WC_MEM_BYTES, sent);
 +        wl.waited_ms = 0;
 +        wl.state = 21;
 +        break;
@@ -3288,7 +3398,7 @@
 +        } else {
 +            wl.waited_ms = 0;
 +            if (next == 1) {
-+                printf("COACHZ wifi: %u commands sent: pdev parameters, regdomain, %u passive channels, vdev 0\n", ws.step, (unsigned)WS_CHANS);
++                printf("COACHZ wifi: %u commands sent: HTT frag bank, rx ring, aggregation, pdev parameters, regdomain, %u passive channels, vdev 0\n", ws.step, (unsigned)WS_CHANS);
 +                wl.state = 23;
 +            }
 +        }
@@ -3322,6 +3432,12 @@
 +                ws.completed ? "done" : "timed out", wl.waited_ms, ws.started, ws.reason, ws.events, ws.channels, ws.last_type, ws.bad);
 +            printf("COACHZ wifi: scan %u heard %u frames, %u beacons or probe responses from %u transmitters, 2.4 GHz %u, 5 GHz %u, best snr %u\n",
 +                ws.number, ws.mgmt, ws.beacons, ws.bss, ws.band2, ws.band5, ws.snr_best);
++            printf("COACHZ wifi: scan %u radio: %u channel reports, noise %d to %d, busiest %u%%, %u HTT messages\n", ws.number, ws.chan_infos, ws.noise_low,
++                ws.noise_high, ws.busy_most, wh.htt_messages);
++            for (unsigned i = 0; i < 32; i++) {
++                if (ws.htt_types[i]) printf("COACHZ wifi: HTT message %u: %u\n", i, ws.htt_types[i]);
++            }
++            for (unsigned i = 0; i < 12 && ws.wmi_ids[i]; i++) printf("COACHZ wifi: WMI event 0x%x: %u\n", ws.wmi_ids[i], ws.wmi_counts[i]);
 +            ws.number++;
 +            wl.waited_ms = 0;
 +            wl.state = ws.number < 3 ? 25 : 19;

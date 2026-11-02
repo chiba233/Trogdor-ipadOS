@@ -441,6 +441,17 @@ class DisplayTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             pack(bytes(fixture()), adt(), 0x40000000, 1 << 30, display=True)
 
+    def test_screen_image_keeps_linux_below_the_modem_reserved_memory(self):
+        # Behind the XNU payload Linux overlapped mpss_mem at 0x86000000, and Debian entered through the menu had no modem.
+        script=(ROOT/'boot/xnu-screen.ld').read_text();wrapper=(ROOT/'tools/linux_log.py').read_text()
+        self.assertLess(script.index('.linux :'),script.index('.xnu_payload'))
+        self.assertIn('ASSERT(. <= 0x5400000',script)
+        self.assertIn('"boot/xnu-screen.ld" if screen',wrapper)
+        self.assertIn('start + memory > 0x5400000',wrapper)
+        # The checkpoint images keep Linux last.
+        checkpoint=(ROOT/'boot/xnu-chain.ld').read_text()
+        self.assertLess(checkpoint.index('.xnu_payload'),checkpoint.index('.linux :'))
+
     def test_boot_menu_only_reads_buttons_and_chooses_before_the_load(self):
         menu=(ROOT/'boot/boot_menu.c').read_text();ec=(ROOT/'boot/display_ec.c').read_text();prepare=(ROOT/'boot/xnu_checkpoint.c').read_text()
         # The only EC command the menu adds is the read-only button state the kernel's input driver polls.

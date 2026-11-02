@@ -141,7 +141,7 @@ def compile_wrapper(out, kernel, memory, checkpoint=None, discovery=False, patte
                "-DPROBE_XNU_SCREEN=" + str(int(screen)),
                "-DPROBE_USB_READ=" + str(int(usb_read)),
                "-Wl,--build-id=none", "-Wl,--no-undefined", "-Wl,-z,max-page-size=4096",
-               "-Wl,-T," + str(ROOT / ("boot/xnu-chain.ld" if checkpoint is not None else "boot/chain.ld")),
+               "-Wl,-T," + str(ROOT / ("boot/xnu-screen.ld" if screen else "boot/xnu-chain.ld" if checkpoint is not None else "boot/chain.ld")),
                *[str(ROOT / "boot" / name) for name in ("entry.S", "probe.c", "fdt.c", "checkpoint.c")],
                *([str(ROOT / "boot" / name) for name in
                   ("xnu_checkpoint.c", "xnu_load.c", "xnu_memory.c", "xnu_tables.c", "xnu_cinit.c", "xnu_cpu.c", "xnu_platform.c", "xnu_pe.c", "xnu_diagnostics.c", "xnu_topology.c")] if checkpoint is not None else []),
@@ -170,7 +170,12 @@ def compile_wrapper(out, kernel, memory, checkpoint=None, discovery=False, patte
             raise ValueError("XNU arena overlaps Linux memory")
         extra = {"xnu_checkpoint_version": int.from_bytes(checkpoint[8:12],"little"),
                  "xnu_payload_sha256": sha(checkpoint), "xnu_window_offset": arena, "xnu_window_bytes": 24 * 1024 * 1024}
-    if (start % 0x200000 or start < symbols["_stack_top"]["address"] or
+    if screen:
+        # Linux before the payload, ending below the reserved memory at 0x86000000 (boot/xnu-screen.ld).
+        if (start % 0x200000 or start + memory > 0x5400000 or symbols["_stack_top"]["address"] < start + memory or
+                header["memory_size"] != expected_memory or image[start:start + len(kernel)] != kernel):
+            raise ValueError("Screen wrapper memory/payload layout mismatch")
+    elif (start % 0x200000 or start < symbols["_stack_top"]["address"] or
             header["memory_size"] != expected_memory or
             image[start:start + len(kernel)] != kernel or len(image) != start + len(kernel)):
         raise ValueError("Linux wrapper memory/payload layout mismatch")
@@ -325,7 +330,7 @@ def main():
     if a.display_backlight:
         code_files += ("boot/display_ec.c",)
     if a.screen:
-        code_files += ("boot/xnu_screen.c", "boot/boot_menu.c", "tools/xnu_screen.py", "tools/xnu_init.py", "tools/coachz_init.S")
+        code_files += ("boot/xnu_screen.c", "boot/boot_menu.c", "boot/xnu-screen.ld", "tools/xnu_screen.py", "tools/xnu_init.py", "tools/coachz_init.S")
     if a.usb_read:
         code_files += ("boot/usb_read.c", "tools/usb_stack.py", "boot/usb_compat/libpayload.h")
     report = {"schema": 1, "display_discovery": a.display_discovery, "display_pattern": a.pattern, "display_backlight": a.display_backlight, "xnu_screen": a.screen,

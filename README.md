@@ -107,7 +107,7 @@ flowchart LR
 | 阶段 | 状态 | 证据 |
 | --- | --- | --- |
 | 原厂启动链、XNU 早期检查点、内核初始化、prelink 和原版 AMFI | 通过 | 真机日志逐字段校验，屏幕照片 |
-| 启动菜单 | 部分 | 音量键选择、电源键确认，iPadOS 和 Debian 都能启动；从菜单进 Debian 暂时没有网络；键盘还不能操作菜单 |
+| 启动菜单 | 部分 | 音量键选择、电源键确认，iPadOS 和 Debian 都能启动，从菜单进的 Debian 有网络；键盘还不能操作菜单 |
 | 从外接盘（USB、GPT、APFS）启动主系统，进入主屏幕和 Dock | 通过 | 屏幕和日志；未封存的根卷是放行，不是验证 |
 | 外接 Data 卷可写 | 通过 | 日志；跨重启的持久性有实际使用，没有单独验收 |
 | eMMC、microSD | 部分 | 照主线 `sdhci-msm` 移植：eMMC 以 52 MHz、8 位总线识别，只向切出的 1 GiB 分区写入，窗口外的写被拒绝，2048 块写后读回无错，重启后内容还在（写约 27 MB/s，读约 35 MB/s）；GPT 分区都已发布；还没有 HS200/HS400；microSD 没插卡时报告无卡，读写卡未测 |
@@ -125,7 +125,7 @@ flowchart LR
 | 加速度计、合盖、底座 | 只读 | 能读到值，底座状态随拆装变化，都不触发任何动作；没接 CoreMotion，陀螺仪没开 |
 | GPU 启动、Metal 合成界面 | 通过，还不够流畅 | CP 经 SMMU 执行命令，所有故障寄存器为 0；提交到完成平均约 18–23 ms，每次提交都完成；fence 等待由中断唤醒，中断错误位全 0；App 自己用 Metal 还没确认，没有电源管理 |
 | GPU 调频 | 通过 | 档位切换实测应答 18–60 µs、测得 179–800 MHz；按 UniXNU 的规则让 GPU 约一半时间忙碌，触摸后用最高档 |
-| Wi-Fi、蜂窝网络 | 部分 | 照主线 `qcom_q6v5_mss` 启动 modem，AP 这边有 GLINK、QRTR 和 rmtfs，modem 一直运行；照 ath10k 走完 WLAN 固件握手、WCN3990 供电、12 个 copy engine、HTC 和 WMI 初始化，固件报告 READY；固件接受 vdev 和信道表，22 个信道的被动扫描能跑完，但还听不到任何帧；没有系统网络接口，没有网络 |
+| Wi-Fi、蜂窝网络 | 部分 | 照主线 `qcom_q6v5_mss` 启动 modem，AP 这边有 GLINK、QRTR 和 rmtfs，modem 一直运行；照 ath10k 走完 WLAN 固件握手、WCN3990 供电、12 个 copy engine、HTC 和 WMI 初始化，固件报告 READY；HTT 初始化后 22 个信道的被动扫描能听到周围的 beacon（只收不发）；没有系统网络接口，没有网络 |
 
 屏幕照片阶段没有逐字段核对。有一个原因不明的随机 zone panic，没有解决；长时间稳定性没有验证。详情见 [状态](docs/status.md) 和 [硬件记录](docs/hardware-tests.md)。
 

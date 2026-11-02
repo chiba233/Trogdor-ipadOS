@@ -1526,3 +1526,10 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 - **eMMC 分区**：开机 30 秒列出所有 IOMedia：`disk0`（eMMC）的 `disk0s1`～`disk0s5` 都已发布，含 KernelA、KernelB 和 `coachz-scratch`；`disk1` 是外接盘。没有写入窗口以外的区域。
 - **Wi-Fi**：7 个 pdev 参数、监管域、22 个信道和 vdev 0 都发出。三轮被动扫描都正常结束（约 2.9 秒，67 个事件，22 个信道，原因 0），但 mgmt 帧计数是 0。HTT 版本请求没发出去（`wh_send` 返回 -1），HTT 还没有初始化，这是接下来要查的。
 
+## 从菜单进的 Debian 有网络，被动扫描听到 beacon（k108）
+
+- **菜单进 Debian**：Linux 排到镜像最前面（`boot/xnu-screen.ld`，偏移 `0x200000`）后，机主确认有网络。这次启动的探针记录是 `Boot menu entry=1`，日志里 `mpss_mem` 保留成功（`nomap non-reusable`），`remoteproc` 启动 modem，ath10k 报告 WCN3990，`wlan0` 和 `rmnet_ipa0` 都在。k107 的现象因此归因于内核布局压到保留内存。
+- **Wi-Fi 被动扫描**：k107 听不到帧，这张先照 `ath10k_core_start` 填好接收环，再发 HTT 版本请求（回复 3.87）、分片描述符、接收环配置和聚合配置。之后三轮扫描各听到 69、72、67 个 beacon 或 probe response，来自 45、43、41 个发射源（只数 BSSID 的散列，名称和地址都不记录），最好 SNR 55～56，信道最忙约 56%～67%。整个过程没有发射。日志里按频段的分类是错的（把信道号当成 MHz），已改正，这次的数字不能说明 5 GHz。
+- **GPU 中断**：9074 次中断对应 9074 个 fence。
+- **PosterBoard**：3 次 SIGTRAP，都在 `-[PBFModalRootViewController initWithScene:dataStore:behaviorAssertionProvider:]`，来自场景连接时的断言。原因没查，k107 里没有出现。
+
