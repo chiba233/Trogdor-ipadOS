@@ -99,8 +99,91 @@ uint64_t ringNow(void *) {
     clock_get_system_microtime(&sec, &usec);
     return uint64_t(sec) * 1000000 + usec;
 }
-// Between two fence polls, which take the publisher's lock: 100 us, the most upstream's board pauses for a GPU interrupt (none here yet).
-int ringIdle(void *) {IODelay(100); return 0;}
+// The GPU's interrupts, as a6xx_irq, a6xx_gmu_irq and a6xx_hfi_irq take them (sc7180.dtsi: SPI 300, 305 and 304, level high). CACHE_FLUSH_TS ends
+// every submission, so it wakes the fence waiters. There is no hang recovery yet: the errors are counted for the report, and masked if they storm.
+extern "C" int armcpu_spi_attach(uint32_t, bool, void (*)(void *), void *, uint32_t *, uint64_t *);
+extern "C" int coachz_gpu_assert_wait_deadline(void *, int, uint64_t) __asm__("_assert_wait_deadline");
+extern "C" int coachz_gpu_thread_wakeup(void *, int, int) __asm__("_thread_wakeup_prim");
+extern "C" int coachz_gpu_thread_block(void *) __asm__("_thread_block");
+enum : uint32_t {
+    RbbmIntClearCmd = 0x0037, RbbmInt0Mask = 0x0038, CpInterruptStatus = 0x0823,
+    IrqAhb = 1u << 1, IrqAtbAsync = 1u << 6, IrqCpHw = 1u << 9, IrqFlushTs = 1u << 20, IrqAtbBus = 1u << 22, IrqHang = 1u << 23, IrqUcheOob = 1u << 24,
+    IrqErrors = IrqAhb | IrqAtbAsync | IrqCpHw | IrqAtbBus | IrqHang | IrqUcheOob,
+    // A6XX_INT_MASK: the errors, the fence, the CP's IB1, IB2 and RB ends and the UCHE trap.
+    IrqMask = IrqErrors | IrqFlushTs | 1u << 13 | 1u << 14 | 1u << 15 | 1u << 25,
+    // GMU window byte offsets: (a6xx_gmu.xml dword offset * 4) - 0x6a000.
+    GmuHfiClr = 0x14644, GmuHfiInfo = 0x14648, GmuHfiMask = 0x1464c, GmuAoClr = 0x24c10, GmuAoStatus = 0x24c14, GmuAoMask = 0x24c18,
+    GmuHfiFault = 1u << 23, GmuAoErrors = 1u << 0 | 1u << 3 | 1u << 5,   // CM3 fault; watchdog bite, fence error, AHB bus error
+};
+volatile bool gIrqOn;
+volatile uint32_t gFlushTs, gFlushSeen, gIrqAll, gIrqAhb, gIrqAtb, gIrqCpHw, gIrqHang, gIrqOob, gCpHwStatus, gGmuAoIrqs, gGmuAoStatus, gHfiIrqs, gHfiInfo;
+volatile uint32_t gIdleBlocks, gIdleTimeouts;
+
+void gpuIrq(void *) {
+    const uint32_t status = *reinterpret_cast<volatile uint32_t *>(gCore + size_t(RbbmInt0Status) * 4);
+    *reinterpret_cast<volatile uint32_t *>(gCore + size_t(RbbmIntClearCmd) * 4) = status;
+    gIrqAll = gIrqAll + 1;
+    if (status & IrqErrors) {
+        if (status & IrqAhb) gIrqAhb = gIrqAhb + 1;
+        if (status & (IrqAtbAsync | IrqAtbBus)) gIrqAtb = gIrqAtb + 1;
+        if (status & IrqHang) gIrqHang = gIrqHang + 1;
+        if (status & IrqUcheOob) gIrqOob = gIrqOob + 1;
+        if (status & IrqCpHw) {
+            gIrqCpHw = gIrqCpHw + 1;
+            gCpHwStatus = *reinterpret_cast<volatile uint32_t *>(gCore + size_t(CpInterruptStatus) * 4);
+        }
+        // priv->disable_err_irq's reason: an error that does not stop must not hold a core.
+        if (gIrqAhb + gIrqAtb + gIrqHang + gIrqOob + gIrqCpHw > 10000)
+            *reinterpret_cast<volatile uint32_t *>(gCore + size_t(RbbmInt0Mask) * 4) = IrqFlushTs;
+    }
+    if (status & IrqFlushTs) {
+        gFlushTs = gFlushTs + 1;
+        coachz_gpu_thread_wakeup(const_cast<uint32_t *>(&gFlushTs), 0, 0);   // every waiter, THREAD_AWAKENED
+    }
+}
+void gmuAoIrq(void *) {
+    const uint32_t status = *reinterpret_cast<volatile uint32_t *>(gGmu + GmuAoStatus);
+    *reinterpret_cast<volatile uint32_t *>(gGmu + GmuAoClr) = status;
+    gGmuAoIrqs = gGmuAoIrqs + 1;
+    gGmuAoStatus = gGmuAoStatus | status;
+}
+void hfiIrq(void *) {
+    const uint32_t info = *reinterpret_cast<volatile uint32_t *>(gGmu + GmuHfiInfo);
+    *reinterpret_cast<volatile uint32_t *>(gGmu + GmuHfiClr) = info;
+    gHfiIrqs = gHfiIrqs + 1;
+    gHfiInfo = gHfiInfo | info;
+}
+// After hw_init, as a6xx_hw_init and a6xx_gmu_resume do it: anything pending cleared, handlers in place, then unmasked.
+void gpuInterruptsOn() {
+    uint32_t readback = 0;
+    uint64_t router = 0;
+    *reinterpret_cast<volatile uint32_t *>(gGmu + GmuAoClr) = ~0u;
+    *reinterpret_cast<volatile uint32_t *>(gGmu + GmuHfiClr) = ~0u;
+    const int ao = armcpu_spi_attach(32 + 305, false, gmuAoIrq, nullptr, &readback, &router);
+    const int hfi = armcpu_spi_attach(32 + 304, false, hfiIrq, nullptr, &readback, &router);
+    coreWrite(RbbmIntClearCmd, ~0u);
+    const int rbbm = armcpu_spi_attach(32 + 300, false, gpuIrq, nullptr, &readback, &router);
+    if (!ao) *reinterpret_cast<volatile uint32_t *>(gGmu + GmuAoMask) = ~uint32_t(GmuAoErrors);
+    if (!hfi) *reinterpret_cast<volatile uint32_t *>(gGmu + GmuHfiMask) = ~uint32_t(GmuHfiFault);
+    if (!rbbm) {
+        coreWrite(RbbmInt0Mask, IrqMask);
+        __asm__ volatile("dsb sy" ::: "memory");
+        gIrqOn = true;
+    }
+    printf("COACHZ gpu irq: rbbm attach 0x%x mask 0x%x readback 0x%x, gmu 0x%x hfi 0x%x\n", rbbm, coreRead(RbbmInt0Mask), readback, ao, hfi);
+}
+// Between two fence polls, which take the publisher's lock (not held here). With the interrupt: sleep until a fence completes, at most 1 ms, as UniXNU porting/power's fence waits (a wake lost
+// between the caller's poll and this wait); a completion since the last call means polling again at once. Before it: 100 us, as upstream's board pauses.
+int ringIdle(void *) {
+    if (!gIrqOn) {IODelay(100); return 0;}
+    const uint32_t flushes = gFlushTs;
+    if (flushes != gFlushSeen) {gFlushSeen = flushes; return 0;}
+    gIdleBlocks = gIdleBlocks + 1;
+    (void)coachz_gpu_assert_wait_deadline(const_cast<uint32_t *>(&gFlushTs), 0, mach_absolute_time() + 19200);   // 1 ms of the 19.2 MHz clock, THREAD_UNINT
+    if (gFlushTs != flushes) coachz_gpu_thread_wakeup(const_cast<uint32_t *>(&gFlushTs), 0, 0);
+    if (coachz_gpu_thread_block(nullptr) == 1) gIdleTimeouts = gIdleTimeouts + 1;   // THREAD_TIMED_OUT
+    return 0;
+}
 int timerRead(void *, uint32_t reg, uint32_t *value) {*value = coreRead(reg); return 0;}
 
 void cpState(const char *when) {
@@ -175,6 +258,8 @@ void reportThread(void *, wait_result_t) {
             gRing.lastSubmitted(), static_cast<unsigned long long>(native_gop_gpu_offers), static_cast<unsigned long long>(native_gop_gpu_completions),
             static_cast<unsigned long long>(native_gop_gpu_failures), static_cast<unsigned long long>(native_gop_gpu_abandoned));
         cpState("now");
+        printf("COACHZ gpu irq: %u interrupts, %u fences; waits slept %u, timed out %u; errors ahb %u atb %u cp hw %u (0x%x) hang %u uche %u; gmu %u (0x%x) hfi %u (0x%x)\n",
+            gIrqAll, gFlushTs, gIdleBlocks, gIdleTimeouts, gIrqAhb, gIrqAtb, gIrqCpHw, gCpHwStatus, gIrqHang, gIrqOob, gGmuAoIrqs, gGmuAoStatus, gHfiIrqs, gHfiInfo);
         stampReport();
         // Imported BOs the submit path left alone under IO coherence: [2] before submissions, [3] after completions.
         printf("COACHZ gpu9: coherent %u, maintenance skipped before submit %u after completion %u\n", native_adreno_io_coherent,
@@ -724,6 +809,7 @@ extern "C" int coachz_gpu_driver_start(volatile uint8_t *core, volatile uint8_t 
     const IOReturn timed = gTimer.attach(&timer, NativeAdrenoTimeCp);
     const NativeAdrenoRingClock clock{nullptr, ringNow, ringIdle};
     if (!status) coherenceProbe(vm);
+    if (!status) gpuInterruptsOn();
     if (!status) status = native_adreno_publish(vm, &gSubmit, &gRing, &clock, timed ? nullptr : &gTimer, &gDeviceInfo, 32, gReport.output_bits);
     printf("COACHZ gpu9: published 0x%x, timer 0x%x\n", status, timed);
     if (status) return 0;

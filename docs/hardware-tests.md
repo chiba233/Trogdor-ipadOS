@@ -1500,3 +1500,12 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
   - k104 把 ShengHidInput 未用的手指槽改用 ID 255，并统计交给 backboardd 的事件。机主确认问题没变。日志里 10 个可见的 `held` 有 9 个是 0，另一个是 4，当时确实有 4 指按着。K45 行太长被日志环截断，dup、hand、rebegin 等计数大多没留下，所以 HID 层是否完全干净还没有结论。
   - K45 的 `frames` 只在打印时清零，安静的几秒之后的值是多秒累计（71、103 都是这样），不是每秒帧数。
 
+## eMMC 写入、GPU 中断、电源键，触摸失效的线索指向路径编号（k105）
+
+一张镜像走完整启动，日志来自外接盘的日志环。机主实测：普通单指点滑正常，大面积手指乱搓才触发失灵；电源键正常。
+
+- **eMMC 写入**：写入窗口只认 GPT 名字和起止都对得上的 `coachz-scratch`（1 GiB）。自检在窗口最后 2048 块进行：窗口外 5 次写全部拒绝，单块 8 块、多块 2040 块写入，读回 0 处不符；写 23317 KB/s，读 35560 KB/s。`previous image 0 of 2048` 说明这是第一次写，跨重启保留要看下一次启动。microSD 这次也没插卡。
+- **GPU 中断**：SPI 300 上 2312 次中断对应 2312 个 fence，AHB、ATB、CP、hang、UCHE、GMU、HFI 错误位全 0。等 fence 的线程不再自旋：这段时间睡了 10573 次，其中 8348 次到 1 ms 上限才醒，随后重新检查。
+- **电源键**：`enabled volume and power`，按下时 `buttons 0x1 -> report 0x2`，松开回到 0。休眠本身还没做。
+- **触摸**：K47 的 HID 计数这次完整。失灵前后 `hid out` 和 `fingers` 继续增长，`held` 回到 0，`dup`、`hand`、`rebegin`、`lone up`、`cancel` 全是 0，驱动的 palms、continued、duplicates、sticky 也都是 0。SpringBoard 和 backboardd 的线程采样前后没有差别，所以事件确实离开了内核，线程没有卡住。
+- **静态核对，不是真机结果**：`IOHIDEventDriver` 把 contact id 当路径编号（`kIOHIDEventFieldDigitizerIndex`）。backboardd 的反汇编里，`%d >= MAX_PATH_COUNT` 前面是 `cmp x0, #0x1e`，`addContact: pathIndex out of bounds` 前面是 `cmp x23, #0x1f`，还有 `_pathIndexTouchingMask` 这样的位掩码。这里传的是控制器 7 位的滚动 id（0..127）；主线 `mt_compute_slot` 用 `input_mt_get_slot_by_key` 映射成最小的空闲槽号，移植时漏了这一步。按这个解释，乱搓时新接触很多，id 很快超过 30，之后的单指被 backboardd 丢弃，id 回绕后又恢复。要等修正上机后由机主实测确认。

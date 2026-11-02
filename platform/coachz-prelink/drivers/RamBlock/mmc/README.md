@@ -10,7 +10,7 @@ The driver is a port of the mainline Linux driver for this exact SoC and board: 
 |---|---|
 | `coachz_mmc_proto.h` | Portable, no MMIO: SDHCI/msm/MMC/SD constants, response and card-register decoding (CID, CSD, EXT_CSD, SCR), command and transfer-mode encodings, the ADMA2 table, GCC RCG register values and floor selection, OCR and RPMh VRM millivolt selection, ARC corner selection, TLMM SDC pin states, and the msm power-interrupt decisions (decode, acknowledge, IO pad switch, which writes must wait). |
 | `coachz_sdcc.c` | Kernel side: GCC branches and RCG, RPMh supplies through `coachz_rpmh_iface.h`, the two interrupts through `armcpu_spi_attach`, the SDHCI host operations with the msm write hooks, power up/off, the eMMC and SD initialisation, and block reads. |
-| `CoachzMmcBlock.cpp` | One write-protected `IOBlockStorageDevice` per slot, attached under IOResources like `CoachzDataBlock`; `coachz_mmc_start()` starts one thread per enabled slot. |
+| `CoachzMmcBlock.cpp` | One `IOBlockStorageDevice` per slot, write-protected unless the slot has a write window, attached under IOResources like `CoachzDataBlock`; `coachz_mmc_start()` starts one thread per enabled slot. |
 | `coachz_rpmh_iface.h` | The contract of the shared RPMh client this driver calls. **Not implemented here** (see below). |
 
 Host checks: `python3 -B -m unittest discover -s tests -p test_mmc.py -v` compiles and runs `tests/coachz_mmc_model_test.c` (ten groups, ASan/UBSan), type-checks `coachz_sdcc.c` against stub kernel headers with `-Wall -Wextra -Werror`, and confirms the active build does not reference it. `CoachzMmcBlock.cpp` needs IOKit headers and is not checked on the host.
@@ -30,7 +30,7 @@ Per slot, behind `coachz-emmc=1` (sdhc_1, 0x7c4000) and `coachz-sd=1` (sdhc_2, 0
 
 - Core clock only from XO and GPLL0 even, so at most 100 MHz. No HS200, HS400/HS400ES, DDR52, UHS-I, tuning, DLL/CDC calibration, CQE, ICE or SDIO probe. GPLL6 (192/384 MHz) and GPLL7 (202 MHz) are untouched.
 - No interconnect (BCM) bandwidth vote; the CX vote goes through the shared aggregator.
-- Read only. EXT_CSD is switched only for BUS_WIDTH and HS_TIMING, both lost at power-off. ERASE_GROUP_DEF, POWER_OFF_NOTIFICATION, HPI, CACHE_CTRL, CMDQ and POWER_CLASS are not switched, and a PART_CONFIG that selects a boot partition is reported and the card is not used, because rewriting PART_CONFIG rewrites its persistent boot bits. No write, erase, RPMB or boot partition access. eMMC writes need the owner's fresh consent.
+- Writes need `coachz-emmc=2` or `coachz-sd=2`. On the eMMC they stay inside the GPT partition named `coachz-scratch` at its exact bounds, checked before any command; everything else is refused and counted. EXT_CSD is switched only for BUS_WIDTH and HS_TIMING, both lost at power-off. ERASE_GROUP_DEF, POWER_OFF_NOTIFICATION, HPI, CACHE_CTRL, CMDQ and POWER_CLASS are not switched, and a PART_CONFIG that selects a boot partition is reported and the card is not used, because rewriting PART_CONFIG rewrites its persistent boot bits. No write, erase, RPMB or boot partition access. eMMC writes need the owner's fresh consent.
 - SD: no hot-plug (card detect is read at start and before each read); SSR and the SD extension registers are not read.
 - Data commands use the maximum hardware timeout count (0xF, sdhci-msm's `max_timeout_count`) instead of `mmc_set_data_timeout`; busy commands use their own timeout.
 

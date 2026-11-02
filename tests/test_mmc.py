@@ -56,6 +56,15 @@ class MmcTests(unittest.TestCase):
                                     capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_emmc_writes_stay_in_the_carved_window(self):
+        source = (PENDING / 'coachz_sdcc.c').read_text()
+        self.assertIn('#define SCRATCH_START  242171904ull', source)
+        self.assertIn('#define SCRATCH_BLOCKS 2097152ull', source)
+        self.assertIn('static const char name[] = "coachz-scratch";', source)
+        write = source[source.index('int coachz_sdcc_write(int slot, uint64_t block, uint32_t count, const void *source)'):]
+        check = write.index('s->writes_refused++;')
+        self.assertLess(check, write.index('request(s, &cmd, &d)'))   # the window is checked before any command
+
     def test_in_the_build(self):
         series = (ROOT / 'platform/coachz-prelink/patches/xnu/series').read_text().split()
         self.assertIn('coachz-prelink-mmc.patch', series)
@@ -63,7 +72,7 @@ class MmcTests(unittest.TestCase):
         build = (ROOT / 'platform/coachz-prelink/drivers/RamBlock/build-usb-stack.py').read_text()
         self.assertIn("mmc / 'coachz_sdcc.c'", build)
         self.assertIn("'CoachzMmcBlock.o'", build)
-        self.assertIn("' coachz-emmc=1 coachz-sd=1'", (ROOT / 'tools/xnu_screen.py').read_text())
+        self.assertIn("' coachz-emmc=2 coachz-sd=2'", (ROOT / 'tools/xnu_screen.py').read_text())
         # The shared RPMh client of coachz_rpmh_iface.h lives in the Wi-Fi patch, with cx aggregated over its consumers.
         wifi = (ROOT / 'platform/coachz-prelink/patches/xnu/coachz-prelink-wifi.patch').read_text()
         for name in ('coachz_cmd_db_address', 'coachz_cmd_db_aux', 'coachz_rpmh_write', 'coachz_rpmh_cx_request'):

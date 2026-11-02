@@ -202,8 +202,13 @@ GPU 核心寄存器不能用 64 位写。很多寄存器不是 8 字节对齐，
 - k79 照主线配置 LLCC 后，提交到完成快了约 25%。k80 的前台优先排队在 ring 前生效，但这台机器上和渲染服务器抢 GPU 的主要是它自己每帧之后的那次复制，别的进程很少。
 - 上游的 GPU 调度是按前后台优先级分到两条 ring，靠 CP 抢占切换。主线 Linux 不给 A6xx 开抢占，只有一条 ring，所以 A618 只能在这一条 ring 前按优先级排队，不能打断正在跑的作业。
 
+## 中断
+
+SPI 300（`RBBM_INT_0`）、304（HFI）、305（GMU AO）已接（`CoachzGpu.cpp` 的 `gpuInterruptsOn`）。真机上 2312 次中断对应 2312 个 fence，错误位全 0；等 fence 的线程睡在 `CACHE_FLUSH_TS` 上，最多 1 ms 后重查，中断打开之前退回 `IODelay`。
+
 ## 还没做的
 
 表里的阶段都走通了，接下来是性能。另外：
-- GPU 中断（SPI 300/304/305）还没接。
+- 电源管理：主线 a618 没有 IFPC，靠 66 ms 自动挂起走 `a6xx_gmu_shutdown`（slumber HFI、CM3 复位、RPMh 停止），恢复时重跑 GMU 启动和 hw_init。
+- 迁移到上游按进程 VM 的 Adreno740 框架（去掉 4 个窗口的限制，带挂起恢复）。
 - 带宽投票（interconnect / BCM）还没有 RPMh 客户端。GX 的 ARC 投票不需要：表从 CMD DB 读，由 GMU 固件代投。

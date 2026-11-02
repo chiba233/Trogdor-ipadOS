@@ -19,6 +19,9 @@ int coachz_sdcc_read(int slot, uint64_t block, uint32_t count, void **data);
 uint32_t coachz_sdcc_max_blocks(void);
 int coachz_sdcc_removable(int slot);
 int coachz_sdcc_enabled(int slot);
+int coachz_sdcc_write(int slot, uint64_t block, uint32_t count, const void *data);
+int coachz_sdcc_writable(int slot);
+void coachz_sdcc_write_selftest(int slot);
 void coachz_mmc_start(void);
 kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
 void thread_deallocate(thread_t);
@@ -27,23 +30,30 @@ void thread_deallocate(thread_t);
 class CoachzMmcBlock : public IOBlockStorageDevice {
   OSDeclareDefaultStructors(CoachzMmcBlock)
   IOLock *gate = nullptr;
+  void *bounce = nullptr;
   uint64_t capacity = 0;
   int slot = -1;
   bool online = false;
 public:
   bool setSlot(int which, uint64_t blocks) {
-    slot = which; capacity = blocks; gate = IOLockAlloc(); online = gate && capacity;
+    slot = which; capacity = blocks; gate = IOLockAlloc();
+    bounce = IOMalloc(coachz_sdcc_max_blocks() * 512u);
+    online = gate && bounce && capacity;
     return online;
   }
   bool start(IOService *provider) override { return IOBlockStorageDevice::start(provider) && (registerService(), true); }
-  void free() override { if (gate) { IOLockFree(gate); gate = nullptr; } IOBlockStorageDevice::free(); }
+  void free() override {
+    if (gate) { IOLockFree(gate); gate = nullptr; }
+    if (bounce) { IOFree(bounce, coachz_sdcc_max_blocks() * 512u); bounce = nullptr; }
+    IOBlockStorageDevice::free();
+  }
   IOReturn doEjectMedia() override { return kIOReturnUnsupported; }
   IOReturn doFormatMedia(UInt64) override { return kIOReturnUnsupported; }
   UInt32 doGetFormatCapacities(UInt64 *, UInt32) const override { return 0; }
   char *getVendorString() override { return const_cast<char *>("Coachz"); }
   char *getProductString() override { return const_cast<char *>(slot == 0 ? "eMMC" : "microSD"); }
   char *getRevisionString() override { return const_cast<char *>("1.0"); }
-  char *getAdditionalDeviceInfoString() override { return const_cast<char *>("sdhci-msm, read-only stage 1"); }
+  char *getAdditionalDeviceInfoString() override { return const_cast<char *>("sdhci-msm"); }
   IOReturn reportBlockSize(UInt64 *value) override { *value = 512; return kIOReturnSuccess; }
   IOReturn reportEjectability(bool *value) override { *value = false; return kIOReturnSuccess; }
   IOReturn reportMaxValidBlock(UInt64 *value) override { *value = capacity - 1; return kIOReturnSuccess; }
@@ -51,7 +61,7 @@ public:
     *present = online; if (changed) *changed = false; return kIOReturnSuccess;
   }
   IOReturn reportRemovability(bool *value) override { *value = coachz_sdcc_removable(slot) != 0; return kIOReturnSuccess; }
-  IOReturn reportWriteProtection(bool *value) override { *value = true; return kIOReturnSuccess; }
+  IOReturn reportWriteProtection(bool *value) override { *value = !coachz_sdcc_writable(slot); return kIOReturnSuccess; }
   IOReturn doSynchronizeCache() override { return kIOReturnSuccess; }
   IOReturn doSynchronize(UInt64, UInt64, IOOptionBits) override { return kIOReturnSuccess; }
   IOReturn getWriteCacheState(bool *value) override { *value = false; return kIOReturnSuccess; }
@@ -60,7 +70,8 @@ public:
                             IOStorageAttributes *, IOStorageCompletion *completion) override {
     if (!buffer || !completion || !completion->action || !count || block >= capacity || count > capacity - block ||
         buffer->getLength() < count * 512) return kIOReturnBadArgument;
-    if (buffer->getDirection() != kIODirectionIn) return kIOReturnNotWritable;
+    const bool writing = buffer->getDirection() == kIODirectionOut;
+    if ((!writing && buffer->getDirection() != kIODirectionIn) || (writing && !coachz_sdcc_writable(slot))) return kIOReturnNotWritable;
     IOLockLock(gate);
     const uint32_t most = coachz_sdcc_max_blocks();
     uint64_t done = 0;
@@ -68,8 +79,12 @@ public:
     while (done < count) {
       const uint32_t n = count - done > most ? most : static_cast<uint32_t>(count - done);
       void *data = nullptr;
-      if (!coachz_sdcc_read(slot, block + done, n, &data) ||
-          buffer->writeBytes(done * 512, data, n * 512ull) != n * 512ull) { status = kIOReturnIOError; break; }
+      // The driver refuses a write outside its window, so a whole-disk writer gets an error rather than the blocks.
+      if (writing ? buffer->readBytes(done * 512, bounce, n * 512ull) != n * 512ull || !coachz_sdcc_write(slot, block + done, n, bounce)
+                  : !coachz_sdcc_read(slot, block + done, n, &data) || buffer->writeBytes(done * 512, data, n * 512ull) != n * 512ull) {
+        status = kIOReturnIOError;
+        break;
+      }
       done += n;
     }
     IOLockUnlock(gate);
@@ -84,6 +99,7 @@ static void coachz_mmc_slot_thread(void *parameter, wait_result_t)
   const int slot = static_cast<int>(reinterpret_cast<uintptr_t>(parameter));
   uint64_t blocks = 0;
   if (!coachz_sdcc_open(slot, &blocks)) return;
+  coachz_sdcc_write_selftest(slot);   // before anything above the driver can use the disk
   IOService *resources = IOService::getResourceService();
   CoachzMmcBlock *device = OSTypeAlloc(CoachzMmcBlock);
   bool started = device && device->init(nullptr) && device->setSlot(slot, blocks) && resources && device->attach(resources);

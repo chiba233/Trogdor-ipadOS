@@ -293,7 +293,7 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         command_line += ' coachz-null-call=1'
         # The drivers under test: Chrome EC battery, a speaker tone and the volume buttons (docs/plans/battery-speaker.md, input.md).
         # coachz-speaker=2 starts the audio service; its plug-in's trust cache module comes with --root-trust-cache (build-coachz-audio.py).
-        command_line += ' coachz-battery=1 coachz-speaker=2 coachz-buttons=1'
+        command_line += ' coachz-battery=1 coachz-speaker=2 coachz-buttons=3'
         # The panel backlight behind the system's brightness control, and the Zed keyboard (docs/plans/backlight.md, input.md).
         command_line += ' coachz-backlight=1 coachz-usb-keyboard=1'
         # Read-only probes: SoC temperatures and the SMEM inventory, with their nodes from prelink_tree (docs/plans/thermal.md, wifi.md).
@@ -303,8 +303,9 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         command_line += ' coachz-thermal=1 coachz-wifi=4 coachz-motion=1 coachz-switches=1'
         # The MPSS firmware tools/linux_log.py --modem-firmware stores in the kernel partition, read back and hashed for coachz-wifi=4.
         command_line += ' coachz-modem-fw=1'
-        # The read-only SDHCI driver (sdhci-msm stage 1, platform/coachz-prelink/drivers/RamBlock/mmc): eMMC and microSD block devices.
-        command_line += ' coachz-emmc=1 coachz-sd=1'
+        # The SDHCI driver (sdhci-msm, platform/coachz-prelink/drivers/RamBlock/mmc): eMMC and microSD block devices. 2 opens writes: the
+        # microSD card whole, the eMMC only inside the 1 GiB coachz-scratch partition, with a write test on that window's last MiB.
+        command_line += ' coachz-emmc=2 coachz-sd=2'
     if gpu:
         # Adreno 618 bring-up stages (docs/plans/gpu.md): 1 inventory, 2 CX + GMU clock window, 3 also the GMU firmware into TCM,
         # 4 the window with a read-only GPU SMMU inventory.

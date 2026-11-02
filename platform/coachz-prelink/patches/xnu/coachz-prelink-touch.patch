@@ -10,7 +10,7 @@
  bsd/dev/unix_startup.c			standard
 --- a/bsd/dev/coachz_touch.c
 +++ b/bsd/dev/coachz_touch.c
-@@ -0,0 +1,881 @@
+@@ -0,0 +1,884 @@
 +/*
 + * Coachz touchscreen (coachz-touch=1): the Goodix GT7375P on QUPv3 wrap0 SE4 as HID over I2C.
 + * The device side is a port of Linux's drivers/hid/i2c-hid: i2c-hid-of-goodix.c's power-up for this part (reset asserted, 10 ms,
@@ -825,18 +825,21 @@
 +					absolutetime_to_nanoseconds(now - touch_down_since, &held);
 +				}
 +				printf("K45 touch 1s: interrupts %u, reports %u to HID %u, frames %llu, read errors %u, unasked resets %u, bad lengths %u, "
-+				    "spurious %u%s, line %s, intr cfg %x, down %u for %llu ms (most %u), strokes %u, palms %u continued %u duplicates %u "
-+				    "sticky %u | hid out %u fingers %u held %u dup %u hand %u rebegin %u lone up %u cancel %u\n", irqs, reports,
++				    "spurious %u%s, line %s, intr cfg %x\n", irqs, reports,
 +				    native_touch_hid_reports - hid_last, frames - frames_last, input_errors - errors_last, resets_unasked - unasked_last,
 +				    short_reads - short_last, st.spurious - spurious_last, st.storm ? " (storm: interrupt disabled)" : "",
-+				    (rd(st.north, GPIO_IO(9)) & 1u) ? "high" : "low", rd(st.north, GPIO_INTR_CFG(9)), touch_down_now, held / NSEC_PER_MSEC,
-+				    touch_down_most, stroke_count, frame_palms, frame_continued, frame_duplicates, frame_sticky,
++				    (rd(st.north, GPIO_IO(9)) & 1u) ? "high" : "low", rd(st.north, GPIO_INTR_CFG(9)));
++				/* Lines of their own: the log ring cuts a long one. */
++				printf("K47 down %u for %llu ms, most %u, strokes %u, palms %u continued %u duplicates %u sticky %u\n", touch_down_now,
++				    held / NSEC_PER_MSEC, touch_down_most, stroke_count, frame_palms, frame_continued, frame_duplicates, frame_sticky);
++				printf("K47 hid out %u fingers %u held %u dup %u hand %u rebegin %u lone up %u cancel %u\n",
 +				    &coachz_hid_observed ? coachz_hid_observed[0] : 0, &coachz_hid_observed ? coachz_hid_observed[1] : 0,
 +				    &coachz_hid_observed ? coachz_hid_observed[2] : 0, &coachz_hid_observed ? coachz_hid_observed[3] : 0,
 +				    &coachz_hid_observed ? coachz_hid_observed[4] : 0, &coachz_hid_observed ? coachz_hid_observed[5] : 0,
 +				    &coachz_hid_observed ? coachz_hid_observed[6] : 0, &coachz_hid_observed ? coachz_hid_observed[7] : 0);
-+				frames_last = frames;
 +			}
++			/* Each second's own frames, printed or not: a line after quiet seconds used to report their sum. */
++			frames_last = &native_gop_gpu_completions ? native_gop_gpu_completions : 0;
 +			quiet = !irqs && !problems;
 +			irqs_last = st.irqs;
 +			reports_last = coachz_touch_reports;

@@ -15,7 +15,7 @@
 
 - **报告怎么进系统**：直接调用该设备的 `handleReport`，也就是原版 `IOHIDDevice` 虚表第 181 项。`build-sheng-hid-input.py` 在每次构建时都核对第 181 项是原版的 handleReport（`0xfffffff004add0c4`），所以不需要改 `CoachzHid.cpp`、HID 构建脚本，也不需要它的空 `native_buttons_set_sink`。
 - **不抢 EC 事件**：按键读的是 EC 的当前状态，而不是 `GET_NEXT_EVENT` 队列，因此不会吃掉电池或其他读者需要的 MKBP 事件。`ec_commands.h` 写明 `EC_MKBP_INFO_CURRENT` 支持 `EC_MKBP_EVENT_BUTTON`；固定版本源码里没有 EC 侧的处理函数，所以先查 `EC_MKBP_INFO_SUPPORTED`，若 EC 拒绝会打印并停止。
-- **电源键默认不上报**：按电源键会让 iPadOS 进入睡眠，而睡眠尚未支持。EC 自己的长按强制关机不受影响。
+- **电源键**：`coachz-buttons=3` 同时上报音量键和电源键（报告 2 的第 1 位），机主确认真机上正常。休眠本身还没做。EC 自己的长按强制关机不受影响。
 - **键盘不会碰根盘**：`usb_poll()` 会对根盘做 TEST UNIT READY，失败就把它当作拔出；USB 键盘代码从不调用它，开机时的 hub 轮询也跳过根盘，之后只读键盘自己的中断队列，并且和块 I/O 用同一把锁。
 - **只做 boot 协议**：默认是 report protocol，固定 8 字节只在 SET_PROTOCOL(boot) 之后才成立。顶排 Vivaldi 功能键、语言布局和输入法留给后续；驱动发的是按键 usage，不是字符。
 

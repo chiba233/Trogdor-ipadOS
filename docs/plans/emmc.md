@@ -1,6 +1,6 @@
 # eMMC 与 microSD（sdhci-msm）
 
-第一阶段只读驱动已编进预链接内核（RamBlock 的归档、采样线程启动、`coachz-emmc=1 coachz-sd=1`）。真机上 eMMC 以 52 MHz、8 位总线识别并发布只读块设备；microSD 槽没插卡时报告无卡，读卡未测；分区发布还没有证实。入口：[实现与接入说明](../../platform/coachz-prelink/drivers/RamBlock/mmc/README.md)，[固定源码](../../platform/coachz-prelink/drivers/RamBlock/mmc/SOURCES.md)。
+驱动已编进预链接内核（RamBlock 的归档、采样线程启动、`coachz-emmc=2 coachz-sd=2`）。真机上 eMMC 以 52 MHz、8 位总线识别，只向机主切出的 1 GiB 分区 `coachz-scratch` 写入，窗口外的写被拒绝，2048 块写后读回无错；跨重启保留和分区发布还没有证实；microSD 槽没插卡时报告无卡，读写卡未测。入口：[实现与接入说明](../../platform/coachz-prelink/drivers/RamBlock/mmc/README.md)，[固定源码](../../platform/coachz-prelink/drivers/RamBlock/mmc/SOURCES.md)。
 
 ## 路线
 
@@ -14,7 +14,9 @@
 - eMMC：CMD1、CID、CSD、EXT_CSD，HS 52 MHz，8 位总线。SD：CMD8、ACMD41、SCR、CMD6 高速，4 位总线。
 - 读：CMD17/CMD18，配合 Auto-CMD23 或 Auto-CMD12，ADMA2 读进固定的 64 KiB 缓冲。IOKit 发布只读块设备，GPT 由原版存储栈解析。
 
-有意不做的：HS200/HS400/UHS-I/调谐/DLL 校准、CQE、带宽投票、SD 热插拔、任何写入。EXT_CSD 只改读数据必需、断电即失的 BUS_WIDTH 和 HS_TIMING；如果 PART_CONFIG 选的是启动分区，就只报告，不改写，因为改它会连带重写持久的启动位。eMMC 写入要机主另行同意。
+第一阶段没做的：HS200/HS400/UHS-I/调谐/DLL 校准、CQE、带宽投票、SD 热插拔。EXT_CSD 只改读数据必需、断电即失的 BUS_WIDTH 和 HS_TIMING；如果 PART_CONFIG 选的是启动分区，就只报告，不改写，因为改它会连带重写持久的启动位。
+
+写入（`coachz-emmc=2`）：eMMC 上还有 Debian 的根和启动分区，所以块级写入只接受 GPT 名字和起止都对得上的 `coachz-scratch`，发命令之前先查窗口，其他 LBA 一律拒绝并计数。扩大范围要机主重新同意。microSD（`coachz-sd=2`）整张卡可写。
 
 ## 主机验证
 
@@ -36,4 +38,4 @@
 
 ## 下一阶段（要等第一阶段的实机结果）
 
-eMMC HS400ES 384 MHz（GPLL6、CX nom、DLL 校准、增强选通），SD UHS-I（CMD11、GPLL7、调谐），带宽投票，CQE，SD 热插拔，最后才是写入。
+eMMC HS400ES 384 MHz（GPLL6、CX nom、DLL 校准、增强选通），SD UHS-I（CMD11、GPLL7、调谐），带宽投票，CQE，SD 热插拔。

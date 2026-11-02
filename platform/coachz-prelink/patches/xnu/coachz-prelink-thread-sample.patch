@@ -96,13 +96,14 @@
  	proc_rele(p);
  }
  
-@@ -1357,6 +1439,10 @@
+@@ -1357,6 +1439,11 @@
  	}
  	coachz_sample_main_thread(coachz_preferences_pid, "Preferences");
  	coachz_sample_main_thread(os_atomic_load(&coachz_sb_pid, relaxed), "SpringBoard");
 +	unsigned threads = 0;
 +	if (PE_parse_boot_argn("coachz-sample-bbd", &threads, sizeof(threads)) && threads) {
 +		coachz_sample_threads(os_atomic_load(&coachz_bbd_pid, relaxed), "backboardd", 32);
++		coachz_sample_threads(os_atomic_load(&coachz_sb_pid, relaxed), "SpringBoard", 32);
 +	}
  }
  
