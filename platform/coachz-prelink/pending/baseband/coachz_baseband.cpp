@@ -154,7 +154,10 @@ static void bb_queue_tx(uint32_t local_port, uint32_t node, uint32_t port, const
   bb_txq[(bb_tx_head + bb_tx_count++) % BB_TX] = { local_port, node, port, len, copy };
 }
 
-// The modem "booted again" as ABM sees it (reset, power on): its boot loader greets on sahara.
+// BBUEUR13Loader pushes the SBL with SendImage on pbl, frees that transport, opens sahara and waits 40 s for the loaded SBL's HELLO there. So the
+// HELLO goes out when sahara opens after a SendImage.
+static bool bb_boot_image_sent;
+
 static void bb_sahara_restart(void)
 {
   struct cbs_out o;
@@ -162,6 +165,7 @@ static void bb_sahara_restart(void)
   cbs_init(&bb_sahara, bb_sahara_images, sizeof bb_sahara_images / sizeof bb_sahara_images[0], 0x10000);
   cbs_start(&bb_sahara, &o);
   for (uint32_t i = 0; i < o.count; i++) bb_push(CBH_SAHARA, o.data[i], o.len[i]);
+  printf("COACHZ baseband: sahara hello\n");
 }
 
 static void bb_private_note(uint32_t service, uint32_t message)
@@ -456,7 +460,7 @@ IOReturn AppleBasebandPCIUserClient::read(IOExternalMethodArguments *args)
 IOReturn AppleBasebandPCIUserClient::readRegister(IOExternalMethodArguments *args)
 {
   if (args->scalarInputCount < 1) return kIOReturnBadArgument;
-  const uint32_t reg = (uint32_t)args->scalarInput[0];
+  const uint32_t reg = (uint32_t)args->scalarInput[0];   // pbl
   static uint32_t seen;
   if (reg < 32 && !(__atomic_fetch_or(&seen, 1u << reg, __ATOMIC_RELAXED) & (1u << reg)))
     printf("COACHZ baseband: %s register %u read, %u bytes\n", cbh_published[fChannel], reg,
@@ -496,7 +500,10 @@ IOReturn AppleBasebandPCIUserClient::externalMethod(uint32_t selector, IOExterna
     if (free_channel) {
       ch->owner = this;
       if (!ch->opens++) printf("COACHZ baseband: %s opened\n", cbh_published[fChannel]);
-      if (fChannel == CBH_SAHARA) bb_sahara_restart();
+      if (fChannel == CBH_SAHARA && bb_boot_image_sent) {
+        bb_boot_image_sent = false;
+        bb_sahara_restart();
+      }
     }
     IOLockUnlock(bb_lock);
     return free_channel ? kIOReturnSuccess : kIOReturnExclusiveAccess;
@@ -510,6 +517,9 @@ IOReturn AppleBasebandPCIUserClient::externalMethod(uint32_t selector, IOExterna
     return read(args);
   case 4:     // sendImage (BHI): the modem is already running; the image is accepted and dropped
     printf("COACHZ baseband: %s sendImage %llu bytes dropped\n", cbh_published[fChannel], args->scalarInputCount > 1 ? args->scalarInput[1] : 0ull);
+    IOLockLock(bb_lock);
+    if (fChannel == CBH_PBL) bb_boot_image_sent = true;
+    IOLockUnlock(bb_lock);
     if (bb_async(args)) bb_reply(args, kIOReturnSuccess, 2, args->scalarInputCount > 1 ? args->scalarInput[1] : 0, 0);
     return kIOReturnSuccess;
   case 5:
@@ -540,6 +550,21 @@ public:
   {
     fChannel = channel;
     return setProperty(CBH_PROTOCOL_KEY, cbh_published[channel]);
+  }
+  // IOABPClass::start_nl puts ABPInterfaceProtocol straight in the IOServiceMatching dictionary. IOKit does not compare a key it does not know: the
+  // family's matchPropertyTable does, and without it every client gets whichever channel comes first.
+  bool matchPropertyTable(OSDictionary *table, SInt32 *score) override
+  {
+    return IOService::matchPropertyTable(table, score) && matchProtocol(table);
+  }
+  bool matchPropertyTable(OSDictionary *table) override
+  {
+    return IOService::matchPropertyTable(table) && matchProtocol(table);
+  }
+  bool matchProtocol(OSDictionary *table) const
+  {
+    OSString *wanted = OSDynamicCast(OSString, table->getObject(CBH_PROTOCOL_KEY));
+    return !wanted || wanted->isEqualTo(cbh_published[fChannel]);
   }
   IOReturn newUserClient(task_t task, void *security, UInt32 type, OSDictionary *properties, IOUserClient **out) override
   {
@@ -662,9 +687,11 @@ public:
     uint32_t nout = args->scalarOutputCount < 4 ? args->scalarOutputCount : 4;
     IOLockLock(bb_lock);
     const int result = cbc_call(&bb_control, selector, args->scalarInput, args->scalarInputCount, out, &nout);
-    // A reset or power-on starts the boot loader again: it greets BBUpdater on sahara.
-    if (!result && (selector == CBC_RESET_MODEM || selector == CBC_POWERCYCLE || (selector == CBC_POWER && args->scalarInputCount && args->scalarInput[0])))
-      bb_sahara_restart();
+    // A reset or power-on goes back to before SendImage: nothing greets until the next one.
+    if (!result && (selector == CBC_RESET_MODEM || selector == CBC_POWERCYCLE || (selector == CBC_POWER && args->scalarInputCount && args->scalarInput[0]))) {
+      bb_boot_image_sent = false;
+      bb_flush(CBH_SAHARA);
+    }
     IOLockUnlock(bb_lock);
     if (result == CBC_UNSUPPORTED) printf("COACHZ baseband: AppleBaseband selector %u unsupported\n", selector);
     for (uint32_t i = 0; i < nout; i++) args->scalarOutput[i] = out[i];

@@ -21,10 +21,15 @@ static const struct cbh_channel cbh_channels[] = {
     { 8, "ari" }, { 9, "trace" }, { 10, "at" }, { 11, "dpl" }, { 12, "mediactl" }, { 13, "vcom" }, { 14, "gnss" }, { 15, "qdss" },
     { 17, "virtual_timesync" }, { 20, "boot_logger" },
 };
-/* The ones the bridge publishes: firmware push and the two QMUX instances, then channels with nothing behind them yet: they open, count what is
- * written and never have anything to read, so the log shows which of them ABM uses. */
-enum { CBH_SAHARA, CBH_QMUX1, CBH_QMUX2, CBH_DIAG, CBH_REFS, CBH_AT, CBH_TRACE, CBH_BOOT, CBH_PUBLISHED };
-static const char *const cbh_published[CBH_PUBLISHED] = { "sahara", "qmux1", "qmux2", "diag", "refs", "at", "trace", "boot" };
+/* Every channel of that table is published. pbl takes BBUEUR13Loader's register reads and SendImage, sahara the second stage, qmux1 and qmux2 go to the
+ * modem. The rest have nothing behind them yet: they open, count what is written and never have anything to read, so the log shows which of them ABM uses. */
+enum {
+    CBH_PBL, CBH_SAHARA, CBH_DIAG, CBH_REFS, CBH_QMUX1, CBH_QMUX2, CBH_ROM, CBH_BOOT, CBH_ARI, CBH_TRACE, CBH_AT, CBH_DPL, CBH_MEDIACTL, CBH_VCOM, CBH_GNSS,
+    CBH_QDSS, CBH_VIRTUAL_TIMESYNC, CBH_BOOT_LOGGER, CBH_PUBLISHED
+};
+static const char *const cbh_published[CBH_PUBLISHED] = {
+    "pbl", "sahara", "diag", "refs", "qmux1", "qmux2", "rom", "boot", "ari", "trace", "at", "dpl", "mediactl", "vcom", "gnss", "qdss", "virtual_timesync", "boot_logger"
+};
 
 /* AppleBasebandPCIInterface user client: selector, scalar inputs, async completion arguments (-1: synchronous only) */
 struct cbh_method { uint32_t selector, scalars; int async_args; const char *name; };

@@ -620,7 +620,6 @@ void profileSetup() {
     coreWrite(GbifSel, ProfileGbifSelection);
     coreWrite(GbifEnable, coreRead(GbifEnable) | 0xf);
     unsigned bad = 0;
-    for (const ProfileCounter &c : kProfile) if (coreRead(c.select) != c.countable) bad++;
     if (coreRead(GbifSel) != ProfileGbifSelection || (coreRead(GbifEnable) & 0xf) != 0xf) bad++;
     printf("COACHZ gpu prof config: epoch %u selector mismatches %u\n", ++gProfileEpoch, bad);
 }
@@ -644,7 +643,8 @@ bool profileSample(ProfileSample &sample) {
         if (!bad) {firstReg = reg; observed = read; wanted = value;}
         bad++;
     };
-    for (const ProfileCounter &c : kProfile) check(c.select, c.countable, ~0u);
+    // Never read the core selectors back: SP_PERFCTR_SP_SEL_0 (0xae10) took a synchronous external abort on hardware with the GMU vote held and the
+    // power status good.
     check(GbifSel, ProfileGbifSelection, ~0u);
     check(GbifEnable, 0xf, 0xf);
     const uint32_t epoch = gProfileEpoch;

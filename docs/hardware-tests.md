@@ -1650,3 +1650,12 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 - **界面**：“蜂窝数据”不再提示需要更新，显示转移 iPad 套餐和使用二维码；“关于本机”多了调制解调器固件一行，值为空；运营商和号码没有，SIM 卡没有识别。
 - **GPU**：方向来回变化修好后显示正常。这次 `CZ frames made 2 private 1 shown 0 plain 2365`，主帧基本没走私有纹理，压缩还没验证到。提交到完成平均 8.5 ms；host first 计划传输 175 MB。这段运行没有 slumber，也没有 Submit 超时。
 
+## 基带启动成功，QMI 接到 modem
+
+- **通道匹配**：`ABPInterfaceProtocol` 是 IOKit 不比较的键，之前所有客户端都拿到同一个通道，第二路 qmux 打开时报独占错误（`Engage failure`）。`matchPropertyTable` 比较它之后，`pbl`、`sahara`、`qmux1`、`qmux2`、`refs` 各开各的。
+- **启动**：`Sending Image 'SBL'` 100%，`END: bootup`，`Baseband state: booted`，`Baseband bootup succeeded`，`IPC state changing from kDisengaged -> kEngaged`，engage 用时 24 ms。
+- **QMI**：53 个客户端，qmux1 收发 262/270 帧，无丢弃，CommCenter 没有崩溃。
+- **界面**：识别到 SIM 卡，“关于本机”显示调制解调器固件。IMEI、ICCID 没有显示。
+- **未实现**：苹果私有服务 0xe1、0xe2、0xe4、0xe5、0xe7 的消息回不支持；注册网络和蜂窝数据没有验证。
+- **GPU**：读回 `0xae10` 在 GMU 投票和电源状态都正常时仍触发同步外部错误，两次 panic 都在这里。去掉读回后这次运行没有 panic。
+
