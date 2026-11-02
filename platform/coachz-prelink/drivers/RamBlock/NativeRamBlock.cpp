@@ -26,6 +26,7 @@ int coachz_usb_open_keyboard(void);
 int coachz_emmc_root(void);
 int coachz_sdcc_window(const char *name, uint64_t *first, uint64_t *blocks);
 int coachz_mmc_log_write(uint64_t block, uint32_t count, const void *data);
+int coachz_mmc_log_read(uint64_t block, void *out);
 int coachz_usb_read(uint64_t block, uint32_t count, void **data);
 int coachz_usb_write(uint64_t block, uint32_t count, const void *data);
 int coachz_usb_sync(void);
@@ -60,8 +61,9 @@ static bool persistent_data;
 /*
  * The kernel log on the external disk: once a second, everything the screen console printed since the last flush
  * (coachz_log_capture, filled by osfmk/arm64/coachz_early.c) is appended to the log ring after its header block, the header
- * is rewritten and the drive's cache is synchronized, under the same gate as block I/O. One boot per ring: it starts again
- * at each boot. Header: "COACHZLOG1\0", then little-endian u64 bytes stored, bytes dropped, flushes, seconds since boot.
+ * is rewritten and the drive's cache is synchronized, under the same gate as block I/O. On the eMMC the partition holds
+ * the last kLogSlots boots, each in its own slot, so a boot does not overwrite the log of the one before it. One boot per ring: it starts again
+ * at each boot. Header: "COACHZLOG1\0", then little-endian u64 bytes stored, bytes dropped, flushes, seconds since boot, boot number.
  */
 extern "C" {
 extern char coachz_log_capture[];
@@ -71,7 +73,8 @@ static const uint64_t kCaptureBytes = 1ull << 20;
 static CoachzUSBDataWindow log_window;
 static IOLock *log_gate;
 static thread_call_t log_call;
-static uint64_t log_taken, log_stored, log_dropped, log_flushes;
+static const unsigned kLogSlots = 4;
+static uint64_t log_taken, log_stored, log_dropped, log_flushes, log_boot;
 static uint8_t *log_buffer;  // 128 blocks: the header, then up to 127 blocks to write
 static uint8_t log_tail[512];  // the bytes of the last partial block, rewritten with the next flush
 static bool log_on_emmc;  // the partition coachz-log instead of the end of the USB drive
@@ -93,6 +96,7 @@ static bool log_write_header(void) {
   log_put(24, log_dropped);
   log_put(32, log_flushes);
   log_put(40, ns / 1000000000ull);
+  log_put(48, log_boot);
   return log_write(log_window.first, 1, log_buffer);
 }
 
@@ -137,9 +141,23 @@ static void log_flush(thread_call_param_t, thread_call_param_t) {
   if (log_on_emmc && !log_window.blocks) {
     uint64_t first = 0, blocks = 0;
     if (coachz_sdcc_window("coachz-log", &first, &blocks)) {
-      log_window.first = first;
-      log_window.blocks = blocks;
-      kprintf("COACHZ log: kernel log ring on the eMMC at block %llu, %llu MiB\n", first, blocks / 2048);
+      // The slot after the highest boot number; a slot never written, or a header without the number, counts as boot 0.
+      const uint64_t slot_blocks = blocks / kLogSlots;
+      unsigned next = 0;
+      uint64_t newest = 0;
+      for (unsigned i = 0; i < kLogSlots; i++) {
+        if (!coachz_mmc_log_read(first + i * slot_blocks, log_buffer) || memcmp(log_buffer, "COACHZLOG1", 11)) continue;
+        uint64_t boot = 0;
+        for (unsigned b = 0; b < 8; b++) boot |= (uint64_t)log_buffer[48 + b] << (8 * b);
+        if (boot >= newest) {
+          newest = boot;
+          next = (i + 1) % kLogSlots;
+        }
+      }
+      log_boot = newest + 1;
+      log_window.first = first + next * slot_blocks;
+      log_window.blocks = slot_blocks;
+      kprintf("COACHZ log: kernel log ring on the eMMC at block %llu, %llu MiB, slot %u, boot %llu\n", log_window.first, slot_blocks / 2048, next, log_boot);
     }
   }
   if (!log_on_emmc || log_window.blocks) {

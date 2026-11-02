@@ -2,8 +2,8 @@
 /* The boot choice, before the kernel load: the volume buttons or the keyboard's arrows move the selection, the power button or Enter
    confirms it. The keyboard is a USB device behind the board hub, so it only answers once the USB stack has enumerated it. Depthcharge has
    already loaded this whole partition, so both entries are in memory: iPadOS continues to the XNU load, Debian takes the wrapper's
-   existing return to the Linux kernel of the same FIT. Without a press the first entry starts after five seconds; a failing EC does
-   not block the boot. The caches are off, so only what changed is redrawn. Buttons as the EC reports them: power 0, up 1, down 2. */
+   existing return to the Linux kernel of the same FIT. Without a press the selected entry, Debian, starts after five seconds, so an
+   unattended reboot returns to Debian and keeps the log of the last XNU boot; a failing EC does not block the boot. The caches are off, so only what changed is redrawn. Buttons as the EC reports them: power 0, up 1, down 2. */
 #include "display.h"
 void usb_menu_start(uint64_t);
 unsigned usb_menu_poll(void);
@@ -20,6 +20,7 @@ void usb_menu_stop(void);
 #define COLOR_SELECTED 0xffffffffu
 #define COLOR_OTHER 0xff303030u
 #define COLOR_OTHER_TEXT 0xffc0c0c0u
+#define DEFAULT_ENTRY 1u   /* Debian */
 static const char names[ENTRIES][7]={"iPadOS","Debian"};
 /* 5x7: the letters of the names only. */
 static const struct { char letter; uint8_t rows[7]; } font[]={
@@ -68,7 +69,7 @@ static void draw_bar(const struct display_video *v,uint64_t filled) {
 }
 unsigned boot_menu(const struct display_video *v,uint64_t freq) {
     if(!v->ready || v->width<ROW_WIDTH || v->height<ENTRIES*(ROW_HEIGHT+ROW_GAP)+2*ROW_GAP+BAR_HEIGHT || freq<1000)return 0;
-    unsigned selected=0,failures=0;
+    unsigned selected=DEFAULT_ENTRY,failures=0;
     int waiting=1;
     uint32_t held=~0u,error=0;   /* a button already down when the menu appears does not count until it is released */
     for(unsigned entry=0;entry<ENTRIES;entry++)draw_row(v,entry,entry==selected);
@@ -80,7 +81,7 @@ unsigned boot_menu(const struct display_video *v,uint64_t freq) {
         uint32_t buttons=0;
         const int answered=display_ec_buttons(freq,&buttons,&error);
         buttons|=usb_menu_poll();
-        if(!answered && ++failures>=20)break;   /* no EC, no choice: boot the first entry rather than wait forever */
+        if(!answered && ++failures>=20)break;   /* no EC, no choice: boot the default rather than wait forever */
         if(answered)failures=0;
         {
             const uint32_t pressed=buttons&~held;

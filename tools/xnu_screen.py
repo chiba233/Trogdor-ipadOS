@@ -336,7 +336,7 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
             command_line += ' coachz-cpufreq=4'
             # The DDR and memory NoC bandwidth mainline votes for the top CPU and GPU states, at start (coachz_wifi.c): without it the
             # memory ran at about two thirds of Debian's speed. The render server's frame trace is summarised per 30 s (coachz_trace.c).
-            command_line += ' coachz-ddr-vote=1 coachz-sample-bbd=1'
+            command_line += ' coachz-ddr-vote=1 coachz-orientation=1'
             # Every backboardd thread at each report (coachz-prelink-thread-sample.patch), for the k85 freeze.
             # The system cache as mainline sets it up: sc7180's slices configured, CPUSS active, and the GPU and GPUHTW slices for the GPU (CoachzGpu.cpp).
             command_line += ' coachz-llcc=1'

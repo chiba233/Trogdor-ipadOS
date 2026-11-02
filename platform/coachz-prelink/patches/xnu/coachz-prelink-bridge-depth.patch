@@ -1,0 +1,409 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@
+ bsd/dev/memdev.c			standard
+ bsd/dev/coachz_sample.c		standard
+ bsd/dev/coachz_touch.c		standard
++bsd/dev/coachz_bridge.c		standard
+ bsd/dev/coachz_thermal.c		standard
+ bsd/dev/coachz_ec.c		standard
+ bsd/dev/coachz_wifi.c		standard
+--- a/bsd/dev/coachz_bridge.c
++++ b/bsd/dev/coachz_bridge.c
+@@ -0,0 +1,381 @@
++/*
++ * The SN65DSI86 eDP bridge's output depth. Coreboot's sn65dsi86_bridge_configure writes SN_DATA_FORMAT_REG 1 (18 bpp) whatever
++ * the panel says, and XNU keeps the firmware's display, so every channel reached the panel with 6 bits: white scenes and
++ * shadows show bands. Linux (ti-sn65dsi86.c) takes the depth from the EDID, 24 bpp on this 8-bit panel, and trains at the lowest
++ * rate that carries it. The firmware trains for 18 bpp, so the depth changes here only if the running link already has the
++ * capacity Linux would ask for; training is not repeated. The video stream is stopped around the change, as Linux's disable
++ * and enable do and as Coreboot writes it. Before and after go to the log.
++ *
++ * Board facts: Coreboot's BRIDGE_BUS is QUPV3_0_SE2 at 0x888000; Linux runs that bus at 400 kHz and the bridge at address 0x2d.
++ * GCC: S2's vote is bit 12 of 0x52008, its branch 0x17290, its RCG 0x17294 (gcc-sc7180.c). The GENI I2C engine follows
++ * bsd/dev/coachz_touch.c (i2c-qcom-geni.c), polled, one register at a time.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++void coachz_bridge_start(void);
++
++#define GCC_PA          0x00100000u
++#define GCC_VOTE        0x52008u
++#define GCC_VOTE_BITS   ((1u << 6) | (1u << 7) | (1u << 8) | (1u << 9) | (1u << 12))
++#define GCC_S2_CBCR     0x17290u
++#define GCC_S2_DFS_CMD  0x172a8u
++#define GCC_S2_DFS_L0   0x172b0u
++#define SE2_PA          0x00888000u
++#define BRIDGE_ADDR     0x2d
++
++#define SE_FORCE_DEFAULT 0x020u
++#define SE_OUTPUT_CTRL  0x024u
++#define SE_CGC_CTRL     0x028u
++#define SE_STATUS       0x040u
++#define SE_MCLK         0x048u
++#define SE_IF_DISABLE   0x064u
++#define SE_FW           0x068u
++#define SE_CLK_SEL      0x07cu
++#define SE_SCL          0x278u
++#define SE_BYTE_GRAN    0x254u
++#define SE_DMA          0x258u
++#define SE_TX_PACK0     0x260u
++#define SE_TX_PACK1     0x264u
++#define SE_TX_LEN       0x26cu
++#define SE_RX_LEN       0x270u
++#define SE_RX_PACK0     0x284u
++#define SE_RX_PACK1     0x288u
++#define SE_CMD          0x600u
++#define SE_CTRL         0x604u
++#define SE_IRQ          0x610u
++#define SE_IRQ_EN       0x614u
++#define SE_IRQ_CLR      0x618u
++#define SE_S_IRQ_EN     0x644u
++#define SE_S_IRQ_CLR    0x648u
++#define SE_TX           0x700u
++#define SE_RX           0x780u
++#define SE_TX_COUNT     0x800u
++#define SE_RX_COUNT     0x804u
++#define SE_TX_WM        0x80cu
++#define SE_RX_WM        0x810u
++#define SE_RX_RFR       0x814u
++#define SE_GSI_EVENT_EN 0xe18u
++#define SE_IRQ_ROUTE    0xe1cu
++#define SE_HW_TX        0xe24u
++#define SE_HW_RX        0xe28u
++#define SE_DMA_CFG      0xe30u
++#define SE_DONE         (1u << 0)
++#define SE_ABORT_DONE   (1u << 5)
++#define SE_NACK         (1u << 10)
++#define SE_ERRORS       (0x3eu | (1u << 9) | (1u << 10) | (1u << 12) | (1u << 13) | (3u << 24) | (3u << 28))
++#define SE_RX_WM_IRQ    (1u << 26)
++#define SE_RX_LAST      (1u << 27)
++#define SE_TX_WM_IRQ    (1u << 30)
++#define SE_EVENTS       (SE_DONE | SE_ERRORS | SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ)
++#define SE_PACK0        0x0007f8feu
++#define SE_PACK1        0x000ffefeu
++
++#define SN_ACTIVE_LINE  0x20u
++#define SN_VDISPLAY     0x24u
++#define SN_HSYNC        0x2cu
++#define SN_VSYNC        0x30u
++#define SN_HBP          0x34u
++#define SN_VBP          0x36u
++#define SN_HFP          0x38u
++#define SN_VFP          0x3au
++#define SN_ENH_FRAME    0x5au
++#define SN_DATA_FORMAT  0x5bu
++#define SN_SSC_CONFIG   0x93u
++#define SN_DATARATE     0x94u
++#define SN_ML_TX_MODE   0x96u
++#define VSTREAM_ENABLE  (1u << 3)
++#define BPP_18_RGB      (1u << 0)
++#define ML_TX_NORMAL    1u
++#define PANEL_HZ        60u
++
++static vm_offset_t se;
++static int bridge_chan;
++
++static uint32_t
++rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static void
++spin_us(unsigned us)
++{
++	uint64_t hz, start, now;
++	__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(hz));
++	__asm__ volatile ("isb\n\tmrs %0, cntpct_el0" : "=r"(start));
++	const uint64_t ticks = (hz ? hz : 19200000) * us / 1000000 + 1;
++	do {
++		__asm__ volatile ("isb\n\tmrs %0, cntpct_el0" : "=r"(now));
++	} while (now - start < ticks);
++}
++
++static void
++sleep_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&bridge_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool
++wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
++{
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (!(rd(base, off) & mask)) {
++			return true;
++		}
++		spin_us(1);
++	}
++	return false;
++}
++
++static void
++engine_abort(void)
++{
++	wr(se, SE_CTRL, 2);
++	for (unsigned i = 0; i < 5000 && !(rd(se, SE_IRQ) & SE_ABORT_DONE); ++i) {
++		spin_us(1);
++	}
++	(void)wait_clear(se, SE_STATUS, 1u);
++	for (unsigned i = 0; i < 1024 && (rd(se, SE_RX_COUNT) & 0x1ffffffu); ++i) {
++		(void)rd(se, SE_RX);
++	}
++	wr(se, SE_IRQ_CLR, 0xffffffffu);
++}
++
++/* One FIFO message of at most four bytes, written or read. stretch keeps the bus for a repeated start. */
++static int
++engine_msg(const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, bool stretch)
++{
++	unsigned got = 0;
++	bool sent = false;
++
++	if (!wait_clear(se, SE_STATUS, 1u)) {
++		return EBUSY;
++	}
++	wr(se, SE_IRQ_CLR, 0xffffffffu);
++	wr(se, SE_TX_WM, nt ? 1u : 0u);
++	wr(se, nr ? SE_RX_LEN : SE_TX_LEN, nr ? nr : nt);
++	wr(se, SE_CMD, ((nr ? 2u : 1u) << 27) | ((uint32_t)BRIDGE_ADDR << 9) | (stretch ? 4u : 0u));
++	for (unsigned waited = 0; waited < 50000; ++waited) {
++		uint32_t irq = rd(se, SE_IRQ);
++		if (irq & SE_ERRORS) {
++			const int error = (irq & SE_NACK) ? ENXIO : EIO;
++			engine_abort();
++			return error;
++		}
++		if (nt && !sent && (irq & SE_TX_WM_IRQ)) {
++			uint32_t word = 0;
++			for (unsigned j = 0; j < nt; ++j) {
++				word |= (uint32_t)tx[j] << (8u * j);
++			}
++			wr(se, SE_TX, word);
++			sent = true;
++			wr(se, SE_TX_WM, 0);
++		}
++		uint32_t count = rd(se, SE_RX_COUNT) & 0x1ffffffu;
++		while (count--) {
++			uint32_t word = rd(se, SE_RX);
++			for (unsigned j = 0; j < 4 && got < nr; ++j) {
++				rx[got++] = (uint8_t)(word >> (8u * j));
++			}
++		}
++		if (irq & SE_DONE) {
++			wr(se, SE_IRQ_CLR, irq);
++			return got == nr && (!nt || sent) ? 0 : EIO;
++		}
++		wr(se, SE_IRQ_CLR, irq & (SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ));
++		spin_us(10);
++	}
++	engine_abort();
++	return ETIMEDOUT;
++}
++
++static int
++reg_read(uint8_t reg, uint8_t *value)
++{
++	int error = engine_msg(&reg, 1, NULL, 0, true);
++	return error ? error : engine_msg(NULL, 0, value, 1, false);
++}
++
++static int
++reg_write(uint8_t reg, uint8_t value)
++{
++	const uint8_t bytes[2] = { reg, value };
++	return engine_msg(bytes, 2, NULL, 0, false);
++}
++
++static int
++reg_read16(uint8_t reg, unsigned *value)
++{
++	uint8_t low = 0, high = 0;
++	int error = reg_read(reg, &low);
++	if (!error) {
++		error = reg_read((uint8_t)(reg + 1), &high);
++	}
++	*value = low | ((unsigned)high << 8);
++	return error;
++}
++
++static bool
++engine_init(void)
++{
++	uint32_t fw = rd(se, SE_FW), tx = rd(se, SE_HW_TX), rx = rd(se, SE_HW_RX);
++	if (((fw >> 8) & 0xffu) != 3u || (rd(se, SE_IF_DISABLE) & 1u) || ((tx >> 24) & 0x3fu) != 32u ||
++	    ((rx >> 24) & 0x3fu) != 32u || (rd(se, SE_STATUS) & 0x1001u)) {
++		return false;
++	}
++	wr(se, SE_GSI_EVENT_EN, 0);
++	wr(se, SE_IRQ_ROUTE, 0);
++	wr(se, SE_S_IRQ_EN, 0);
++	wr(se, SE_IRQ_CLR, 0xffffffffu);
++	wr(se, SE_S_IRQ_CLR, 0xffffffffu);
++	wr(se, SE_DMA, 0);
++	wr(se, SE_CGC_CTRL, rd(se, SE_CGC_CTRL) | 0x7fu);
++	wr(se, SE_DMA_CFG, rd(se, SE_DMA_CFG) | 0x0fu);
++	wr(se, SE_OUTPUT_CTRL, 0x7f);
++	wr(se, SE_FORCE_DEFAULT, 1);
++	wr(se, SE_CLK_SEL, 0);
++	wr(se, SE_MCLK, (2u << 4) | 1u);
++	wr(se, SE_SCL, (5u << 20) | (12u << 10) | 24u);
++	wr(se, SE_BYTE_GRAN, 0);
++	wr(se, SE_TX_PACK0, SE_PACK0);
++	wr(se, SE_TX_PACK1, SE_PACK1);
++	wr(se, SE_RX_PACK0, SE_PACK0);
++	wr(se, SE_RX_PACK1, SE_PACK1);
++	wr(se, SE_TX_WM, 0);
++	wr(se, SE_RX_WM, 0);
++	wr(se, SE_RX_RFR, ((rx >> 16) & 0x3fu) - 1u);
++	wr(se, SE_IRQ_EN, SE_EVENTS);
++	return true;
++}
++
++/* What a later direct scanout has to change, read only: the pipe the firmware left scanning, the controller, the interface and the
++ * apps SMMU entries of the display's streams (Linux: iommus = <&apps_smmu 0x800 0x2>). */
++static void
++display_state(void)
++{
++	static const uint32_t regs[] = { 0xae05000u, 0xae05014u, 0xae05024u, 0xae05030u };
++	const vm_offset_t mdp = ml_io_map(0x0ae00000u, 0x100000), smmu = ml_io_map(0x15000000u, 0x1000);
++
++	if (!mdp || !smmu) {
++		return;
++	}
++	printf("COACHZ display: pipe size 0x%x scanout 0x%x stride 0x%x format 0x%x; SMMU cr0 0x%x idr0 0x%x\n",
++	    rd(mdp, regs[0] - 0xae00000u), rd(mdp, regs[1] - 0xae00000u), rd(mdp, regs[2] - 0xae00000u), rd(mdp, regs[3] - 0xae00000u),
++	    rd(smmu, 0), rd(smmu, 0x20));
++	const unsigned groups = rd(smmu, 0x20) & 0xffu;
++	for (unsigned n = 0; n < groups; ++n) {
++		const uint32_t smr = rd(smmu, 0x800 + n * 4);
++		const uint32_t id = smr & 0xffffu, mask = (smr >> 16) & 0x7fffu;
++		if ((smr & (1u << 31)) && ((0x800u ^ id) & ~mask) == 0) {
++			printf("COACHZ display: stream group %u smr 0x%x s2cr 0x%x\n", n, smr, rd(smmu, 0xc00 + n * 4));
++		}
++	}
++}
++
++static void
++bridge_thread(__unused void *arg, __unused wait_result_t result)
++{
++	static const unsigned rates[] = { 0, 1620, 2160, 2430, 2700, 3240, 4320, 5400 };
++	const vm_offset_t gcc = ml_io_map(GCC_PA, 0x60000);
++	uint8_t frame = 0, format = 0, ssc = 0, rate = 0, mode = 0, hbp = 0, vbp = 0, hfp = 0, vfp = 0;
++	unsigned line = 0, height = 0, hsync = 0, vsync = 0;
++	int error;
++
++	display_state();
++	se = ml_io_map(SE2_PA, 0x4000);
++	if (!gcc || !se) {
++		printf("COACHZ bridge: no mapping\n");
++		goto done;
++	}
++	wr(gcc, GCC_VOTE, rd(gcc, GCC_VOTE) | GCC_VOTE_BITS);
++	if (!wait_clear(gcc, GCC_S2_CBCR, 1u << 31) ||
++	    ((rd(gcc, GCC_S2_DFS_CMD) & 1u) && (rd(gcc, GCC_S2_DFS_L0) & 0x371fu) != 1u) || !engine_init()) {
++		printf("COACHZ bridge: bus not usable: cbcr 0x%x fw 0x%x status 0x%x\n", rd(gcc, GCC_S2_CBCR), rd(se, SE_FW), rd(se, SE_STATUS));
++		goto done;
++	}
++	error = reg_read(SN_ENH_FRAME, &frame);
++	error = error ? error : reg_read(SN_DATA_FORMAT, &format);
++	error = error ? error : reg_read(SN_SSC_CONFIG, &ssc);
++	error = error ? error : reg_read(SN_DATARATE, &rate);
++	error = error ? error : reg_read(SN_ML_TX_MODE, &mode);
++	error = error ? error : reg_read16(SN_ACTIVE_LINE, &line);
++	error = error ? error : reg_read16(SN_VDISPLAY, &height);
++	error = error ? error : reg_read16(SN_HSYNC, &hsync);
++	error = error ? error : reg_read16(SN_VSYNC, &vsync);
++	error = error ? error : reg_read(SN_HBP, &hbp);
++	error = error ? error : reg_read(SN_VBP, &vbp);
++	error = error ? error : reg_read(SN_HFP, &hfp);
++	error = error ? error : reg_read(SN_VFP, &vfp);
++	if (error) {
++		printf("COACHZ bridge: register read failed: %d\n", error);
++		goto done;
++	}
++	hsync &= 0x7fffu;
++	vsync &= 0x7fffu;
++	const unsigned field = (ssc >> 4) & 3u, lanes = field == 3 ? 4 : field;
++	const unsigned mbps = rates[rate >> 5];
++	const uint64_t pixel_khz = (uint64_t)(line + hsync + hbp + hfp) * (height + vsync + vbp + vfp) * PANEL_HZ / 1000;
++	/* ti_sn_bridge_calc_min_dp_rate_idx: the pixel clock times the depth, plus a quarter, over the lanes. */
++	const uint64_t need = (pixel_khz * 24 * 5 / 4 + 999) / 1000 / (lanes ? lanes : 1);
++	printf("COACHZ bridge: firmware state 5a 0x%x 5b 0x%x 93 0x%x 94 0x%x 96 0x%x; %ux%u, %llu kHz, %u lanes at %u MHz, 24 bpp needs %llu\n",
++	    frame, format, ssc, rate, mode, line, height, pixel_khz, lanes, mbps, need);
++	if (!(format & BPP_18_RGB)) {
++		printf("COACHZ bridge: already 24 bpp\n");
++		goto done;
++	}
++	if (mode != ML_TX_NORMAL || !lanes || !mbps || need > mbps) {
++		printf("COACHZ bridge: left at 18 bpp, the running link would not carry 24\n");
++		goto done;
++	}
++	error = reg_write(SN_ENH_FRAME, frame & ~VSTREAM_ENABLE);
++	sleep_ms(20);
++	const int format_error = error ? error : reg_write(SN_DATA_FORMAT, format & ~BPP_18_RGB);
++	/* The stream comes back whatever happened, or the panel stays dark. */
++	error = reg_write(SN_ENH_FRAME, frame | VSTREAM_ENABLE);
++	sleep_ms(100);
++	uint8_t after_format = 0xff, after_frame = 0xff, after_mode = 0xff;
++	(void)reg_read(SN_DATA_FORMAT, &after_format);
++	(void)reg_read(SN_ENH_FRAME, &after_frame);
++	(void)reg_read(SN_ML_TX_MODE, &after_mode);
++	printf("COACHZ bridge: depth write %d, stream write %d; now 5a 0x%x 5b 0x%x 96 0x%x\n", format_error, error, after_frame, after_format, after_mode);
++done:
++	(void)thread_terminate(current_thread());
++}
++
++void
++coachz_bridge_start(void)
++{
++	static bool started;
++	int enabled = 0;
++	thread_t thread;
++
++	if (started || !PE_parse_boot_argn("coachz-display", &enabled, sizeof(enabled)) || enabled != 1) {
++		return;
++	}
++	started = true;
++	if (kernel_thread_start(bridge_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
+--- a/osfmk/arm64/coachz_thread.c
++++ b/osfmk/arm64/coachz_thread.c
+@@ -1151,6 +1151,12 @@
+ 		extern void coachz_touch_start(void);
+ 		extern char coachz_touch_status[3][160], coachz_hid_status[160], coachz_hid_live[160], coachz_touch_stroke[160];
+ 		coachz_touch_start();
++		{
++			extern void coachz_bridge_start(void);
++			coachz_bridge_start();
++			extern void coachz_staged_mark_built(void);
++			coachz_staged_mark_built();
++		}
+ 		if (coachz_hid_status[0]) {
+ 			printf("%.160s\n", coachz_hid_status);
+ 		}

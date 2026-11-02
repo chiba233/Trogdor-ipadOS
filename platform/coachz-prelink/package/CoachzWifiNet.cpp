@@ -61,10 +61,10 @@ enum {
   kSsid = 1, kAuthType = 2, kCipherKey = 3, kChannel = 4, kPowerSave = 5, kTxPower = 7, kRate = 8, kBssid = 9, kScanReq = 10, kScanResult = 11,
   kCardCaps = 12, kState = 13, kPhyMode = 14, kOpMode = 15, kRssi = 16, kNoise = 17, kPower = 19, kAssociate = 20, kAssociateResult = 21,
   kDisassociate = 22, kSupportedChannels = 27, kLocale = 28, kDeauth = 29, kDriverVersion = 43, kHardwareVersion = 44, kCountryCode = 51,
-  kRadioInfo = 54, kScanReqMultiple = 86, kScanCacheClear = 90, kCurrentNetwork = 103, kChannelsInfo = 207, kHwSupportedChannels = 254,
+  kRadioInfo = 54, kScanReqMultiple = 86, kScanCacheClear = 90, kCurrentNetwork = 103, kRssiBounds = 106, kChannelsInfo = 207, kHwSupportedChannels = 254,
 };
 // events
-enum { kEvPowerChanged = 1, kEvSsidChanged = 2, kEvBssidChanged = 3, kEvLinkChanged = 4, kEvAssocDone = 9, kEvScanDone = 10 };
+enum { kEvPowerChanged = 1, kEvSsidChanged = 2, kEvBssidChanged = 3, kEvLinkChanged = 4, kEvAssocDone = 9, kEvScanDone = 10, kEvRssiChanged = 39 };
 // results of an association, as the framework numbers them
 enum { kAssocOk = 1, kAssocFailed = 2, kAssocTimeout = 9, kAssocBadKey = 21 };
 
@@ -127,7 +127,7 @@ void post_event(uint32_t code, const void *payload, size_t length) {
   msg.vendor_code = KEV_VENDOR_APPLE; msg.kev_class = 6; msg.kev_subclass = 1; msg.event_code = code;
   msg.dv[0].data_length = static_cast<uint32_t>(16 + length); msg.dv[0].data_ptr = data;
   const int error = coachz_kev_post(&msg);
-  if (code != kEvScanDone || error) log(6, "wifi-net: event %u bytes %u -> %d", code, static_cast<unsigned>(length), error);
+  if ((code != kEvScanDone && code != kEvRssiChanged) || error) log(6, "wifi-net: event %u bytes %u -> %d", code, static_cast<unsigned>(length), error);
 }
 // link state for the network configuration: the interface's flags and the stack's own link events
 void post_link(bool up) {
@@ -178,6 +178,18 @@ void visible_status(nw_wifi_status &st) {
 // ---- what the module tells us ----
 void on_scan_done() { __atomic_store_n(&gScanning, 0u, __ATOMIC_RELEASE); gScanCursor = 0; post_event(kEvScanDone, nullptr, 0); }
 // A scan answered from the cache finishes after the time a short scan takes: answered at once, the daemon asks again straight away.
+// wifid's APPLE80211_M_RSSI_CHANGED (39, from its monitoring table): nothing else tells it the signal once joined, and the status
+// bar then shows no bars. The same {version, radios, unit (0: dBm), per chain[4], aggregate, extension per chain[4], its aggregate}
+// as the kRssi request. The value is the access point's strength when the join began; the data path does not measure it yet.
+thread_call_t gRssiCall;
+void post_rssi(thread_call_param_t, thread_call_param_t) {
+  nw_wifi_status st; nw_wifi_status_get(&st);
+  if (st.state != NW_STA_UP) return;
+  const uint32_t v = static_cast<uint32_t>(static_cast<int32_t>(st.signal_dbm));
+  const uint32_t w[13] = {1, 1, 0, v, v, v, v, v, v, v, v, v, v};
+  post_event(kEvRssiChanged, w, sizeof w);
+  uint64_t at; clock_interval_to_deadline(5000, kMillisecondScale, &at); thread_call_enter_delayed(gRssiCall, at);
+}
 thread_call_t gCachedScan;
 void cached_scan_done(thread_call_param_t, thread_call_param_t) { on_scan_done(); }
 void on_connect_done(int result) {
@@ -196,6 +208,8 @@ void on_connect_done(int result) {
     nw_wifi_status st; nw_wifi_status_get(&st);
     link_event ev; memset(&ev, 0, sizeof ev); ev.rssi = st.signal_dbm; ev.noise = static_cast<uint16_t>(-95); ev.snr = static_cast<uint16_t>(st.signal_dbm + 95);
     post_event(kEvLinkChanged, &ev, sizeof ev);
+    if (!gRssiCall) gRssiCall = thread_call_allocate(post_rssi, nullptr);
+    if (gRssiCall) thread_call_enter(gRssiCall);
   }
 }
 void on_link_lost(int reason) {
@@ -400,6 +414,9 @@ int apple80211(bool set, apple80211req &rq) {
   case kSsid: if (st.state < NW_STA_ASSOC) return ENOENT; return answer_bytes(rq, st.ssid, st.ssid_len);
   case kBssid: if (st.state < NW_STA_ASSOC) return ENOENT; return answer_bytes(rq, st.bssid, 6);
   case kChannel: if (st.state < NW_STA_AUTH) return ENOENT; w[0] = 1; fill_channel(*reinterpret_cast<channel *>(out.raw + 4), st.freq_mhz); return copy_out(rq, w, 16);
+  // wifid's RSSI_MIN, RSSI_MAX and RSSI_THRESHOLD. Without them all three stay 0: it scales every signal to no bars and calls
+  // every known network "Below minimum RSSI threshold", so nothing auto-joins and the status bar icon stays empty.
+  case kRssiBounds: { const uint32_t w[4] = {1, static_cast<uint32_t>(-95), static_cast<uint32_t>(-40), static_cast<uint32_t>(-85)}; return answer_bytes(rq, w, sizeof w); }
   case kRssi: case kNoise: {   // {version, radios, unit (0: dBm), per chain[4], aggregate, extension per chain[4], its aggregate}
     if (type == kRssi && st.state != NW_STA_UP) return ENOENT;
     const uint32_t v = static_cast<uint32_t>(type == kRssi ? static_cast<int32_t>(st.signal_dbm) : -95);
@@ -411,8 +428,14 @@ int apple80211(bool set, apple80211req &rq) {
   case kAssociateResult: return answer_value(rq, static_cast<uint32_t>(gAssocResult));
   case kSupportedChannels: case kHwSupportedChannels: {
     out.chans.version = 1; unsigned n = 0;
+    // ath10k's channels. wifid's auto-join skips a known network on a channel missing here ("BSS channel ... is not supported"),
+    // so a network on a DFS channel only ever joined by hand. DFS channels and 12-13 are passive: flag 0x100 is DFS, 0x80 active scan.
     static const uint16_t known[] = { 2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 5180, 5200, 5220, 5240, 5745, 5765, 5785, 5805, 5825 };
+    static const uint16_t passive[] = { 2467, 2472 };
+    static const uint16_t dfs[] = { 5260, 5280, 5300, 5320, 5500, 5520, 5540, 5560, 5580, 5600, 5620, 5640, 5660, 5680, 5700, 5720 };
     for (uint16_t f : known) { fill_channel(*reinterpret_cast<channel *>(&out.chans.list[n]), f); out.chans.list[n].flags |= 0x80; n++; }
+    for (uint16_t f : passive) { fill_channel(*reinterpret_cast<channel *>(&out.chans.list[n]), f); n++; }
+    for (uint16_t f : dfs) { fill_channel(*reinterpret_cast<channel *>(&out.chans.list[n]), f); out.chans.list[n].flags |= 0x100; n++; }
     out.chans.count = n; return copy_out(rq, &out.chans, sizeof out.chans); }
   case kScanResult: {
     nw_bss_info b; const int count = nw_wifi_bss_count();

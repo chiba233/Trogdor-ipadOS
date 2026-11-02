@@ -292,7 +292,8 @@ void coachz_usb_hid_poll(void) {
 			}
 		}
 	}
-	if (root_disk && !(++keyboard_ticks % 32)) {
+	/* With no USB disk on_disk_path() is false for every hub, so the base can still be attached after boot. */
+	if (!(++keyboard_ticks % 32)) {
 		poll_other_hubs();
 	}
 }

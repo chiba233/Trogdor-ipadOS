@@ -1,0 +1,42 @@
+--- a/bsd/dev/coachz_touch.c
++++ b/bsd/dev/coachz_touch.c
+@@ -928,6 +928,14 @@
+ 		return;
+ 	}
+ 	started = true;
++	/* The panel scans landscape and the system's native frame is portrait (coachz-orientation, /chosen/display-rotation): with the
++	 * top of that frame at the panel's left edge, x runs up the panel and y along it. */
++	{
++		int rotated = 0;
++		if (PE_parse_boot_argn("coachz-orientation", &rotated, sizeof(rotated)) && rotated == 1) {
++			touch_flip = 2 | 4;
++		}
++	}
+ 	(void)PE_parse_boot_argn("coachz-touch-flip", &touch_flip, sizeof(touch_flip));
+ 	if (kernel_thread_start(touch_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+--- a/iokit/Kernel/CoachzMotion.cpp
++++ b/iokit/Kernel/CoachzMotion.cpp
+@@ -93,6 +93,7 @@
+         }
+         unsigned follow = 0;
+         followGravity = PE_parse_boot_argn("coachz-orientation", &follow, sizeof(follow)) && follow == 1;
++        if (followGravity) derived = 3;   // UIDeviceOrientationLandscapeLeft: how the machine stands on its base
+         if (accelSensor >= 0 && gyroSensor >= 0) coachz_motion_ready = 1;
+     }
+ 
+@@ -114,6 +115,14 @@
+             const int sign = i < 2 ? -1 : 1;
+             accel[i] = (int32_t)(sign * (int64_t)rawAccel[i] * accelRange * 1000 / 32768);                  // milli-g
+             gyro[i] = gyroError ? 0 : (int32_t)(sign * (int64_t)rawGyro[i] * gyroRange * 17453 / 32768 / 1000);   // milliradians per second
++        }
++        if (followGravity) {
++            // The device frame with the system's native portrait: its top at the panel's left edge, as /chosen/display-rotation says.
++            const int32_t ax = accel[0], gx = gyro[0];
++            accel[0] = accel[1];
++            accel[1] = -ax;
++            gyro[0] = gyro[1];
++            gyro[1] = -gx;
+         }
+         const int32_t next = orientationOf(derived, accel);
+         if (next != derived) {

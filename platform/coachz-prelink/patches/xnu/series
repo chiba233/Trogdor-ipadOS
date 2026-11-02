@@ -123,3 +123,6 @@ coachz-prelink-gpu-grant-all.patch
 coachz-prelink-dataprotect.patch
 coachz-prelink-gpu-map-grant.patch
 coachz-prelink-disabled-jobs.patch
+coachz-prelink-bridge-depth.patch
+coachz-prelink-staged-apps.patch
+coachz-prelink-rotation.patch

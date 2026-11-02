@@ -30,6 +30,17 @@ void thread_deallocate(thread_t);
 
 // The eMMC's one gate: the log ring (NativeRamBlock.cpp) writes beside block I/O, and the driver serves one transfer at a time.
 static IOLock *emmc_gate;
+extern "C" int coachz_mmc_log_read(uint64_t block, void *out)
+{
+  void *data = nullptr;
+  if (!emmc_gate) return 0;
+  IOLockLock(emmc_gate);
+  const int done = coachz_sdcc_read(0, block, 1, &data);
+  if (done && data) memcpy(out, data, 512);
+  IOLockUnlock(emmc_gate);
+  return done && data;
+}
+
 extern "C" int coachz_mmc_log_write(uint64_t block, uint32_t count, const void *data)
 {
   if (!emmc_gate) return 0;

@@ -177,7 +177,11 @@ int coachz_display_start(void) {
        video.v_rotate || video.v_width>16384 || video.v_height>16384 || video.v_rowBytes<video.v_width*4 ||
        video.v_rowBytes>UINT64_MAX/video.v_height)return EINVAL;
     IORegistryEntry *chosen=IORegistryEntry::fromPath("/chosen",gIODTPlane);
-    bool scale=chosen && word(chosen,"display-scale",2) && word(chosen,"display-rotation",video.v_rotate);
+    // The panel scans landscape while the system's native frame is portrait. MobileGestalt turns this into main-screen-orientation
+    // ((360 - degrees) % 360) and QuartzCore composites for it, so nothing rotates after the render server. The console is not rotated.
+    int rotated=0;
+    const bool portrait=PE_parse_boot_argn("coachz-orientation",&rotated,sizeof(rotated)) && rotated==1;
+    bool scale=chosen && word(chosen,"display-scale",2) && word(chosen,"display-rotation",portrait?270:video.v_rotate);
     OSSafeReleaseNULL(chosen);if(!scale)return EINVAL;
     IOService *display=native_legacy_display_allocate();
     if(!display || !display->metaCast("IOMobileFramebufferLegacy") || !display->metaCast("IOMobileFramebuffer"))return EIO;
