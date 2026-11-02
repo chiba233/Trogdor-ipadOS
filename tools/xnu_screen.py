@@ -179,7 +179,7 @@ def smp_tree(root, count):
 
 
 def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=True, root_uuid=None, cpus=1,
-                 full_screen=False, gmu_firmware_size=0, sqe_firmware_size=0, gpu_addon_size=0, motion_probe=False, wifi_mac=None):
+                 full_screen=False, gmu_firmware_size=0, sqe_firmware_size=0, gpu_addon_size=0, motion_probe=False, wifi_mac=None, gestalt_cache=None):
     root = read_tree(adt)
     if cpus > 1:
         smp_tree(root, cpus)
@@ -193,6 +193,9 @@ def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=T
             apply_identity(root.child(name), FULL_SCREEN_IDENTITY[name])
     if environment:
         root.child('chosen').set('osenvironment', environment.encode() + b'\0')
+    if gestalt_cache:
+        # MobileGestalt's cached answers: the kernel writes them before launchd (coachz-prelink-smart-cover.patch).
+        root.child('chosen').set('coachz-mgcache', gestalt_cache)
     if root_uuid:
         root.child('chosen').set('root-matching', root_matching(root_uuid))
         # mount -P 1 of the original launchd exits 66 without it. An identity of this unsigned image set,
@@ -251,7 +254,7 @@ def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=T
 
 def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=False, root_cache=None, root_device=None,
          root_uuid=None, data_seed=None, data_uuid=None, display=False, cpus=1, gpu=0, gmu_firmware=None, sqe_firmware=None, gpu_addon=None,
-         diagnostics=False, wifi_mac=None, root_emmc=False):
+         diagnostics=False, wifi_mac=None, root_emmc=False, gestalt_cache=None):
     if window & 0x1fffff or memory & 0x1fffff:
         raise ValueError('window base and size must be 2 MiB aligned')
     kernel = macho(data)
@@ -375,7 +378,7 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         ramdisk += bytes(-len(ramdisk) % 4096)
         # The restore volume, from memory or from disk, runs as the restore OS environment; the main OS does not.
         environment = 'restore' if root_cache and not root_uuid else None
-        adt = prelink_tree(adt, window, tree, ramdisk, cache, environment, wifi_mac=wifi_mac, ram_root=not disk_root or bool(data_seed),
+        adt = prelink_tree(adt, window, tree, ramdisk, cache, environment, wifi_mac=wifi_mac, gestalt_cache=gestalt_cache, ram_root=not disk_root or bool(data_seed),
                            root_uuid=root_uuid, cpus=cpus, full_screen=display,
                            gmu_firmware_size=len(gmu_firmware) if gmu_firmware else 0, sqe_firmware_size=len(sqe_firmware) if sqe_firmware else 0, gpu_addon_size=len(gpu_addon) if gpu_addon else 0, motion_probe=diagnostics)
         ramdisk = ramdisk + cache + bytes(-len(cache) % 4096)
@@ -424,6 +427,7 @@ def main():
     p.add_argument('--smp', type=int, default=1, help='main OS: start CPU0..N-1 (up to 8) through PSCI')
     p.add_argument('--gpu', type=int, default=0, help='prelinked: Adreno 618 bring-up stage 1 to 8, or 9 for the driver (docs/plans/gpu.md)')
     p.add_argument('--root-emmc', action='store_true', help='the system, Data and the log ring on the eMMC partitions the owner carved')
+    p.add_argument('--gestalt-cache', type=Path, help='a MobileGestalt cache plist the kernel writes before launchd; device data, keep it out of the repository')
     p.add_argument('--wifi-mac', type=Path, help='a file with 12 hex digits: the Wi-Fi address this image uses on every boot')
     p.add_argument('--gpu-addon', type=Path, help='with --gpu 9: the Metal plug-in addon from tools/xnu_gpu_userland.py')
     p.add_argument('--sqe-firmware', type=Path, help='with --gpu 8 or 9: the CP firmware, linux-firmware qcom/a630_sqe.fw')
@@ -446,7 +450,8 @@ def main():
                    gpu=a.gpu, gmu_firmware=a.gmu_firmware.read_bytes() if a.gmu_firmware else None,
                    sqe_firmware=a.sqe_firmware.read_bytes() if a.sqe_firmware else None,
                    gpu_addon=a.gpu_addon.read_bytes() if a.gpu_addon else None, diagnostics=a.diagnostics,
-                   wifi_mac=a.wifi_mac.read_text().strip() if a.wifi_mac else None, root_emmc=a.root_emmc)
+                   wifi_mac=a.wifi_mac.read_text().strip() if a.wifi_mac else None, root_emmc=a.root_emmc,
+                   gestalt_cache=a.gestalt_cache.read_bytes() if a.gestalt_cache else None)
     a.output.parent.mkdir(parents=True, exist_ok=True)
     a.output.write_bytes(payload)
     print('Built screen-output XNU payload', hashlib.sha256(payload).hexdigest())

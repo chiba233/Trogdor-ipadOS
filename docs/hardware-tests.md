@@ -1595,3 +1595,9 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 - **基带**：握手完成后 `COACHZ modem: rmnet_ipa0 registered (raw IP, MTU 1500; rmnet data devices MTU 1492, data format 0xd)`，`rmnet_ipa0 up: TX channel 0 (505 slots), RX endpoint 9 with 251 buffers, IRQ_SUSPEND_EN 0x300`，GSI 通道 0 和 3 的状态都是 2（started）。这次启动在第一个 40 秒内的周期记录里，modem RX 的 packets、delivered、dropped 和 TX packets 都是 0，和没有数据呼叫相符。启动在别的原因下 panic 了，所以这里没有长时间运行的记录。
 - **麦克风**：采集环 256 KiB。两次开机的自检都完整跑完，3236 ms 内 150610 和 150708 帧，没有错误、没有重启，两路都有信号，之后干净停止。录音还没有重新测。
 
+## 磁吸盖和显示帧
+
+- **磁吸盖**：能力项 `hall-effect-sensor` 由内核写进 MobileGestalt 缓存的 `CacheExtra` 后，backboardd 建起 Smart Cover 处理器并来查询传感器。原版 `parseKeyboardElement` 不保留 `0xff09` 页，所以传感器元素在驱动启动后加入它的键盘元素表（数组已在 registry 中不可变，换一份副本），查询和事件都走这张表。两次失败都在这一步：改动不可变数组，以及匹配到没有值的集合元素。修好后机主确认合上熄屏、打开亮屏。
+- **显示帧**：转屏的目标面改成私有纹理后，机主确认方向和画面正确，Wi-Fi 也能自动连上；流畅度机主不确定。
+- **录音**：语音备忘录能录到波形，回放是炸麦声。
+

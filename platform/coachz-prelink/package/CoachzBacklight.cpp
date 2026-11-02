@@ -120,10 +120,15 @@ bool setNumber(OSDictionary *dictionary, const char *key, uint32_t value) {
 }
 }  // namespace
 
+class CoachzBacklight;
+static CoachzBacklight *gCoverBacklight;
+
 class CoachzBacklight : public AppleARMBacklight {
 	OSDeclareDefaultStructors(CoachzBacklight)
 	IOLock *lock = nullptr;
 	uint64_t request = 0;            // 1 << 63 | duty << 32 | fade ms, taken by the worker
+	uint32_t coverClosed = 0;        // the magnetic cover is closed: the panel stays dark and requests only move the target
+	uint32_t coverChanged = 0;
 	uint32_t mode = 0;               // coachz-backlight: 1 CoreBrightness service, 2 EC sweep without backlight-control
 	uint32_t applied = 0, readback = 0, sets = 0, errors = 0;
 	int lastError = 0;
@@ -172,6 +177,17 @@ class CoachzBacklight : public AppleARMBacklight {
 		IOLockUnlock(lock);
 	}
 
+public:
+	// The magnetic cover: the worker turns the panel's light off at once, and back to the current target when it opens.
+	void setCover(bool closed) {
+		IOLockLock(lock);
+		__atomic_store_n(&coverClosed, closed ? 1u : 0u, __ATOMIC_RELEASE);
+		__atomic_store_n(&coverChanged, 1u, __ATOMIC_RELEASE);
+		IOLockWakeup(lock, &request, true);
+		IOLockUnlock(lock);
+	}
+
+private:
 	void apply(uint32_t duty) {
 		const int error = pwmSet(duty);
 		sets++;
@@ -216,6 +232,25 @@ class CoachzBacklight : public AppleARMBacklight {
 		}
 		for (;;) {
 			const uint64_t taken = __atomic_exchange_n(&request, 0, __ATOMIC_ACQ_REL);
+			const bool closed = __atomic_load_n(&coverClosed, __ATOMIC_ACQUIRE) != 0;
+			if (__atomic_exchange_n(&coverChanged, 0, __ATOMIC_ACQ_REL)) {
+				if (taken) {
+					to = (uint32_t)(taken >> 32) & 0xffff;
+				}
+				moving = false;
+				apply(closed ? 0 : to);
+				settle(closed ? 0 : to);
+			} else if (closed && taken) {
+				to = (uint32_t)(taken >> 32) & 0xffff;
+			}
+			if (closed) {
+				IOLockLock(lock);
+				while (!__atomic_load_n(&request, __ATOMIC_ACQUIRE) && !__atomic_load_n(&coverChanged, __ATOMIC_ACQUIRE)) {
+					IOLockSleep(lock, &request, THREAD_UNINT);
+				}
+				IOLockUnlock(lock);
+				continue;
+			}
 			if (taken) {
 				from = applied;
 				to = (uint32_t)(taken >> 32) & 0xffff;
@@ -225,7 +260,7 @@ class CoachzBacklight : public AppleARMBacklight {
 			}
 			if (!moving) {
 				IOLockLock(lock);
-				while (!__atomic_load_n(&request, __ATOMIC_ACQUIRE)) {
+				while (!__atomic_load_n(&request, __ATOMIC_ACQUIRE) && !__atomic_load_n(&coverChanged, __ATOMIC_ACQUIRE)) {
 					IOLockSleep(lock, &request, THREAD_UNINT);
 				}
 				IOLockUnlock(lock);
@@ -284,6 +319,7 @@ public:
 			IOService::stop(provider);
 			return false;
 		}
+		gCoverBacklight = this;
 		thread_deallocate(worker);
 		setName("CoachzPanelBacklight");
 		return true;
@@ -355,4 +391,11 @@ extern "C" IOService *
 coachz_backlight_allocate(void)
 {
 	return new CoachzBacklight;
+}
+
+// CoachzInput.cpp's cover state: nothing until the service has started; the switch reports again on the next change.
+extern "C" void coachz_backlight_cover(int closed) {
+	if (gCoverBacklight) {
+		gCoverBacklight->setCover(closed != 0);
+	}
 }
