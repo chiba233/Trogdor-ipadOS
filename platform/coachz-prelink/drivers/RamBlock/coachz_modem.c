@@ -2,7 +2,8 @@
 /*
  * Connects modem/ (mainline's ipa_config, ipa_setup and the IPA QMI handshake) to the modem start in bsd/dev/coachz_wifi.c, in
  * mainline's order: coachz_modem_configure before the modem boots, coachz_modem_starting as its start begins, coachz_modem_setup once
- * it raises ipa-setup-ready, then the handshake over QRTR. It stops where mainline calls ipa_modem_start.
+ * it raises ipa-setup-ready, then the handshake over QRTR and ipa_modem_start with rmnet_ipa0 open. No data call exists yet: that needs
+ * QMI control (WDA data format, WDS bind mux and start network), so no packet is expected.
  *
  * Polled from the Wi-Fi thread's millisecond loop instead of SPI 311 and 432. The WLAN firmware shares this modem, so every failure is
  * printed and turns the rest of this sequence off; nothing here stops the Wi-Fi sequence.
@@ -12,6 +13,7 @@
  */
 #include "coachz_ipa_cmd.c"
 #include "coachz_ipa_rx.c"
+#include "coachz_ipa_modem.c"
 #include "coachz_ipa_qmi.h"
 
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
@@ -31,13 +33,19 @@ void coachz_modem_report(unsigned);
 #define CM_CMD_BYTES 0x4000u
 #define CM_ZERO_PA   0x81710000ull
 #define CM_ZERO_BYTES 0x2000u
+#define CM_MODEM_RX_PA 0x82000000ull
+#define CM_MODEM_RX_BYTES 0x200000u
+#define CM_MODEM_TX_PA 0x82200000ull
+#define CM_MODEM_TX_BYTES 0x100000u
 
 enum { CM_OFF, CM_CONFIGURED, CM_SET_UP };
 
 static struct coachz_ipa cm_ipa;
 static struct coachz_gsi cm_gsi;
 static struct coachz_ipa_cmd cm_cmd;
-static struct coachz_ipa_rx cm_lan;
+static struct coachz_ipa_rx cm_lan, cm_modem_rx;
+static struct coachz_ipa_modem cm_modem;
+static int cm_modem_open;
 static struct ci_handshake cm_hs;
 static int cm_state;
 static int (*cm_send)(int client, uint32_t node, uint32_t port, const void *message, uint32_t length);
@@ -75,6 +83,30 @@ coachz_modem_starting(void)
     if (cm_state != CM_OFF) coachz_ipa_modem_starting(&cm_ipa);
 }
 
+static uint32_t
+cm_channel_state(uint32_t id)
+{
+    return cgs_state(gsi_rd(&cm_gsi, CGSI_CH_C_CNTXT_0 + id * CGSI_CH_C_CNTXT_0_STRIDE));
+}
+
+/* ipa_modem_start and opening rmnet_ipa0, which is as far as Linux goes before a data call. */
+static void
+cm_modem_start(void)
+{
+    void *rx = (void *)ml_io_map_wcomb((vm_offset_t)CM_MODEM_RX_PA, CM_MODEM_RX_BYTES);
+    void *tx = (void *)ml_io_map_wcomb((vm_offset_t)CM_MODEM_TX_PA, CM_MODEM_TX_BYTES);
+    int err = !rx || !tx ? -1 : coachz_ipa_rx_init(&cm_modem_rx, &cm_ipa, &cm_gsi, CIPA_EP_AP_MODEM_RX, rx, CM_MODEM_RX_PA, CM_MODEM_RX_BYTES);
+    if (!err) err = coachz_ipa_modem_init(&cm_modem, &cm_ipa, &cm_gsi, &cm_modem_rx, tx, CM_MODEM_TX_PA, CM_MODEM_TX_BYTES);
+    if (!err) err = coachz_ipa_modem_start(&cm_modem);
+    if (!err) err = coachz_ipa_modem_open(&cm_modem);
+    if (err) {
+        printf("COACHZ modem: data path failed (%d), the modem and Wi-Fi go on without it\n", err);
+        return;
+    }
+    cm_modem_open = 1;
+    printf("COACHZ modem: channel states TX 0:%u RX 3:%u\n", cm_channel_state(0), cm_channel_state(3));
+}
+
 static void
 cm_step(void)
 {
@@ -89,7 +121,10 @@ cm_step(void)
             ci_indication_sent(&cm_hs);
             continue;
         }
-        if (step.start_modem) printf("COACHZ ipa: handshake complete; ipa_modem_start is next\n");
+        if (step.start_modem) {
+            printf("COACHZ ipa: handshake complete, starting the modem endpoints\n");
+            cm_modem_start();
+        }
         return;
     }
 }
@@ -188,6 +223,15 @@ coachz_modem_poll(void)
         cm_gsi.ieob_pending &= ~(1u << cm_lan.evt_ring);
         coachz_ipa_rx_poll(&cm_lan);
     }
+    if (!cm_modem_open) return;
+    if (cm_gsi.ieob_pending & (1u << cm_modem_rx.evt_ring)) {
+        cm_gsi.ieob_pending &= ~(1u << cm_modem_rx.evt_ring);
+        coachz_ipa_rx_poll(&cm_modem_rx);
+    }
+    if (cm_gsi.ieob_pending & (1u << cm_modem.tx_evt_ring)) {
+        cm_gsi.ieob_pending &= ~(1u << cm_modem.tx_evt_ring);
+        coachz_ipa_modem_tx_poll(&cm_modem);
+    }
 }
 
 /* What the handshake and LAN RX have seen, with the Wi-Fi thread's periodic report. */
@@ -198,4 +242,6 @@ coachz_modem_report(unsigned second)
     printf("COACHZ ipa: %u s: uc_loaded %d modem_ready %d uc_ready %d indication %d/%d, LAN RX packets %llu delivered %llu dropped %llu\n",
         second, cm_ipa.uc_loaded, cm_hs.modem_ready, cm_hs.uc_ready, cm_hs.indication_requested, cm_hs.indication_sent,
         cm_lan.packets, cm_lan.delivered, cm_lan.dropped);
+    if (cm_modem_open) printf("COACHZ modem: %u s: channels TX 0:%u RX 3:%u, modem RX packets %llu delivered %llu dropped %llu, TX packets %llu\n",
+        second, cm_channel_state(0), cm_channel_state(3), cm_modem_rx.packets, cm_modem_rx.delivered, cm_modem_rx.dropped, cm_modem.tx_packets);
 }

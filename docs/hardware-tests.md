@@ -1590,3 +1590,8 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 - **卡顿**：机主打开“降低透明度”和“减弱动态效果”后还是很卡，转屏和 Wi-Fi 正常。稳定使用时 8 核约 30–60% 忙，`backboardd` 每 10 秒占 5–7 秒 CPU，GPU 忙碌率 18–85%，提交到完成平均 24.5 ms。前端的压缩统计用 `NSLog` 写，系统日志里没有出现，这次没有拿到数据。
 - **同机 Debian 对照**（2160x1440 glmark2，texture/shadow FPS）：默认 760/378，`noubwc` 330/106，`nogmem,noubwc` 327/103，`notile` 337/126，`nogmem,notile` 338/121。差距在 UBWC，tile 内存和不压缩的 tile 布局都不提速。
 
+## 基带数据通路和麦克风采集
+
+- **基带**：握手完成后 `COACHZ modem: rmnet_ipa0 registered (raw IP, MTU 1500; rmnet data devices MTU 1492, data format 0xd)`，`rmnet_ipa0 up: TX channel 0 (505 slots), RX endpoint 9 with 251 buffers, IRQ_SUSPEND_EN 0x300`，GSI 通道 0 和 3 的状态都是 2（started）。这次启动在第一个 40 秒内的周期记录里，modem RX 的 packets、delivered、dropped 和 TX packets 都是 0，和没有数据呼叫相符。启动在别的原因下 panic 了，所以这里没有长时间运行的记录。
+- **麦克风**：采集环 256 KiB。两次开机的自检都完整跑完，3236 ms 内 150610 和 150708 帧，没有错误、没有重启，两路都有信号，之后干净停止。录音还没有重新测。
+

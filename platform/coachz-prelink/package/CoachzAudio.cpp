@@ -11,7 +11,7 @@
 #include <libkern/c++/OSMetaClass.h>
 #include <libkern/c++/OSSymbol.h>
 #include <kern/clock.h>
-#include <kern/thread_call.h>
+#include <kern/thread.h>
 #include <mach/kmod.h>
 #include "CoachzAudioAbi.h"
 #include "CoachzMicXnu.hpp"
@@ -24,6 +24,8 @@ vm_offset_t phystokv(uint64_t pa);
 uint64_t pmap_find_pa(void *pmap, uint64_t va);
 void coachz_audio_static_init(void) __asm__("__GLOBAL__sub_I_CoachzAudio.cpp");
 void coachz_audio_start(void);
+kern_return_t kernel_thread_start_priority(thread_continue_t, void *, integer_t, thread_t *);
+void thread_deallocate(thread_t);
 int coachz_rpmh_vreg_request(unsigned consumer, const char *resource, uint32_t mv, int hpm, int enable);
 }
 
@@ -46,6 +48,10 @@ const uint32_t kTickMs = 10;
 // SMMU is in bypass (sCR0 CLIENTPD), so LPASS's capture stream sees it at this physical address. The speaker's RDMA1 stays as it is.
 const uint64_t kMicDmaPa = 0x81300000;
 const unsigned kMicRailConsumer = 3;                 // coachz_rpmh_vreg_request's identity for this rail vote
+// The capture's worker runs here. Under full load a 10 ms thread call came more than 64 ms late, so it has a thread of its own above user work.
+const integer_t kTickPriority = 91;
+// After a failed capture a client's recording starts again, with a hole in it, no more often than this.
+const uint32_t kMicRestartTicks = 50;
 // One short capture at boot, before any client: a second after the service starts, for three seconds. Only counters and peaks are kept.
 const uint32_t kMicTestStartTick = 100, kMicTestStopTick = 400;
 
@@ -84,7 +90,6 @@ IOBufferMemoryDescriptor *controlMemory, *inputMemory;
 IOMemoryDescriptor *outputMemory;
 CoachzAudioControl *control;
 volatile uint32_t *ring;
-thread_call_t tickCall;
 uint64_t ticksPerFrame, wraps, cleared;
 uint32_t lastIndex;
 bool anchored;
@@ -94,7 +99,8 @@ uint32_t badReads, adjustments;
 CoachzMic::XnuBinding *microphone;
 CoachzMicShared *micStatus;
 void *micOwner;
-uint32_t micTicks;
+uint32_t micTicks, micRestartWait, micRestarts;
+uint64_t micWorstGap;
 
 // ADAU7002's IOVDD, pp1800_l15a. A refused enable takes its own vote back, so the rail is not left counted for this consumer.
 int micSupply(void *, bool on) {
@@ -109,10 +115,11 @@ int micSupply(void *, bool on) {
 }
 
 void micReport(const char *why) {
-	printf("COACHZ mic: %s: state %u error %u generation %u frames %llu first %llu written %llu peak %u/%u nonzero %u/%u irq %u/%u misses %u\n",
+	printf("COACHZ mic: %s: state %u error %u generation %u frames %llu first %llu written %llu peak %u/%u nonzero %u/%u irq %u/%u misses %u restarts %u worst tick gap %llu ms\n",
 	    why, micStatus->state, micStatus->error, micStatus->generation, micStatus->frames_copied, micStatus->first, micStatus->written,
 	    micStatus->peak[0], micStatus->peak[1], micStatus->nonzero[0], micStatus->nonzero[1], micStatus->irq_periods, micStatus->irq_faults,
-	    reinterpret_cast<CoachzAudioDiag *>(reinterpret_cast<uint8_t *>(control) + COACHZ_AUDIO_DIAG_OFFSET)->in_misses);
+	    reinterpret_cast<CoachzAudioDiag *>(reinterpret_cast<uint8_t *>(control) + COACHZ_AUDIO_DIAG_OFFSET)->in_misses, micRestarts, ticksPerFrame ? micWorstGap / (ticksPerFrame * 48) : 0);
+	micWorstGap = 0;
 }
 
 void micState(bool running) {
@@ -143,7 +150,7 @@ void micSelfTest(uint64_t now) {
 }
 
 // The play position from the DMA, the clearing behind it, and the one timeline's anchor, corrected only when it has really moved.
-void tick(thread_call_param_t, thread_call_param_t) {
+void tick(void *, void *) {
 	const uint64_t now = mach_absolute_time();
 	const uint32_t current = rd(kDmaCurr);
 	const uint32_t index = (current - (uint32_t)kRingPa) / 4;
@@ -178,13 +185,27 @@ void tick(thread_call_param_t, thread_call_param_t) {
 				micSelfTest(now);
 				micTicks++;
 			}
-			const int polled = microphone->poll(mach_absolute_time(), control->out_anchor_host, ticksPerFrame);
+			static uint64_t lastTick;
+			const uint64_t polledAt = mach_absolute_time();
+			if (lastTick && polledAt - lastTick > micWorstGap) {
+				micWorstGap = polledAt - lastTick;
+			}
+			lastTick = polledAt;
+			const int polled = microphone->poll(polledAt, control->out_anchor_host, ticksPerFrame);
 			static int lastPolled;
 			if (polled != lastPolled) {
 				lastPolled = polled;
 				micReport(polled ? "capture failed" : "capture recovered");
 				if (polled) {
 					micState(false);
+				}
+			}
+			if (polled && micOwner && ++micRestartWait >= kMicRestartTicks) {
+				micRestartWait = 0;
+				micRestarts++;
+				const int started = microphone->start(0);
+				if (started && micRestarts <= 8) {
+					printf("COACHZ mic: restart %u refused: %d\n", micRestarts, started);
 				}
 			}
 			control->in_frames = micStatus->frames_copied;
@@ -200,9 +221,13 @@ void tick(thread_call_param_t, thread_call_param_t) {
 	} else if (!badReads++) {
 		printf("COACHZ audio: DMA position 0x%x outside the ring\n", current);
 	}
-	uint64_t deadline;
-	clock_interval_to_deadline(kTickMs, NSEC_PER_MSEC, &deadline);
-	thread_call_enter_delayed(tickCall, deadline);
+}
+
+void tickThread(void *, wait_result_t) {
+	for (;;) {
+		tick(nullptr, nullptr);
+		IOSleep(kTickMs);
+	}
 }
 
 // CoreAudio takes the host clock to be 24 MHz, the timer of Apple's chips: AudioGetHostClockFrequency and the audio server's IO clock read
@@ -350,8 +375,7 @@ extern "C" void coachz_audio_start(void) {
 	controlMemory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, (IOOptionBits)kIODirectionInOut | kIOMemoryKernelUserShared, 4096, 4096);
 	inputMemory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, (IOOptionBits)kIODirectionInOut | kIOMemoryKernelUserShared, kInputBytes, 4096);
 	outputMemory = IOMemoryDescriptor::withPhysicalAddress(kRingPa, kRingBytes, kIODirectionInOut);
-	tickCall = thread_call_allocate(tick, nullptr);
-	if (!ringVa || !controlMemory || !inputMemory || !outputMemory || !tickCall || !reg(kLpass + kDmaCtl) || !reg(kLpass + kI2sCtl) ||
+	if (!ringVa || !controlMemory || !inputMemory || !outputMemory || !reg(kLpass + kDmaCtl) || !reg(kLpass + kI2sCtl) ||
 	    !reg(kLpass + kIrqEn) || !reg(kLpass + kBitBranch) || !reg(kLpass + kModeMux) || !reg(kAmpCfg)) {
 		printf("COACHZ audio: no memory or mappings\n");
 		return;
@@ -409,7 +433,12 @@ extern "C" void coachz_audio_start(void) {
 		printf("COACHZ mic: not prepared\n");
 		microphone = nullptr;
 	}
-	tick(nullptr, nullptr);
+	thread_t tickWorker = nullptr;
+	if (kernel_thread_start_priority(tickThread, nullptr, kTickPriority, &tickWorker) == KERN_SUCCESS) {
+		thread_deallocate(tickWorker);
+	} else {
+		printf("COACHZ audio: no worker thread\n");
+	}
 	// Registered now rather than at boot, like the other late classes here.
 	const OSSymbol *name = OSSymbol::withCString("CoachzAudio");
 	const bool absent = name && !OSMetaClass::getMetaClassWithName(name);

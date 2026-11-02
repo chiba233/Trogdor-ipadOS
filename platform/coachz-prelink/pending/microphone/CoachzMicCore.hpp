@@ -23,7 +23,9 @@ enum : uint32_t {
     RcgFields = 0x1fu | (7u << 8) | (3u << 12) | (1u << 20)
 };
 static_assert(DmaFormat == 0x0022100e, "WRDMA fields differ from RDMA");
-static_assert(COACHZ_MIC_DMA_FRAMES == 6144, "48 KiB stereo S32 ring");
+static_assert(COACHZ_MIC_DMA_FRAMES == 32768, "256 KiB stereo S32 ring");
+// Half the ring is 341 ms: the worker must have copied before the producer can overwrite the oldest unread sample.
+enum : uint32_t {DeadlineUs = 320000u};
 static_assert(sizeof(CoachzMicShared) + COACHZ_MIC_CONTROL_OFFSET <= 2048,
     "microphone status must not overlap existing diagnostics");
 
@@ -163,14 +165,14 @@ public:
         if (__atomic_load_n(&faults_, __ATOMIC_RELAXED)) return fail(CoachzMicDmaFault);
         uint32_t index;
         if (!position(index)) return fail(CoachzMicPosition);
-        // 48 KiB is 128 ms; a half-ring deadline leaves time to copy before
+        // 256 KiB is 683 ms; a half-ring deadline leaves time to copy before
         // the producer can overwrite our oldest unread sample. Lost/coalesced
         // IRQs cannot manufacture another wrap. Ask the owner to restart.
-        if (now < lastUs_ || now - lastUs_ >= 64000u) return fail(CoachzMicOverrun);
+        if (now < lastUs_ || now - lastUs_ >= DeadlineUs) return fail(CoachzMicOverrun);
         const uint32_t count = (index + COACHZ_MIC_DMA_FRAMES - lastIndex_) % COACHZ_MIC_DMA_FRAMES;
         if (count >= COACHZ_MIC_DMA_FRAMES / 2) return fail(CoachzMicOverrun);
         if (count) stalledUs_ = now;
-        else if (now - stalledUs_ >= 64000u) return fail(CoachzMicStoppedDma);
+        else if (now - stalledUs_ >= DeadlineUs) return fail(CoachzMicStoppedDma);
         lastUs_ = now;
         if (now - startedUs_ < 80000u || !ticksPerFrame || host < anchor) {
             lastIndex_ = index;
@@ -205,7 +207,7 @@ public:
         const uint64_t copyEnd = ops_.nowUs(ops_.context);
         // The source began at most a half-ring behind. Never publish a copy
         // that might have been overtaken, even when the final cursor wraps.
-        const bool valid = copyEnd >= copyStart && copyEnd - copyStart < 64000u &&
+        const bool valid = copyEnd >= copyStart && copyEnd - copyStart < DeadlineUs &&
             !__atomic_load_n(&faults_, __ATOMIC_RELAXED);
         if (valid) {
             range(out - shared_->first > capacity_ ? out - capacity_ : shared_->first, out);

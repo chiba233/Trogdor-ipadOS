@@ -73,7 +73,7 @@ int main() {
         m.regs[Irq] = 7u << 3; // unrelated DMA channel stays enabled
         m.warm();
         assert(m.regs[Dma] == 0x22100f);
-        assert(m.regs[Dma + 8] == 12287 && m.regs[Dma + 16] == 6143);
+        assert(m.regs[Dma + 8] == COACHZ_MIC_DMA_BYTES / 4 - 1 && m.regs[Dma + 16] == COACHZ_MIC_PERIOD_BYTES / 4 - 1);
         assert(m.regs[Rcg + 8] == 1 && m.regs[Rcg + 12] == 0xfffc && m.regs[Rcg + 16] == 0xfffb);
         assert((m.regs[I2s] & I2sOwned) == 0x212);
         for (unsigned i = 0; i < COACHZ_MIC_DMA_FRAMES; ++i) {
@@ -111,7 +111,7 @@ int main() {
     }
     {
         Model m; m.warm();
-        assert(m.step(150000) == CoachzMicOverrun); // missed worker deadline
+        assert(m.step(500000) == CoachzMicOverrun); // missed worker deadline
         assert(m.shared.state == CoachzMicFault && m.votes == 0);
     }
     {
