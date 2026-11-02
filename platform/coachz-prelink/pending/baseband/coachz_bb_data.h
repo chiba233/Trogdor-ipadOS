@@ -243,14 +243,33 @@ static inline int cbd_answer(struct cbd_setup *s, uint32_t service, const uint8_
  * state from the indication of the same id, TLV 0x01, one byte of bsp::ActivationState (0 kActivated, 1 kReady, 2 kNotReady, 3 kError).
  * An Apple modem reports kActivated once its activation ticket is accepted; until then CommCenter keeps /cc/props/baseband_activated
  * false, which stops operator names, network attach and data contexts. This modem has no activation lock: it is activated.
+ *
+ * The same indication carries the service provisioned state. Without it CommCenter keeps baseband_service_provisioned_states at
+ * kUnknown and gives up the operator name ("not provisioned"), and the interface shows no service while the modem is registered.
+ * TLV 0x4f (one byte, parseLegacyTlvs): 2 is kProvisioned, 3 kNotProvisioned. TLV 0x50 and 0x51 (one byte each, slot one and two,
+ * parseMutableTlvs): 2 is kCardProvisionedStateProvisioned. Slot two has no card here, so 0x51 is left out.
+ *
+ * TLV 0x56 and 0x57 (Slot1IsAccepted, Slot2IsAccepted, one byte, nonzero true) are the activation's verdict on each slot's SIM, the
+ * SIM lock. While slot one is not accepted CommCenter logs "Baseband activation result is unexpected!" and "BB activated, but there
+ * is no SIM" on every activation query and sets the service provisioned state back to kUnknown. This modem has no SIM lock: both
+ * slots are accepted.
  */
 #define CBD_SVC_BSP 0xe2u
 #define CBD_BSP_ACTIVATION_REGISTER 0xb00cu
 #define CBD_ACTIVATED 0u
+#define CBD_PROVISIONED 2u
+#define CBD_ACCEPTED 1u
+#define CBD_ACTIVATION_TLVS 20u
 static inline uint32_t cbd_activation_state(uint8_t *tlvs, uint32_t room)
 {
-    const uint8_t state = CBD_ACTIVATED;
-    return cbd_tlv(tlvs, room, 0x01, &state, 1);
+    const uint8_t state = CBD_ACTIVATED, provisioned = CBD_PROVISIONED, accepted = CBD_ACCEPTED;
+    if (room < CBD_ACTIVATION_TLVS) return 0;
+    uint32_t w = cbd_tlv(tlvs, room, 0x01, &state, 1);
+    w += cbd_tlv(tlvs + w, room - w, 0x4f, &provisioned, 1);
+    w += cbd_tlv(tlvs + w, room - w, 0x50, &provisioned, 1);
+    w += cbd_tlv(tlvs + w, room - w, 0x56, &accepted, 1);
+    w += cbd_tlv(tlvs + w, room - w, 0x57, &accepted, 1);
+    return w;
 }
 
 #endif /* COACHZ_BB_DATA_H */

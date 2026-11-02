@@ -136,8 +136,17 @@ b9 用 drivers/RamBlock/coachz_modem.c 按上面的顺序接入，在 Wi-Fi 线�
 - **工作模式**：这次开机 ABM 第一次读到的工作模式是 Shutdown，CommCenter 把射频留在低功耗；约 40 s 时基带重启一次，之后请求 Online 成功。
 - **注册**：插入有效 SIM 后，modem 在 LTE 上报 `kRegisteredRoaming`，CS 和 PS 都附着上，信号格（3 到 4 格）传到 SpringBoard。界面仍是无服务：CommCenter 的基带服务开通状态停在 `kUnknown`，每次评估运营商名都记 `Operator name change aborted: not provisioned`，给界面的显示状态一直是 `kNotRegistered`。开通状态最早由 `set.cdma.qmi` 报 `kUnavailable`。测试卡仍只有紧急服务。
 
+### 第六次上机（开通状态）
+
+- 开通状态来自 ActivationRegister 指示：TLV 0x4f（一字节，`parseLegacyTlvs`：2 为 kProvisioned，3 为 kNotProvisioned），0x50、0x51（各卡槽，`parseMutableTlvs`：2 为 kCardProvisionedStateProvisioned）。指示带上 0x4f = 2、0x50 = 2 后，CommCenter 记 `Service provisioned changing from kUnknown to kProvisioned`。
+- 但 `pp` 每次查询激活状态都判 `Baseband activation result is unexpected!`、`BB activated, but there is no SIM`，又把开通状态改回 kUnknown。判断看的是 0x56 `Slot1IsAccepted`（一字节，非零为真，即 SIM 锁的结论）；0x57 是卡槽二。现在两项都发 1。
+- 数据口：所有 WDS 0xa2 和 QOS 0x2b 绑定都返回成功。
+- 有效 SIM：开机后插拔一次 SIM，再开关飞行模式，状态栏才出运营商名和信号格；0x56、0x57 加上以后仍要插拔一次。“关于本机”的运营商是未知，CommCenter 记 `Missing carrier preferences path`。
+- 开关飞行模式后 Wi-Fi 重新加入，驱动报的信号正常，SpringBoard 收到的却是 0 格，图标变空心。
+
 接下来的卡点：
-- **服务开通状态**：查 CommCenter 的基带服务开通状态从哪条消息来，让注册状态显示到界面上。
+- **开机即显示**：查为什么要插拔一次 SIM 才显示注册状态。
+- **运营商设置包**：“关于本机”的运营商是未知。
 - **蜂窝数据**：数据口设置已被接受；要看 `BindMuxDataPort` 的应答，之后才是 `pdp_ip` 接 `rmnet_ipa0`。蜂窝数据和数据漫游默认关闭，开数据通路前先确认。
 - **eSIM**：在 UIM 0x2f 应答里补 TLV 0x21，VINYL 0xe5 的 Tape 请求转成 UIM 逻辑通道上对 ISD-R 的 APDU。
 - **EFS 持久化**：modem 的写入只留在内核内存里，重启后从 FSG 重建。

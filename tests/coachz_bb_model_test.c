@@ -423,11 +423,14 @@ static void test_data(void)
     n = cbq_private_answer(act, CBD_SVC_BSP, 3, 0, 0, 0, out, sizeof out);
     const uint8_t act_ok[] = { 1, 19, 0, 0x80, 0xe2, 3, 2, 0x34, 0x12, 0x0c, 0xb0, 7, 0, 2, 4, 0, 0, 0, 0, 0 };
     CHECK(n == sizeof act_ok && !memcmp(out, act_ok, sizeof act_ok));
-    uint8_t tlvs[8];
+    uint8_t tlvs[CBD_ACTIVATION_TLVS];
     const uint32_t t = cbd_activation_state(tlvs, sizeof tlvs);
     n = cbq_private_indication(CBD_BSP_ACTIVATION_REGISTER, CBD_SVC_BSP, 3, tlvs, t, out, sizeof out);
-    const uint8_t act_ind[] = { 1, 16, 0, 0x80, 0xe2, 3, 4, 0, 0, 0x0c, 0xb0, 4, 0, 1, 1, 0, 0 };
-    CHECK(n == sizeof act_ind && !memcmp(out, act_ind, sizeof act_ind));
+    /* kActivated, service provisioned (0x4f = 2), slot one's card provisioned (0x50 = 2), both slots accepted (0x56, 0x57 = 1) */
+    const uint8_t act_ind[] = { 1, 32, 0, 0x80, 0xe2, 3, 4, 0, 0, 0x0c, 0xb0, 20, 0, 1, 1, 0, 0, 0x4f, 1, 0, 2, 0x50, 1, 0, 2,
+                                0x56, 1, 0, 1, 0x57, 1, 0, 1 };
+    CHECK(t == CBD_ACTIVATION_TLVS && n == sizeof act_ind && !memcmp(out, act_ind, sizeof act_ind));
+    CHECK(!cbd_activation_state(tlvs, CBD_ACTIVATION_TLVS - 1));   /* no room: nothing to send */
     n = cbq_private_unsupported(act, 0xe5, 2, out, sizeof out);
     CHECK(n == 20 && out[4] == 0xe5 && cbq_rd16(out + 16) == 1 && cbq_rd16(out + 18) == CBQ_ERR_NOT_SUPPORTED);
     if (!failures) printf("PASS data port and activation\n");
@@ -525,6 +528,30 @@ static void test_esim(void)
     CHECK(n == sizeof card && out[1] == 0x34 && out[2] == 0x12 && caps && len == 2 && !caps[0] && caps[1] == 2);
     const uint8_t *kept = cbd_find(out, n, 0x10, &len);
     CHECK(kept && len == 1 && kept[0] == 0xaa);
+
+    /* Hotplug must not erase Tape capability: the driver replaces its vector on every indication. */
+    const uint8_t change[] = { 4, 0, 0, 0x32, 0, 4, 0, 0x10, 1, 0, 0xaa };
+    n = cbe_card_status_fix(&esim, 11, change, sizeof change, out, sizeof out);
+    caps = cbd_find(out, n, 0x21, &len);
+    CHECK(n == sizeof change + 5 && out[0] == 4 && out[3] == 0x32 && caps && len == 2 && !caps[0] && caps[1] == 2);
+    kept = cbd_find(out, n, 0x10, &len);
+    CHECK(kept && len == 1 && kept[0] == 0xaa);
+
+    /* The real startup wire request is legacy GetCsn, not a Tape/APDU operation.
+     * Reply with the exact absent-legacy-Vinyl result used by the native driver's Ready callback. */
+    uint8_t csn[] = { 0, 0x78, 0x56, 0, 0x10, 9, 0, 2, 6, 0, 1, 1, 0, 0, 0, 1 };
+    for (unsigned slot = 1; slot <= 2; slot++) {
+        csn[15] = (uint8_t)slot;
+        n = cbe_host(&esim, 1, 9, csn, sizeof csn, out, sizeof out, 2);
+        CHECK(n == CBQ_HDR + 14 && out[4] == 0xe5 && out[5] == 9);
+        CHECK(out[CBQ_HDR + 1] == 0x78 && out[CBQ_HDR + 2] == 0x56);
+        CHECK(cbd_error(out + CBQ_HDR, n - CBQ_HDR) == 0x204);
+        CHECK(!esim.req_len && esim.step == CBE_S_IDLE && !esim.freeze && !esim.switches);
+        uint8_t current[2]; cbe_caps(&esim, current);
+        CHECK(!current[0] && current[1] == CBE_CAP_TAPE);
+    }
+    csn[10] = 2; /* unimplemented legacy operations keep the existing fallback */
+    CHECK(cbe_host(&esim, 1, 9, csn, sizeof csn, out, sizeof out, 2) == 0);
 
     /* A two-part command does not run before its last segment. Short APDUs preserve its full DER. */
     uint8_t der[1505] = { 0xbf, 0x20, 0x82, 0x05, 0xdc };

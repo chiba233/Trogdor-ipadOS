@@ -332,7 +332,7 @@ static int bb_private_answer(uint32_t channel, const struct cbq_result &r, const
     return 1;
   }
   if (r.service == CBD_SVC_BSP && message == CBD_BSP_ACTIVATION_REGISTER) {
-    uint8_t tlvs[8];
+    uint8_t tlvs[CBD_ACTIVATION_TLVS];
     const uint32_t t = cbd_activation_state(tlvs, sizeof tlvs);
     uint32_t n = cbq_private_answer(sdu, r.service, r.cid, 0, 0, 0, bb_out, sizeof bb_out);
     if (n) bb_push(channel, bb_out, n);
