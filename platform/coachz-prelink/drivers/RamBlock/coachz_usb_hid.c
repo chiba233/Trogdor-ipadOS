@@ -7,8 +7,9 @@
  * coachz_input_keyboard_report() (iokit/Kernel/CoachzInput.cpp), which sends it to iPadOS as report 1 of the keyboard device.
  *
  * The root disk is never polled from here: usb_poll() would also run TEST UNIT READY on it, and a failed one detaches it.
- * coachz_usb_enumerate_hubs() polls only hubs, once at boot, so a keyboard enumerated after the disk is still attached.
- * Not in the build yet: see README.md beside this file.
+ * coachz_usb_enumerate_hubs() polls only hubs, once at boot, so a keyboard enumerated after the disk is still attached. After boot
+ * the hubs off the disk's path keep being polled, as the Linux hub driver watches its ports, so the base can be attached and detached:
+ * the disk's own path is left alone, because a port change there would detach it.
  */
 #include <libpayload.h>
 #include <usb/usb.h>
@@ -26,7 +27,8 @@ extern hci_t *usb_hcs;   /* usb.c: the registered controllers */
 static usbdev_t *keyboard;
 static endpoint_t *keyboard_endpoint;
 static void *keyboard_queue;
-static unsigned keyboard_reports, keyboard_failures;
+static unsigned keyboard_reports, keyboard_failures, keyboard_ticks, keyboard_attaches;
+static usbdev_t *root_disk;
 
 static void hid_nop_poll(usbdev_t *dev) { (void)dev; }
 
@@ -38,6 +40,7 @@ static void hid_destroy(usbdev_t *dev) {
 		keyboard_endpoint = NULL;
 		keyboard = NULL;
 		(void)coachz_input_keyboard_report(released);   /* no key stays down after the base is removed */
+		kprintf("COACHZ USB HID: keyboard detached after %u reports\n", keyboard_reports);
 	}
 }
 
@@ -108,25 +111,54 @@ void usb_hid_init(usbdev_t *dev) {
 	keyboard = dev;
 	keyboard_endpoint = in;
 	keyboard_queue = queue;
+	keyboard_attaches++;
+}
+
+/* Whether dev is the disk or a hub between the disk and the controller. */
+static int on_disk_path(hci_t *controller, usbdev_t *dev) {
+	if (!root_disk || root_disk->controller != controller) {
+		return 0;
+	}
+	for (usbdev_t *at = root_disk; at; at = at->address && at->hub >= 0 ? controller->devices[at->hub] : NULL) {
+		if (at == dev) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/* Hubs off the disk's path, a few times a second: generic_hub attaches and detaches what changed on their ports. */
+static void poll_other_hubs(void) {
+	for (hci_t *controller = usb_hcs; controller; controller = controller->next) {
+		for (int i = 0; i < 128; i++) {
+			usbdev_t *dev = controller->devices[i];
+			if (dev && dev->poll && dev->poll != hid_nop_poll && !on_disk_path(controller, dev)) {
+				dev->poll(dev);
+			}
+		}
+	}
 }
 
 /* Every report waiting in the queue, in order. The caller holds the RamBlock gate. */
 void coachz_usb_hid_poll(void) {
-	if (!keyboard || !keyboard_queue) {
-		return;
-	}
-	const unsigned char *report;
-	while ((report = keyboard->controller->poll_intr_queue(keyboard_queue)) != NULL) {
-		if (coachz_input_keyboard_report(report) == 0) {
-			keyboard_reports++;
-		} else if (!keyboard_failures++) {
-			kprintf("COACHZ USB HID: the keyboard device is not ready for report %u\n", keyboard_reports);
+	if (keyboard && keyboard_queue) {
+		const unsigned char *report;
+		while ((report = keyboard->controller->poll_intr_queue(keyboard_queue)) != NULL) {
+			if (coachz_input_keyboard_report(report) == 0) {
+				keyboard_reports++;
+			} else if (!keyboard_failures++) {
+				kprintf("COACHZ USB HID: the keyboard device is not ready for report %u\n", keyboard_reports);
+			}
 		}
+	}
+	if (root_disk && !(++keyboard_ticks % 32)) {
+		poll_other_hubs();
 	}
 }
 
 /* Once, after the disk is found: poll only the hubs for ms milliseconds, so the devices behind them are attached. */
 void coachz_usb_enumerate_hubs(unsigned ms, usbdev_t *disk) {
+	root_disk = disk;
 	for (unsigned waited = 0; waited < ms; waited += 10) {
 		for (hci_t *controller = usb_hcs; controller; controller = controller->next) {
 			for (int i = 0; i < 128; i++) {

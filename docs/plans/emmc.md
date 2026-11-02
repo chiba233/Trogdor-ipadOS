@@ -1,6 +1,6 @@
 # eMMC 与 microSD（sdhci-msm）
 
-驱动已编进预链接内核（RamBlock 的归档、采样线程启动、`coachz-emmc=2 coachz-sd=2`）。真机上 eMMC 以 52 MHz、8 位总线识别，只向机主切出的 1 GiB 分区 `coachz-scratch` 写入，窗口外的写被拒绝，2048 块写后读回无错；跨重启保留和分区发布还没有证实；microSD 槽没插卡时报告无卡，读写卡未测。入口：[实现与接入说明](../../platform/coachz-prelink/drivers/RamBlock/mmc/README.md)，[固定源码](../../platform/coachz-prelink/drivers/RamBlock/mmc/SOURCES.md)。
+驱动已编进预链接内核（RamBlock 的归档、采样线程启动、`coachz-emmc=2 coachz-sd=2`）。真机上 eMMC 以 52 MHz、8 位总线识别，只向机主切出的 1 GiB 分区 `coachz-scratch` 写入，窗口外的写被拒绝，2048 块写后读回无错，重启后内容还在；分区发布还没有证实；microSD 槽没插卡时报告无卡，读写卡未测。入口：[实现与接入说明](../../platform/coachz-prelink/drivers/RamBlock/mmc/README.md)，[固定源码](../../platform/coachz-prelink/drivers/RamBlock/mmc/SOURCES.md)。
 
 ## 路线
 

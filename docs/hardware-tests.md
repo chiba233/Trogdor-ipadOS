@@ -1509,3 +1509,11 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 - **电源键**：`enabled volume and power`，按下时 `buttons 0x1 -> report 0x2`，松开回到 0。休眠本身还没做。
 - **触摸**：K47 的 HID 计数这次完整。失灵前后 `hid out` 和 `fingers` 继续增长，`held` 回到 0，`dup`、`hand`、`rebegin`、`lone up`、`cancel` 全是 0，驱动的 palms、continued、duplicates、sticky 也都是 0。SpringBoard 和 backboardd 的线程采样前后没有差别，所以事件确实离开了内核，线程没有卡住。
 - **静态核对，不是真机结果**：`IOHIDEventDriver` 把 contact id 当路径编号（`kIOHIDEventFieldDigitizerIndex`）。backboardd 的反汇编里，`%d >= MAX_PATH_COUNT` 前面是 `cmp x0, #0x1e`，`addContact: pathIndex out of bounds` 前面是 `cmp x23, #0x1f`，还有 `_pathIndexTouchingMask` 这样的位掩码。这里传的是控制器 7 位的滚动 id（0..127）；主线 `mt_compute_slot` 用 `input_mt_get_slot_by_key` 映射成最小的空闲槽号，移植时漏了这一步。按这个解释，乱搓时新接触很多，id 很快超过 30，之后的单指被 backboardd 丢弃，id 回绕后又恢复。要等修正上机后由机主实测确认。
+
+## 触摸失灵修好，键盘可拆装，eMMC 写入跨重启保留（k106）
+
+- **触摸**：移植 `input_mt_get_slot_by_key` 后，机主实测大面积手指乱搓不再失灵。这次启动有 162 个新接触，其中 104 个的原始 id 不小于 30（最高 120），槽位最多用到 5 个，没有溢出；这 104 个在旧内核上都会被 backboardd 按 `MAX_PATH_COUNT` 丢弃。HID 计数继续干净：`hid out` 1484，`fingers` 3759，`held` 回到 0，其余异常计数全 0。
+- **键盘拆装**：只轮询不在根盘路径上的 hub。机主在系统里把底座拆下、装回两次，日志是 `keyboard detached` 和新的 `keyboard at N` 交替，第二次之间收到 26 份报告；根盘没断，没有 panic。EC 开关状态同步在 `0x5`（底座在）和 `0x3`（底座离开，平板模式）之间变化了 4 次。之前那次日志停在 127 秒的现象这次没有复现，原因还是不明。
+- **eMMC**：写入自检读到 `previous image 2048 of 2048`，上一次启动写的内容重启后还在。这次写 27044 KB/s。分区发布仍然没有日志能证实。
+- **GPU 中断**：1954 次中断对应 1954 个 fence，错误位全 0。
+- **Wi-Fi**：这张带了 HTT 和被动扫描的代码，但 `wl_step` 开头的 `wl.state >= 19` 把新状态都挡住了，没有执行。这是代码错误，不是固件的结果。

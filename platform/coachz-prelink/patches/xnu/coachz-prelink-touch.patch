@@ -10,7 +10,7 @@
  bsd/dev/unix_startup.c			standard
 --- a/bsd/dev/coachz_touch.c
 +++ b/bsd/dev/coachz_touch.c
-@@ -0,0 +1,884 @@
+@@ -0,0 +1,935 @@
 +/*
 + * Coachz touchscreen (coachz-touch=1): the Goodix GT7375P on QUPv3 wrap0 SE4 as HID over I2C.
 + * The device side is a port of Linux's drivers/hid/i2c-hid: i2c-hid-of-goodix.c's power-up for this part (reset asserted, 10 ms,
@@ -186,6 +186,44 @@
 +static uint8_t frame_seen[128], touch_active[128];
 +static uint32_t frame_palms, frame_continued, frame_duplicates, frame_sticky;
 +
++/*
++ * input_mt_get_slot_by_key, which mt_compute_slot uses for this class: a contact keeps its slot while it is down, a new one takes the
++ * lowest slot that is neither active nor used in this frame, and a slot unused in a frame is released (INPUT_MT_DROP_UNUSED), so it
++ * is not reused in the frame that lifts it. IOHIDEventDriver turns the contact identifier into the path index, and backboardd drops a
++ * path index of MAX_PATH_COUNT (30) or more; the controller's own identifiers roll through 0..127.
++ */
++static struct { bool active; unsigned key; } mt_slot[FRAME_CONTACTS];
++static uint32_t frame_slots_most, frame_slot_overflow, frame_new_contacts, frame_raw_id_most, frame_raw_id_high;
++
++static int
++mt_slot_by_key(unsigned key, const bool *used)
++{
++	for (unsigned s = 0; s < FRAME_CONTACTS; s++) {
++		if (mt_slot[s].active && mt_slot[s].key == key) {
++			return (int)s;
++		}
++	}
++	for (unsigned s = 0; s < FRAME_CONTACTS; s++) {
++		if (!mt_slot[s].active && !used[s]) {
++			mt_slot[s].active = true;
++			mt_slot[s].key = key;
++			frame_new_contacts++;
++			if (key > frame_raw_id_most) {
++				frame_raw_id_most = key;
++			}
++			if (key >= 30) {
++				frame_raw_id_high++;
++			}
++			if (s + 1 > frame_slots_most) {
++				frame_slots_most = s + 1;
++			}
++			return (int)s;
++		}
++	}
++	frame_slot_overflow++;
++	return -1;
++}
++
 +static void publish_frame(void);
 +
 +static void
@@ -268,8 +306,14 @@
 +{
 +	unsigned count = 0;
 +	int xs[FRAME_CONTACTS], ys[FRAME_CONTACTS], ids[FRAME_CONTACTS];
++	bool used[FRAME_CONTACTS] = {};
 +	for (unsigned c = 0; c < frame_count; c++) {
 +		const unsigned rx = frame_contact[c].x, ry = frame_contact[c].y;
++		const int slot = mt_slot_by_key((unsigned)frame_contact[c].id, used);
++		if (slot < 0) {
++			continue;
++		}
++		used[slot] = true;
 +		if (!count) {
 +			if (stroke_first[0] < 0) {
 +				stroke_first[0] = (int)rx;
@@ -281,7 +325,7 @@
 +			stroke_frames++;
 +		}
 +		unsigned ux = (touch_flip & 1) ? 12960 - rx : rx, uy = (touch_flip & 2) ? 8640 - ry : ry;
-+		ids[count] = frame_contact[c].id;
++		ids[count] = slot;
 +		if (touch_flip & 4) {
 +			xs[count] = (int)(uy * 30480u / 8640u);
 +			ys[count] = (int)(ux * 20320u / 12960u);
@@ -290,6 +334,11 @@
 +			ys[count] = (int)(uy * 20320u / 8640u);
 +		}
 +		count++;
++	}
++	for (unsigned s = 0; s < FRAME_CONTACTS; s++) {
++		if (!used[s]) {
++			mt_slot[s].active = false;
++		}
 +	}
 +	const uint64_t at = mach_absolute_time();
 +	if (count && !touch_down_now) {
@@ -832,6 +881,8 @@
 +				/* Lines of their own: the log ring cuts a long one. */
 +				printf("K47 down %u for %llu ms, most %u, strokes %u, palms %u continued %u duplicates %u sticky %u\n", touch_down_now,
 +				    held / NSEC_PER_MSEC, touch_down_most, stroke_count, frame_palms, frame_continued, frame_duplicates, frame_sticky);
++				printf("K47 slots most %u overflow %u, new contacts %u, raw id most %u, at 30 or more %u\n", frame_slots_most,
++				    frame_slot_overflow, frame_new_contacts, frame_raw_id_most, frame_raw_id_high);
 +				printf("K47 hid out %u fingers %u held %u dup %u hand %u rebegin %u lone up %u cancel %u\n",
 +				    &coachz_hid_observed ? coachz_hid_observed[0] : 0, &coachz_hid_observed ? coachz_hid_observed[1] : 0,
 +				    &coachz_hid_observed ? coachz_hid_observed[2] : 0, &coachz_hid_observed ? coachz_hid_observed[3] : 0,
