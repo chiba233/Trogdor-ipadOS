@@ -20,6 +20,13 @@ struct xnu_handoff xnu_prepare(void) {
     /* x19 is saved in the EL2 snapshot before any XNU code executes. */
     extern uint64_t xnu_saved[10];
 #if PROBE_XNU_SCREEN
+    /* Debian: no load, so the caller takes the wrapper's return to Linux. */
+    const unsigned chosen=el==4?boot_menu(&display_video,freq):0;
+    probe_value("Boot menu entry=",chosen);
+    if(chosen) {
+        display_release();
+        return out;
+    }
     int started=el==4 && xnu_screen_load(_xnu_payload_start,(size_t)(_xnu_payload_end-_xnu_payload_start),
         (const void *)(uintptr_t)xnu_saved[0],cpu&0xff00ffffffull,freq,&display_video,&out);
     probe_value("XNU copied=",(uint64_t)started);

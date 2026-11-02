@@ -32,7 +32,12 @@ class InputTests(unittest.TestCase):
         self.assertNotIn('usb_poll(', code)
         self.assertIn('dev != disk', code)
         # Boot protocol first: an 8-byte reading is only valid after SET_PROTOCOL(boot).
-        self.assertLess(code.index('HID_SET_PROTOCOL, HID_BOOT_PROTOCOL'), code.index('create_intr_queue(in, 8, 8'))
+        # Report protocol, as Linux's usbhid leaves it: the action keys of the top row only exist there.
+        self.assertNotIn('SET_PROTOCOL', code)
+        self.assertIn('create_intr_queue(in, KEYBOARD_REPORT, 8', code)
+        self.assertIn('#define KEYBOARD_REPORT 12', code)
+        # After boot only hubs off the disk's path are polled, so a port change there cannot detach the root disk.
+        self.assertIn('!on_disk_path(controller, dev)', code)
 
 
 if __name__ == '__main__':

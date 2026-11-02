@@ -441,9 +441,22 @@ class DisplayTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             pack(bytes(fixture()), adt(), 0x40000000, 1 << 30, display=True)
 
+    def test_boot_menu_only_reads_buttons_and_chooses_before_the_load(self):
+        menu=(ROOT/'boot/boot_menu.c').read_text();ec=(ROOT/'boot/display_ec.c').read_text();prepare=(ROOT/'boot/xnu_checkpoint.c').read_text()
+        # The only EC command the menu adds is the read-only button state the kernel's input driver polls.
+        self.assertEqual(re.findall(r'display_ec_\w+',menu),['display_ec_buttons'])
+        self.assertIn('uint8_t data[2]={2,3},reply[4];',ec)
+        self.assertIn('command(0x61,data,2,reply,4)',ec)
+        # Debian returns before anything is loaded or the framebuffer region of XNU is touched; the display stops first.
+        self.assertLess(prepare.index('boot_menu(&display_video,freq)'),prepare.index('xnu_screen_load('))
+        self.assertLess(prepare.index('display_release();'),prepare.index('xnu_screen_load('))
+        # Without a usable EC the menu must end, or a broken EC would block the boot.
+        self.assertIn('if(++failures>=20)break;',menu)
+
     def test_hardware_verified_scanout_restart_order_is_unchanged(self):
         source=(ROOT/'boot/display.c').read_text()
-        self.assertEqual(re.findall(r'pattern_write\(DISPLAY_(\w+),',source),['COUNT_EN','DSI','SCANOUT','TE','TE','DSI','COUNT_EN'])
+        # The hardware-verified start and stop, then display_release (the boot menu chose Linux) repeating that same stop.
+        self.assertEqual(re.findall(r'pattern_write\(DISPLAY_(\w+),',source),['COUNT_EN','DSI','SCANOUT','TE','TE','DSI','COUNT_EN','TE','DSI','COUNT_EN'])
         for fixed in ('#define DISPLAY_TE 0xae6b800u','#define DISPLAY_DSI 0xae94004u','#define DISPLAY_SCANOUT 0xae05014u','#define DISPLAY_DSI_VIDEO 0x1f3u','pattern_write(DISPLAY_TE,0,&o->writes);pattern_wait(freq/50);pattern_write(DISPLAY_DSI,0,&o->writes);'):
             self.assertIn(fixed,source)
 

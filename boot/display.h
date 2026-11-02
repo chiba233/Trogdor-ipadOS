@@ -11,4 +11,7 @@ struct display_video { uint64_t pa,bytes;uint32_t width,height,stride,ready; };
 extern struct display_video display_video;
 int display_ec_hello(uint64_t,uint32_t *);
 int display_ec_backlight(uint64_t,uint16_t,uint32_t *);
+int display_ec_buttons(uint64_t,uint32_t *,uint32_t *);
+void display_release(void);
+unsigned boot_menu(const struct display_video *,uint64_t);
 #endif

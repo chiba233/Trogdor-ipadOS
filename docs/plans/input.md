@@ -7,7 +7,7 @@
 | 位置 | 内容 | 启用方式 |
 |---|---|---|
 | `patches/xnu/coachz-prelink-input.patch` | `iokit/Kernel/CoachzInput.cpp`：在 `IOHIDResource` 下、触摸数字化仪旁边发布 ShengHidInput 的键盘/Consumer 设备（`native_hid_input_allocate`，报告 1 为 boot 键盘，报告 2 的第 1～3 位为 Power、音量加、音量减），并为它加一个内核 IOHIDEventDriver personality（与 CoachzHid.cpp 给数字化仪的做法相同）；每 20 ms 用 `EC_CMD_MKBP_INFO` 读 EC 按键的**当前状态**，变化时发报告 2；导出 `coachz_input_keyboard_report()` 给 USB 键盘发报告 1 | `series` 中放在电池补丁之后；`coachz-buttons=1`（只有音量）或 `=3`（加上电源键） |
-| `drivers/RamBlock/coachz_usb_hid.c` | Zed 底座键盘（USB `18d1:504c` 的接口 0，boot keyboard）：`usb_hid_init()` 切到 boot protocol、SET_IDLE 0、开一个 interrupt-IN 队列；`coachz_usb_hid_poll()` 取报告转给上面的函数；`coachz_usb_enumerate_hubs()` 开机时只轮询 hub 一秒 | 见同目录 `README.md` 的五步接线 |
+| `drivers/RamBlock/coachz_usb_hid.c` | Zed 底座键盘（USB `18d1:504c` 的接口 0）：`usb_hid_init()` 留在 report protocol、SET_IDLE 0、开一个 interrupt-IN 队列，12 字节报告的按键进 report 1，顶排 18 个动作键进 report 4；`coachz_usb_hid_poll()` 取报告转给上面的函数；`coachz_usb_enumerate_hubs()` 开机时只轮询 hub 一秒 | 见同目录 `README.md` 的五步接线 |
 
 `input.patch` 与 `speaker.patch` 互不依赖，都以 `battery.patch` 为前提；电池→扬声器→输入、电池→输入→扬声器两种顺序都已验证能打上。
 
@@ -17,7 +17,7 @@
 - **不抢 EC 事件**：按键读的是 EC 的当前状态，而不是 `GET_NEXT_EVENT` 队列，因此不会吃掉电池或其他读者需要的 MKBP 事件。`ec_commands.h` 写明 `EC_MKBP_INFO_CURRENT` 支持 `EC_MKBP_EVENT_BUTTON`；固定版本源码里没有 EC 侧的处理函数，所以先查 `EC_MKBP_INFO_SUPPORTED`，若 EC 拒绝会打印并停止。
 - **电源键**：`coachz-buttons=3` 同时上报音量键和电源键（报告 2 的第 1 位），机主确认真机上正常。休眠本身还没做。EC 自己的长按强制关机不受影响。
 - **键盘不会碰根盘**：`usb_poll()` 会对根盘做 TEST UNIT READY，失败就把它当作拔出；USB 键盘代码从不调用它。开机后每隔约 250 ms 只轮询不在根盘路径上的 hub，所以底座可以拆装（真机通过），根盘那条路径不碰，并且和块 I/O 用同一把锁。
-- **只做 boot 协议**：默认是 report protocol，固定 8 字节只在 SET_PROTOCOL(boot) 之后才成立。顶排 Vivaldi 功能键、语言布局和输入法留给后续；驱动发的是按键 usage，不是字符。
+- **report 协议**：和主线 usbhid 一样不切 boot 协议，顶排功能键只在这个协议里有。语言布局和输入法留给后续；驱动发的是按键 usage，不是字符。
 
 ## 真机上要看什么
 
@@ -32,5 +32,5 @@
 ## 还没做的
 
 - 触控板：Zed 的接口 2，多点 HID（subclass/protocol 均为 0，不是 boot mouse）。先看原版 HID 是否识别原始报告，否则先做基础指针和点击；不能套用触摸屏的绝对坐标和 edge-tip 处理。
-- 顶排功能键、折叠状态（主线 `hid-google-hammer` 的 usage `0xffd10019`、`hid-vivaldi` 的物理映射）、report protocol，要先读真实的报告描述符。
+- 顶排其余功能键逐个确认。Debian 上接口 0 走 `hid-generic`，接口 2 走 `hid-multitouch`，输入报告里没有折叠位。
 - 休眠恢复，以及电源短按/长按/唤醒的分别验收。

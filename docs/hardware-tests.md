@@ -1517,3 +1517,12 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 - **eMMC**：写入自检读到 `previous image 2048 of 2048`，上一次启动写的内容重启后还在。这次写 27044 KB/s。分区发布仍然没有日志能证实。
 - **GPU 中断**：1954 次中断对应 1954 个 fence，错误位全 0。
 - **Wi-Fi**：这张带了 HTT 和被动扫描的代码，但 `wl_step` 开头的 `wl.state >= 19` 把新状态都挡住了，没有执行。这是代码错误，不是固件的结果。
+
+## 启动菜单、功能键、eMMC 分区发布、第一次被动扫描（k107）
+
+- **启动菜单**：机主确认音量键选择、电源键确认都可用，iPadOS 和 Debian 两项都能启动。选 Debian 时探针按 pattern 镜像验证过的顺序停掉背光和显示，再走已有的 `linux_handoff`。
+- **从菜单进的 Debian 没有网络**：桌面显示飞行模式，Wi-Fi 和 LTE 都没有；之后正常开机 `wlan0`、`rmnet_ipa0` 都在，没有留下后遗症。源码和布局推断，还没有日志证实：Depthcharge 把 Image 搬到第一段放得下的内存，也就是 `atf_mem` 之后（`get_kernel_reloc_addr`），Linux 排在 XNU 负载之后的偏移 `0x4000000`，占用的范围和 LTE 版的 `mpss_mem`（`0x86000000` 起）重叠；主线 `early_init_dt_reserve_memory` 遇到已保留的范围返回 `EBUSY`，这个 no-map 区域就保留失败，modem 起不来，而系统本身还能启动。下一张镜像把 Linux 排到最前面。
+- **功能键**：接口 0 留在 report 协议（主线 usbhid 就不切 boot 协议），12 字节报告前 8 字节不变，后面 18 个位按键盘描述符的 usage 顺序原样进 report 4。机主确认亮度和音量键完全正常，其他键没有逐个确认。
+- **eMMC 分区**：开机 30 秒列出所有 IOMedia：`disk0`（eMMC）的 `disk0s1`～`disk0s5` 都已发布，含 KernelA、KernelB 和 `coachz-scratch`；`disk1` 是外接盘。没有写入窗口以外的区域。
+- **Wi-Fi**：7 个 pdev 参数、监管域、22 个信道和 vdev 0 都发出。三轮被动扫描都正常结束（约 2.9 秒，67 个事件，22 个信道，原因 0），但 mgmt 帧计数是 0。HTT 版本请求没发出去（`wh_send` 返回 -1），HTT 还没有初始化，这是接下来要查的。
+

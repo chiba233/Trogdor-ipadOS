@@ -13,7 +13,7 @@
  	/* A one-second tone on the speaker (iokit/Kernel/CoachzSpeaker.cpp, coachz-speaker=1), once. */
 --- a/iokit/Kernel/CoachzInput.cpp
 +++ b/iokit/Kernel/CoachzInput.cpp
-@@ -0,0 +1,204 @@
+@@ -0,0 +1,216 @@
 +// SPDX-License-Identifier: BSD-2-Clause
 +// Keyboard and Consumer input for iPadOS (coachz-buttons=1 volume, =3 volume and power): ShengHidInput's keyboard/Consumer device
 +// (native_hid_input_allocate, its descriptor's report 1 a boot keyboard and report 2 the Consumer bits Menu 0, Power 1, Volume
@@ -40,6 +40,7 @@
 +IOService *native_hid_input_allocate(void);
 +void coachz_input_start(void);
 +int coachz_input_keyboard_report(const uint8_t *boot);
++int coachz_input_action_report(const uint8_t *bits);
 +}
 +
 +namespace {
@@ -199,6 +200,17 @@
 +	uint8_t report[9] = {1};
 +	for (unsigned i = 0; i < 8; i++) {
 +		report[1 + i] = boot[i];
++	}
++	return send(report, sizeof(report)) == kIOReturnSuccess ? 0 : -1;
++}
++
++// The USB keyboard's action key bits, in the order of its own descriptor, as report 4 of the keyboard device. 0 when sent.
++extern "C" int
++coachz_input_action_report(const uint8_t *bits)
++{
++	uint8_t report[5] = {4};
++	for (unsigned i = 0; i < 4; i++) {
++		report[1 + i] = bits[i];
 +	}
 +	return send(report, sizeof(report)) == kIOReturnSuccess ? 0 : -1;
 +}

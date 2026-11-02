@@ -145,6 +145,15 @@ int display_ec_hello(uint64_t freq,uint32_t *error) {
     if(status)*error=status;
     return !status;
 }
+/* EC_CMD_MKBP_INFO, the current state of EC_MKBP_EVENT_BUTTON: the same query the kernel's input driver polls. */
+int display_ec_buttons(uint64_t freq,uint32_t *buttons,uint32_t *error) {
+    uint8_t data[2]={2,3},reply[4];
+    ec_freq=freq;
+    uint32_t status=command(0x61,data,2,reply,4);
+    if(status)*error=status;
+    else *buttons=reply[0]|(uint32_t)reply[1]<<8|(uint32_t)reply[2]<<16|(uint32_t)reply[3]<<24;
+    return !status;
+}
 int display_ec_backlight(uint64_t freq,uint16_t duty,uint32_t *error) {
     uint8_t data[4]={(uint8_t)duty,(uint8_t)(duty>>8),2,0};
     ec_freq=freq;

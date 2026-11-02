@@ -146,7 +146,7 @@ def compile_wrapper(out, kernel, memory, checkpoint=None, discovery=False, patte
                *([str(ROOT / "boot" / name) for name in
                   ("xnu_checkpoint.c", "xnu_load.c", "xnu_memory.c", "xnu_tables.c", "xnu_cinit.c", "xnu_cpu.c", "xnu_platform.c", "xnu_pe.c", "xnu_diagnostics.c", "xnu_topology.c")] if checkpoint is not None else []),
                *([str(ROOT / "boot" / name) for name in ("coreboot.c","display_state.c","display.c",*(() if screen else ("xnu_memory.c",)))] if discovery else []),
-               *([str(ROOT / "boot/xnu_screen.c")] if screen else []),
+               *([str(ROOT / "boot" / name) for name in ("xnu_screen.c", "boot_menu.c")] if screen else []),
                *([str(ROOT / "boot/display_ec.c")] if backlight else []),
                *([str(ROOT / "boot/xnu_memory.c")] if usb_read else []),
                *[str(obj) for obj in usb_objects],
@@ -325,7 +325,7 @@ def main():
     if a.display_backlight:
         code_files += ("boot/display_ec.c",)
     if a.screen:
-        code_files += ("boot/xnu_screen.c", "tools/xnu_screen.py", "tools/xnu_init.py", "tools/coachz_init.S")
+        code_files += ("boot/xnu_screen.c", "boot/boot_menu.c", "tools/xnu_screen.py", "tools/xnu_init.py", "tools/coachz_init.S")
     if a.usb_read:
         code_files += ("boot/usb_read.c", "tools/usb_stack.py", "boot/usb_compat/libpayload.h")
     report = {"schema": 1, "display_discovery": a.display_discovery, "display_pattern": a.pattern, "display_backlight": a.display_backlight, "xnu_screen": a.screen,

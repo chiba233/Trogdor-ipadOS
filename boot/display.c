@@ -94,6 +94,7 @@ static void pattern_wait(uint64_t ticks) {
 }
 #if PROBE_XNU_SCREEN
 struct display_video display_video;
+static uint32_t screen_saved,screen_backlight,screen_polarity;
 /* Black: the load draws its picture on this (xnu_screen.c). */
 static uint32_t pattern_pixel(uint32_t x,uint32_t y,const struct cb_display *b) {
     (void)x;(void)y;(void)b;
@@ -135,7 +136,8 @@ static void display_pattern(const struct cb_display *b,uint32_t pa,struct displa
     }
 #endif
 #if PROBE_XNU_SCREEN
-    /* The screen stays on: XNU owns it from here and never returns. */
+    /* The screen stays on: XNU owns it from here and never returns, unless the boot menu chooses Linux. */
+    screen_saved=o->saved;screen_backlight=o->ec_on;screen_polarity=b->bl_polarity;
     display_video.pa=pa;display_video.bytes=(uint64_t)b->stride*b->height;
     display_video.width=b->width;display_video.height=b->height;display_video.stride=b->stride;display_video.ready=!o->fault;
     return;
@@ -153,6 +155,18 @@ static void display_pattern(const struct cb_display *b,uint32_t pa,struct displa
     pattern_write(DISPLAY_COUNT_EN,o->saved,&o->writes);
     o->te_after=pattern_read(DISPLAY_TE,&o->fault);o->dsi_after=pattern_read(DISPLAY_DSI,&o->fault);
 }
+#if PROBE_XNU_SCREEN
+/* Linux takes the display from where the firmware left it: the end of display_pattern, in its order. */
+void display_release(void) {
+    uint64_t freq;uint32_t writes=0,error=0;__asm__ volatile("mrs %0, cntfrq_el0":"=r"(freq));
+    if(screen_backlight) {
+        pattern_write(COACHZ_BACKLIGHT_PORT+4,screen_polarity?0u:2u,&writes);
+        (void)display_ec_backlight(freq,0,&error);
+    }
+    pattern_write(DISPLAY_TE,0,&writes);pattern_wait(freq/50);pattern_write(DISPLAY_DSI,0,&writes);
+    pattern_write(DISPLAY_COUNT_EN,screen_saved,&writes);
+}
+#endif
 #define DISPLAY_SCHEMA (PROBE_DISPLAY_BACKLIGHT?4:3)
 #define DISPLAY_WRITES pattern.writes
 #else

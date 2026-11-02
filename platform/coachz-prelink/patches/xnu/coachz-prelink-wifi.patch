@@ -13,7 +13,7 @@
  	extern void coachz_battery_start(void);
 --- /dev/null
 +++ b/bsd/dev/coachz_wifi.c
-@@ -0,0 +1,3515 @@
+@@ -0,0 +1,3767 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/* WCN3990 / SC7180: the modem that hosts the WLAN firmware, started as mainline's qcom_q6v5_mss does (coachz-wifi=4), and the SMEM
 + * inventory (coachz-wifi=1 plus an explicit /arm-io/coachz-wifi ADT node). With the modem up: SMP2P, GLINK over SMEM, QRTR and
@@ -2348,6 +2348,16 @@
 +}
 +
 +static void wh_rx(unsigned pipe, const uint8_t *data, uint32_t bytes);
++static void ws_scan_event(const uint8_t *m, uint32_t n);
++static void ws_mgmt_rx(const uint8_t *m, uint32_t n);
++/* Past READY (ws_next and the wl_step states from 20). Addresses are only hashed to count them; names are never read. */
++static struct {
++    unsigned step, number;
++    uint8_t mac[8];
++    uint8_t htt_version, htt_major, htt_minor, started, completed;
++    uint32_t events, channels, last_mhz, reason, last_type;
++    uint32_t mgmt, beacons, band2, band5, bad, snr_best, bss, bss_hash[64];
++} ws;
 +
 +/* ath10k_ce_per_engine_service: the copy complete and watermark status cleared, completed receives handed to HTC and their entries
 + * posted again (_ath10k_ce_completed_recv_next_nolock_64: a zero length is not done yet), completed sends retired
@@ -2583,9 +2593,19 @@
 +            wh.rdy_len = bytes - 4;
 +            memcpy(wh.rdy, p + 4, wh.rdy_len);
 +            wh.ready_event = 1;
++        } else if (wh.last_wmi == 0x3001 && bytes >= 4) {   /* WMI_TLV_SCAN_EVENTID */
++            ws_scan_event(p + 4, bytes - 4);
++        } else if (wh.last_wmi == 0x7001 && bytes >= 4) {   /* WMI_TLV_MGMT_RX_EVENTID */
++            ws_mgmt_rx(p + 4, bytes - 4);
 +        }
 +    } else if ((int)eid == wh.htt) {
 +        wh.htt_messages++;
++        /* ath10k_htt_t2h_msg_handler: VERSION_CONF is message 0 in every map, then minor and major. */
++        if (bytes >= 3 && p[0] == 0) {
++            ws.htt_minor = p[1];
++            ws.htt_major = p[2];
++            ws.htt_version = 1;
++        }
 +    } else if ((int)eid == wh.log) {
 +        wh.log_messages++;
 +    }
@@ -2756,6 +2776,164 @@
 +    return wh_send((unsigned)wh.wmi, m, at);
 +}
 +
++/* ath10k_start's order past ath10k_core_start, ath10k_regd_update, ath10k_update_channel_list, ath10k_add_interface and
++ * ath10k_hw_scan. With no SSID the scan is passive and every channel is marked passive, so the radio only listens. */
++static const uint16_t ws_mhz[] = {2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472,
++    5180, 5200, 5220, 5240, 5745, 5765, 5785, 5805, 5825};
++#define WS_CHANS (sizeof(ws_mhz) / sizeof(ws_mhz[0]))
++#define WS_PUT32(v) do { const uint32_t w_ = (v); memcpy(m + at, &w_, 4); at += 4; } while (0)
++#define WS_TLV(tag, len) do { const uint16_t l_ = (uint16_t)(len), t_ = (uint16_t)(tag); memcpy(m + at, &l_, 2); memcpy(m + at + 2, &t_, 2); at += 4; } while (0)
++
++/* The next command before the scan: 0 sent, 1 when none is left, otherwise wh_send's error (-2 waits for credits). */
++static int
++ws_next(void)
++{
++    static const struct { uint32_t id, value; } param[] = {
++        {0x22, 1},   /* PMF_QOS */
++        {0x0a, 1},   /* DYNAMIC_BW */
++        {0x2c, 1},   /* IDLE_PS_CONFIG */
++        {0x01, 3},   /* TX_CHAIN_MASK: __ath10k_set_antenna, the two chains service ready reports */
++        {0x02, 3},   /* RX_CHAIN_MASK */
++        {0x23, 0},   /* ARP_AC_OVERRIDE */
++        {0x25, 1},   /* ANI_ENABLE */
++    };
++    const unsigned params = sizeof(param) / sizeof(param[0]);
++    static uint8_t m[4 + 8 + 4 + WS_CHANS * 28];
++    uint32_t at = 0;
++    if (ws.step < params) {
++        WS_PUT32(0x4003);   /* WMI_TLV_PDEV_SET_PARAM_CMDID */
++        WS_TLV(0x52, 12);
++        WS_PUT32(0);
++        WS_PUT32(param[ws.step].id);
++        WS_PUT32(param[ws.step].value);
++    } else if (ws.step == params) {
++        /* ath10k_regd_update: service ready's 0x406c is the world SKU pair 0x6c, without a conformance test limit (NO_CTL). */
++        WS_PUT32(0x4001);   /* WMI_TLV_PDEV_SET_REGDOMAIN_CMDID */
++        WS_TLV(0x51, 24);
++        WS_PUT32(0);
++        WS_PUT32(0x6c);
++        WS_PUT32(0x6c);
++        WS_PUT32(0x6c);
++        WS_PUT32(0xff);
++        WS_PUT32(0xff);
++    } else if (ws.step == params + 1) {
++        WS_PUT32(0x3003);   /* WMI_TLV_SCAN_CHAN_LIST_CMDID */
++        WS_TLV(0x4f, 4);
++        WS_PUT32(WS_CHANS);
++        WS_TLV(0x12, WS_CHANS * 28);
++        for (unsigned c = 0; c < WS_CHANS; c++) {
++            WS_TLV(0x50, 24);
++            WS_PUT32(ws_mhz[c]);
++            WS_PUT32(ws_mhz[c]);
++            WS_PUT32(0);
++            /* ath10k_wmi_put_wmi_channel: the mode (11G 1, 11A 0) in the low bits, PASSIVE bit 7, ALLOW_HT bit 11. */
++            WS_PUT32((ws_mhz[c] < 3000 ? 1u : 0u) | 1u << 7 | 1u << 11);
++            WS_PUT32(40u << 8 | 40u << 16);   /* min 0, max and regulatory 20 dBm in half dB: the world entries of Debian's iw reg get */
++            WS_PUT32(6u | 40u << 8);          /* antenna 6 dBi, max tx */
++        }
++    } else if (ws.step == params + 2) {
++        /* A locally administered address for this boot, not the device's. */
++        const uint64_t now = mach_absolute_time();
++        ws.mac[0] = 0x02;
++        for (unsigned b = 1; b < 6; b++) ws.mac[b] = (uint8_t)(now >> (b * 7));
++        WS_PUT32(0x5001);   /* WMI_TLV_VDEV_CREATE_CMDID */
++        WS_TLV(0x56, 20);
++        WS_PUT32(0);
++        WS_PUT32(2);        /* WMI_VDEV_TYPE_STA */
++        WS_PUT32(0);
++        memcpy(m + at, ws.mac, 8);
++        at += 8;
++    } else {
++        return 1;
++    }
++    const int sent = wh_send((unsigned)wh.wmi, m, at);
++    if (!sent) ws.step++;
++    return sent;
++}
++
++/* ath10k_wmi_tlv_op_gen_start_scan with ath10k_wmi_start_scan_init's values. */
++static int
++ws_start_scan(void)
++{
++    static uint8_t m[4 + 4 + 100 + 4 + WS_CHANS * 4 + 4 + 4 + 8 + 4];
++    uint32_t at = 0;
++    WS_PUT32(0x3001);        /* WMI_TLV_START_SCAN_CMDID */
++    WS_TLV(0x4d, 100);
++    WS_PUT32(0xa000u | ws.number);   /* scan id */
++    WS_PUT32(0xa001);        /* requester */
++    WS_PUT32(0);             /* vdev */
++    WS_PUT32(1);             /* WMI_SCAN_PRIORITY_LOW */
++    WS_PUT32(0x11f);         /* STARTED, COMPLETED, BSS_CHANNEL, FOREIGN_CHANNEL, DEQUEUED, FOREIGN_CHANNEL_EXIT */
++    WS_PUT32(50);            /* dwell active */
++    WS_PUT32(150);           /* dwell passive */
++    WS_PUT32(50);            /* min rest */
++    WS_PUT32(500);           /* max rest */
++    WS_PUT32(0);             /* repeat probe */
++    WS_PUT32(0);             /* probe spacing */
++    WS_PUT32(0);             /* idle */
++    WS_PUT32(20000);         /* max scan time */
++    WS_PUT32(5);             /* probe delay */
++    /* PASSIVE, CHAN_STAT_EVENT, and WMI-TLV inverts FILTER_PROBE_REQ. */
++    WS_PUT32(0x01u | 0x10u | 0x20u);
++    WS_PUT32(0);             /* burst duration */
++    WS_PUT32(WS_CHANS);
++    WS_PUT32(1);             /* bssids */
++    WS_PUT32(0);             /* ssids */
++    WS_PUT32(0);             /* ie length */
++    WS_PUT32(3);             /* probes */
++    memset(m + at, 0, 16);   /* no random address: mac and mask */
++    at += 16;
++    WS_TLV(0x10, WS_CHANS * 4);
++    for (unsigned c = 0; c < WS_CHANS; c++) WS_PUT32(ws_mhz[c]);
++    WS_TLV(0x13, 0);
++    WS_TLV(0x13, 8);
++    memset(m + at, 0xff, 6);
++    m[at + 6] = m[at + 7] = 0;
++    at += 8;
++    WS_TLV(0x11, 0);
++    return wh_send((unsigned)wh.wmi, m, at);
++}
++#undef WS_PUT32
++#undef WS_TLV
++
++/* ath10k_wmi_event_scan: the started, foreign channel and completed events (types 1, 8 and 2). */
++static void
++ws_scan_event(const uint8_t *m, uint32_t n)
++{
++    uint16_t l = 0;
++    const uint8_t *e = wm_tlv(m, n, 0x24, 0, &l);
++    if (!e || l < 24) { ws.bad++; return; }
++    const uint32_t type = wm_u32(e, 0);
++    ws.events++;
++    ws.last_type = type;
++    if (type == 1) ws.started = 1;
++    if (type == 8) { ws.channels++; ws.last_mhz = wm_u32(e, 2); }
++    if (type == 2 || type == 0x40) { ws.completed = 1; ws.reason = wm_u32(e, 1); }
++}
++
++/* ath10k_wmi_event_mgmt_rx: counts beacons and probe responses per band and their distinct transmitters. */
++static void
++ws_mgmt_rx(const uint8_t *m, uint32_t n)
++{
++    uint16_t lh = 0, lf = 0;
++    const uint8_t *h = wm_tlv(m, n, 0x2c, 0, &lh), *f = wm_tlv(m, n, 0x11, 0, &lf);
++    if (!h || lh < 24 || !f || lf < 24) { ws.bad++; return; }
++    ws.mgmt++;
++    const uint8_t type = f[0] & 0xfc;
++    if (type != 0x80 && type != 0x50) return;
++    ws.beacons++;
++    const uint32_t mhz = wm_u32(h, 0);
++    if (mhz < 3000) ws.band2++; else ws.band5++;
++    if (wm_u32(h, 1) > ws.snr_best) ws.snr_best = wm_u32(h, 1);
++    uint32_t hash = 2166136261u;
++    for (unsigned b = 16; b < 22; b++) hash = (hash ^ f[b]) * 16777619u;
++    for (unsigned b = 0; b < ws.bss && b < 64; b++) {
++        if (ws.bss_hash[b] == hash) return;
++    }
++    if (ws.bss < 64) ws.bss_hash[ws.bss] = hash;
++    ws.bss++;
++}
++
 +static void
 +wc_report(unsigned second)
 +{
@@ -2780,7 +2958,7 @@
 +    uint32_t at = 0;
 +    uint16_t error = 0;
 +    int result = 0;
-+    if (wl.failed || !wl.known || !wg.open_acked || wl.state >= 19) return;
++    if (wl.failed || !wl.known || !wg.open_acked || wl.state == 19) return;
 +    const int awaiting = (wl.state >= 1 && wl.state <= 8 && wl.state != 6) || wl.state == 11 || wl.state == 12;
 +    if (awaiting && !wl.resp_ready) {
 +        if (++wl.waited_ms >= 30000) {
@@ -3071,14 +3249,88 @@
 +            } else {
 +                printf("COACHZ wmi: ready event without its structure (%u bytes)\n", wh.rdy_len);
 +            }
-+            printf("COACHZ wmi: firmware initialised; vdev creation and scanning are next\n");
-+            wl.state = 19;
++            wl.state = 20;
++            wl.waited_ms = 0;
 +        } else if (++wl.waited_ms >= 5000) {
 +            printf("COACHZ wmi: no ready event in 5 s after init (%u events, last 0x%x, wmi credits %d):", wh.wmi_events, wh.last_wmi,
 +                wh.ep[wh.wmi].credits);
 +            for (unsigned i = 0; i < 8 && i < wh.wmi_events; i++) printf(" 0x%x/%u", wh.wmi_ids[i], wh.wmi_lens[i]);
 +            printf("\n");
 +            wl.state = 19;
++        }
++        break;
++    case 20: {
++        /* ath10k_htt_setup begins with the version request (HTT_H2T_MSG_TYPE_VERSION_REQ). */
++        static const uint8_t version_req[4] = {0, 0, 0, 0};
++        const int sent = wh.htt >= 0 ? wh_send((unsigned)wh.htt, version_req, sizeof(version_req)) : -1;
++        if (sent) printf("COACHZ wifi: HTT version request not sent (%d)\n", sent);
++        wl.waited_ms = 0;
++        wl.state = 21;
++        break;
++    }
++    case 21:
++        if (ws.htt_version || ++wl.waited_ms >= 1000) {
++            printf("COACHZ wifi: HTT version %u.%u after %u ms (%u messages)\n", ws.htt_major, ws.htt_minor, wl.waited_ms, wh.htt_messages);
++            wl.waited_ms = 0;
++            wl.state = 22;
++        }
++        break;
++    case 22: {
++        const int next = ws_next();
++        if (next == -2) {
++            if (++wl.waited_ms >= 5000) {
++                printf("COACHZ wifi: no WMI credits for command %u in 5 s\n", ws.step);
++                wl.state = 19;
++            }
++        } else if (next < 0) {
++            printf("COACHZ wifi: command %u not sent (%d)\n", ws.step, next);
++            wl.state = 19;
++        } else {
++            wl.waited_ms = 0;
++            if (next == 1) {
++                printf("COACHZ wifi: %u commands sent: pdev parameters, regdomain, %u passive channels, vdev 0\n", ws.step, (unsigned)WS_CHANS);
++                wl.state = 23;
++            }
++        }
++        break;
++    }
++    case 23:
++        if (++wl.waited_ms >= 100) {
++            const uint32_t number = ws.number;
++            const int sent = ws_start_scan();
++            if (sent == -2) {
++                if (wl.waited_ms >= 5000) {
++                    printf("COACHZ wifi: no WMI credits for scan %u in 5 s\n", number);
++                    wl.state = 19;
++                }
++                break;
++            }
++            if (sent) {
++                printf("COACHZ wifi: scan %u not sent (%d)\n", number, sent);
++                wl.state = 19;
++                break;
++            }
++            memset((uint8_t *)&ws + __builtin_offsetof(__typeof__(ws), started), 0, sizeof(ws) - __builtin_offsetof(__typeof__(ws), started));
++            wl.waited_ms = 0;
++            wl.state = 24;
++        }
++        break;
++    case 24:
++        /* ath10k_hw_scan waits for the started event, then the scan's own 20 s limit and a margin. */
++        if (ws.completed || ++wl.waited_ms >= 30000) {
++            printf("COACHZ wifi: scan %u %s after %u ms: started %u, reason %u, %u events, %u channels, last type 0x%x, %u bad\n", ws.number,
++                ws.completed ? "done" : "timed out", wl.waited_ms, ws.started, ws.reason, ws.events, ws.channels, ws.last_type, ws.bad);
++            printf("COACHZ wifi: scan %u heard %u frames, %u beacons or probe responses from %u transmitters, 2.4 GHz %u, 5 GHz %u, best snr %u\n",
++                ws.number, ws.mgmt, ws.beacons, ws.bss, ws.band2, ws.band5, ws.snr_best);
++            ws.number++;
++            wl.waited_ms = 0;
++            wl.state = ws.number < 3 ? 25 : 19;
++        }
++        break;
++    case 25:
++        if (++wl.waited_ms >= 30000) {
++            wl.waited_ms = 100;
++            wl.state = 23;
 +        }
 +        break;
 +    }

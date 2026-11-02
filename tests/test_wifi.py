@@ -47,6 +47,10 @@ class WifiTests(unittest.TestCase):
         self.assertIn('rdy[512]', wifi)                                        # the READY event is larger than its fixed structure
         self.assertIn('COACHZ wmi: ready after %u ms', wifi)
         self.assertNotIn('wifi_rpmh_send(wifi_mss_rails,', wifi)               # cx.lvl only through the aggregator
+        # The scan only listens: every channel passive, the scan passive, and no name or address is printed.
+        self.assertIn('| 1u << 7 | 1u << 11', wifi)
+        self.assertIn('WS_PUT32(0x01u | 0x10u | 0x20u);', wifi)
+        self.assertNotIn('%02x:%02x:%02x:%02x', wifi)
 
     def test_candidate_patch_applies_and_matches_sources(self):
         patch = shutil.which('patch')

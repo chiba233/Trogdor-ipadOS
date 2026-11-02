@@ -94,6 +94,24 @@ public:
 };
 OSDefineMetaClassAndStructors(CoachzMmcBlock, IOBlockStorageDevice)
 
+// What the storage stack published, names and sizes only: a root on the eMMC needs its partitions here.
+static void coachz_mmc_list_media(void)
+{
+  OSDictionary *match = IOService::serviceMatching("IOMedia");
+  OSIterator *media = match ? IOService::getMatchingServices(match) : nullptr;
+  OSSafeReleaseNULL(match);
+  if (!media) return;
+  while (OSObject *object = media->getNextObject()) {
+    IORegistryEntry *entry = OSDynamicCast(IORegistryEntry, object);
+    if (!entry) continue;
+    OSString *bsd = OSDynamicCast(OSString, entry->getProperty("BSD Name"));
+    OSNumber *size = OSDynamicCast(OSNumber, entry->getProperty("Size"));
+    IOLog("COACHZ mmc media: %s \"%s\" %llu MiB, writable %d\n", bsd ? bsd->getCStringNoCopy() : "-", entry->getName(),
+        size ? size->unsigned64BitValue() >> 20 : 0, entry->getProperty("Writable") == kOSBooleanTrue);
+  }
+  media->release();
+}
+
 static void coachz_mmc_slot_thread(void *parameter, wait_result_t)
 {
   const int slot = static_cast<int>(reinterpret_cast<uintptr_t>(parameter));
@@ -106,6 +124,10 @@ static void coachz_mmc_slot_thread(void *parameter, wait_result_t)
   if (started && !device->start(resources)) { device->detach(resources); started = false; }
   OSSafeReleaseNULL(device);
   IOLog("COACHZ mmc slot %d: block device %s, %llu blocks\n", slot, started ? "published" : "not published", blocks);
+  if (started && slot == 0) {
+    IOSleep(30000);
+    coachz_mmc_list_media();
+  }
 }
 
 extern "C" void coachz_mmc_start(void)
