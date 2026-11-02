@@ -1384,7 +1384,7 @@ static void test_block(uint64_t block, uint32_t *words)
 #define TEST_BLOCKS 2048u
 void coachz_sdcc_write_selftest(int slot)
 {
-    if (slot != 0 || !write_requested(slot) || !coachz_sdcc_writable(slot)) return;
+    if (!write_requested(slot) || !coachz_sdcc_writable(slot)) return;
     struct sdcc *s = &slots[slot];
     const uint64_t start = s->write_start + s->write_blocks - TEST_BLOCKS;
     static uint32_t want[128], chunk[128 * TEST_BLOCKS_AT];
@@ -1404,8 +1404,9 @@ void coachz_sdcc_write_selftest(int slot)
     refused += !coachz_sdcc_write(slot, s->write_start - 1u, 2, want);
     refused += !coachz_sdcc_write(slot, s->write_start + s->write_blocks, 1, want);
     refused += !coachz_sdcc_write(slot, s->write_start + s->write_blocks - 1u, 2, want);
-    refused += !coachz_sdcc_write(slot, 0, 1, want);
-    if (refused != 5) { printf("COACHZ mmc %s: window let a write through (%u of 5 refused), test stops\n", s->name, refused); return; }
+    const unsigned must_refuse = s->write_start ? 5u : 4u;   /* a whole card has no first block to keep */
+    if (s->write_start) refused += !coachz_sdcc_write(slot, 0, 1, want);
+    if (refused != must_refuse) { printf("COACHZ mmc %s: window let a write through (%u of %u refused), test stops\n", s->name, refused, must_refuse); return; }
     const uint64_t began = now_us();
     uint32_t b = 0;
     for (; b < 8u; b++) {

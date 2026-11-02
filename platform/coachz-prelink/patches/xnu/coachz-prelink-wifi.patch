@@ -13,7 +13,7 @@
  	extern void coachz_battery_start(void);
 --- /dev/null
 +++ b/bsd/dev/coachz_wifi.c
-@@ -0,0 +1,3998 @@
+@@ -0,0 +1,5590 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/* WCN3990 / SC7180: the modem that hosts the WLAN firmware, started as mainline's qcom_q6v5_mss does (coachz-wifi=4), and the SMEM
 + * inventory (coachz-wifi=1 plus an explicit /arm-io/coachz-wifi ADT node). With the modem up: SMP2P, GLINK over SMEM, QRTR and
@@ -37,6 +37,7 @@
 +#include "coachz_wifi_smem.h"
 +#include "coachz_wifi_net.h"
 +#include <kern/locks.h>
++#include <sys/random.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
@@ -2180,8 +2181,8 @@
 +/* host_ce_config_wlan: flags, source entries and maximum, destination entries, callbacks (1 send, 2 receive). */
 +static const struct { uint32_t flags, src_n, src_max, dst_n, cb; } wc_host[WC_COUNT] = {
 +    {0, 16, 2048, 0, 1}, {0, 0, 2048, 512, 2}, {0, 0, 2048, 64, 2}, {0, 32, 2048, 0, 1}, {WC_DIS_INTR, 2048, 256, 0, 1},
-+    {0, 0, 512, 512, 2}, {0, 0, 0, 0, 0}, {0, 2, 2048, 2, 0}, {0, 0, 2048, 128, 0}, {0, 0, 2048, 512, 2}, {0, 0, 2048, 512, 2},
-+    {0, 0, 2048, 512, 2},
++    {0, 0, 512, 512, 2}, {0, 0, 0, 0, 0}, {0, 2, 2048, 2, 0}, {0, 0, 2048, 128, 0}, {0, 0, 2048, 64, 2}, {0, 0, 2048, 64, 2},
++    {0, 0, 2048, 64, 2},   /* the host's receive ring size only: 512 in Linux, and these carry almost nothing here */
 +};
 +/* target_ce_config_wlan: pipe, direction (1 in, 2 out, 3 both), entries, maximum bytes, flags. */
 +static const uint32_t wc_target[WC_COUNT][5] = {
@@ -2352,6 +2353,41 @@
 +    return 0;
 +}
 +
++/* ath10k_snoc_hif_tx_sg of two items: a header copied into the entry's slot with the gather flags, then a buffer of its own; the write index
++ * goes to the shadow register with the last. */
++static int
++wc_send_gather(unsigned id, const void *head, uint32_t head_bytes, uint64_t pa, uint32_t bytes)
++{
++    static const uint32_t shadow[WC_COUNT] = {0x00, 0, 0, 0x0c, 0x10, 0x14, 0, 0x1c, 0, 0, 0, 0};
++    struct wc_ring *s = &wc.src[id];
++    if (!wc.up || !s->n || !s->buf || head_bytes > wc_host[id].src_max) return -1;
++    const uint32_t sw = wc.rri[id] & 0xffffu;
++    if ((((sw - 1u) - s->write) & s->mask) < 2u) return -2;
++    const uint64_t head_pa = s->buf_pa + (uint64_t)s->write * wc_host[id].src_max;
++    memcpy(s->buf + (uint64_t)s->write * wc_host[id].src_max, head, head_bytes);
++    uint8_t *desc = s->desc + 16u * s->write;
++    const uint32_t first[2] = {(uint32_t)head_pa, ((uint32_t)(head_pa >> 32) & 0x1fu) | 1u << 31};   /* CE_WCN3990_DESC_FLAGS_GATHER */
++    uint16_t length = (uint16_t)head_bytes, flags = 1;                                                /* CE_DESC_FLAGS_GATHER */
++    memcpy(desc, first, 8);
++    memcpy(desc + 8, &length, 2);
++    memcpy(desc + 10, &flags, 2);
++    const uint32_t next = (s->write + 1u) & s->mask;
++    desc = s->desc + 16u * next;
++    const uint32_t second[2] = {(uint32_t)pa, (uint32_t)(pa >> 32) & 0x1fu};
++    length = (uint16_t)bytes;
++    flags = 0;
++    memcpy(desc, second, 8);
++    memcpy(desc + 8, &length, 2);
++    memcpy(desc + 10, &flags, 2);
++    s->write = (next + 1u) & s->mask;
++    __asm__ volatile ("dsb st" ::: "memory");
++    *(volatile uint32_t *)(wc.shadow + shadow[id]) = s->write;
++    wc.tx[id]++;
++    return 0;
++}
++
++static void wj_htt_message(const uint8_t *p, uint32_t n);
++static void wj_wmi_event(uint32_t id, const uint8_t *m, uint32_t n);
 +static void wh_rx(unsigned pipe, const uint8_t *data, uint32_t bytes);
 +static void ws_scan_event(const uint8_t *m, uint32_t n);
 +static void ws_chan_info(const uint8_t *m, uint32_t n);
@@ -2615,6 +2651,8 @@
 +            ws_scan_event(p + 4, bytes - 4);
 +        } else if (wh.last_wmi == 0x7001 && bytes >= 4) {   /* WMI_TLV_MGMT_RX_EVENTID */
 +            ws_mgmt_rx(p + 4, bytes - 4);
++        } else if (bytes >= 4) {
++            wj_wmi_event(wh.last_wmi, p + 4, bytes - 4);
 +        }
 +    } else if ((int)eid == wh.htt) {
 +        wh.htt_messages++;
@@ -2625,6 +2663,7 @@
 +            ws.htt_major = p[2];
 +            ws.htt_version = 1;
 +        }
++        if (bytes) wj_htt_message(p, bytes);
 +    } else if ((int)eid == wh.log) {
 +        wh.log_messages++;
 +    }
@@ -2798,7 +2837,8 @@
 +/* ath10k_start's order past ath10k_core_start, ath10k_regd_update, ath10k_update_channel_list, ath10k_add_interface and
 + * ath10k_hw_scan. With no SSID the scan is passive and every channel is marked passive, so the radio only listens. */
 +static const uint16_t ws_mhz[] = {2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472,
-+    5180, 5200, 5220, 5240, 5745, 5765, 5785, 5805, 5825};
++    5180, 5200, 5220, 5240, 5260, 5280, 5300, 5320, 5500, 5520, 5540, 5560, 5580, 5600, 5620, 5640, 5660, 5680, 5700, 5720,
++    5745, 5765, 5785, 5805, 5825};
 +#define WS_CHANS (sizeof(ws_mhz) / sizeof(ws_mhz[0]))
 +#define WS_PUT32(v) do { const uint32_t w_ = (v); memcpy(m + at, &w_, 4); at += 4; } while (0)
 +#define WS_TLV(tag, len) do { const uint16_t l_ = (uint16_t)(len), t_ = (uint16_t)(tag); memcpy(m + at, &l_, 2); memcpy(m + at + 2, &t_, 2); at += 4; } while (0)
@@ -2811,6 +2851,18 @@
 +#define WS_FRAG_DESCS 1056u   /* TARGET_TLV_NUM_MSDU_DESC */
 +#define WS_FRAG_DESC 72u      /* sizeof(struct htt_msdu_ext_desc_64) */
 +static uint64_t ws_ring_pa, ws_index_pa, ws_frag_pa;
++/* The receive ring as ath10k_htt_rx_ring_fill_n and the pops use it, and the frames waiting to go or sent and not yet completed: a slot's
++ * number is its MSDU identifier. */
++#define WJ_TX_SLOTS 256u
++#define WJ_TX_SLOT 2048u
++#define WJ_MGMT_SLOTS 8u
++#define WJ_MGMT_SLOT 1024u
++static uint8_t *wr_ring, *wr_index, *wr_buffers, *ws_frag_mem, *wj_tx_mem, *wj_mgmt_mem;
++static uint64_t wr_buffers_pa, wj_tx_pa, wj_mgmt_pa;
++static uint32_t wr_alloc, wr_read, wj_tx_head, wj_tx_tail;
++static uint16_t wj_tx_free[WJ_TX_SLOTS], wj_tx_q[WJ_TX_SLOTS], wj_tx_len[WJ_TX_SLOTS];
++static uint8_t wj_tx_busy[WJ_TX_SLOTS], wj_tx_flag[WJ_TX_SLOTS];
++static unsigned wj_tx_free_n;
 +
 +static int
 +ws_htt_prepare(void)
@@ -2818,7 +2870,16 @@
 +    uint64_t buffers_pa = 0;
 +    uint8_t *ring = wc_alloc(WS_RX_RING * 8u, &ws_ring_pa), *index = wc_alloc(4, &ws_index_pa), *buffers = wc_alloc(WS_RX_FILL * WS_RX_BUF, &buffers_pa),
 +            *frags = wc_alloc(WS_FRAG_DESCS * WS_FRAG_DESC, &ws_frag_pa);
-+    if (!ring || !index || !buffers || !frags) return -1;
++    wj_tx_mem = wc_alloc(WJ_TX_SLOTS * WJ_TX_SLOT, &wj_tx_pa);
++    wj_mgmt_mem = wc_alloc(WJ_MGMT_SLOTS * WJ_MGMT_SLOT, &wj_mgmt_pa);
++    if (!ring || !index || !buffers || !frags || !wj_tx_mem || !wj_mgmt_mem) return -1;
++    wr_ring = ring;
++    wr_index = index;
++    wr_buffers = buffers;
++    wr_buffers_pa = buffers_pa;
++    ws_frag_mem = frags;
++    wr_alloc = WS_RX_FILL;
++    wr_read = 0;
 +    memset(ring, 0, WS_RX_RING * 8u);
 +    memset(buffers, 0, WS_RX_FILL * WS_RX_BUF);
 +    memset(frags, 0, WS_FRAG_DESCS * WS_FRAG_DESC);
@@ -2917,8 +2978,11 @@
 +            WS_PUT32(ws_mhz[c]);
 +            WS_PUT32(ws_mhz[c]);
 +            WS_PUT32(0);
-+            /* ath10k_wmi_put_wmi_channel: the mode (11G 1, 11A 0) in the low bits, PASSIVE bit 7, ALLOW_HT bit 11. */
-+            WS_PUT32((ws_mhz[c] < 3000 ? 1u : 0u) | 1u << 7 | 1u << 11);
++            /* ath10k_update_channel_list on the world domain (Debian's iw reg get) through ath10k_wmi_put_wmi_channel: the mode (11G 1, 11A 0) in
++             * the low bits, PASSIVE bit 7 where it asks for a passive scan (all of 5 GHz, channels 12 and 13), DFS bit 10, ALLOW_HT bit 11, ALLOW_VHT
++             * bit 12. The scans themselves stay passive. */
++            const uint32_t mhz = ws_mhz[c];
++            WS_PUT32((mhz < 3000 ? 1u : 0u) | (mhz > 2462 ? 1u << 7 : 0) | ((mhz >= 5260 && mhz <= 5720) ? 1u << 10 : 0) | 1u << 11 | 1u << 12);
 +            WS_PUT32(40u << 8 | 40u << 16);   /* min 0, max and regulatory 20 dBm in half dB: the world entries of Debian's iw reg get */
 +            WS_PUT32(6u | 40u << 8);          /* antenna 6 dBi, max tx */
 +        }
@@ -3096,17 +3160,1517 @@
 +    return found ? 0 : -1;
 +}
 +
-+/* No data path yet: joining and sending fail plainly, so the system sees a network it cannot join rather than a hang. */
-+int nw_wifi_connect(const uint8_t *ssid, size_t len, const uint8_t *bssid, const char *pass, size_t plen) { (void)ssid; (void)len; (void)bssid; (void)pass; (void)plen; return -1; }
-+void nw_wifi_disconnect(void) {}
-+int nw_wifi_tx(const uint8_t *eth, size_t len) { (void)eth; (void)len; return -1; }
++/*
++ * Joining a network. The order is what mac80211 and wpa_supplicant make ath10k do (mac.c, wmi-tlv.c, htt_tx.c, htt_rx.c): the vdev started on
++ * the access point's channel, its peer created and seen in HTT's peer map, authentication and association as management frames over WMI by
++ * reference, ath10k_bss_assoc's peer assoc and vdev up, the four-way handshake as data frames, the keys, the peer authorized. Data moves in
++ * native Wi-Fi format through HTT: a 3-address header without QoS control, then LLC. Names, addresses and keys are never printed.
++ */
++
++/* ---- WPA2-Personal's hashes: SHA-1, HMAC, the 802.11i PRF, PBKDF2 and AES key unwrap (RFC 3394) ---- */
++static inline uint32_t wk_rol(uint32_t v, unsigned n) { return v << n | v >> (32 - n); }
++
++static void
++wk_sha1_block(uint32_t h[5], const uint8_t *p)
++{
++    uint32_t w[80];
++    for (unsigned i = 0; i < 16; i++) w[i] = (uint32_t)p[4 * i] << 24 | (uint32_t)p[4 * i + 1] << 16 | (uint32_t)p[4 * i + 2] << 8 | p[4 * i + 3];
++    for (unsigned i = 16; i < 80; i++) w[i] = wk_rol(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
++    uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
++    for (unsigned i = 0; i < 80; i++) {
++        const uint32_t f = i < 20 ? ((b & c) | (~b & d)) + 0x5a827999u : i < 40 ? (b ^ c ^ d) + 0x6ed9eba1u
++            : i < 60 ? ((b & c) | (b & d) | (c & d)) + 0x8f1bbcdcu : (b ^ c ^ d) + 0xca62c1d6u;
++        const uint32_t t = wk_rol(a, 5) + f + e + w[i];
++        e = d;
++        d = c;
++        c = wk_rol(b, 30);
++        b = a;
++        a = t;
++    }
++    h[0] += a;
++    h[1] += b;
++    h[2] += c;
++    h[3] += d;
++    h[4] += e;
++}
++
++/* SHA-1 of two pieces, the first a whole number of blocks when it is an HMAC pad. */
++static void
++wk_sha1(const uint8_t *a, uint32_t an, const uint8_t *b, uint32_t bn, uint8_t out[20])
++{
++    uint32_t h[5] = {0x67452301u, 0xefcdab89u, 0x98badcfeu, 0x10325476u, 0xc3d2e1f0u};
++    uint8_t block[64];
++    uint32_t fill = 0;
++    const uint64_t bits = ((uint64_t)an + bn) * 8u;
++    for (unsigned piece = 0; piece < 2; piece++) {
++        const uint8_t *p = piece ? b : a;
++        uint32_t n = piece ? bn : an;
++        while (n) {
++            if (!fill && n >= 64) {
++                wk_sha1_block(h, p);
++                p += 64;
++                n -= 64;
++                continue;
++            }
++            const uint32_t take = n < 64 - fill ? n : 64 - fill;
++            memcpy(block + fill, p, take);
++            fill += take;
++            p += take;
++            n -= take;
++            if (fill == 64) {
++                wk_sha1_block(h, block);
++                fill = 0;
++            }
++        }
++    }
++    block[fill++] = 0x80;
++    if (fill > 56) {
++        memset(block + fill, 0, 64 - fill);
++        wk_sha1_block(h, block);
++        fill = 0;
++    }
++    memset(block + fill, 0, 56 - fill);
++    for (unsigned i = 0; i < 8; i++) block[56 + i] = (uint8_t)(bits >> (56 - 8 * i));
++    wk_sha1_block(h, block);
++    for (unsigned i = 0; i < 5; i++)
++        for (unsigned k = 0; k < 4; k++) out[4 * i + k] = (uint8_t)(h[i] >> (24 - 8 * k));
++}
++
++static void
++wk_hmac(const uint8_t *key, uint32_t kn, const uint8_t *data, uint32_t n, uint8_t out[20])
++{
++    uint8_t pad[64], inner[20];
++    memset(pad, 0x36, sizeof(pad));
++    if (kn > 64) kn = 64;
++    for (uint32_t i = 0; i < kn; i++) pad[i] ^= key[i];
++    wk_sha1(pad, 64, data, n, inner);
++    for (unsigned i = 0; i < 64; i++) pad[i] ^= 0x36 ^ 0x5c;
++    wk_sha1(pad, 64, inner, 20, out);
++}
++
++/* PRF-X of 802.11i: HMAC-SHA1(key, label, 0, data, counter) until enough. */
++static void
++wk_prf(const uint8_t *key, uint32_t kn, const char *label, const uint8_t *data, uint32_t n, uint8_t *out, uint32_t bytes)
++{
++    uint8_t m[128], digest[20];
++    const uint32_t ln = (uint32_t)strlen(label);
++    if (ln + 1u + n + 1u > sizeof(m)) return;
++    memcpy(m, label, ln);
++    m[ln] = 0;
++    memcpy(m + ln + 1u, data, n);
++    for (uint32_t i = 0, done = 0; done < bytes; i++) {
++        m[ln + 1u + n] = (uint8_t)i;
++        wk_hmac(key, kn, m, ln + 2u + n, digest);
++        const uint32_t take = bytes - done < 20 ? bytes - done : 20;
++        memcpy(out + done, digest, take);
++        done += take;
++    }
++}
++
++/* The pairwise master key of a passphrase: PBKDF2-HMAC-SHA1, 4096 rounds, the network's name as salt. */
++static void
++wk_pmk(const char *pass, uint32_t pn, const uint8_t *ssid, uint32_t sn, uint8_t out[32])
++{
++    uint8_t salt[36];
++    memcpy(salt, ssid, sn);
++    for (uint32_t block = 1, done = 0; done < 32; block++) {
++        uint8_t u[20], t[20];
++        salt[sn] = salt[sn + 1] = salt[sn + 2] = 0;
++        salt[sn + 3] = (uint8_t)block;
++        wk_hmac((const uint8_t *)pass, pn, salt, sn + 4u, u);
++        memcpy(t, u, 20);
++        for (unsigned round = 1; round < 4096; round++) {
++            wk_hmac((const uint8_t *)pass, pn, u, 20, u);
++            for (unsigned i = 0; i < 20; i++) t[i] ^= u[i];
++        }
++        const uint32_t take = 32 - done < 20 ? 32 - done : 20;
++        memcpy(out + done, t, take);
++        done += take;
++    }
++}
++
++/* AES-128 decryption of one block, the tables computed on first use. */
++static uint8_t wk_sbox[256], wk_inv[256];
++static inline uint8_t wk_xt(uint8_t v) { return (uint8_t)(v << 1) ^ (v & 0x80 ? 0x1b : 0); }
++static uint8_t
++wk_mul(uint8_t a, uint8_t b)
++{
++    uint8_t r = 0;
++    while (b) {
++        if (b & 1) r ^= a;
++        a = wk_xt(a);
++        b >>= 1;
++    }
++    return r;
++}
++
++static void
++wk_tables(void)
++{
++    if (wk_sbox[0]) return;
++    uint8_t p = 1, q = 1;
++    do {
++        p = p ^ wk_xt(p);
++        q ^= (uint8_t)(q << 1);
++        q ^= (uint8_t)(q << 2);
++        q ^= (uint8_t)(q << 4);
++        if (q & 0x80) q ^= 0x09;
++        const uint8_t x = q ^ (uint8_t)(q << 1 | q >> 7) ^ (uint8_t)(q << 2 | q >> 6) ^ (uint8_t)(q << 3 | q >> 5) ^ (uint8_t)(q << 4 | q >> 4);
++        wk_sbox[p] = x ^ 0x63;
++    } while (p != 1);
++    wk_sbox[0] = 0x63;
++    for (unsigned i = 0; i < 256; i++) wk_inv[wk_sbox[i]] = (uint8_t)i;
++}
++
++static void
++wk_aes_expand(const uint8_t key[16], uint8_t rk[176])
++{
++    uint8_t rcon = 1;
++    memcpy(rk, key, 16);
++    for (unsigned i = 16; i < 176; i += 4) {
++        uint8_t t[4];
++        memcpy(t, rk + i - 4, 4);
++        if (!(i % 16)) {
++            const uint8_t first = t[0];
++            t[0] = wk_sbox[t[1]] ^ rcon;
++            t[1] = wk_sbox[t[2]];
++            t[2] = wk_sbox[t[3]];
++            t[3] = wk_sbox[first];
++            rcon = wk_xt(rcon);
++        }
++        for (unsigned k = 0; k < 4; k++) rk[i + k] = rk[i - 16 + k] ^ t[k];
++    }
++}
++
++static void
++wk_aes_decrypt(const uint8_t rk[176], uint8_t s[16])
++{
++    for (unsigned k = 0; k < 16; k++) s[k] ^= rk[160 + k];
++    for (int round = 9; round >= 0; round--) {
++        uint8_t t[16];
++        for (unsigned c = 0; c < 4; c++)
++            for (unsigned r = 0; r < 4; r++) t[(4 * (c + r) + r) % 16] = wk_inv[s[4 * c + r]];
++        for (unsigned k = 0; k < 16; k++) t[k] ^= rk[16 * (unsigned)round + k];
++        if (round) {
++            for (unsigned c = 0; c < 4; c++) {
++                const uint8_t *i = t + 4 * c;
++                s[4 * c] = wk_mul(i[0], 14) ^ wk_mul(i[1], 11) ^ wk_mul(i[2], 13) ^ wk_mul(i[3], 9);
++                s[4 * c + 1] = wk_mul(i[0], 9) ^ wk_mul(i[1], 14) ^ wk_mul(i[2], 11) ^ wk_mul(i[3], 13);
++                s[4 * c + 2] = wk_mul(i[0], 13) ^ wk_mul(i[1], 9) ^ wk_mul(i[2], 14) ^ wk_mul(i[3], 11);
++                s[4 * c + 3] = wk_mul(i[0], 11) ^ wk_mul(i[1], 13) ^ wk_mul(i[2], 9) ^ wk_mul(i[3], 14);
++            }
++        } else {
++            memcpy(s, t, 16);
++        }
++    }
++}
++
++/* Key data of the handshake; the plain text is n - 8 bytes. Zero when its integrity value checks. */
++static int
++wk_unwrap(const uint8_t kek[16], const uint8_t *in, uint32_t n, uint8_t *out)
++{
++    uint8_t rk[176], a[8], b[16];
++    if (n < 24 || n % 8) return -1;
++    wk_tables();
++    wk_aes_expand(kek, rk);
++    const uint32_t blocks = n / 8u - 1u;
++    memcpy(a, in, 8);
++    memcpy(out, in + 8, n - 8u);
++    for (int j = 5; j >= 0; j--) {
++        for (uint32_t i = blocks; i >= 1; i--) {
++            const uint64_t t = (uint64_t)blocks * (unsigned)j + i;
++            memcpy(b, a, 8);
++            for (unsigned k = 0; k < 8; k++) b[7 - k] ^= (uint8_t)(t >> (8 * k));
++            memcpy(b + 8, out + 8u * (i - 1u), 8);
++            wk_aes_decrypt(rk, b);
++            memcpy(a, b, 8);
++            memcpy(out + 8u * (i - 1u), b + 8, 8);
++        }
++    }
++    for (unsigned k = 0; k < 8; k++)
++        if (a[k] != 0xa6) return -1;
++    return 0;
++}
++
++/* ---- the join ---- */
++#define WJ_VDEV 0u
++enum { WJ_IDLE, WJ_VDEV_START, WJ_PEER, WJ_AUTH, WJ_ASSOC, WJ_KEYS, WJ_M4, WJ_UP, WJ_LEAVE_PEER, WJ_LEAVE_VDEV };
++static struct {
++    unsigned state, tries, seq, up_on, peer_on, vdev_on, started, stopped, peer_mapped, peer_unmapped, stage;
++    uint32_t waited_ms, tx_ms, second_ms;
++    struct nw_bss_info ap;
++    uint8_t ssid[32], ssid_len, secure, wmm, ht, vht, width, keyed, m4_acked;
++    uint8_t pmk[32], rsn[22], anonce[32], snonce[32], ptk[48], gtk[16], gtk_idx, gtk_len, replay[8], have_replay, eapol_ver;
++    uint32_t center_mhz, mode;
++    uint16_t aid, peer_id, m4_slot;
++    /* What came and went, for the once-a-ten-seconds line. */
++    uint32_t rx_frames, rx_bytes, rx_eapol, rx_bad, rx_undone, tx_frames, tx_acked, tx_noack, tx_discard, tx_full, roam, kickout, mgmt_tx, mgmt_ok, mgmt_fail;
++    uint32_t bmiss_rx, bmiss_ms, bmiss_on, rx_ind, rx_in_ord;
++} wj;
++static struct { uint8_t kind, ssid[32], ssid_len, bssid[6], has_bssid, has_pass, pass_len; char pass[65]; } wj_req;   /* under ws_lock */
++static struct nw_wifi_status wj_pub;   /* under ws_lock */
++
++static void
++wj_publish(unsigned state, int result)
++{
++    lck_mtx_lock(ws_lock);
++    wj_pub.state = state;
++    wj_pub.result = result;
++    if (state >= NW_STA_AUTH) {
++        memcpy(wj_pub.bssid, wj.ap.bssid, 6);
++        wj_pub.ssid_len = wj.ssid_len;
++        memcpy(wj_pub.ssid, wj.ssid, 32);
++        wj_pub.freq_mhz = wj.ap.freq_mhz;
++        wj_pub.signal_dbm = wj.ap.signal_dbm;
++    } else {
++        memset(wj_pub.bssid, 0, 6);
++        wj_pub.ssid_len = 0;
++        memset(wj_pub.ssid, 0, 32);
++    }
++    lck_mtx_unlock(ws_lock);
++}
++
++/* Commands wait here for WMI credits, in order; data waits until they are gone, so a handshake frame cannot pass the peer assoc. */
++#define WJ_CMDS 24u
++static struct { uint16_t bytes; uint8_t m[256]; } wj_cmd[WJ_CMDS];
++static unsigned wj_cmd_in, wj_cmd_out;
++
++static uint32_t wj_tlv(uint8_t *m, uint32_t at, uint16_t tag, uint16_t len) { memcpy(m + at, &len, 2); memcpy(m + at + 2, &tag, 2); return at + 4; }
++static uint32_t wj_u32(uint8_t *m, uint32_t at, uint32_t v) { memcpy(m + at, &v, 4); return at + 4; }
++static uint32_t wj_mac(uint8_t *m, uint32_t at, const uint8_t *mac) { memcpy(m + at, mac, 6); m[at + 6] = m[at + 7] = 0; return at + 8; }
++
++static uint8_t *
++wj_cmd_new(uint32_t id)
++{
++    uint8_t *m = wj_cmd[wj_cmd_in % WJ_CMDS].m;
++    memset(m, 0, sizeof(wj_cmd[0].m));
++    (void)wj_u32(m, 0, id);
++    return m;
++}
++
++static void
++wj_cmd_push(uint32_t bytes)
++{
++    if (wj_cmd_in - wj_cmd_out >= WJ_CMDS) {
++        printf("COACHZ join: command queue full\n");
++        return;
++    }
++    wj_cmd[wj_cmd_in % WJ_CMDS].bytes = (uint16_t)bytes;
++    wj_cmd_in++;
++}
++
++static void
++wj_cmd_flush(void)
++{
++    while (wj_cmd_out != wj_cmd_in) {
++        const unsigned at = wj_cmd_out % WJ_CMDS;
++        const int sent = wh_send((unsigned)wh.wmi, wj_cmd[at].m, wj_cmd[at].bytes);
++        if (sent == -2) return;
++        if (sent) printf("COACHZ join: command 0x%x not sent (%d)\n", wm_u32(wj_cmd[at].m, 0), sent);
++        wj_cmd_out++;
++    }
++}
++
++static void
++wj_vdev_param(uint32_t id, uint32_t value)
++{
++    uint8_t *m = wj_cmd_new(0x5008);
++    uint32_t at = wj_tlv(m, 4, 0x5f, 12);
++    at = wj_u32(m, at, WJ_VDEV);
++    at = wj_u32(m, at, id);
++    wj_cmd_push(wj_u32(m, at, value));
++}
++
++static void
++wj_pdev_param(uint32_t id, uint32_t value)
++{
++    uint8_t *m = wj_cmd_new(0x4003);
++    uint32_t at = wj_tlv(m, 4, 0x52, 12);
++    at = wj_u32(m, at, 0);
++    at = wj_u32(m, at, id);
++    wj_cmd_push(wj_u32(m, at, value));
++}
++
++static void
++wj_peer_param(uint32_t id, uint32_t value)
++{
++    uint8_t *m = wj_cmd_new(0x6004);
++    uint32_t at = wj_tlv(m, 4, 0x64, 20);
++    at = wj_u32(m, at, WJ_VDEV);
++    at = wj_mac(m, at, wj.ap.bssid);
++    at = wj_u32(m, at, id);
++    wj_cmd_push(wj_u32(m, at, value));
++}
++
++static void
++wj_sta_ps(uint32_t id, uint32_t value)
++{
++    uint8_t *m = wj_cmd_new(0x9002);
++    uint32_t at = wj_tlv(m, 4, 0x6d, 12);
++    at = wj_u32(m, at, WJ_VDEV);
++    at = wj_u32(m, at, id);
++    wj_cmd_push(wj_u32(m, at, value));
++}
++
++static void
++wj_vdev_id_cmd(uint32_t id, uint16_t tag)
++{
++    uint8_t *m = wj_cmd_new(id);
++    uint32_t at = wj_tlv(m, 4, tag, 4);
++    wj_cmd_push(wj_u32(m, at, WJ_VDEV));
++}
++
++/* ath10k_vdev_start_restart for a station: the channel with the width the access point runs, its name, no flags. */
++static void
++wj_send_vdev_start(uint32_t dtim)
++{
++    uint8_t *m = wj_cmd_new(0x5003);
++    uint32_t at = wj_tlv(m, 4, 0x58, 72);
++    at = wj_u32(m, at, WJ_VDEV);
++    at = wj_u32(m, at, 0);
++    at = wj_u32(m, at, wj.ap.beacon_int ? wj.ap.beacon_int : 100u);
++    at = wj_u32(m, at, dtim ? dtim : 1u);
++    at = wj_u32(m, at, 0);
++    at = wj_u32(m, at, wj.ssid_len);
++    memcpy(m + at, wj.ssid, wj.ssid_len);
++    at += 32 + 16;   /* the name, and beacon rate, power, notice of absence and hardware ack: zero */
++    at = wj_tlv(m, at, 0x50, 24);
++    at = wj_u32(m, at, wj.ap.freq_mhz);
++    at = wj_u32(m, at, wj.center_mhz);
++    at = wj_u32(m, at, 0);
++    at = wj_u32(m, at, wj.mode);
++    at = wj_u32(m, at, 40u << 8 | 40u << 16);   /* max and regulatory 20 dBm in half dB, as in the channel list */
++    at = wj_u32(m, at, 6u | 40u << 8);
++    at = wj_tlv(m, at, 0x12, 0);
++    wj_cmd_push(at);
++}
++
++static void
++wj_send_peer_create(void)
++{
++    uint8_t *m = wj_cmd_new(0x6001);
++    uint32_t at = wj_tlv(m, 4, 0x61, 16);
++    at = wj_u32(m, at, WJ_VDEV);
++    at = wj_mac(m, at, wj.ap.bssid);
++    wj_cmd_push(wj_u32(m, at, 0));   /* WMI_PEER_TYPE_DEFAULT */
++}
++
++static void
++wj_send_peer_delete(void)
++{
++    uint8_t *m = wj_cmd_new(0x6002);
++    uint32_t at = wj_tlv(m, 4, 0x62, 12);
++    at = wj_u32(m, at, WJ_VDEV);
++    wj_cmd_push(wj_mac(m, at, wj.ap.bssid));
++}
++
++/* wmi_tlv_op_gen_mgmt_tx_send: by reference, the first bytes also inline. The frame stays in its slot until the slot comes round again. */
++static unsigned wj_mgmt_next;
++
++static void
++wj_send_mgmt(const uint8_t *f, uint32_t n)
++{
++    if (!wj_mgmt_mem || n > WJ_MGMT_SLOT) return;
++    const unsigned slot = wj_mgmt_next++ % WJ_MGMT_SLOTS;
++    memcpy(wj_mgmt_mem + (uint64_t)slot * WJ_MGMT_SLOT, f, n);
++    __asm__ volatile ("dsb st" ::: "memory");
++    const uint64_t pa = wj_mgmt_pa + (uint64_t)slot * WJ_MGMT_SLOT;
++    uint32_t inline_bytes = n < 64 ? n : 64;
++    inline_bytes = (inline_bytes + 3u) & ~3u;
++    uint8_t *m = wj_cmd_new(0x7008);
++    uint32_t at = wj_tlv(m, 4, 0x1a6, 28);
++    at = wj_u32(m, at, WJ_VDEV);
++    at = wj_u32(m, at, slot);
++    at = wj_u32(m, at, 0);
++    memcpy(m + at, &pa, 8);
++    at += 8;
++    at = wj_u32(m, at, n);
++    at = wj_u32(m, at, inline_bytes);
++    at = wj_tlv(m, at, 0x11, (uint16_t)inline_bytes);
++    memcpy(m + at, f, n < inline_bytes ? n : inline_bytes);
++    wj_cmd_push(at + inline_bytes);
++    wj.mgmt_tx++;
++    wj.tx_ms = 0;
++}
++
++static const uint8_t *
++wj_ie(uint8_t id)
++{
++    const uint8_t *e = wj.ap.ie;
++    for (uint32_t at = 0; at + 2u <= wj.ap.ie_len && at + 2u + e[at + 1] <= wj.ap.ie_len; at += 2u + e[at + 1])
++        if (e[at] == id) return e + at;
++    return NULL;
++}
++
++/* The WMM element, vendor 00:50:f2 type 2. */
++static int
++wj_has_wmm(void)
++{
++    const uint8_t *e = wj.ap.ie;
++    for (uint32_t at = 0; at + 2u <= wj.ap.ie_len && at + 2u + e[at + 1] <= wj.ap.ie_len; at += 2u + e[at + 1])
++        if (e[at] == 221 && e[at + 1] >= 5 && e[at + 2] == 0 && e[at + 3] == 0x50 && e[at + 4] == 0xf2 && e[at + 5] == 2) return 1;
++    return 0;
++}
++
++/* Our HT and VHT capability, as Debian's iw phy shows for this radio; A-MPDU exponent 3 with 8 us spacing, two streams. */
++#define WJ_HT_CAP 0x19efu
++#define WJ_VHT_CAP (0x739139b2u & ~(1u << 11 | 1u << 12 | 7u << 13 | 7u << 16 | 1u << 19 | 1u << 20))   /* no sounding is set up: no beamforming */
++
++/* What the access point's beacon says about the link: 20, 40 or 80 MHz, the centre, and the mode of chan_to_phymode. */
++static void
++wj_channel_plan(void)
++{
++    const uint8_t *htop = wj_ie(61), *vhtop = wj_ie(192);
++    const uint32_t f = wj.ap.freq_mhz;
++    const int five = f >= 4900;
++    wj.ht = wj_ie(45) != NULL;
++    wj.vht = five && wj.ht && wj_ie(191) != NULL;
++    wj.width = 20;
++    wj.center_mhz = f;
++    const uint32_t chan = five ? (f - 5000u) / 5u : 0;
++    if (wj.ht && htop && htop[1] >= 2 && (htop[3] & 4) && (htop[3] & 3)) {
++        wj.width = 40;
++        wj.center_mhz = (htop[3] & 3) == 1 ? f + 10u : f - 10u;
++    }
++    if (wj.vht && vhtop && vhtop[1] >= 3 && vhtop[2] >= 1 && wj.width == 40) {
++        static const uint8_t centres[] = {42, 58, 106, 122, 138, 155};
++        for (unsigned i = 0; i < sizeof(centres); i++) {
++            if (chan + 6u >= centres[i] && chan <= centres[i] + 6u) {
++                wj.width = 80;
++                wj.center_mhz = 5000u + 5u * centres[i];
++            }
++        }
++    }
++    if (!five) wj.mode = !wj.ht ? 1u : wj.width == 40 ? 7u : 5u;                                      /* 11G, 11NG_HT40, 11NG_HT20 */
++    else wj.mode = !wj.ht ? 0u : wj.width == 80 ? 10u : wj.width == 40 ? (wj.vht ? 9u : 6u) : (wj.vht ? 8u : 4u);
++}
++
++/* An RSN element we can answer: pairwise CCMP, key management PSK, group CCMP, management protection not required. */
++static int
++wj_rsn_prepare(const uint8_t *e)
++{
++    static const uint8_t oui[3] = {0x00, 0x0f, 0xac};
++    if (!e || e[1] < 18) return -1;
++    const uint8_t *p = e + 2, *end = e + 2 + e[1];
++    p += 2;
++    if (memcmp(p, oui, 3) || p[3] != 4) return -1;
++    p += 4;
++    unsigned n = (unsigned)(p[0] | p[1] << 8), found = 0;
++    p += 2;
++    if (end - p < (long)(4u * n + 2u)) return -1;
++    for (unsigned i = 0; i < n; i++, p += 4) if (!memcmp(p, oui, 3) && p[3] == 4) found = 1;
++    if (!found) return -1;
++    n = (unsigned)(p[0] | p[1] << 8);
++    found = 0;
++    p += 2;
++    if (end - p < (long)(4u * n)) return -1;
++    for (unsigned i = 0; i < n; i++, p += 4) if (!memcmp(p, oui, 3) && p[3] == 2) found = 1;
++    if (!found) return -1;
++    if (end - p >= 2 && (p[0] & 0x40)) return -1;
++    static const uint8_t rsn[22] = {48, 20, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 2, 0, 0};
++    memcpy(wj.rsn, rsn, sizeof(rsn));
++    return 0;
++}
++
++static void
++wj_mgmt_header(uint8_t *f, uint8_t type)
++{
++    memset(f, 0, 24);
++    f[0] = type;
++    memcpy(f + 4, wj.ap.bssid, 6);
++    memcpy(f + 10, ws.mac, 6);
++    memcpy(f + 16, wj.ap.bssid, 6);
++    const uint16_t seq = (uint16_t)(wj.seq++ << 4);
++    memcpy(f + 22, &seq, 2);
++}
++
++static void
++wj_send_auth(void)
++{
++    uint8_t f[30];
++    wj_mgmt_header(f, 0xb0);
++    memset(f + 24, 0, 6);
++    f[26] = 1;   /* open system, transaction 1 */
++    wj_send_mgmt(f, sizeof(f));
++}
++
++/* What ieee80211_send_assoc puts in: capability, listen interval, name, rates, power and channels if the access point manages spectrum, RSN,
++ * HT, VHT and WMM. */
++static void
++wj_send_assoc(void)
++{
++    static uint8_t f[600];
++    wj_mgmt_header(f, 0x00);
++    const uint16_t apcap = wj.ap.caps;
++    const int five = wj.ap.freq_mhz >= 4900;
++    const uint16_t cap = (uint16_t)(1u | (wj.secure ? 0x10u : 0) | (apcap & 0x20u) | (!five ? (apcap & 0x400u) : 0) | (five ? (apcap & 0x100u) : 0));
++    f[24] = (uint8_t)cap;
++    f[25] = (uint8_t)(cap >> 8);
++    f[26] = 10;
++    f[27] = 0;
++    uint32_t at = 28;
++    f[at++] = 0;
++    f[at++] = wj.ssid_len;
++    memcpy(f + at, wj.ssid, wj.ssid_len);
++    at += wj.ssid_len;
++    /* The access point's rates that this radio has, plain (no basic bit). */
++    uint8_t rates[16], nr = 0;
++    for (unsigned pass = 0; pass < 2; pass++) {
++        const uint8_t *e = wj_ie(pass ? 50 : 1);
++        for (unsigned i = 0; e && i < e[1] && nr < sizeof(rates); i++) {
++            const uint8_t r = e[2 + i] & 0x7f;
++            if (r == 2 || r == 4 || r == 11 || r == 22) { if (!five) rates[nr++] = r; }
++            else if (r == 12 || r == 18 || r == 24 || r == 36 || r == 48 || r == 72 || r == 96 || r == 108) rates[nr++] = r;
++        }
++    }
++    const uint8_t first = nr < 8 ? nr : 8;
++    f[at++] = 1;
++    f[at++] = first;
++    memcpy(f + at, rates, first);
++    at += first;
++    if (nr > 8) {
++        f[at++] = 50;
++        f[at++] = (uint8_t)(nr - 8u);
++        memcpy(f + at, rates + 8, nr - 8u);
++        at += nr - 8u;
++    }
++    if (cap & 0x100u) {
++        static const uint8_t power[4] = {33, 2, 0, 20};
++        static const uint8_t channels[10] = {36, 8, 36, 4, 52, 4, 100, 12, 149, 5};
++        memcpy(f + at, power, sizeof(power));
++        at += sizeof(power);
++        memcpy(f + at, channels, sizeof(channels));
++        at += sizeof(channels);
++    }
++    if (wj.secure) {
++        memcpy(f + at, wj.rsn, sizeof(wj.rsn));
++        at += sizeof(wj.rsn);
++    }
++    if (wj.ht) {
++        const uint16_t ht = wj.width >= 40 ? WJ_HT_CAP : WJ_HT_CAP & ~0x42u;   /* no 40 MHz claim on a 20 MHz link */
++        f[at++] = 45;
++        f[at++] = 26;
++        memset(f + at, 0, 26);
++        f[at] = (uint8_t)ht;
++        f[at + 1] = (uint8_t)(ht >> 8);
++        f[at + 2] = 0x1b;
++        f[at + 3] = f[at + 4] = 0xff;
++        f[at + 15] = 1;   /* transmit MCS set defined */
++        at += 26;
++    }
++    if (wj.vht) {
++        const uint32_t vht = WJ_VHT_CAP;
++        f[at++] = 191;
++        f[at++] = 12;
++        memcpy(f + at, &vht, 4);
++        f[at + 4] = 0xfa;
++        f[at + 5] = 0xff;
++        f[at + 6] = f[at + 7] = 0;
++        f[at + 8] = 0xfa;
++        f[at + 9] = 0xff;
++        f[at + 10] = f[at + 11] = 0;
++        at += 12;
++    }
++    if (wj.wmm) {
++        static const uint8_t wmm[9] = {221, 7, 0x00, 0x50, 0xf2, 2, 0, 1, 0};
++        memcpy(f + at, wmm, sizeof(wmm));
++        at += sizeof(wmm);
++    }
++    wj_send_mgmt(f, at);
++}
++
++/* ath10k_peer_assoc_prepare for the access point: its beacon's capabilities narrowed to this radio's, in ath10k_peer_assoc_h_*'s fields. */
++static void
++wj_send_peer_assoc(void)
++{
++    uint32_t flags = 1u, rate_caps = 0, max_mpdu = 0, density = 0, nss = 1, ht_caps = 0, vht_caps = 0, vht_rx = 0, vht_tx = 0, vht_rx_max = 0, vht_tx_max = 0;
++    const int five = wj.ap.freq_mhz >= 4900;
++    if (wj.secure) flags |= 4u;
++    if (wj.wmm) flags |= 2u;
++    uint8_t legacy[16], ht_rates[16], nl = 0, nh = 0;
++    for (unsigned pass = 0; pass < 2; pass++) {
++        const uint8_t *e = wj_ie(pass ? 50 : 1);
++        for (unsigned i = 0; e && i < e[1] && nl < 12; i++) {
++            const uint8_t r = e[2 + i] & 0x7f;
++            const int cck = r == 2 || r == 4 || r == 11 || r == 22;
++            if (cck && five) continue;
++            if (cck || r == 12 || r == 18 || r == 24 || r == 36 || r == 48 || r == 72 || r == 96 || r == 108) legacy[nl++] = cck ? (r | 0x80) : r;
++        }
++    }
++    const uint8_t *ht = wj_ie(45);
++    if (wj.ht && ht && ht[1] >= 26) {
++        uint32_t cap = (uint32_t)(ht[2] | ht[3] << 8);
++        if (wj.width < 40) cap &= ~0x42u;
++        const uint8_t ampdu = ht[4];
++        flags |= 0x1000u;
++        rate_caps |= 8u;
++        max_mpdu = (1u << (13u + (ampdu & 3u))) - 1u;
++        const uint8_t d = (ampdu >> 2) & 7u;
++        density = d == 0 ? 0u : d <= 3 ? 1u : d == 4 ? 2u : d == 5 ? 4u : d == 6 ? 8u : 16u;
++        if (cap & 1u) flags |= 0x10000u;
++        if (wj.width >= 40) {
++            flags |= 0x2000u;
++            rate_caps |= 2u;
++        }
++        if ((cap & 0x20u) || (cap & 0x40u)) rate_caps |= 4u;
++        if (cap & 0x80u) {
++            rate_caps |= 0x20u;
++            flags |= 0x8000u;
++        }
++        if (cap & 0x300u) {
++            rate_caps |= ((cap >> 8) & 3u) << 6;
++            flags |= 0x8000u;
++        }
++        const uint8_t m0 = ht[5], m1 = ht[6];
++        if (m1) rate_caps |= 1u;
++        for (unsigned i = 0; i < 16; i++) {
++            if (((i < 8 ? m0 : m1) >> (i % 8)) & 1u) {
++                ht_rates[nh++] = (uint8_t)i;
++                nss = i / 8u + 1u;
++            }
++        }
++        if (!nh) for (nh = 0; nh < 8; nh++) ht_rates[nh] = nh;
++        ht_caps = cap;
++    }
++    const uint8_t *vht = wj_ie(191);
++    if (wj.vht && vht && vht[1] >= 12) {
++        memcpy(&vht_caps, vht + 2, 4);
++        vht_caps &= ~(1u << 11 | 1u << 12 | 7u << 13 | 7u << 16 | 1u << 19 | 1u << 20);
++        flags |= 0x2000000u;
++        const uint32_t factor = (vht_caps >> 23) & 7u, mpdu = (1u << (13u + factor)) - 1u;
++        if (mpdu > max_mpdu) max_mpdu = mpdu;
++        if (wj.width == 80) flags |= 0x4000000u;
++        vht_rx = (uint32_t)(vht[6] | vht[7] << 8);
++        vht_rx_max = (uint32_t)(vht[8] | vht[9] << 8);
++        vht_tx = (uint32_t)(vht[10] | vht[11] << 8);
++        vht_tx_max = (uint32_t)(vht[12] | vht[13] << 8);
++        /* Beyond two streams this radio has nothing: those fields read as not supported. */
++        vht_rx |= 0xfff0u;
++        vht_tx |= 0xfff0u;
++        unsigned streams = 0;
++        for (unsigned i = 0; i < 2; i++) if (((vht_rx >> (2 * i)) & 3u) != 3u) streams = i + 1u;
++        if (streams) nss = streams;
++    }
++    if (nss > 2) nss = 2;
++    uint32_t phy = wj.mode;
++    uint8_t *m = wj_cmd_new(0x6005);
++    uint32_t at = wj_tlv(m, 4, 0x65, 76);
++    at = wj_mac(m, at, wj.ap.bssid);
++    at = wj_u32(m, at, WJ_VDEV);
++    at = wj_u32(m, at, 1);   /* new association */
++    at = wj_u32(m, at, wj.aid);
++    at = wj_u32(m, at, flags);
++    at = wj_u32(m, at, wj.ap.caps);
++    at = wj_u32(m, at, 10);
++    at = wj_u32(m, at, ht_caps);
++    at = wj_u32(m, at, max_mpdu);
++    at = wj_u32(m, at, density);
++    at = wj_u32(m, at, rate_caps);
++    at = wj_u32(m, at, nss);
++    at = wj_u32(m, at, vht_caps);
++    at = wj_u32(m, at, phy);
++    at += 8;
++    at = wj_u32(m, at, nl);
++    at = wj_u32(m, at, nh);
++    const uint32_t lr = (nl + 3u) & ~3u, hr = (nh + 3u) & ~3u;
++    at = wj_tlv(m, at, 0x11, (uint16_t)lr);
++    memcpy(m + at, legacy, nl);
++    at += lr;
++    at = wj_tlv(m, at, 0x11, (uint16_t)hr);
++    memcpy(m + at, ht_rates, nh);
++    at += hr;
++    at = wj_tlv(m, at, 0x66, 16);
++    at = wj_u32(m, at, vht_rx_max);
++    at = wj_u32(m, at, vht_rx);
++    at = wj_u32(m, at, vht_tx_max);
++    at = wj_u32(m, at, vht_tx);
++    wj_cmd_push(at);
++    if (wj.ht && ht) {
++        static const uint8_t smps[4] = {1, 2, 0, 0};   /* ath10k_smps_map */
++        wj_peer_param(1, smps[(ht_caps >> 2) & 3u]);
++    }
++    printf("COACHZ join: peer assoc flags 0x%x, caps 0x%x, mode %u, %u streams, %u legacy and %u HT rates, ht 0x%x vht 0x%x, A-MPDU %u, density %u\n", flags, rate_caps, phy,
++        nss, nl, nh, ht_caps, vht_caps, max_mpdu, density);
++}
++
++static void
++wj_send_vdev_up(void)
++{
++    uint8_t *m = wj_cmd_new(0x5005);
++    uint32_t at = wj_tlv(m, 4, 0x5c, 16);
++    at = wj_u32(m, at, WJ_VDEV);
++    at = wj_u32(m, at, wj.aid);
++    wj_cmd_push(wj_mac(m, at, wj.ap.bssid));
++}
++
++/* ath10k_send_key: AES-CCM; a group key is sent with the access point's address too on a station. */
++static void
++wj_send_key(int pairwise, unsigned index, const uint8_t key[16])
++{
++    uint8_t *m = wj_cmd_new(0x5009);
++    uint32_t at = wj_tlv(m, 4, 0x60, 92);
++    at = wj_u32(m, at, WJ_VDEV);
++    at = wj_mac(m, at, wj.ap.bssid);
++    at = wj_u32(m, at, index);
++    at = wj_u32(m, at, pairwise ? 0u : 1u);
++    at = wj_u32(m, at, 4);        /* WMI_TLV_CIPHER_AES_CCM */
++    at += 8 + 8 + 8 + 16 + 16;    /* sequence counters: zero */
++    at = wj_u32(m, at, 16);
++    at = wj_u32(m, at, 0);
++    at = wj_u32(m, at, 0);
++    at = wj_tlv(m, at, 0x11, 16);
++    memcpy(m + at, key, 16);
++    wj_cmd_push(at + 16);
++}
++
++/* ---- data: ath10k_htt_tx_64 in native Wi-Fi format ---- */
++static void
++wj_tx_reset(void)
++{
++    lck_mtx_lock(ws_lock);
++    wj_tx_free_n = 0;
++    for (unsigned i = 0; i < WJ_TX_SLOTS; i++) {
++        wj_tx_free[wj_tx_free_n++] = (uint16_t)(WJ_TX_SLOTS - 1u - i);
++        wj_tx_busy[i] = 0;
++    }
++    wj_tx_head = wj_tx_tail = 0;
++    lck_mtx_unlock(ws_lock);
++}
++
++/* A frame into a slot and onto the queue; the service thread sends it. The frame's LLC type and body follow the header. */
++static int
++wj_tx_put(const uint8_t *da, const uint8_t *type, const uint8_t *body, uint32_t n, int eapol)
++{
++    if (n + 32u > WJ_TX_SLOT || !wj_tx_mem) return -1;
++    lck_mtx_lock(ws_lock);
++    if (!wj_tx_free_n) {
++        wj.tx_full++;
++        lck_mtx_unlock(ws_lock);
++        return -2;
++    }
++    const uint16_t slot = wj_tx_free[--wj_tx_free_n];
++    wj_tx_busy[slot] = 1;
++    uint8_t *f = wj_tx_mem + (uint64_t)slot * WJ_TX_SLOT;
++    uint8_t h[32];
++    memset(h, 0, sizeof(h));
++    h[0] = 0x08;
++    h[1] = (uint8_t)(0x01u | (wj.keyed ? 0x40u : 0));   /* to the distribution system, protected once the key is in */
++    memcpy(h + 4, wj.ap.bssid, 6);
++    memcpy(h + 10, ws.mac, 6);
++    memcpy(h + 16, da, 6);
++    h[24] = h[25] = 0xaa;
++    h[26] = 3;
++    h[30] = type[0];
++    h[31] = type[1];
++    memcpy(f, h, sizeof(h));
++    memcpy(f + sizeof(h), body, n);
++    wj_tx_len[slot] = (uint16_t)(n + sizeof(h));
++    wj_tx_flag[slot] = (uint8_t)(eapol ? 1u : 0);
++    wj_tx_q[wj_tx_tail % WJ_TX_SLOTS] = slot;
++    wj_tx_tail++;
++    wj.tx_frames++;
++    if (eapol) wj.m4_slot = slot;
++    lck_mtx_unlock(ws_lock);
++    return 0;
++}
++
++/* One slot through CE 4: the fragment descriptor, the HTC and HTT headers, then the frame's first bytes for the firmware to look at. */
++static int
++wj_tx_send(uint16_t slot)
++{
++    const uint32_t len = wj_tx_len[slot];
++    const uint64_t pa = wj_tx_pa + (uint64_t)slot * WJ_TX_SLOT;
++    const uint64_t desc = ws_frag_pa + (uint64_t)slot * WS_FRAG_DESC;
++    uint32_t prefetch = len < 50u ? len : 50u;
++    prefetch = (prefetch + 3u) & ~3u;
++    uint8_t ext[WS_FRAG_DESC];
++    memset(ext, 0, sizeof(ext));
++    const uint32_t lo = (uint32_t)pa;
++    const uint16_t hi = (uint16_t)(pa >> 32), fl = (uint16_t)len;
++    memcpy(ext + 24, &lo, 4);
++    memcpy(ext + 28, &hi, 2);
++    memcpy(ext + 30, &fl, 2);
++    memcpy(ws_frag_mem + (uint64_t)slot * WS_FRAG_DESC, ext, sizeof(ext));
++    uint8_t h[28];
++    memset(h, 0, sizeof(h));
++    const int eapol = wj_tx_flag[slot] != 0;
++    const uint8_t tid = !wj.wmm ? 16u : eapol ? 7u : 0u;
++    const uint16_t htc = (uint16_t)(20u + prefetch);
++    const uint16_t flags1 = (uint16_t)(tid << 6 | 1u << 11);   /* the vdev is 0; POSTPONED: no inspection requests */
++    const uint16_t id = slot;
++    const uint16_t peer = 0xffff, freq = 0;
++    h[0] = (uint8_t)wh.htt;
++    memcpy(h + 2, &htc, 2);
++    h[8] = 1;                                                  /* HTT_H2T_MSG_TYPE_TX_FRM */
++    h[9] = (uint8_t)(1u | 1u << 5 | (eapol && !wj.keyed ? 4u : 0));   /* a MAC header is present, native Wi-Fi; no encryption before the key */
++    memcpy(h + 10, &flags1, 2);
++    memcpy(h + 12, &fl, 2);
++    memcpy(h + 14, &id, 2);
++    memcpy(h + 16, &desc, 8);
++    memcpy(h + 24, &peer, 2);
++    memcpy(h + 26, &freq, 2);
++    return wc_send_gather(wh.ep[wh.htt].ul, h, sizeof(h), pa, prefetch);
++}
++
++static void
++wj_tx_drain(void)
++{
++    for (;;) {
++        lck_mtx_lock(ws_lock);
++        if (wj_tx_head == wj_tx_tail) {
++            lck_mtx_unlock(ws_lock);
++            return;
++        }
++        const uint16_t slot = wj_tx_q[wj_tx_head % WJ_TX_SLOTS];
++        lck_mtx_unlock(ws_lock);
++        if (wj_tx_send(slot)) return;   /* the ring is full: the next pass takes it */
++        lck_mtx_lock(ws_lock);
++        wj_tx_head++;
++        lck_mtx_unlock(ws_lock);
++    }
++}
++
++/* HTT_T2H_MSG_TYPE_TX_COMPL_IND: {type, status in the low 3 bits, count, flags}, then the identifiers. */
++static void
++wj_tx_compl(const uint8_t *p, uint32_t n)
++{
++    if (n < 4) return;
++    const uint8_t status = p[1] & 7u, count = p[2];
++    for (unsigned i = 0; i < count && 4u + 2u * i + 2u <= n; i++) {
++        const uint16_t slot = (uint16_t)(p[4 + 2 * i] | p[5 + 2 * i] << 8);
++        if (slot >= WJ_TX_SLOTS) continue;
++        if (status == 0) wj.tx_acked++;
++        else if (status == 2) wj.tx_noack++;
++        else wj.tx_discard++;
++        lck_mtx_lock(ws_lock);
++        if (wj_tx_busy[slot]) {
++            wj_tx_busy[slot] = 0;
++            wj_tx_free[wj_tx_free_n++] = slot;
++        }
++        lck_mtx_unlock(ws_lock);
++        if (wj.state == WJ_M4 && slot == wj.m4_slot) wj.m4_acked = status == 0 ? 1 : 2;
++    }
++}
++
++static void wj_eapol(const uint8_t *e, uint32_t n);
++
++/* One received MSDU: htt_rx_desc_v2 at the buffer's start, the frame at 360 (no L3 padding on this chip). Native Wi-Fi: a 3-address header, then
++ * LLC; the header's addresses are this subframe's even inside an A-MSDU. */
++static void
++wr_msdu(uint8_t *buf, uint32_t len)
++{
++    static uint8_t frame[WS_RX_BUF];
++    uint32_t attention, start;
++    memcpy(&attention, buf + 4, 4);
++    memcpy(&start, buf + 36, 4);
++    const uint32_t decap = (start >> 8) & 3u;
++    if (!(attention & (1u << 31))) { wj.rx_undone++; return; }
++    if (attention & (1u << 28 | 1u << 29 | 1u << 30 | 1u << 16 | 1u << 17 | 1u << 27)) { wj.rx_bad++; return; }
++    if (len < 14u || len > WS_RX_BUF - 360u || wj.state < WJ_KEYS || wj.state > WJ_UP) { wj.rx_bad++; return; }
++    memcpy(frame, buf + 360, len);
++    uint8_t *eth;
++    uint32_t bytes;
++    if (decap == 1) {
++        if (len < 32u || frame[24] != 0xaa || frame[25] != 0xaa || frame[26] != 3) { wj.rx_bad++; return; }
++        uint8_t da[6], sa[6];
++        memcpy(da, frame + 4, 6);
++        memcpy(sa, frame + 16, 6);
++        eth = frame + 32 - 14;
++        bytes = len - 32u + 14u;
++        memmove(eth + 12, frame + 30, 2);
++        memcpy(eth, da, 6);
++        memcpy(eth + 6, sa, 6);
++    } else if (decap == 2) {
++        eth = frame;
++        bytes = len;
++    } else {
++        wj.rx_bad++;
++        return;
++    }
++    wj.rx_frames++;
++    wj.rx_bytes += bytes;
++    if (eth[12] == 0x88 && eth[13] == 0x8e) {
++        wj.rx_eapol++;
++        wj_eapol(eth + 14, bytes - 14u);
++        return;
++    }
++    if (wj.state == WJ_UP && ws_events && ws_events->rx) ws_events->rx(eth, bytes);
++}
++
++/* ath10k_htt_rx_ring_fill_n's share for one buffer: its attention word cleared, its address at the alloc index. */
++static void
++wr_post(uint64_t pa)
++{
++    const uint32_t zero = 0;
++    memcpy(wr_buffers + (pa - wr_buffers_pa) + 4, &zero, 4);
++    memcpy(wr_ring + 8u * wr_alloc, &pa, 8);
++    wr_alloc = (wr_alloc + 1u) & (WS_RX_RING - 1u);
++    __asm__ volatile ("dsb st" ::: "memory");
++    memcpy(wr_index, &wr_alloc, 4);
++}
++
++/* HTT_T2H_MSG_TYPE_RX_IN_ORD_PADDR_IND with 64-bit addresses: {type, info, peer, vdev, reserved, count}, then {address, length, fw_desc, reserved}. */
++static void
++wr_in_ord(const uint8_t *p, uint32_t n)
++{
++    wj.rx_in_ord++;
++    if (n < 8) return;
++    const uint32_t count = (uint32_t)(p[6] | p[7] << 8);
++    const int skip = (p[1] & 0x60u) != 0;   /* offloaded or a fragment: not asked for, returned to the ring */
++    for (uint32_t i = 0; i < count && 8u + 12u * (i + 1u) <= n; i++) {
++        uint64_t pa;
++        uint16_t len;
++        memcpy(&pa, p + 8 + 12 * i, 8);
++        memcpy(&len, p + 16 + 12 * i, 2);
++        if (pa < wr_buffers_pa || pa >= wr_buffers_pa + (uint64_t)WS_RX_FILL * WS_RX_BUF || ((pa - wr_buffers_pa) % WS_RX_BUF)) { wj.rx_bad++; continue; }
++        if (!skip) wr_msdu(wr_buffers + (pa - wr_buffers_pa), len);
++        wr_post(pa);
++    }
++}
++
++/* HTT_T2H_MSG_TYPE_RX_IND: the ring's buffers in order, MSDUs to each MPDU's last one (ath10k_htt_rx_amsdu_pop). */
++static void
++wr_rx_ind(const uint8_t *p, uint32_t n)
++{
++    wj.rx_ind++;
++    if (n < 48) return;
++    uint32_t info1;
++    memcpy(&info1, p + 4, 4);
++    const uint32_t ranges = info1 >> 24, fw = ((uint32_t)(p[44] | p[45] << 8) + 3u) & ~3u;
++    const uint8_t *r = p + 48 + fw;
++    if (48u + fw + 4u * ranges > n) return;
++    for (uint32_t i = 0; i < ranges; i++, r += 4) {
++        for (uint32_t m = 0; m < r[0]; m++) {
++            for (unsigned guard = 0; guard < 64; guard++) {
++                uint64_t pa;
++                memcpy(&pa, wr_ring + 8u * wr_read, 8);
++                wr_read = (wr_read + 1u) & (WS_RX_RING - 1u);
++                if (pa < wr_buffers_pa || pa >= wr_buffers_pa + (uint64_t)WS_RX_FILL * WS_RX_BUF) return;
++                uint8_t *buf = wr_buffers + (pa - wr_buffers_pa);
++                uint32_t start, end;
++                memcpy(&start, buf + 28, 4);
++                memcpy(&end, buf + 64, 4);
++                if (r[1] == 1) wr_msdu(buf, start & 0x3fffu);
++                wr_post(pa);
++                if (end & (1u << 15)) break;
++            }
++        }
++    }
++}
++
++/* ---- the four-way handshake ---- */
++#define WK_FIXED 99u   /* the EAPOL header and the key descriptor up to its data */
++static uint16_t wk_be16(const uint8_t *p) { return (uint16_t)(p[0] << 8 | p[1]); }
++
++static void
++wk_reply(uint16_t info, const uint8_t *replay, const uint8_t *nonce, const uint8_t *data, uint16_t data_len)
++{
++    static uint8_t f[WK_FIXED + 64];
++    const uint16_t body = (uint16_t)(WK_FIXED - 4u + data_len);
++    memset(f, 0, sizeof(f));
++    f[0] = wj.eapol_ver;
++    f[1] = 3;
++    f[2] = (uint8_t)(body >> 8);
++    f[3] = (uint8_t)body;
++    f[4] = 2;
++    f[5] = (uint8_t)(info >> 8);
++    f[6] = (uint8_t)info;
++    memcpy(f + 9, replay, 8);
++    if (nonce) memcpy(f + 17, nonce, 32);
++    f[97] = (uint8_t)(data_len >> 8);
++    f[98] = (uint8_t)data_len;
++    if (data_len) memcpy(f + 99, data, data_len);
++    uint8_t digest[20];
++    wk_hmac(wj.ptk, 16, f, WK_FIXED + data_len, digest);
++    memcpy(f + 81, digest, 16);
++    static const uint8_t type[2] = {0x88, 0x8e};
++    (void)wj_tx_put(wj.ap.bssid, type, f, WK_FIXED + data_len, 1);
++}
++
++static void
++wk_derive(void)
++{
++    uint8_t d[76];
++    const int own_low = memcmp(ws.mac, wj.ap.bssid, 6) < 0, nonce_low = memcmp(wj.snonce, wj.anonce, 32) < 0;
++    memcpy(d, own_low ? ws.mac : wj.ap.bssid, 6);
++    memcpy(d + 6, own_low ? wj.ap.bssid : ws.mac, 6);
++    memcpy(d + 12, nonce_low ? wj.snonce : wj.anonce, 32);
++    memcpy(d + 44, nonce_low ? wj.anonce : wj.snonce, 32);
++    wk_prf(wj.pmk, 32, "Pairwise key expansion", d, sizeof(d), wj.ptk, sizeof(wj.ptk));
++}
++
++static void wj_fail(int result);
++
++static void
++wj_eapol(const uint8_t *e, uint32_t n)
++{
++    static uint8_t copy[512], plain[400];
++    if (!wj.secure || n < WK_FIXED || e[1] != 3 || (e[4] != 2 && e[4] != 254)) return;
++    const uint32_t total = 4u + wk_be16(e + 2);
++    if (total < WK_FIXED || total > n || total > sizeof(copy)) return;
++    const uint16_t info = wk_be16(e + 5), data_len = wk_be16(e + 97);
++    if (WK_FIXED + (uint32_t)data_len > total) return;
++    if ((info & 7u) != 2u) {
++        printf("COACHZ join: key descriptor version %u not handled\n", info & 7u);
++        return;
++    }
++    const int pairwise = (info & 0x0008u) != 0, ack = (info & 0x0080u) != 0, mic = (info & 0x0100u) != 0;
++    wj.eapol_ver = e[0];
++    if (pairwise && ack && !mic) {           /* message 1: its nonce and ours make the keys */
++        memcpy(wj.anonce, e + 17, 32);
++        read_frandom(wj.snonce, sizeof(wj.snonce));
++        wk_derive();
++        wj.stage = 1;
++        wk_reply(0x010a, e + 9, wj.snonce, wj.rsn, sizeof(wj.rsn));
++        printf("COACHZ join: message 1 heard, message 2 sent\n");
++        return;
++    }
++    if (!mic || !wj.stage) return;
++    memcpy(copy, e, total);
++    memset(copy + 81, 0, 16);
++    uint8_t digest[20];
++    wk_hmac(wj.ptk, 16, copy, total, digest);
++    if (memcmp(digest, e + 81, 16)) {
++        printf("COACHZ join: message MIC does not match: wrong passphrase\n");
++        if (wj.state == WJ_KEYS && pairwise) wj_fail(NW_RES_BAD_KEY);
++        return;
++    }
++    if (wj.have_replay && memcmp(e + 9, wj.replay, 8) < 0) return;
++    memcpy(wj.replay, e + 9, 8);
++    wj.have_replay = 1;
++    const uint8_t *kd = e + WK_FIXED;
++    uint32_t kn = data_len;
++    if (info & 0x1000u) {                    /* key data wrapped with the KEK */
++        if (data_len > sizeof(plain) + 8u || wk_unwrap(wj.ptk + 16, e + WK_FIXED, data_len, plain)) {
++            printf("COACHZ join: key data does not unwrap\n");
++            return;
++        }
++        kd = plain;
++        kn = data_len - 8u;
++    }
++    const uint8_t *gtk = NULL;
++    uint32_t gtk_bytes = 0, gtk_id = 0;
++    for (uint32_t at = 0; at + 2u <= kn && at + 2u + kd[at + 1] <= kn; at += 2u + kd[at + 1]) {
++        if (kd[at] == 0xdd && kd[at + 1] >= 6 && kd[at + 2] == 0x00 && kd[at + 3] == 0x0f && kd[at + 4] == 0xac && kd[at + 5] == 1) {
++            gtk_id = kd[at + 6] & 3u;
++            gtk = kd + at + 8;
++            gtk_bytes = kd[at + 1] - 6u;
++        }
++        if (!kd[at] && !kd[at + 1]) break;
++    }
++    if (pairwise && ack) {                   /* message 3: answered, and the keys go in once that answer has left */
++        if (memcmp(e + 17, wj.anonce, 32)) return;
++        wk_reply(0x030a, e + 9, NULL, NULL, 0);
++        if (wj.state == WJ_KEYS) {
++            wj.gtk_len = gtk && gtk_bytes >= 16 ? 16 : 0;
++            wj.gtk_idx = (uint8_t)gtk_id;
++            if (wj.gtk_len) memcpy(wj.gtk, gtk, 16);
++            wj.m4_acked = 0;
++            wj.waited_ms = 0;
++            wj.state = WJ_M4;
++            printf("COACHZ join: message 3 heard, message 4 sent\n");
++        }
++        return;
++    }
++    if (!pairwise && ack) {                  /* a new group key */
++        if (gtk && gtk_bytes >= 16) wj_send_key(0, gtk_id, gtk);
++        wk_reply(0x0302, e + 9, NULL, NULL, 0);
++        printf("COACHZ join: group key updated\n");
++    }
++}
++
++/* ---- the sequence ---- */
++static void
++wj_leave(void)
++{
++    wj.keyed = 0;
++    memset(wj.ptk, 0, sizeof(wj.ptk));
++    memset(wj.pmk, 0, sizeof(wj.pmk));
++    if (wj.up_on) wj_vdev_id_cmd(0x5007, 0x5e);
++    wj.up_on = 0;
++    wj.waited_ms = 0;
++    wj.state = WJ_LEAVE_PEER;
++    if (wj.peer_on) {
++        wj.peer_unmapped = 0;
++        wj_send_peer_delete();
++    }
++}
++
++static void
++wj_fail(int result)
++{
++    printf("COACHZ join: stopped in state %u with result %d after %u tries\n", wj.state, result, wj.tries);
++    wj_leave();
++    if (ws_events && ws_events->connect_done) ws_events->connect_done(result);
++}
++
++/* A beacon loss or an access point's own goodbye. */
++static void
++wj_lost(int reason)
++{
++    printf("COACHZ join: link lost, reason %d\n", reason);
++    wj_leave();
++    if (ws_events && ws_events->link_lost) ws_events->link_lost(reason);
++}
++
++/* HTT's peer map and unmap: {type, vdev, peer id, address}; {type, reserved, peer id}. The vdev's own peer also comes through here. */
++static void
++wj_peer_event(const uint8_t *p, uint32_t n)
++{
++    if (p[0] == 3 && n >= 10 && !memcmp(p + 4, wj.ap.bssid, 6)) {
++        wj.peer_mapped = 1;
++        wj.peer_id = (uint16_t)(p[2] | p[3] << 8);
++    } else if (p[0] == 4 && n >= 4 && (uint16_t)(p[2] | p[3] << 8) == wj.peer_id) {
++        wj.peer_unmapped = 1;
++    }
++}
++
++/* The access point's answers, from ws_mgmt_rx (ath10k_wmi_event_mgmt_rx hands them to mac80211). */
++static void
++wj_mgmt(const uint8_t *f, uint32_t n)
++{
++    if (n < 24 || wj.state < WJ_AUTH || wj.state > WJ_UP || memcmp(f + 10, wj.ap.bssid, 6)) return;
++    const uint8_t type = f[0] & 0xfc;
++    if (type == 0xb0 && wj.state == WJ_AUTH && n >= 30) {
++        const uint16_t transaction = (uint16_t)(f[26] | f[27] << 8), status = (uint16_t)(f[28] | f[29] << 8);
++        if (transaction != 2) return;
++        if (status) {
++            printf("COACHZ join: authentication refused, status %u\n", status);
++            wj_fail(NW_RES_REJECTED);
++            return;
++        }
++        printf("COACHZ join: authenticated after %u tries\n", wj.tries + 1u);
++        wj.tries = 0;
++        wj.state = WJ_ASSOC;
++        wj_publish(NW_STA_ASSOC, 0);
++        wj_send_assoc();
++        return;
++    }
++    if ((type == 0x10 || type == 0x30) && wj.state == WJ_ASSOC && n >= 30) {
++        const uint16_t status = (uint16_t)(f[26] | f[27] << 8);
++        if (status) {
++            printf("COACHZ join: association refused, status %u\n", status);
++            wj_fail(NW_RES_REJECTED);
++            return;
++        }
++        wj.aid = (uint16_t)((f[28] | f[29] << 8) & 0x3fffu);
++        printf("COACHZ join: associated, aid %u\n", wj.aid);
++        /* ath10k_bss_assoc. */
++        wj_send_peer_assoc();
++        wj_send_vdev_up();
++        wj_peer_param(0xff, 1);   /* its power save workaround */
++        wj.up_on = 1;
++        wj.waited_ms = 0;
++        if (wj.secure) {
++            wj.state = WJ_KEYS;
++            wj_publish(NW_STA_KEYS, 0);
++        } else {
++            wj_peer_param(3, 1);  /* WMI_TLV_PEER_AUTHORIZE */
++            wj.state = WJ_UP;
++            wj_publish(NW_STA_UP, 0);
++            if (ws_events && ws_events->connect_done) ws_events->connect_done(NW_RES_OK);
++        }
++        return;
++    }
++    if (type == 0xc0 || type == 0xa0) {
++        const uint16_t reason = n >= 26 ? (uint16_t)(f[24] | f[25] << 8) : 0;
++        printf("COACHZ join: access point ended it, frame 0x%x reason %u\n", type, reason);
++        if (wj.state == WJ_UP) wj_lost(reason);
++        else wj_fail(NW_RES_REJECTED);
++    }
++}
++
++/* The WMI events of the sequence. */
++static void
++wj_wmi_event(uint32_t id, const uint8_t *m, uint32_t n)
++{
++    uint16_t l = 0;
++    if (id == 0x5001) {                      /* VDEV_START_RESP */
++        const uint8_t *e = wm_tlv(m, n, 0x28, 0, &l);
++        if (e && l >= 16) {
++            const uint32_t status = wm_u32(e, 3);
++            printf("COACHZ join: vdev started, status %u\n", status);
++            wj.started = status ? 2 : 1;
++        }
++    } else if (id == 0x5002) {               /* VDEV_STOPPED */
++        wj.stopped = 1;
++    } else if (id == 0x7006) {               /* MGMT_TX_COMPLETION */
++        const uint8_t *e = wm_tlv(m, n, 0x1a7, 0, &l);
++        if (e && l >= 8) {
++            if (wm_u32(e, 1)) wj.mgmt_fail++;
++            else wj.mgmt_ok++;
++        }
++    } else if (id == 0xb001) {               /* ROAM: reason 2 is a beacon miss */
++        const uint8_t *e = wm_tlv(m, n, 0x30, 0, &l);
++        wj.roam++;
++        if (e && l >= 8 && wm_u32(e, 1) == 2 && wj.state == WJ_UP && !wj.bmiss_on) {
++            /* As mac80211 probes first: frames still arriving in the next 5 s keep the connection. */
++            wj.bmiss_on = 1;
++            wj.bmiss_ms = 0;
++            wj.bmiss_rx = wj.rx_frames;
++            printf("COACHZ join: beacon miss reported\n");
++        }
++    } else if (id == 0x6001) {               /* PEER_STA_KICKOUT */
++        wj.kickout++;
++    }
++}
++
++/* A new join: the strongest entry with the name (and address, if given), its element checks, and the first commands. */
++static void
++wj_begin(void)
++{
++    static uint8_t once;
++    char pass[65];
++    uint8_t has_pass, pass_len;
++    lck_mtx_lock(ws_lock);
++    int best = -1;
++    for (unsigned i = 0; i < ws_bss_count; i++) {
++        const struct nw_bss_info *b = &ws_bss[i].info;
++        if (b->ssid_len != wj_req.ssid_len || memcmp(b->ssid, wj_req.ssid, b->ssid_len)) continue;
++        if (wj_req.has_bssid && memcmp(b->bssid, wj_req.bssid, 6)) continue;
++        if (best < 0 || b->signal_dbm > ws_bss[best].info.signal_dbm) best = (int)i;
++    }
++    if (best >= 0) wj.ap = ws_bss[best].info;
++    memset(wj.ssid, 0, sizeof(wj.ssid));
++    memcpy(wj.ssid, wj_req.ssid, wj_req.ssid_len);
++    wj.ssid_len = wj_req.ssid_len;
++    has_pass = wj_req.has_pass;
++    pass_len = wj_req.pass_len;
++    memcpy(pass, wj_req.pass, sizeof(pass));
++    memset(wj_req.pass, 0, sizeof(wj_req.pass));
++    lck_mtx_unlock(ws_lock);
++    int result = 0;
++    if (best < 0) {
++        printf("COACHZ join: network not in the list (%u entries)\n", ws_bss_count);
++        result = NW_RES_NOT_FOUND;
++    }
++    wj.secure = has_pass;
++    if (!result) {
++        const uint8_t *rsn = wj_ie(48);
++        if (has_pass && wj_rsn_prepare(rsn)) {
++            printf("COACHZ join: only WPA2-Personal with CCMP is handled here\n");
++            result = NW_RES_UNSUPPORTED;
++        } else if (!has_pass && rsn) {
++            result = NW_RES_BAD_KEY;
++        }
++    }
++    if (result) {
++        memset(pass, 0, sizeof(pass));
++        if (ws_events && ws_events->connect_done) ws_events->connect_done(result);
++        return;
++    }
++    if (has_pass) {
++        if (pass_len == 64) {   /* the daemon's own master key, as hex digits */
++            for (unsigned i = 0; i < 32; i++) {
++                const char a = pass[2 * i], b = pass[2 * i + 1];
++                wj.pmk[i] = (uint8_t)(((a <= '9' ? a - '0' : (a | 32) - 'a' + 10) << 4) | (b <= '9' ? b - '0' : (b | 32) - 'a' + 10));
++            }
++        } else {
++            wk_pmk(pass, pass_len, wj.ssid, wj.ssid_len, wj.pmk);
++        }
++    }
++    memset(pass, 0, sizeof(pass));
++    wj.wmm = (uint8_t)wj_has_wmm();
++    wj_channel_plan();
++    const uint8_t *tim = wj_ie(5);
++    printf("COACHZ join: %u MHz, %d dBm, %u MHz wide at %u, mode %u, ht %u vht %u wmm %u, %s\n", wj.ap.freq_mhz, wj.ap.signal_dbm, wj.width, wj.center_mhz, wj.mode, wj.ht, wj.vht,
++        wj.wmm, wj.secure ? "WPA2-Personal" : "open");
++    if (!once) {
++        /* ath10k_add_interface's settings, for the one vdev. */
++        once = 1;
++        wj_pdev_param(0x3, 40);       /* TXPOWER_LIMIT2G, half dB */
++        wj_pdev_param(0x4, 40);       /* TXPOWER_LIMIT5G */
++        wj_vdev_param(34, 2);         /* NSS */
++        wj_vdev_param(48, 1);         /* TX_ENCAP_TYPE: native Wi-Fi */
++        wj_vdev_param(1, 2347);       /* RTS_THRESHOLD, ATH10K_RTS_MAX */
++        wj_sta_ps(0, 0);              /* RX_WAKE_POLICY: wake */
++        wj_sta_ps(1, 1);              /* TX_WAKE_THRESHOLD: always */
++        wj_sta_ps(2, 0);              /* PSPOLL_COUNT: no maximum */
++    }
++    {
++        uint8_t *m = wj_cmd_new(0x9001);   /* STA_POWERSAVE_MODE: off, with a thread that polls every millisecond */
++        uint32_t at = wj_tlv(m, 4, 0x6c, 8);
++        at = wj_u32(m, at, WJ_VDEV);
++        wj_cmd_push(wj_u32(m, at, 0));
++    }
++    wj.started = wj.peer_mapped = 0;
++    wj.keyed = wj.have_replay = 0;
++    wj.stage = wj.tries = wj.waited_ms = 0;
++    wj.up_on = wj.peer_on = 0;
++    wj.vdev_on = 1;
++    wj.bmiss_on = 0;
++    wj_tx_reset();
++    wj_send_vdev_start(tim && tim[1] >= 2 ? tim[3] : 1u);
++    wj.state = WJ_VDEV_START;
++    wj_publish(NW_STA_AUTH, 0);
++}
++
++static void
++wj_step(void)
++{
++    wj_cmd_flush();
++    if (wj_cmd_in == wj_cmd_out) wj_tx_drain();
++    /* Requests from the system's side. */
++    uint8_t kind = 0;
++    lck_mtx_lock(ws_lock);
++    if (wj.state == WJ_IDLE || wj_req.kind == 2) {
++        kind = wj_req.kind;
++        if (kind == 2 || kind == 1) wj_req.kind = 0;
++    }
++    lck_mtx_unlock(ws_lock);
++    if (kind == 1 && wj.state == WJ_IDLE) wj_begin();
++    else if (kind == 2 && wj.state >= WJ_VDEV_START && wj.state <= WJ_UP) wj_leave();
++    wj.waited_ms++;
++    wj.tx_ms++;
++    switch (wj.state) {
++    case WJ_VDEV_START:
++        if (wj.started == 1) {
++            wj_send_peer_create();
++            wj.peer_on = 1;
++            wj.waited_ms = 0;
++            wj.state = WJ_PEER;
++        } else if (wj.started == 2 || wj.waited_ms >= 3000) {
++            wj_fail(NW_RES_FAILED);
++        }
++        break;
++    case WJ_PEER:
++        if (wj.peer_mapped) {
++            /* ath10k_bss_info_changed's share before the first frame. */
++            wj_vdev_param(7, (wj.ap.caps & 0x400u) ? 2u : 1u);   /* SLOT_TIME */
++            wj_vdev_param(8, (wj.ap.caps & 0x20u) ? 2u : 1u);    /* PREAMBLE */
++            wj.tries = 0;
++            wj.state = WJ_AUTH;
++            wj_send_auth();
++            printf("COACHZ join: peer %u mapped, authentication sent\n", wj.peer_id);
++        } else if (wj.waited_ms >= 3000) {
++            wj_fail(NW_RES_FAILED);
++        }
++        break;
++    case WJ_AUTH:
++    case WJ_ASSOC:
++        if (wj.tx_ms >= 300) {
++            if (++wj.tries >= 8) {
++                printf("COACHZ join: %u frames sent, %u done, %u failed\n", wj.mgmt_tx, wj.mgmt_ok, wj.mgmt_fail);
++                wj_fail(NW_RES_TIMEOUT);
++                break;
++            }
++            if (wj.state == WJ_AUTH) wj_send_auth();
++            else wj_send_assoc();
++        }
++        break;
++    case WJ_KEYS:
++        if (wj.waited_ms >= 8000) {
++            printf("COACHZ join: key handshake stopped at stage %u, %u key frames heard\n", wj.stage, wj.rx_eapol);
++            wj_fail(wj.stage ? NW_RES_BAD_KEY : NW_RES_TIMEOUT);
++        }
++        break;
++    case WJ_M4:
++        if (wj.m4_acked || wj.waited_ms >= 300) {
++            wj_send_key(1, 0, wj.ptk + 32);
++            if (wj.gtk_len) wj_send_key(0, wj.gtk_idx, wj.gtk);
++            wj_peer_param(3, 1);   /* WMI_TLV_PEER_AUTHORIZE */
++            wj.keyed = 1;
++            wj.state = WJ_UP;
++            wj.waited_ms = 0;
++            printf("COACHZ join: keys in (message 4 %s)\n", wj.m4_acked == 1 ? "acknowledged" : wj.m4_acked ? "not acknowledged" : "unanswered");
++            wj_publish(NW_STA_UP, 0);
++            if (ws_events && ws_events->connect_done) ws_events->connect_done(NW_RES_OK);
++        }
++        break;
++    case WJ_UP:
++        if (wj.bmiss_on && ++wj.bmiss_ms >= 5000) {
++            wj.bmiss_on = 0;
++            if (wj.rx_frames == wj.bmiss_rx) wj_lost(0);
++        }
++        break;
++    case WJ_LEAVE_PEER:
++        if (!wj.peer_on || wj.peer_unmapped || wj.waited_ms >= 1000) {
++            wj.peer_on = 0;
++            wj.stopped = 0;
++            wj_vdev_id_cmd(0x5006, 0x5d);
++            wj.waited_ms = 0;
++            wj.state = WJ_LEAVE_VDEV;
++        }
++        break;
++    case WJ_LEAVE_VDEV:
++        if (wj.stopped || wj.waited_ms >= 3000) {
++            wj.vdev_on = 0;
++            wj.state = WJ_IDLE;
++            wj_publish(NW_STA_IDLE, 0);
++            printf("COACHZ join: left the channel\n");
++        }
++        break;
++    }
++    if (wj.state >= WJ_VDEV_START && ++wj.second_ms >= 10000) {
++        wj.second_ms = 0;
++        printf("COACHZ join: state %u, rx %u frames %u bytes (%u key, %u bad, %u not done; %u ind, %u in order), tx %u frames, %u acked %u no ack %u discarded %u no slot, mgmt %u/%u/%u, roam %u kickout %u\n",
++            wj.state, wj.rx_frames, wj.rx_bytes, wj.rx_eapol, wj.rx_bad, wj.rx_undone, wj.rx_ind, wj.rx_in_ord, wj.tx_frames, wj.tx_acked, wj.tx_noack, wj.tx_discard, wj.tx_full,
++            wj.mgmt_tx, wj.mgmt_ok, wj.mgmt_fail, wj.roam, wj.kickout);
++    }
++}
++
++/* The station interface for the network side. A request waits for the radio; only one is held. */
++int
++nw_wifi_connect(const uint8_t *ssid, size_t len, const uint8_t *bssid, const char *pass, size_t plen)
++{
++    if (wl.failed || !ws_lock || len > 32 || plen > 64 || (pass && plen < 8)) return -1;
++    lck_mtx_lock(ws_lock);
++    wj_req.kind = 1;
++    wj_req.ssid_len = (uint8_t)len;
++    memset(wj_req.ssid, 0, 32);
++    memcpy(wj_req.ssid, ssid, len);
++    wj_req.has_bssid = bssid != NULL;
++    if (bssid) memcpy(wj_req.bssid, bssid, 6);
++    wj_req.has_pass = pass != NULL;
++    wj_req.pass_len = (uint8_t)(pass ? plen : 0);
++    memset(wj_req.pass, 0, sizeof(wj_req.pass));
++    if (pass) memcpy(wj_req.pass, pass, plen);
++    lck_mtx_unlock(ws_lock);
++    return 0;
++}
++
++void
++nw_wifi_disconnect(void)
++{
++    if (!ws_lock) return;
++    lck_mtx_lock(ws_lock);
++    wj_req.kind = 2;
++    lck_mtx_unlock(ws_lock);
++}
++
++/* An Ethernet frame from the stack, in native Wi-Fi format with the LLC header the access point expects. */
++int
++nw_wifi_tx(const uint8_t *eth, size_t len)
++{
++    if (len < 14 || len > 1600 || wj.state != WJ_UP) return -1;
++    return wj_tx_put(eth, eth + 12, eth + 14, (uint32_t)len - 14u, 0);
++}
 +
 +void
 +nw_wifi_status_get(struct nw_wifi_status *st)
 +{
 +    memset(st, 0, sizeof(*st));
-+    st->state = wl.state == 24 ? NW_STA_SCANNING : NW_STA_IDLE;
++    if (ws_lock) {
++        lck_mtx_lock(ws_lock);
++        *st = wj_pub;
++        lck_mtx_unlock(ws_lock);
++    }
++    if (st->state < NW_STA_AUTH) st->state = wl.state == 24 ? NW_STA_SCANNING : NW_STA_IDLE;
 +    memcpy(st->mac, ws.mac, 6);
++}
++
++/* The HTT messages of the join and the data path, from wh_rx. */
++static void
++wj_htt_message(const uint8_t *p, uint32_t n)
++{
++    switch (p[0]) {
++    case 1: wr_rx_ind(p, n); break;
++    case 3:
++    case 4: wj_peer_event(p, n); break;
++    case 7: wj_tx_compl(p, n); break;
++    case 0x12: wr_in_ord(p, n); break;
++    default: break;
++    }
 +}
 +
 +/* ath10k_wmi_event_mgmt_rx: counts beacons and probe responses per band and their distinct transmitters, and keeps them for the system. */
@@ -3118,7 +4682,10 @@
 +    if (!h || lh < 24 || !f || lf < 24) { ws.bad++; return; }
 +    ws.mgmt++;
 +    const uint8_t type = f[0] & 0xfc;
-+    if (type != 0x80 && type != 0x50) return;
++    if (type != 0x80 && type != 0x50) {
++        wj_mgmt(f, wm_u32(h, 4) < lf ? wm_u32(h, 4) : lf);
++        return;
++    }
 +    ws.beacons++;
 +    /* The header's channel is the IEEE number: ath10k_wmi_event_mgmt_rx takes 1..14 as 2.4 GHz. */
 +    if (wm_u32(h, 0) <= 14) ws.band2++; else ws.band5++;
@@ -3517,9 +5084,20 @@
 +                break;
 +            }
 +            memset((uint8_t *)&ws + __builtin_offsetof(__typeof__(ws), started), 0, sizeof(ws) - __builtin_offsetof(__typeof__(ws), started));
-+            /* A fresh list: what no longer answers should not stay on the system's list. */
++            /* What has not answered for a minute leaves the list; the rest stays, because a join may ask for a network while this scan runs. */
 +            lck_mtx_lock(ws_lock);
-+            ws_bss_count = 0;
++            {
++                uint64_t minute;
++                nanoseconds_to_absolutetime(60000000000ull, &minute);
++                const uint64_t now = mach_absolute_time();
++                unsigned kept = 0;
++                for (unsigned i = 0; i < ws_bss_count; i++) {
++                    if (now - ws_bss[i].seen > minute) continue;
++                    if (kept != i) ws_bss[kept] = ws_bss[i];
++                    kept++;
++                }
++                ws_bss_count = kept;
++            }
 +            lck_mtx_unlock(ws_lock);
 +            wl.waited_ms = 0;
 +            wl.state = 24;
@@ -3548,7 +5126,8 @@
 +        }
 +        break;
 +    case 25:
-+        if (__atomic_exchange_n(&ws_scan_wanted, 0u, __ATOMIC_ACQ_REL)) {
++        wj_step();
++        if (wj.state == WJ_IDLE && !wj_req.kind && __atomic_exchange_n(&ws_scan_wanted, 0u, __ATOMIC_ACQ_REL)) {
 +            wl.waited_ms = 100;
 +            wl.state = 23;
 +        }
@@ -3940,6 +5519,19 @@
 +        const uint64_t now = mach_absolute_time();
 +        ws.mac[0] = 0x02;
 +        for (unsigned b = 1; b < 6; b++) ws.mac[b] = (uint8_t)(now >> (b * 7));
++        /* coachz-wifi-mac=<12 hex digits>: the image's own locally administered address, so networks and leases know this machine across boots. */
++        char text[13] = {0};
++        if (PE_parse_boot_arg_str("coachz-wifi-mac", text, sizeof(text)) && strlen(text) == 12) {
++            uint8_t address[6];
++            int good = 1;
++            for (unsigned i = 0; i < 12; i++) {
++                const char c = text[i];
++                const int v = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
++                if (v < 0) { good = 0; break; }
++                address[i / 2] = (uint8_t)((i & 1) ? address[i / 2] << 4 | v : v);
++            }
++            if (good && (address[0] & 3) == 2) memcpy(ws.mac, address, 6);
++        }
 +        ws_group = lck_grp_alloc_init("coachz-wifi-scan", LCK_GRP_ATTR_NULL);
 +        ws_lock = lck_mtx_alloc_init(ws_group, LCK_ATTR_NULL);
 +        coachz_wifi_net_start(ws.mac);

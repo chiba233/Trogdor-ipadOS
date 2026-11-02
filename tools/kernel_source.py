@@ -179,11 +179,13 @@ def main():
         # whose Adreno740 entry would also pull in the SM8550 GMU code.
         gpu = out / 'reference/Adreno740-a618'
         shutil.rmtree(gpu, ignore_errors=True)
-        shutil.copytree(base / 'drivers/Adreno740', gpu, ignore=shutil.ignore_patterns('.git'))
+        # The framework, its kits and the ABI it shares with the Metal plug-in all come from the GPU userland's checkout (upstream.lock.json unixnu-gpu).
+        gpu_base = ROOT / 'upstream/unixnu-gpu'
+        shutil.copytree(gpu_base / 'drivers/Adreno740', gpu, ignore=shutil.ignore_patterns('.git'))
         subprocess.run(['patch', '--batch', '--silent', '-p1', '-d', str(gpu), '-i', str(ROOT / 'platform' / a.platform / 'patches/gpu/Adreno740.patch')], check=True)
-        # NativeAdrenoAccelerator.cpp includes ../NativeMetal/, the driver's older directory name.
-        links = {gpu.parent / 'NativeMetal': base / 'drivers/AdrenoMetal', ctx.tree / 'drivers/Adreno740': gpu, ctx.tree / 'kits/AdrenoPM4': base / 'kits/AdrenoPM4',
-                 ctx.tree / 'kits/ArmSmmu4K': base / 'kits/ArmSmmu4K'}
+        # NativeAdrenoAccelerator.cpp includes ../AdrenoMetal/ next to itself, in both the copy and the tree.
+        links = {gpu.parent / 'AdrenoMetal': gpu_base / 'drivers/AdrenoMetal', ctx.tree / 'drivers/AdrenoMetal': gpu_base / 'drivers/AdrenoMetal', ctx.tree / 'drivers/Adreno740': gpu, ctx.tree / 'kits/AdrenoPM4': gpu_base / 'kits/AdrenoPM4',
+                 ctx.tree / 'kits/ArmSmmu4K': gpu_base / 'kits/ArmSmmu4K'}
         for link, target in links.items():
             link.unlink(missing_ok=True)
             link.symlink_to(target.resolve())

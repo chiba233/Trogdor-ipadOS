@@ -247,7 +247,7 @@ def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=T
 
 def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=False, root_cache=None, root_device=None,
          root_uuid=None, data_seed=None, data_uuid=None, display=False, cpus=1, gpu=0, gmu_firmware=None, sqe_firmware=None, gpu_addon=None,
-         diagnostics=False):
+         diagnostics=False, wifi_mac=None):
     if window & 0x1fffff or memory & 0x1fffff:
         raise ValueError('window base and size must be 2 MiB aligned')
     kernel = macho(data)
@@ -306,6 +306,8 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         # The SDHCI driver (sdhci-msm, platform/coachz-prelink/drivers/RamBlock/mmc): eMMC and microSD block devices. 2 opens writes: the
         # microSD card whole, the eMMC only inside the 1 GiB coachz-scratch partition, with a write test on that window's last MiB.
         command_line += ' coachz-emmc=3 coachz-sd=2'
+        if wifi_mac:
+            command_line += ' coachz-wifi-mac=' + wifi_mac
     if gpu:
         # Adreno 618 bring-up stages (docs/plans/gpu.md): 1 inventory, 2 CX + GMU clock window, 3 also the GMU firmware into TCM,
         # 4 the window with a read-only GPU SMMU inventory.
@@ -330,9 +332,8 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
             command_line += ' coachz-cpufreq=4'
             # The DDR and memory NoC bandwidth mainline votes for the top CPU and GPU states, at start (coachz_wifi.c): without it the
             # memory ran at about two thirds of Debian's speed. The render server's frame trace is summarised per 30 s (coachz_trace.c).
-            command_line += ' coachz-ddr-vote=1 coachz-gpu-trace=1'
+            command_line += ' coachz-ddr-vote=1 coachz-sample-bbd=1'
             # Every backboardd thread at each report (coachz-prelink-thread-sample.patch), for the k85 freeze.
-            command_line += ' coachz-sample-bbd=1'
             # The system cache as mainline sets it up: sc7180's slices configured, CPUSS active, and the GPU and GPUHTW slices for the GPU (CoachzGpu.cpp).
             command_line += ' coachz-llcc=1'
     if cpus != 1:
@@ -418,6 +419,7 @@ def main():
     p.add_argument('--display', action='store_true', help='main OS: publish the firmware framebuffer through original MobileFramebuffer Legacy')
     p.add_argument('--smp', type=int, default=1, help='main OS: start CPU0..N-1 (up to 8) through PSCI')
     p.add_argument('--gpu', type=int, default=0, help='prelinked: Adreno 618 bring-up stage 1 to 8, or 9 for the driver (docs/plans/gpu.md)')
+    p.add_argument('--wifi-mac', type=Path, help='a file with 12 hex digits: the Wi-Fi address this image uses on every boot')
     p.add_argument('--gpu-addon', type=Path, help='with --gpu 9: the Metal plug-in addon from tools/xnu_gpu_userland.py')
     p.add_argument('--sqe-firmware', type=Path, help='with --gpu 8 or 9: the CP firmware, linux-firmware qcom/a630_sqe.fw')
     p.add_argument('--gmu-firmware', type=Path, help='with --gpu 3 or 6 to 9: the legacy A618 GMU firmware, linux-firmware qcom/a630_gmu.bin')
@@ -438,7 +440,8 @@ def main():
                    root_uuid=a.root_uuid, data_seed=a.data_image.read_bytes() if a.data_image else None, data_uuid=a.data_uuid, display=a.display, cpus=a.smp,
                    gpu=a.gpu, gmu_firmware=a.gmu_firmware.read_bytes() if a.gmu_firmware else None,
                    sqe_firmware=a.sqe_firmware.read_bytes() if a.sqe_firmware else None,
-                   gpu_addon=a.gpu_addon.read_bytes() if a.gpu_addon else None, diagnostics=a.diagnostics)
+                   gpu_addon=a.gpu_addon.read_bytes() if a.gpu_addon else None, diagnostics=a.diagnostics,
+                   wifi_mac=a.wifi_mac.read_text().strip() if a.wifi_mac else None)
     a.output.parent.mkdir(parents=True, exist_ok=True)
     a.output.write_bytes(payload)
     print('Built screen-output XNU payload', hashlib.sha256(payload).hexdigest())

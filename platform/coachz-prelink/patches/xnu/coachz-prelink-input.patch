@@ -13,7 +13,7 @@
  	/* A one-second tone on the speaker (iokit/Kernel/CoachzSpeaker.cpp, coachz-speaker=1), once. */
 --- a/iokit/Kernel/CoachzInput.cpp
 +++ b/iokit/Kernel/CoachzInput.cpp
-@@ -0,0 +1,220 @@
+@@ -0,0 +1,229 @@
 +// SPDX-License-Identifier: BSD-2-Clause
 +// Keyboard and Consumer input for iPadOS (coachz-buttons=1 volume, =3 volume and power): ShengHidInput's keyboard/Consumer device
 +// (native_hid_input_allocate, its descriptor's report 1 a boot keyboard and report 2 the Consumer bits Menu 0, Power 1, Volume
@@ -41,6 +41,7 @@
 +void coachz_input_start(void);
 +int coachz_input_keyboard_report(const uint8_t *boot);
 +int coachz_input_action_report(const uint8_t *bits);
++int coachz_input_mouse_report(int buttons, int dx, int dy, int wheel, int pan);
 +void coachz_gpu_pm_arm(void);
 +}
 +
@@ -216,6 +217,14 @@
 +	for (unsigned i = 0; i < 4; i++) {
 +		report[1 + i] = bits[i];
 +	}
++	return send(report, sizeof(report)) == kIOReturnSuccess ? 0 : -1;
++}
++
++// The USB touchpad as a mouse, report 5 of the keyboard device. 0 when it was sent.
++extern "C" int
++coachz_input_mouse_report(int buttons, int dx, int dy, int wheel, int pan)
++{
++	const uint8_t report[6] = {5, (uint8_t)buttons, (uint8_t)dx, (uint8_t)dy, (uint8_t)wheel, (uint8_t)pan};
 +	return send(report, sizeof(report)) == kIOReturnSuccess ? 0 : -1;
 +}
 +

@@ -44,7 +44,7 @@
 +coachz_watchdog_policy_prepare(void)
 +{
 +	const char policy[] = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-+	    "<plist version=\"1.0\"><dict><key>com.apple.watchdogd</key><true/></dict></plist>\n";
++	    "<plist version=\"1.0\"><dict><key>com.apple.watchdogd</key><true/><key>com.apple.bluetoothd</key><true/></dict></plist>\n";
 +	int disable = 0;
 +	int error;
 +

@@ -56,6 +56,32 @@ def extract(tree, writable_storage=False):
             text = runtime_table(text, *TABLES[name])
         if name == 'xhci_private.h':
             text = unpacked_registers(text)
+        if writable_storage and name == 'usb.c':
+            # Coachz: a HID device's other HID interfaces count too (the keyboard base's touchpad is interface 2), so the controller configures their endpoints.
+            old = '''	dev->num_endp = 1;
+	for (; ptr + 2 <= end && ptr[0] && ptr + ptr[0] <= end; ptr += ptr[0]) {
+		if (ptr[1] == DT_INTF || ptr[1] == DT_CFG ||
+				dev->num_endp >= ARRAY_SIZE(dev->endpoints))
+			break;
+		if (ptr[1] != DT_ENDP)
+			continue;
+'''
+            if text.count(old) != 1:
+                raise ValueError('libpayload changed around its endpoint loop')
+            text = text.replace(old, '''	dev->num_endp = 1;
+	int coachz_other = 0;
+	for (; ptr + 2 <= end && ptr[0] && ptr + ptr[0] <= end; ptr += ptr[0]) {
+		if (ptr[1] == DT_INTF && intf->bInterfaceClass == 3) {
+			const interface_descriptor_t *next = (const void *)ptr;
+			coachz_other = next->bInterfaceClass != 3 || next->bAlternateSetting;
+			continue;
+		}
+		if (ptr[1] == DT_INTF || ptr[1] == DT_CFG ||
+				dev->num_endp >= ARRAY_SIZE(dev->endpoints))
+			break;
+		if (ptr[1] != DT_ENDP || coachz_other)
+			continue;
+''')
         if writable_storage and name == 'usbmsc.c':
             text += '''\n/* Coachz: complete APFS flushes with the original bulk-only SCSI transport. */\nint coachz_usbmsc_sync(usbdev_t *dev) {\n    const u8 command[10] = {0x35}; /* SYNCHRONIZE CACHE(10), whole LUN */\n    return execute_command(dev, cbw_direction_data_out, command, 10, NULL, 0, 0);\n}\n'''
         (tree / name).write_text(text)

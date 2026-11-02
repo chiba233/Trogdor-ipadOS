@@ -26,8 +26,6 @@
 
 extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *, NativeAdrenoSubmit *, NativeAdrenoRing *, const NativeAdrenoRingClock *,
     const NativeAdrenoTimer *, const NativeAdrenoAbiDeviceInfo *, uint32_t, uint32_t);
-extern "C" volatile uint32_t native_adreno_pool_mib;
-extern "C" volatile uint32_t native_adreno_wc_enabled;
 extern "C" volatile uint32_t coachz_gpu_level_cap;   // coachz_thermal.c: 7, or 6 while the temperature clamp holds
 extern "C" void native_adreno_accelerator_static_init(void) __asm__("__GLOBAL__sub_I_NativeAdrenoAccelerator.cpp");
 extern "C" IOService *native_adreno_accelerator_allocate(void);
@@ -35,6 +33,17 @@ extern "C" unsigned native_adreno_accelerator_instance_size(void);
 extern "C" kern_return_t OSKextLoadKextWithIdentifier(const char *);
 extern "C" void native_adreno_metal_report(void);
 extern "C" void native_adreno_publisher_lock(int locked);
+extern "C" {
+extern volatile uint32_t native_adreno_ring_log[4][4 + 112];
+extern volatile uint32_t native_adreno_ring_log_count;
+extern volatile uint32_t native_adreno_ib_log[8][4 + 208];
+extern volatile uint32_t native_adreno_ib_log_count;
+}
+extern "C" unsigned NativeAdrenoGpuContextInputBits();
+// The framework's two weak board hooks. [1] of the first is the GPU's current level, which it notes per job. The second names a process still mapping a
+// page when a BO goes back; only a diagnostic, and no BO's pages are handed back under a mapping now that views map the VM object.
+extern "C" {volatile uint32_t native_gpu_dcvs[15];}
+extern "C" unsigned int native_pmap_user_mappings(unsigned int, void **, uint64_t *, char *) { return 0; }
 extern "C" void (*volatile native_adreno_power_get)(void);
 extern "C" int coachz_gpu_pm_suspend(void);
 extern "C" int coachz_gpu_pm_resume(void);
@@ -51,9 +60,6 @@ extern kmod_info_t g_kernel_kmod_info;
 extern "C" volatile uint32_t native_adreno_io_coherent;
 extern "C" volatile uint32_t native_adreno_coherent_skips[4];
 extern "C" volatile uint32_t coachz_gpu_ahead[5];   // NativeAdrenoPublish.cpp (patches/gpu/Adreno740.patch)
-extern "C" volatile uint32_t native_adreno_deferred[4];   // NativeAdrenoMemory.cpp: BOs freed only once no process maps them
-extern "C" volatile uint32_t native_adreno_system_bos[3];   // NativeAdrenoMemory.cpp: BOs of system memory, mapped by their VM object
-extern "C" void native_adreno_deferred_poll(void);
 extern "C" vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, unsigned int);
 extern "C" void ml_io_unmap(vm_offset_t, vm_size_t);
 
@@ -78,7 +84,7 @@ NativeAdrenoGmuContextReport gReport;
 NativeAdrenoGpuBuffer gBuffers[GpuBufferCount];
 IOMemoryMap *gMaps[GpuBufferCount];
 // Linux: chip 0x06010800, 512 KiB of GMEM at 1 MiB, UBWC 2.0 with highest bank bit 14 and swizzle 6 (a6xx_catalog.c, a6xx_calc_ubwc_config).
-// The client's addresses are the driver's window of the one 2 GiB space, as NativeAdrenoPublish expects.
+// The client's addresses come from its own address space above 4 GiB (NativeAdrenoPublish's window answers the query); these two are only the fallback.
 const NativeAdrenoAbiDeviceInfo gDeviceInfo = {0x06010800u, 0x80000u, 0x100000ull, 0x1fffffffff000ull, 0x20000000ull, 0x60000000ull,
     14u, 6u, 0u, 2u, NativeAdrenoDeviceClientIova, 0u};
 
@@ -137,6 +143,9 @@ enum : uint32_t {
     GmuHfiFault = 1u << 23, GmuAoErrors = 1u << 0 | 1u << 3 | 1u << 5,   // CM3 fault; watchdog bite, fence error, AHB bus error
 };
 volatile bool gIrqOn;
+// The first errors as the interrupt finds them: status, CP interrupt status, CP_SQE_STAT word 1 (a6xx_cp_hw_err_irq's possible opcode), CP_HW_FAULT,
+// CP_PROTECT_STATUS, RBBM_STATUS, RBBM_STATUS3, IB1 base and remainder, IB2 base, read pointer, bank 0 FSR.
+volatile uint32_t gErrCount, gErrLog[4][13];
 volatile uint32_t gFlushTs, gFlushSeen, gIrqAll, gIrqAhb, gIrqAtb, gIrqCpHw, gIrqHang, gIrqOob, gCpHwStatus, gGmuAoIrqs, gGmuAoStatus, gHfiIrqs, gHfiInfo;
 volatile uint32_t gIdleBlocks, gIdleTimeouts;
 
@@ -149,9 +158,20 @@ void gpuIrq(void *) {
         if (status & (IrqAtbAsync | IrqAtbBus)) gIrqAtb = gIrqAtb + 1;
         if (status & IrqHang) gIrqHang = gIrqHang + 1;
         if (status & IrqUcheOob) gIrqOob = gIrqOob + 1;
+        const auto core = [](uint32_t reg) {return *reinterpret_cast<volatile uint32_t *>(gCore + size_t(reg) * 4);};
+        uint32_t cp = 0, opcode = 0;
         if (status & IrqCpHw) {
             gIrqCpHw = gIrqCpHw + 1;
-            gCpHwStatus = *reinterpret_cast<volatile uint32_t *>(gCore + size_t(CpInterruptStatus) * 4);
+            gCpHwStatus = cp = core(CpInterruptStatus);
+            *reinterpret_cast<volatile uint32_t *>(gCore + size_t(0x0908) * 4) = 1;
+            opcode = core(0x0909);
+        }
+        const uint32_t n = gErrCount;
+        if (n < 4) {
+            const uint32_t row[13] = {status, cp, opcode, core(CpHwFault), core(0x0824), core(RbbmStatus), core(0x0213), core(0x0928), core(0x0929), core(0x092a), core(0x092b), core(0x0806),
+                *reinterpret_cast<volatile uint32_t *>(gSmmu + 0x8000 + 0x58)};
+            for (unsigned i = 0; i < 13; ++i) gErrLog[n][i] = row[i];
+            gErrCount = n + 1;
         }
         // priv->disable_err_irq's reason: an error that does not stop must not hold a core.
         if (gIrqAhb + gIrqAtb + gIrqHang + gIrqOob + gIrqCpHw > 10000)
@@ -213,51 +233,205 @@ void cpState(const char *when) {
         *reinterpret_cast<volatile uint32_t *>(gSmmu + SmmuSgfsr));
 }
 
+// The last framed submissions as the ring stamps them (NativeAdrenoRing's timeline, a6xx_submit's CP_ALWAYS_ON_COUNTER reads at 19.2 MHz): the CP's
+// start to the GPU idle after its buffers, for the ones completed since the last line.
+// The framework's views of DRAM and of the caches, adapted from UniXNU-sheng package/GpuPowerProbe.cpp: without them it cannot audit a write-combined BO
+// (a client view that still caches its pages, the first IB read as zeros by the GPU, int-147) and falls back on nothing.
 extern "C" {
-extern volatile uint32_t native_adreno_stamp_seqno[64];
-extern volatile uint64_t native_adreno_stamp_cpu[64][2];
+extern int (*native_adreno_dram_read32)(uint64_t, uint32_t *);
+extern int (*native_adreno_cached_read32)(uint64_t, uint32_t *);
+extern int (*native_adreno_line_audit)(uint64_t, size_t, uint32_t *, uint32_t *);
+extern volatile uint32_t native_adreno_wc_audit[6];
+extern volatile uint32_t native_adreno_wc_distrusted;
+}
+extern "C" vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
+extern "C" void ml_io_unmap(vm_offset_t addr, vm_size_t size);
+bool physRead64(uint64_t pa, uint64_t *out) {
+    const vm_offset_t va = ml_io_map_unmappable(vm_offset_t(pa & ~uint64_t(0xfff)), 0x1000, 0x7 /* VM_WIMG_IO */);
+    if (!va) return false;
+    *out = *reinterpret_cast<volatile uint64_t *>(va + (pa & 0xff8));
+    ml_io_unmap(va, 0x1000);
+    return true;
+}
+// NativeAdrenoVm::sampleWord's cached reader: one aligned word through the kernel's cacheable physical aperture, so a line a client's
+// cacheable view left dirty is seen whatever the cache mode of the BO's own mappings.
+extern "C" vm_offset_t phystokv(uint64_t pa);
+extern "C" uint64_t gPhysBase, gPhysSize;
+int cachedRead32(uint64_t pa, uint32_t *value) {
+    if ((pa & 3) || pa < gPhysBase || pa - gPhysBase >= gPhysSize) return 1;
+    const vm_offset_t va = phystokv(pa);
+    if (!va) return 1;
+    *value = *reinterpret_cast<volatile uint32_t *>(va);
+    // Drop the line this read brought in: a stale clean copy would later differ from DRAM and look like a dirty one.
+    __asm__ volatile("dsb sy\n\tdc civac, %0\n\tdsb sy" :: "r"(va) : "memory");
+    return 0;
+}
+// NativeAdrenoVm::auditRange's line comparer (int-100): whole lines of one page as the cacheable aperture and DRAM (a fresh uncached
+// mapping) read them. A differing line is cleaned and invalidated, then DRAM is read again: holding the cached copy now, the line was
+// dirty; unchanged, it was a stale clean copy (now dropped). int-099's single-word check wrote its line back before reading DRAM.
+// The time spent and the attribute XNU keeps for the first page that held a dirty line go to the banner (GPUW).
+extern "C" unsigned int pmap_cache_attributes(unsigned int pn);
+extern "C" {volatile uint64_t native_adreno_audit_ticks; volatile uint32_t native_adreno_audit_attr;}
+int lineAudit(uint64_t pa, size_t bytes, uint32_t *dirty, uint32_t *stale) {
+    if (!bytes || ((pa | bytes) & 63) || (pa & 0xfff) + bytes > 0x1000 || pa < gPhysBase || pa - gPhysBase >= gPhysSize) return 1;
+    const uint64_t began = mach_absolute_time();
+    const vm_offset_t page = ml_io_map_unmappable(vm_offset_t(pa & ~uint64_t(0xfff)), 0x1000, 0x7 /* VM_WIMG_IO */);
+    const vm_offset_t cached = phystokv(pa);
+    if (!page || !cached) {if (page) ml_io_unmap(page, 0x1000); return 1;}
+    const vm_offset_t dram = page + vm_offset_t(pa & 0xfff);
+    for (size_t at = 0; at < bytes; at += 64) {
+        const volatile uint64_t *c = reinterpret_cast<const volatile uint64_t *>(cached + at);
+        const volatile uint64_t *d = reinterpret_cast<const volatile uint64_t *>(dram + at);
+        uint64_t copy[8];
+        bool differs = false;
+        for (unsigned i = 0; i < 8; ++i) {copy[i] = c[i]; if (copy[i] != d[i]) differs = true;}
+        if (!differs) continue;
+        __asm__ volatile("dsb sy\n\tdc civac, %0\n\tdsb sy" :: "r"(cached + at) : "memory");
+        bool written = true;
+        for (unsigned i = 0; i < 8; ++i) if (d[i] != copy[i]) written = false;
+        if (written) {
+            if (!*dirty && !native_adreno_audit_attr) native_adreno_audit_attr = 0x100 | (pmap_cache_attributes(unsigned(pa >> 12)) & 0xff);
+            ++*dirty;
+        } else {
+            ++*stale;
+        }
+    }
+    ml_io_unmap(page, 0x1000);
+    native_adreno_audit_ticks += mach_absolute_time() - began;
+    return 0;
+}
+// NativeAdrenoVm::sampleWord's DRAM reader (int-070): one aligned word through a fresh uncached mapping.
+int dramRead32(uint64_t pa, uint32_t *value) {
+    uint64_t w = 0;
+    if (!physRead64(pa & ~uint64_t(7), &w)) return 1;
+    *value = uint32_t(w >> ((pa & 4) * 8));
+    return 0;
 }
 
-// The last 64 framed submissions as the ring stamps them (NativeAdrenoRing.cpp, a6xx_submit's CP_ALWAYS_ON_COUNTER reads): queue is
-// submission to the CP starting it, gpu the CP start to the GPU idle after its buffers, seen that idle to a fence poll noticing it. The
-// GPU counter and mach_absolute_time both count 19.2 MHz; their offset is read here. Only submissions completed since the last line.
+// A fence that has not moved between two reports: the CP's position and the words it was given, a few times a boot.
+// A stopped CP as a6xx_recover and a6xx_gpu_state record it (a6xx_registers' CP ranges, the CP_SQE_STAT and CP_ROQ_DBG banks), with the bank's own view of the
+// addresses it was using: its registers, an address translation (arm_smmu_iova_to_phys_hard) and the table walked in DRAM.
+extern "C" {
+extern volatile uint32_t native_adreno_table_switches[8];
+extern volatile uint32_t native_adreno_recover_trace[4];
+extern volatile uint32_t native_adreno_cp_aperture[4];
+}
+uint64_t bankTranslate(uint64_t va) {
+    volatile uint8_t *bank = gSmmu + 0x8000;
+    __asm__ volatile("dsb sy" ::: "memory");
+    *reinterpret_cast<volatile uint64_t *>(bank + 0x800) = va & ~uint64_t(0xfff);
+    __asm__ volatile("dsb sy\n\tisb" ::: "memory");
+    for (unsigned i = 0; i < 1000 && (*reinterpret_cast<volatile uint32_t *>(bank + 0x8f0) & 1); ++i) IODelay(1);
+    return *reinterpret_cast<volatile uint64_t *>(bank + 0x50);
+}
+void tableWalk(const char *name, uint64_t va) {
+    uint64_t table = *reinterpret_cast<volatile uint64_t *>(gSmmu + 0x8000 + 0x20) & 0xfffffffff000ull, entry[4] = {};
+    for (unsigned level = 0; level < 4; ++level) {
+        if (!physRead64(table + (((va >> (39 - 9 * level)) & 0x1ff) << 3), &entry[level]) || (entry[level] & 3) != 3) break;
+        table = entry[level] & 0xfffffffff000ull;
+    }
+    const uint64_t par = bankTranslate(va);
+    printf("COACHZ gpu dump: %s va 0x%llx par 0x%llx walk %llx %llx %llx %llx\n", name, static_cast<unsigned long long>(va), static_cast<unsigned long long>(par),
+        static_cast<unsigned long long>(entry[0]), static_cast<unsigned long long>(entry[1]), static_cast<unsigned long long>(entry[2]), static_cast<unsigned long long>(entry[3]));
+}
+void wordsPrint(const char *name, const uint32_t *words, unsigned count) {
+    unsigned lines = 0;
+    for (unsigned i = 0; i < count && lines < 128; i += 16) {
+        uint32_t any = 0;
+        for (unsigned j = i; j < i + 16 && j < count; ++j) any |= words[j];
+        if (!any) continue;
+        printf("COACHZ gpu dump: %s +%u:", name, i);
+        for (unsigned j = i; j < i + 16 && j < count; ++j) printf(" %08x", words[j]);
+        printf("\n");
+        ++lines;
+        IOSleep(20);
+    }
+}
+void cpDump(const char *why) {
+    static uint32_t words[2048];
+    const uint32_t done = gRing.completedFence(), issued = gRing.lastSubmitted();
+    printf("COACHZ gpu dump: %s, fence %u of %u, %u errors\n", why, done, issued, gErrCount);
+    for (unsigned i = 0; i < gErrCount && i < 4; ++i) {
+        const volatile uint32_t *e = gErrLog[i];
+        printf("COACHZ gpu dump: error %u status 0x%x cp 0x%x opcode 0x%x hw fault 0x%x protect 0x%x rbbm 0x%x rbbm3 0x%x ib1 0x%x%08x rem 0x%x ib2 0x%x rptr 0x%x fsr 0x%x\n", i, e[0], e[1], e[2], e[3], e[4], e[5], e[6],
+            e[8], e[7], e[9], e[10], e[11], e[12]);
+    }
+    static const uint16_t ranges[][2] = {{0x0210, 0x0213}, {0x0800, 0x0808}, {0x0810, 0x0813}, {0x0820, 0x0821}, {0x0823, 0x0824}, {0x0826, 0x0827}, {0x0830, 0x0833}, {0x0840, 0x0845}, {0x0880, 0x088a},
+        {0x08a0, 0x08ab}, {0x08c0, 0x08c4}, {0x08d0, 0x08dd}, {0x08f0, 0x08f3}, {0x0900, 0x0903}, {0x0928, 0x093e}, {0x0942, 0x094d}};
+    for (const auto &range : ranges) {
+        printf("COACHZ gpu dump: regs 0x%04x:", range[0]);
+        for (uint32_t reg = range[0]; reg <= range[1]; ++reg) printf(" %08x", coreRead(reg));
+        printf("\n");
+    }
+    IOSleep(20);
+    coreWrite(0x0908, 0);
+    for (unsigned i = 0; i < 0x33; ++i) words[i] = coreRead(0x0909);
+    wordsPrint("sqe", words, 0x33);
+    unsigned roq = coreRead(0x08c2) >> 14;   // a6xx_get_cp_roq_size
+    if (roq > 2048) roq = 2048;
+    coreWrite(0x090c, 0);
+    for (unsigned i = 0; i < roq; ++i) words[i] = coreRead(0x090d);
+    printf("COACHZ gpu dump: roq %u words\n", roq);
+    wordsPrint("roq", words, roq);
+    volatile uint8_t *bank = gSmmu + 0x8000;
+    const auto bank32 = [&](size_t at) {return *reinterpret_cast<volatile uint32_t *>(bank + at);};
+    const auto bank64 = [&](size_t at) {return static_cast<unsigned long long>(*reinterpret_cast<volatile uint64_t *>(bank + at));};
+    printf("COACHZ gpu dump: bank sctlr 0x%x tcr2 0x%x ttbr0 0x%llx ttbr1 0x%llx tcr 0x%x mair0 0x%x fsr 0x%x far 0x%llx fsynr0 0x%x gfsr 0x%x\n", bank32(0), bank32(0x10), bank64(0x20), bank64(0x28), bank32(0x30),
+        bank32(0x38), bank32(0x58), bank64(0x60), bank32(0x68), *reinterpret_cast<volatile uint32_t *>(gSmmu + SmmuSgfsr));
+    printf("COACHZ gpu dump: table switches %u %u %u %u %u %u 0x%x %u, table mode %u, recover %u 0x%x %u %u\n", native_adreno_table_switches[0], native_adreno_table_switches[1], native_adreno_table_switches[2],
+        native_adreno_table_switches[3], native_adreno_table_switches[4], native_adreno_table_switches[5], native_adreno_table_switches[6], native_adreno_table_switches[7], native_adreno_cp_aperture[3],
+        native_adreno_recover_trace[0], native_adreno_recover_trace[1], native_adreno_recover_trace[2], native_adreno_recover_trace[3]);
+    uint64_t start = 0, end = 0;
+    const uint32_t seen = gRing.timeline(issued, &start, &end);
+    printf("COACHZ gpu dump: stamps of fence %u status %u start 0x%llx end 0x%llx\n", issued, seen, static_cast<unsigned long long>(start), static_cast<unsigned long long>(end));
+    const uint32_t logged = native_adreno_ib_log_count < 8 ? native_adreno_ib_log_count : 8;
+    uint32_t slot = logged ? logged - 1 : 0;
+    for (uint32_t i = 0; i < logged; ++i) if (native_adreno_ib_log[i][0] == done + 1) slot = i;
+    const volatile uint32_t *r = native_adreno_ring_log[(native_adreno_ring_log_count - 1) & 3], *b = native_adreno_ib_log[slot];
+    tableWalk("ib", uint64_t(b[2]) << 32 | b[1]);
+    tableWalk("ring", GpuRingIova);
+    tableWalk("memptrs", GpuMemptrsIova);
+    tableWalk("sqe", GpuSqeIova);
+    printf("COACHZ gpu dump: ring fence %u start %u end %u words %u:", r[0], r[1], r[2], r[3]);
+    for (unsigned i = 0; i < 40 && i < r[3]; ++i) printf(" %08x", r[4 + i]);
+    printf("\nCOACHZ gpu dump: ib fence %u at 0x%x%08x bytes %u\n", b[0], b[2], b[1], b[3]);
+    IOSleep(20);
+    for (unsigned i = 0; i < 208 && i < b[3] / 4; ++i) words[i] = b[4 + i];
+    wordsPrint("ib", words, b[3] / 4 < 208 ? b[3] / 4 : 208);
+}
+void stuckReport() {
+    static uint32_t lastFence, printed;
+    const uint32_t done = gRing.completedFence(), issued = gRing.lastSubmitted();
+    printf("COACHZ gpu wc: audits %u lines %u dirty %u stale %u status 0x%x re-asserted %u, distrusted at %u, attribute 0x%x, audit %llu ms\n", native_adreno_wc_audit[0], native_adreno_wc_audit[1],
+        native_adreno_wc_audit[2], native_adreno_wc_audit[3], native_adreno_wc_audit[4], native_adreno_wc_audit[5], native_adreno_wc_distrusted, native_adreno_audit_attr,
+        (unsigned long long)(native_adreno_audit_ticks / 19200));
+    if (done == issued || done != lastFence) {lastFence = done; return;}
+    if (printed >= 3 || __atomic_load_n(&gPmAsleep, __ATOMIC_SEQ_CST)) return;
+    ++printed;
+    printf("COACHZ gpu stuck: fence %u of %u, rptr 0x%x wptr 0x%x, ib1 0x%x%08x rem 0x%x, ib2 0x%x%08x rem 0x%x, rbbm 0x%x, sqe stat 0x%x, ring ttbr0 0x%x%08x\n", done, issued, coreRead(0x0806), coreRead(0x0807),
+        coreRead(0x0929), coreRead(0x0928), coreRead(0x092a), coreRead(0x092c), coreRead(0x092b), coreRead(0x092d), coreRead(0x0210), coreRead(0x0831),
+        *reinterpret_cast<volatile uint32_t *>(gSmmu + 0x8000 + 0x24), *reinterpret_cast<volatile uint32_t *>(gSmmu + 0x8000 + 0x20));
+    if (printed == 1) cpDump("stuck");
+}
+
 void stampReport() {
     static uint32_t reported;
-    if (!gMaps[2]) return;
-    const volatile uint32_t *page = reinterpret_cast<const volatile uint32_t *>(gMaps[2]->getVirtualAddress()) + 0x800 / 4;
-    const uint64_t before = mach_absolute_time();
-    uint32_t lo = coreRead(0x980), hi = coreRead(0x981);
-    const uint32_t again = coreRead(0x980);
-    if (again < lo) {lo = again; hi = coreRead(0x981);}
-    const uint64_t after = mach_absolute_time();
-    const int64_t offset = static_cast<int64_t>((before + after) / 2) - static_cast<int64_t>(static_cast<uint64_t>(hi) << 32 | lo);
-    uint64_t queue = 0, gpu = 0, seen = 0, queueMax = 0, gpuMax = 0, seenMax = 0;
+    const uint32_t done = gRing.completedFence();
+    uint64_t gpu = 0, gpuMax = 0;
     unsigned n = 0, bins[7] = {};
-    uint32_t newest = reported;
-    for (unsigned slot = 0; slot < 64; ++slot) {
-        const uint32_t seq = native_adreno_stamp_seqno[slot];
-        const uint64_t submitted = native_adreno_stamp_cpu[slot][0], noticed = native_adreno_stamp_cpu[slot][1];
-        if (!seq || seq <= reported || !noticed) continue;
-        const uint64_t start = page[slot * 4] | static_cast<uint64_t>(page[slot * 4 + 1]) << 32;
-        const uint64_t end = page[slot * 4 + 2] | static_cast<uint64_t>(page[slot * 4 + 3]) << 32;
-        if (!start || end < start) continue;
-        const int64_t startCpu = static_cast<int64_t>(start) + offset, endCpu = static_cast<int64_t>(end) + offset;
-        const uint64_t q = startCpu > static_cast<int64_t>(submitted) ? (static_cast<uint64_t>(startCpu) - submitted) * 10 / 192 : 0;
+    for (uint32_t fence = done - reported > 64 ? done - 63 : reported + 1; fence && fence <= done; ++fence) {
+        uint64_t start = 0, end = 0;
+        if (gRing.timeline(fence, &start, &end) != 31 || !start || end < start) continue;
         const uint64_t g = (end - start) * 10 / 192;
-        const uint64_t d = static_cast<int64_t>(noticed) > endCpu ? (noticed - static_cast<uint64_t>(endCpu)) * 10 / 192 : 0;
-        queue += q; gpu += g; seen += d; ++n;
-        if (q > queueMax) queueMax = q;
+        gpu += g; ++n;
         if (g > gpuMax) gpuMax = g;
-        if (d > seenMax) seenMax = d;
         unsigned bin = 0;
         while (bin < 6 && g >= (1000ull << bin)) ++bin;
         ++bins[bin];
-        if (seq > newest) newest = seq;
     }
-    reported = newest;
+    reported = done;
     if (!n) return;
-    printf("COACHZ gpu stamps: %u submissions, queue mean %llu max %llu us, gpu mean %llu max %llu us, seen mean %llu max %llu us; "
-        "gpu <1 %u <2 %u <4 %u <8 %u <16 %u <32 %u more %u ms\n", n, queue / n, queueMax, gpu / n, gpuMax, seen / n, seenMax,
+    printf("COACHZ gpu stamps: %u submissions, gpu mean %llu max %llu us, gpu <1 %u <2 %u <4 %u <8 %u <16 %u <32 %u more %u ms\n", n, gpu / n, gpuMax,
         bins[0], bins[1], bins[2], bins[3], bins[4], bins[5], bins[6]);
 }
 
@@ -266,6 +440,7 @@ void reportThread(void *, wait_result_t) {
     for (unsigned round = 1;; round++) {
         IOSleep(10000);
         native_adreno_metal_report();
+        stuckReport();
         // Once a minute, which processes have a GPU connection slot (four in this framework) and which were refused.
         if (!(round % 6)) {
             for (const NativeAdrenoClientRecord &r : native_adreno_client_log)
@@ -286,9 +461,6 @@ void reportThread(void *, wait_result_t) {
         printf("COACHZ gpu9: coherent %u, maintenance skipped before submit %u after completion %u\n", native_adreno_io_coherent,
             native_adreno_coherent_skips[2], native_adreno_coherent_skips[3]);
         // UniXNU porting/gpu#frame-path, submission to GPU start: other processes' jobs ahead of backboardd's in the one ring.
-        printf("COACHZ gpu9: system BOs %u (%u spans, %u refused); deferred BO frees %u, freed later %u, waiting %u, kept %u\n",
-            native_adreno_system_bos[0], native_adreno_system_bos[1], native_adreno_system_bos[2], native_adreno_deferred[0],
-            native_adreno_deferred[1], native_adreno_deferred[2], native_adreno_deferred[3]);
         printf("COACHZ gpu9: ahead of backboardd: %u of %u submissions behind others, %u jobs in all, at most %u; others submitted %u\n",
             coachz_gpu_ahead[1], coachz_gpu_ahead[0], coachz_gpu_ahead[2], coachz_gpu_ahead[3], coachz_gpu_ahead[4]);
     }
@@ -353,6 +525,7 @@ void gmuWrite(uint32_t at, uint32_t value) {
     __asm__ volatile("dsb sy" ::: "memory");
 }
 unsigned dcvsSet(unsigned level, uint32_t *result) {
+    native_gpu_dcvs[1] = level;
     if (__atomic_load_n(&gPmAsleep, __ATOMIC_SEQ_CST)) return 0;   // no firmware to ask: the level is set again on resume
     gmuWrite(GmuDcvsAck, 0);
     gmuWrite(GmuDcvsPerf, 3u << 28 | level);
@@ -424,7 +597,7 @@ void pmGet() {
     __atomic_store_n(&gPmAsleep, 0u, __ATOMIC_SEQ_CST);
     coreWrite(CpSqeInstrBase, uint32_t(gBuffers[0].iova));
     coreWrite(CpSqeInstrBase + 1, uint32_t(gBuffers[0].iova >> 32));
-    const IOReturn ring = gRing.restart();
+    const IOReturn ring = gRing.restart(gRing.lastSubmitted());
     coreWrite(CpSqeCntl, 1);
     uint32_t init[9] = {0, 0x2fu, 3u, 0x20000000u, 0, 0, 0, 0, 0};
     uint32_t fence = 0, observed = 0;
@@ -486,7 +659,6 @@ void rateThread(void *, wait_result_t) {
             }
         }
         if (seconds == 20) dcvsTest();
-        native_adreno_deferred_poll();
         const uint64_t newCycles = coreCounter(0x400), newBusy = gmuBusy(), newAlways = coreCounter(0x980);
         const uint64_t dCycles = newCycles - cycles, dBusy = newBusy - busy, dAlways = newAlways - always;
         uint64_t d[ProfileCount], g[4];
@@ -643,12 +815,6 @@ void memoryProbeThread(void *, wait_result_t) {
 
 // The SQE firmware, the kit's GPU context and the CP's first packets.
 bool startCp(volatile uint8_t *smmu, size_t smmuBytes, const uint32_t *sqe, uint32_t sqeBytes) {
-    // 1536 MiB, UniXNU's default (sheng-gpu-pool): k89's pool peaked at 472 of 512 MiB, and a BO outside the pool is the kind a crashed
-    // process's close freed under its mapping.
-    unsigned pool = 1536;
-    PE_parse_boot_argn("coachz-gpu-pool", &pool, sizeof pool);
-    native_adreno_pool_mib = pool;
-    native_adreno_wc_enabled = 1;
     *reinterpret_cast<volatile uint32_t *>(smmu + SmmuScr0) = *reinterpret_cast<volatile uint32_t *>(smmu + SmmuScr0) | SmmuKitGlobal;
     // The groups nothing uses fault, as Linux's arm_smmu_device_reset leaves them; their reset value would translate into bank 0.
     for (unsigned group = 0; group < SmmuGroups; ++group) {
@@ -658,9 +824,8 @@ bool startCp(volatile uint8_t *smmu, size_t smmuBytes, const uint32_t *sqe, uint
     // Bank 0 and stream 0, as Linux's Adreno SMMU; group 1 and bank 1 are the GMU's. The kit routes two streams: sc7180.dtsi names only stream 0 for
     // the GPU, so the second is an unused stream on a free group.
     const IOReturn context = NativeAdrenoGpuContextBringup(smmu, smmuBytes, 0, 2, 0, 0, 2, 1, nullptr, &gReport);
-    printf("COACHZ gpu9: context status 0x%x step %u program %u/%u route %u/%u verified %u output bits %u spans %u pool status %u\n", context, gReport.step,
-        gReport.program_status, gReport.program_enabled, gReport.route_status, gReport.route_phase, gReport.routes_verified, gReport.output_bits, gReport.spans,
-        native_adreno_pool_mib);
+    printf("COACHZ gpu9: context status 0x%x step %u program %u/%u route %u/%u verified %u output bits %u spans %u\n", context, gReport.step,
+        gReport.program_status, gReport.program_enabled, gReport.route_status, gReport.route_phase, gReport.routes_verified, gReport.output_bits, gReport.spans);
     if (context) return false;
     if (NativeAdrenoGpuContextBuffers(gBuffers)) {
         printf("COACHZ gpu9: context buffers refused\n");
@@ -883,9 +1048,13 @@ extern "C" int coachz_gpu_driver_start(volatile uint8_t *core, volatile uint8_t 
     const NativeAdrenoTimeIo timer{nullptr, timerRead};
     const IOReturn timed = gTimer.attach(&timer, NativeAdrenoTimeCp);
     const NativeAdrenoRingClock clock{nullptr, ringNow, ringIdle};
+    gRing.setTimeline(true);
+    native_adreno_dram_read32 = dramRead32;
+    native_adreno_cached_read32 = cachedRead32;
+    native_adreno_line_audit = lineAudit;
     if (!status) coherenceProbe(vm);
     if (!status) gpuInterruptsOn();
-    if (!status) status = native_adreno_publish(vm, &gSubmit, &gRing, &clock, timed ? nullptr : &gTimer, &gDeviceInfo, 32, gReport.output_bits);
+    if (!status) status = native_adreno_publish(vm, &gSubmit, &gRing, &clock, timed ? nullptr : &gTimer, &gDeviceInfo, NativeAdrenoGpuContextInputBits(), gReport.output_bits);
     printf("COACHZ gpu9: published 0x%x, timer 0x%x\n", status, timed);
     if (status) return 0;
     const bool accelerator = publishAccelerator();

@@ -48,7 +48,8 @@ class WifiTests(unittest.TestCase):
         self.assertIn('COACHZ wmi: ready after %u ms', wifi)
         self.assertNotIn('wifi_rpmh_send(wifi_mss_rails,', wifi)               # cx.lvl only through the aggregator
         # The scan only listens: every channel passive, the scan passive, and no name or address is printed.
-        self.assertIn('| 1u << 7 | 1u << 11', wifi)
+        self.assertIn('(mhz > 2462 ? 1u << 7 : 0)', wifi)   # the world domain's passive channels; the scans themselves stay passive
+        self.assertIn('WS_PUT32(0x01u | 0x10u | 0x20u);', wifi)
         self.assertIn('WS_PUT32(0x01u | 0x10u | 0x20u);', wifi)
         self.assertNotIn('%02x:%02x:%02x:%02x', wifi)
 

@@ -58,7 +58,7 @@ class SequenceTests(unittest.TestCase):
         # Only after the power button, and the first submission wakes it.
         self.assertIn('if (!gPmArmed || gPmAsleep', board)
         ring = (ROOT / 'platform/coachz-prelink/patches/gpu/Adreno740.patch').read_text()
-        self.assertLess(ring.index('+    if(native_adreno_power_get)native_adreno_power_get();'), ring.index('     status=ring_->submitFramed(words,word_count,&value);'))
+        self.assertLess(ring.index('+    if(native_adreno_power_get)native_adreno_power_get();'), ring.index('     status=preemption()?target->submitFramed(words,word_count,number,&value)'))
 
     def test_no_power_votes_or_core_access(self):
         source = new_file(PATCH, 'bsd/dev/coachz_gpu_seq.h') + new_file(PATCH, 'bsd/dev/coachz_gpu.c')

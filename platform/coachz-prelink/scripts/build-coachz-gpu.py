@@ -52,7 +52,7 @@ for source in [PM4 / 'AdrenoPM4.c', *sorted(p for p in SMMU.glob('ArmSmmu4K*.c')
     compile_object(c_record, source, output, [*includes, '-w'])
     objects.append(output)
 # NativeAdrenoGmuMemory is the allocator type the GPU context's header carries; everything else that needs the Sheng GMU stays out.
-for stem in ['Cpu', 'GmuMemory', 'GpuContext', 'Memory', 'Publish', 'Ring', 'SmmuContext', 'SmmuMemory', 'Submit', 'Timer', 'UserClient', 'Vm']:
+for stem in ['Cpu', 'GmuMemory', 'GpuContext', 'Memory', 'Preempt', 'Publish', 'Ring', 'SmmuContext', 'SmmuMemory', 'Submit', 'Timer', 'UserClient', 'Vm']:
     output = OUT / ('NativeAdreno' + stem + '.o')
     compile_object(cxx_record, DRIVER / ('NativeAdreno' + stem + '.cpp'), output, [*includes, '-w'])
     objects.append(output)

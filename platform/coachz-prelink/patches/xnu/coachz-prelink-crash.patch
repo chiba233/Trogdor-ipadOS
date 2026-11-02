@@ -35,14 +35,20 @@
  		os_reason_t reason = p->p_exit_reason;
 --- a/osfmk/arm64/coachz_thread.c	2026-11-01 01:28:25
 +++ b/osfmk/arm64/coachz_thread.c	2026-11-01 01:28:25
-@@ -480,6 +480,12 @@
+@@ -480,6 +480,18 @@
  void
  coachz_launch_process(int pid, const char *name, int exited, int status)
  {
 +	{
-+		extern int coachz_preferences_pid;
++		extern int coachz_preferences_pid, coachz_sharingd_pid, coachz_wifid_pid;
 +		if (!strcmp(name, "Preferences")) {
 +			coachz_preferences_pid = exited ? 0 : pid;
++		}
++		if (!strcmp(name, "sharingd")) {
++			coachz_sharingd_pid = exited ? 0 : pid;
++		}
++		if (!strcmp(name, "wifid")) {
++			coachz_wifid_pid = exited ? 0 : pid;
 +		}
 +	}
  	uint32_t index;
@@ -120,7 +126,7 @@
 +}
 +
 +/* Each report, where the main threads of the tapped app and of SpringBoard are, for the disk log. */
-+int coachz_preferences_pid;
++int coachz_preferences_pid, coachz_sharingd_pid, coachz_wifid_pid;
 +void coachz_sample_main_threads(void);
 +
 +static void

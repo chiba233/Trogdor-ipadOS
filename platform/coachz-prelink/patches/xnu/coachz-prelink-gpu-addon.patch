@@ -17,7 +17,7 @@
  static int
  native_cryptex_os_bind(proc_t p, user_addr_t scratch, const char *source, const char *point, int flags)
  {
-@@ -8706,6 +8709,32 @@
+@@ -8706,6 +8709,46 @@
  	return error ? error : close_error;
  }
  
@@ -45,6 +45,20 @@
 +	    "/System/Library/Extensions/NativeAdrenoMetal.bundle/Info.plist", &native_gpu_addon_stage, &native_gpu_addon_status);
 +	printf("COACHZ gpu: plug-in files %d written %d same %d failed %d error %d, mount stage %d status %d\n", native_gpu_addon_files, native_gpu_addon_written,
 +	    native_gpu_addon_same, native_gpu_addon_failed, native_gpu_addon_error, native_gpu_addon_stage, native_gpu_addon_status);
++	/* The default wallpaper's layered animations with JPEG images in place of their HEIC ones, which ImageIO cannot decode without a hardware HEVC
++	 * decoder; UniXNU's overlay route (tools/xnu_gpu_userland.py --wallpaper-root). The sealed assets stay visible below. Which variant PosterBoard
++	 * picks depends on the device identity, so the two that can be picked here both get one. */
++	static const char flat_source[] = "/private/var/ngpu/wallpaper", small_source[] = "/private/var/ngpu/wallpaper-floating";
++#define COACHZ_WALLPAPERS "/Library/Wallpaper/Collections/iPadOS_17~ipad.wallpaperCollection/Wallpapers/"
++#define COACHZ_FLAT COACHZ_WALLPAPERS "7570.iPadOS_17_Flat-1024w-1366h@2x~ipad.wallpaper/7570.iPadOS_17_Flat_Background-1024w-1366h@2x~ipad.ca"
++#define COACHZ_SMALL COACHZ_WALLPAPERS "7570.iPadOS_17-834w-1112h@2x~ipad.wallpaper/7570.iPadOS_17_Background-834w-1112h@2x~ipad.ca"
++	static const char flat_point[] = COACHZ_FLAT, small_point[] = COACHZ_SMALL;
++	static volatile int small_stage, small_status;
++	native_gpu_addon_mount(p, scratch, 0x800, flat_source, sizeof(flat_source), flat_point, sizeof(flat_point), COACHZ_FLAT "/assets/J120.HEIC",
++	    COACHZ_FLAT "/J120.jpg", &native_gpu_addon3_stage, &native_gpu_addon3_status);
++	native_gpu_addon_mount(p, scratch, 0xa00, small_source, sizeof(small_source), small_point, sizeof(small_point), COACHZ_SMALL "/assets/Background Light.HEIC",
++	    COACHZ_SMALL "/Background-Light.jpg", &small_stage, &small_status);
++	printf("COACHZ gpu: wallpaper overlays: flat stage %d status %d, 834 stage %d status %d\n", native_gpu_addon3_stage, native_gpu_addon3_status, small_stage, small_status);
 +}
 +
  static void

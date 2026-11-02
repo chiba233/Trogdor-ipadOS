@@ -71,19 +71,48 @@ def build(prime_list=None):
     shutil.rmtree(target, ignore_errors=True)
     shutil.copytree(harness, target)
     # patches/gpu/unixnu-gpu-plugin.patch, applied only while the plug-in builds: the pinned plug-in does not build for iOS 17 as it is.
-    patch = ['patch', '--batch', '--silent', '-p1', '-d', str(UNIXNU / 'drivers/AdrenoMetal'), '-i',
+    patch = ['patch', '--batch', '--silent', '--no-backup-if-mismatch', '-p1', '-d', str(UNIXNU / 'drivers/AdrenoMetal'), '-i',
              str(ROOT / 'platform/coachz-prelink/patches/gpu/unixnu-gpu-plugin.patch')]
-    subprocess.run(patch, check=True)
     # The plug-in build embeds build/prime-list.txt in __DATA,__primelist when it exists (build-adreno-metal-plugin.py).
     embedded = UNIXNU / 'build/prime-list.txt'
     embedded.unlink(missing_ok=True)
     if prime_list:
         embedded.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(prime_list, embedded)
+    subprocess.run(patch, check=True)
     try:
         subprocess.run(['python3', '-B', 'scripts/build-adreno-metal-plugin.py'], cwd=UNIXNU, check=True)
     finally:
         subprocess.run([*patch, '-R'], check=True)
+
+
+# The default wallpaper's image layers as JPEG instead of HEIC (no hardware HEVC decoder here), as UniXNU's scripts/make-wallpaper-overlay.py makes them:
+# the animation's documents with main.caml pointing at the new images next to it. JPEG keeps them small enough for the kernel partition.
+WALLPAPERS = 'Library/Wallpaper/Collections/iPadOS_17~ipad.wallpaperCollection/Wallpapers/'
+WALLPAPER_OVERLAYS = {
+    'wallpaper': (WALLPAPERS + '7570.iPadOS_17_Flat-1024w-1366h@2x~ipad.wallpaper/7570.iPadOS_17_Flat_Background-1024w-1366h@2x~ipad.ca', {'J120': 'J120', 'J120-Dark': 'J120-Dark'}),
+    'wallpaper-floating': (WALLPAPERS + '7570.iPadOS_17-834w-1112h@2x~ipad.wallpaper/7570.iPadOS_17_Background-834w-1112h@2x~ipad.ca',
+                           {'Background%20Light': 'Background-Light', 'Background%20Dark': 'Background-Dark'}),
+}
+
+
+def wallpaper_overlay(root, output, animation, images):
+    source = root / animation
+    if not (source / 'main.caml').is_file():
+        raise SystemExit('no wallpaper animation at ' + str(source))
+    shutil.rmtree(output, ignore_errors=True)
+    output.mkdir(parents=True)
+    for name in ('index.xml', 'assetManifest.caml'):
+        (output / name).write_bytes((source / name).read_bytes())
+    text = (source / 'main.caml').read_text()
+    for image, jpeg in images.items():
+        text = text.replace(f'/assets/{image}.HEIC', f'/{jpeg}.jpg').replace(f'assets/{image}.HEIC', f'{jpeg}.jpg')
+        heic = source / 'assets' / (image.replace('%20', ' ') + '.HEIC')
+        subprocess.run(['sips', '-Z', '2732', '-s', 'format', 'jpeg', '-s', 'formatOptions', '85', str(heic), '--out', str(output / f'{jpeg}.jpg')],
+                       check=True, stdout=subprocess.DEVNULL)
+    if '.HEIC"/>' in text:   # a layer's name may keep it
+        raise SystemExit('main.caml still points at a HEIC image')
+    (output / 'main.caml').write_text(text)
 
 
 def main():
@@ -92,6 +121,7 @@ def main():
     parser.add_argument('--build', action='store_true', help='build Turnip and the plug-in first')
     parser.add_argument('--make-prime-list', type=Path, nargs='+', metavar='ROOT',
                         help='write the prime list from these mounted OS roots (the OS image, its SystemOS cryptex) to --prime-list and stop')
+    parser.add_argument('--wallpaper-root', type=Path, help='the mounted OS volume: carry the default wallpaper with JPEG images in place of its HEIC ones')
     parser.add_argument('--prime-list', type=Path, help='the libraries the render server compiles ahead, embedded in the plug-in and carried in the addon')
     args = parser.parse_args()
     if args.make_prime_list:
@@ -106,6 +136,11 @@ def main():
     addon = args.output / 'NativeAdrenoMetal.addon'
     addon.unlink(missing_ok=True)
     extra = ['--prime-list', str(args.prime_list.resolve())] if args.prime_list else []
+    if args.wallpaper_root:
+        for name, (animation, images) in WALLPAPER_OVERLAYS.items():
+            directory = args.output / name
+            wallpaper_overlay(args.wallpaper_root, directory, animation, images)
+            extra += ['--' + name, str(directory.resolve())]
     subprocess.run(['python3', '-B', 'scripts/make-gpu-addon.py', '--publish', *extra, str(addon)], cwd=UNIXNU, check=True)
     trust = json.loads((UNIXNU / 'build/adreno-metal-plugin/trust.json').read_text())
     # Every signed executable the build reports (the plug-in, Turnip, the probe daemon). A version 2 module, as build-coachz-audio.py writes:

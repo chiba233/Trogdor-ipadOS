@@ -37,7 +37,7 @@ int main(void) {
     assert(!chmod("disabled.plist",0666));
     assert(!coachz_watchdog_policy_file("disabled.plist",policy,sizeof(policy)-1));
     assert(!stat("disabled.plist",&after)&&(after.st_mode&07777)==0644);
-    const char launchd[]="<?xml version=\"1.0\"?>\n<plist version=\"1.0\">\n<dict>\n\t<key>com.apple.watchdogd</key>\n\t<true/>\n</dict>\n</plist>\n";
+    const char launchd[]="<?xml version=\"1.0\"?>\n<plist version=\"1.0\">\n<dict>\n\t<key>com.apple.bluetoothd</key>\n\t<true/>\n\t<key>com.apple.watchdogd</key>\n\t<true/>\n</dict>\n</plist>\n";
     fd=open("disabled.plist",O_WRONLY|O_TRUNC);assert(write(fd,launchd,sizeof(launchd)-1)==sizeof(launchd)-1);close(fd);
     assert(!stat("disabled.plist",&before));
     assert(!coachz_watchdog_policy_file("disabled.plist",policy,sizeof(policy)-1));

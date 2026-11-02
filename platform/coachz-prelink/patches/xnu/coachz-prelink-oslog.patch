@@ -114,7 +114,7 @@
 +{
 +	static const char *const names[] = {
 +		"SpringBoard", "backboardd", "runningboardd", "lsd", "installd", "iconservicesagent", "splashboardd",
-+		"Preferences", "MobileSMS", "MobileSafari", "MobileNotes", "MobileMail", "MobileSlideShow", "MobileCal",
++		"Preferences", "MobileSMS", "MobileSafari", "MobileNotes", "MobileMail", "MobileSlideShow", "MobileCal", "wifid", "sharingd", "InputUI", "PosterBoard", "CollectionsPoster", "LegacyPoster", "GradientPosterExtension",
 +	};
 +	static int enabled = -1;
 +
