@@ -1,0 +1,36 @@
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -178,8 +178,33 @@
+ #endif /* CONFIG_DEBUG_SYSCALL_REJECTION */
+ 
+ 	AUDIT_SYSCALL_ENTER(code, proc, uthread);
+ 	error = (*(callp->sy_call))(proc, &uthread->uu_arg[0], &(uthread->uu_rval[0]));
+ 	AUDIT_SYSCALL_EXIT(code, proc, uthread, error);
++	{
++		/* Coachz: what PosterBoard's data store fails on: its system calls that return an error, with the path of those that take one. */
++		extern int coachz_poster_pid;
++		static uint32_t coachz_traced;
++		if (error && error != EJUSTRETURN && error != ERESTART && coachz_poster_pid && proc_pid(proc) == coachz_poster_pid && coachz_traced < 400) {
++			const uint64_t *a = (const uint64_t *)&uthread->uu_arg[0];
++			char path[120];
++			size_t got = 0;
++			user_addr_t at = 0;
++			path[0] = 0;
++			switch (code) {
++			case 5: case 10: case 33: case 128: case 136: case 137: case 216: case 220: case 221: case 234: case 236: case 242: case 338: case 340: case 398:
++				at = a[0];
++				break;
++			case 218: case 463: case 464: case 466: case 469: case 470: case 472: case 475: case 476: case 524:
++				at = a[1];
++				break;
++			}
++			if (at) {
++				(void)copyinstr(at, path, sizeof(path), &got);
++			}
++			coachz_traced++;
++			printf("COACHZ poster trace: syscall %d error %d args 0x%llx 0x%llx %s\n", code, error, a[0], a[1], path);
++		}
++	}
+ 
+ #if CONFIG_MACF
+ skip_syscall:

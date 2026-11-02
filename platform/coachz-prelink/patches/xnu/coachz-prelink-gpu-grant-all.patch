@@ -1,0 +1,12 @@
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -4332,5 +4332,9 @@
+ 	if (!list) {
+ 		return false;
+ 	}
++	/* Coachz: "*" is every process: the owner wants no list of GPU clients. */
++	if (0 == strcmp(list->getCStringNoCopy(), "*")) {
++		return true;
++	}
+ 	proc_selfname(name, sizeof(name));
+ 	for (const char * at = list->getCStringNoCopy(); *at;) {

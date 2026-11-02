@@ -179,7 +179,7 @@ def smp_tree(root, count):
 
 
 def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=True, root_uuid=None, cpus=1,
-                 full_screen=False, gmu_firmware_size=0, sqe_firmware_size=0, gpu_addon_size=0, motion_probe=False):
+                 full_screen=False, gmu_firmware_size=0, sqe_firmware_size=0, gpu_addon_size=0, motion_probe=False, wifi_mac=None):
     root = read_tree(adt)
     if cpus > 1:
         smp_tree(root, cpus)
@@ -204,6 +204,10 @@ def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=T
         # boot, holding SpringBoard's check-in (ios-sweet NOTES.md). A fixed synthetic chip ID, not a real one; 0x8011 is A10X.
         root.child('chosen').set('unique-chip-id', COACHZ_UNIQUE_CHIP_ID)
         root.child('chosen').set('chip-id', struct.pack('<I', 0x8011))
+    if wifi_mac:
+        # MobileGestalt's WifiAddressData (IODeviceTree:/chosen/mac-address-wifi0). Without it wifid's next
+        # __WiFiManagerWillAssociateCallback stores a nil address in a dictionary and exits.
+        root.child('chosen').set('mac-address-wifi0', bytes.fromhex(wifi_mac))
     memory_map = root.child('chosen').child('memory-map')
     # Without a RAMDisk entry IOFindBSDRoot makes no md0, and rd= names a disk partition.
     if ram_root:
@@ -247,7 +251,7 @@ def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=T
 
 def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=False, root_cache=None, root_device=None,
          root_uuid=None, data_seed=None, data_uuid=None, display=False, cpus=1, gpu=0, gmu_firmware=None, sqe_firmware=None, gpu_addon=None,
-         diagnostics=False, wifi_mac=None):
+         diagnostics=False, wifi_mac=None, root_emmc=False):
     if window & 0x1fffff or memory & 0x1fffff:
         raise ValueError('window base and size must be 2 MiB aligned')
     kernel = macho(data)
@@ -289,8 +293,6 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         command_line += ' coachz-oslog=1'
         # WebKit's extension processes fail AMFI's launch constraints here (coachz-prelink-crash.patch).
         command_line += ' coachz-no-launch-constraints=1'
-        # CoreImage calls an empty OpenGL table in iconservicesagent, which Settings waits on (coachz-prelink-software-render.patch).
-        command_line += ' coachz-null-call=1'
         # The drivers under test: Chrome EC battery, a speaker tone and the volume buttons (docs/plans/battery-speaker.md, input.md).
         # coachz-speaker=2 starts the audio service; its plug-in's trust cache module comes with --root-trust-cache (build-coachz-audio.py).
         command_line += ' coachz-battery=1 coachz-speaker=2 coachz-buttons=3'
@@ -308,6 +310,8 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         command_line += ' coachz-emmc=3 coachz-sd=2'
         if wifi_mac:
             command_line += ' coachz-wifi-mac=' + wifi_mac
+        if root_emmc:
+            command_line += ' coachz-root-emmc=1'
     if gpu:
         # Adreno 618 bring-up stages (docs/plans/gpu.md): 1 inventory, 2 CX + GMU clock window, 3 also the GMU firmware into TCM,
         # 4 the window with a read-only GPU SMMU inventory.
@@ -371,7 +375,7 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         ramdisk += bytes(-len(ramdisk) % 4096)
         # The restore volume, from memory or from disk, runs as the restore OS environment; the main OS does not.
         environment = 'restore' if root_cache and not root_uuid else None
-        adt = prelink_tree(adt, window, tree, ramdisk, cache, environment, ram_root=not disk_root or bool(data_seed),
+        adt = prelink_tree(adt, window, tree, ramdisk, cache, environment, wifi_mac=wifi_mac, ram_root=not disk_root or bool(data_seed),
                            root_uuid=root_uuid, cpus=cpus, full_screen=display,
                            gmu_firmware_size=len(gmu_firmware) if gmu_firmware else 0, sqe_firmware_size=len(sqe_firmware) if sqe_firmware else 0, gpu_addon_size=len(gpu_addon) if gpu_addon else 0, motion_probe=diagnostics)
         ramdisk = ramdisk + cache + bytes(-len(cache) % 4096)
@@ -419,6 +423,7 @@ def main():
     p.add_argument('--display', action='store_true', help='main OS: publish the firmware framebuffer through original MobileFramebuffer Legacy')
     p.add_argument('--smp', type=int, default=1, help='main OS: start CPU0..N-1 (up to 8) through PSCI')
     p.add_argument('--gpu', type=int, default=0, help='prelinked: Adreno 618 bring-up stage 1 to 8, or 9 for the driver (docs/plans/gpu.md)')
+    p.add_argument('--root-emmc', action='store_true', help='the system, Data and the log ring on the eMMC partitions the owner carved')
     p.add_argument('--wifi-mac', type=Path, help='a file with 12 hex digits: the Wi-Fi address this image uses on every boot')
     p.add_argument('--gpu-addon', type=Path, help='with --gpu 9: the Metal plug-in addon from tools/xnu_gpu_userland.py')
     p.add_argument('--sqe-firmware', type=Path, help='with --gpu 8 or 9: the CP firmware, linux-firmware qcom/a630_sqe.fw')
@@ -441,7 +446,7 @@ def main():
                    gpu=a.gpu, gmu_firmware=a.gmu_firmware.read_bytes() if a.gmu_firmware else None,
                    sqe_firmware=a.sqe_firmware.read_bytes() if a.sqe_firmware else None,
                    gpu_addon=a.gpu_addon.read_bytes() if a.gpu_addon else None, diagnostics=a.diagnostics,
-                   wifi_mac=a.wifi_mac.read_text().strip() if a.wifi_mac else None)
+                   wifi_mac=a.wifi_mac.read_text().strip() if a.wifi_mac else None, root_emmc=a.root_emmc)
     a.output.parent.mkdir(parents=True, exist_ok=True)
     a.output.write_bytes(payload)
     print('Built screen-output XNU payload', hashlib.sha256(payload).hexdigest())

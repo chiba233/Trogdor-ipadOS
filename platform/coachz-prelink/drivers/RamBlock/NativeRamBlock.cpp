@@ -22,6 +22,10 @@
 
 extern "C" {
 int coachz_usb_open(uint64_t *blocks);
+int coachz_usb_open_keyboard(void);
+int coachz_emmc_root(void);
+int coachz_sdcc_window(const char *name, uint64_t *first, uint64_t *blocks);
+int coachz_mmc_log_write(uint64_t block, uint32_t count, const void *data);
 int coachz_usb_read(uint64_t block, uint32_t count, void **data);
 int coachz_usb_write(uint64_t block, uint32_t count, const void *data);
 int coachz_usb_sync(void);
@@ -70,6 +74,11 @@ static thread_call_t log_call;
 static uint64_t log_taken, log_stored, log_dropped, log_flushes;
 static uint8_t *log_buffer;  // 128 blocks: the header, then up to 127 blocks to write
 static uint8_t log_tail[512];  // the bytes of the last partial block, rewritten with the next flush
+static bool log_on_emmc;  // the partition coachz-log instead of the end of the USB drive
+
+static bool log_write(uint64_t block, uint32_t count, const void *data) {
+  return log_on_emmc ? coachz_mmc_log_write(block, count, data) != 0 : coachz_usb_write(block, count, data) != 0;
+}
 
 static void log_put(uint64_t at, uint64_t value) {
   for (unsigned i = 0; i < 8; i++) log_buffer[at + i] = (uint8_t)(value >> (8 * i));
@@ -84,7 +93,7 @@ static bool log_write_header(void) {
   log_put(24, log_dropped);
   log_put(32, log_flushes);
   log_put(40, ns / 1000000000ull);
-  return coachz_usb_write(log_window.first, 1, log_buffer);
+  return log_write(log_window.first, 1, log_buffer);
 }
 
 // The caller holds log_gate.
@@ -107,7 +116,7 @@ static void log_store(void) {
     for (uint64_t i = 0; i < take; i++) out[offset + i] = (uint8_t)coachz_log_capture[(log_taken + i) & (kCaptureBytes - 1)];
     uint64_t end = offset + take, blocks = (end + 511) / 512;
     memset(out + end, 0, blocks * 512 - end);
-    ok = coachz_usb_write(log_window.first + 1 + block, (uint32_t)blocks, out);
+    ok = log_write(log_window.first + 1 + block, (uint32_t)blocks, out);
     if (ok) {
       log_taken += take;
       log_stored += take;
@@ -119,13 +128,25 @@ static void log_store(void) {
     log_taken = head;
   }
   log_flushes++;
-  if (ok) ok = log_write_header() && coachz_usb_sync();
+  // The eMMC's cache is off: a finished write is on flash.
+  if (ok) ok = log_write_header() && (log_on_emmc || coachz_usb_sync());
 }
 
 static void log_flush(thread_call_param_t, thread_call_param_t) {
-  IOLockLock(log_gate);
-  log_store();
-  IOLockUnlock(log_gate);
+  // On the eMMC the ring waits until the disk has opened and its window was validated.
+  if (log_on_emmc && !log_window.blocks) {
+    uint64_t first = 0, blocks = 0;
+    if (coachz_sdcc_window("coachz-log", &first, &blocks)) {
+      log_window.first = first;
+      log_window.blocks = blocks;
+      kprintf("COACHZ log: kernel log ring on the eMMC at block %llu, %llu MiB\n", first, blocks / 2048);
+    }
+  }
+  if (!log_on_emmc || log_window.blocks) {
+    IOLockLock(log_gate);
+    log_store();
+    IOLockUnlock(log_gate);
+  }
   uint64_t deadline;
   clock_interval_to_deadline(1, NSEC_PER_SEC, &deadline);
   thread_call_enter_delayed(log_call, deadline);
@@ -137,7 +158,8 @@ static void log_flush(thread_call_param_t, thread_call_param_t) {
 extern "C" void coachz_log_panic_flush(void) {
   static volatile uint32_t running;
   static bool held;
-  if (!log_gate || !log_buffer || !__sync_bool_compare_and_swap(&running, 0, 1)) return;
+  // The eMMC driver sleeps on its interrupts, which a panic has stopped: there the panic stays on the screen.
+  if (log_on_emmc || !log_gate || !log_buffer || !__sync_bool_compare_and_swap(&running, 0, 1)) return;
   if (!held) {
     uint64_t start = mach_absolute_time(), ns = 0;
     do {
@@ -166,7 +188,7 @@ static void keyboard_poll(thread_call_param_t, thread_call_param_t) {
 }
 
 static void log_start(IOLock *gate, uint64_t capacity) {
-  if (!coachz_log_window(capacity, data_window, log_window)) {
+  if (!log_on_emmc && !coachz_log_window(capacity, data_window, log_window)) {
     kprintf("COACHZ log: no room for the log ring past the partitions\n");
     return;
   }
@@ -175,7 +197,7 @@ static void log_start(IOLock *gate, uint64_t capacity) {
   if (!log_buffer || !log_call) return;
   memset(log_buffer, 0, 128 * 512);
   log_gate = gate;
-  kprintf("COACHZ log: kernel log ring at block %llu, %llu MiB\n", log_window.first, log_window.blocks / 2048);
+  if (!log_on_emmc) kprintf("COACHZ log: kernel log ring at block %llu, %llu MiB\n", log_window.first, log_window.blocks / 2048);
   thread_call_enter(log_call);
   if (coachz_usb_keyboard_enabled() && (keyboard_call = thread_call_allocate(keyboard_poll, nullptr))) {
     thread_call_enter(keyboard_call);
@@ -215,9 +237,26 @@ public:
 };
 OSDefineMetaClassAndStructors(NativeRamBlock, IOBlockStorageDevice)
 
+// The drive the system runs from: the USB disk, or with coachz-root-emmc=1 the eMMC's block device (CoachzMmcBlock.cpp, its own unit).
+static bool coachz_root_storage(IOService *service) {
+  return coachz_emmc_root() ? service->metaCast("CoachzMmcBlock") != nullptr : OSDynamicCast(NativeRamBlock, service) != nullptr;
+}
+
 bool NativeRamBlock::start(IOService *provider)
 {
   if (!IOBlockStorageDevice::start(provider)) return false;
+  // The system on the eMMC: this driver publishes no disk (CoachzMmcBlock does) and keeps the keyboard and the log ring.
+  if (coachz_emmc_root()) {
+    if (!(gate = IOLockAlloc())) return false;
+    const int keyboard = coachz_usb_open_keyboard();
+    kprintf("COACHZ USB: keyboard stack %d, no disk published here\n", keyboard);
+    if (!PE_parse_boot_argn("coachz-data-uuid", data_uuid, sizeof(data_uuid)) || strlen(data_uuid) != 36) panic("Coachz eMMC root without a Data volume");
+    persistent_data = true;
+    log_on_emmc = true;
+    log_start(gate, 0);
+    native_ram_block_ready = 1;
+    return true;
+  }
   if (!(gate = IOLockAlloc()) || !coachz_usb_open(&capacity) || !capacity) {
     kprintf("COACHZ USB: no storage, driver not started\n");
     return false;
@@ -371,6 +410,12 @@ extern "C" int coachz_data_volume_device(char *path, size_t size)
   if (!path || size < 6) return 0;
   path[0] = 0;
   if (persistent_data) {
+    if (coachz_emmc_root()) {
+      uint64_t first = 0, blocks = 0;
+      if (!coachz_sdcc_window("coachz-data", &first, &blocks)) return 0;
+      data_window.first = first;
+      data_window.blocks = blocks;
+    }
     if (!coachz_usb_volume_device(data_uuid, path, size)) return 0;
     OSDictionary *matching = IOService::serviceMatching("IOMedia");
     OSIterator *iterator = matching ? IOService::getMatchingServices(matching) : nullptr;
@@ -387,7 +432,7 @@ extern "C" int coachz_data_volume_device(char *path, size_t size)
         IOMedia *extent = static_cast<IOMedia *>(media->metaCast("IOMedia"));
         if (extent && extent->getBase() == data_window.first * 512 &&
             extent->getSize() == data_window.blocks * 512) partition = true;
-        if (OSDynamicCast(NativeRamBlock, media)) { found = partition; break; }
+        if (coachz_root_storage(media)) { found = partition; break; }
       }
       break;
     }
@@ -435,7 +480,7 @@ extern "C" void coachz_usb_report(void)
   iterator->release();
 }
 
-// Whether a BSD device is media stacked on this driver, as the unsealed root patch asks. One media
+// Whether a BSD device is media stacked on the drive the system runs from, as the unsealed root patch asks. One media
 // must carry that major and minor, and its provider chain must reach us. This is not a verification.
 extern "C" int coachz_usb_root_device(dev_t device)
 {
@@ -456,14 +501,14 @@ extern "C" int coachz_usb_root_device(dev_t device)
     if (!media || ++matches != 1) { ours = false; continue; }
     unsigned depth = 0;
     for (IOService *provider = media; provider && depth < 64; provider = provider->getProvider(), depth++) {
-      if (OSDynamicCast(NativeRamBlock, provider)) { ours = true; break; }
+      if (coachz_root_storage(provider)) { ours = true; break; }
     }
   }
   iterator->release();
   return matches == 1 && ours;
 }
 
-// The /dev path of the one media with this volume UUID on this driver, for the SystemOS mount.
+// The /dev path of the one media with this volume UUID on the system's drive, for the SystemOS mount.
 extern "C" int coachz_usb_volume_device(const char *uuid, char *path, size_t size)
 {
   if (!uuid || !path || size < 6) return 0;
@@ -489,7 +534,7 @@ extern "C" int coachz_usb_volume_device(const char *uuid, char *path, size_t siz
     name = OSDynamicCast(OSString, media->getProperty(kIOBSDNameKey));
     unsigned depth = 0;
     for (IOService *provider = media; provider && depth < 64; provider = provider->getProvider(), depth++) {
-      if (OSDynamicCast(NativeRamBlock, provider)) { ours = true; break; }
+      if (coachz_root_storage(provider)) { ours = true; break; }
     }
   }
   bool found = matches == 1 && ours && name;

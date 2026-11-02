@@ -1560,3 +1560,12 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 - **Wi-Fi 加入**：系统发起加入后，认证、关联和四次握手都完成，发出 262 帧全部被确认，收到 173 帧；没有拿到 IPv4 地址。离开后下一次加入时 wifid 抛异常退出（`PRIVATE_MAC_ADDRESS_VALUE` 为空），设置显示无法加入。
 - **充电显示**：那次用的是慢充（EC 输入限流 512 mA，电池约 -718 mA），系统显示未在充电是真实状态。
 
+## 从 eMMC 启动
+
+- **存储**：外接盘拔掉后，内核、OS、SystemOS、Data 和日志都在 eMMC 上，启动进入主屏幕。Data 由 Debian 从外接盘逐字节拷贝，读回哈希一致；OS 卷逐字节一致；SystemOS 拷贝时哈希一致，事后复查在拔盘前的约 85% 内没有差异。它和 IPSW 原文件差 10 个 4 MiB 块，容器事务号从 14 变成 23，只读挂载为什么推进事务号还不知道。
+- **壁纸**：数据保护类保留后，8 个壁纸扩展第一次启动（Aegir、Collections、Emoji、Gradient、Hello、Kaleidoscope、Pride、Rhizome）；壁纸设置页能打开，机主手动选的壁纸能显示。不选的话默认壁纸还是黑的。Aegir、Collections、Kaleidoscope 各有一次状态 0x9 退出。
+- **GPU 和图标**：`COACHZ grant` 记录 WebKit 经 kobject 过滤放行映射 GPU 内存。主屏图标画出来了，`@nullcall` 0 次。
+- **网络和时间**：EC RTC 校时后系统日期正确；照片上 Safari 打开 HTTPS 网页，日期和时间设置页正常。保存的密码还在，但开机后不会自动加入：wifid 启动后扫描一轮，取完结果不发起关联。
+- **传感器**：加速度计量程 4 g，静止约 (-0.04, 0.93, 0.41) g；陀螺仪量程 1000 dps，静止读数约 (20, -21, 3)。两者 25 Hz；3 个 SPU HID 设备都被 IOHIDEventDriver 打开。这份日志里没有方向变化记录，无法判断转动时方向判断对不对。
+- **后台任务**：`fairplayd`、`identityservicesd`、`CommCenter`、`accessoryupdaterd` 不再启动；`bluetoothd` 启动 18 次，每次状态 0 退出。
+- **色阶**：机主拍到白色场景和弹窗阴影的一圈圈色阶。源码（pinned coreboot）在桥接芯片上写 18 bpp，Debian 读到 `0x5b` 为 0、`0x94` 为 0x20、`0x93` 为 0x34。固件状态下的值还没在真机上读过。

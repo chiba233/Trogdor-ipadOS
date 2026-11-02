@@ -13,7 +13,7 @@
  	extern void coachz_battery_start(void);
 --- /dev/null
 +++ b/bsd/dev/coachz_wifi.c
-@@ -0,0 +1,5590 @@
+@@ -0,0 +1,5663 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/* WCN3990 / SC7180: the modem that hosts the WLAN firmware, started as mainline's qcom_q6v5_mss does (coachz-wifi=4), and the SMEM
 + * inventory (coachz-wifi=1 plus an explicit /arm-io/coachz-wifi ADT node). With the modem up: SMP2P, GLINK over SMEM, QRTR and
@@ -673,7 +673,10 @@
 + * its header; each file's ELF header fields are printed. The verified MBA is kept in memory, the verified qdsp6sw.mbn's place on the
 + * disk for wifi_mpss_boot.
 + */
-+#define WIFI_FW_BLOB (144ull << 20)
++#define WIFI_FW_BLOB_USB (144ull << 20)
++/* With the system on the eMMC the kernel partition is coachz-kernel (GPT entry 6, at block 107954176): the blob is 143 MiB into it, as on the USB disk. */
++#define WIFI_FW_BLOB_EMMC ((107954176ull << 9) + (143ull << 20))
++static uint64_t wifi_fw_blob = WIFI_FW_BLOB_USB;
 +static uint8_t wifi_fw_header[4096];
 +static uint8_t *volatile wifi_mba_image;
 +static size_t wifi_mba_bytes, wifi_mba_rounded;
@@ -706,6 +709,10 @@
 +{
 +    const char *const *const disks = wifi_fw_disks;
 +    const size_t chunk = 256u << 10;   /* Z_NOFAIL is refused above the zone sizes, so a plain request, checked */
++    {
++        unsigned on_emmc = 0;
++        if (PE_parse_boot_argn("coachz-root-emmc", &on_emmc, sizeof(on_emmc)) && on_emmc == 1) wifi_fw_blob = WIFI_FW_BLOB_EMMC;
++    }
 +    vfs_context_t context = vfs_context_kernel();
 +    vnode_t disk = NULLVP;
 +    uint8_t *buffer;
@@ -721,7 +728,7 @@
 +        if (attempt) delay(2 * 1000 * 1000);
 +        for (which = 0; which < (unsigned)(sizeof(wifi_fw_disks) / sizeof(wifi_fw_disks[0])); which++) {
 +            if (vnode_open(disks[which], FREAD, 0, 0, &disk, context)) continue;
-+            if (!wifi_fw_read(disk, context, wifi_fw_header, sizeof(wifi_fw_header), WIFI_FW_BLOB) &&
++            if (!wifi_fw_read(disk, context, wifi_fw_header, sizeof(wifi_fw_header), wifi_fw_blob) &&
 +                !memcmp(wifi_fw_header, "COACHZMODEMFW1", 14)) break;
 +            vnode_close(disk, FREAD, context);
 +            disk = NULLVP;
@@ -746,7 +753,7 @@
 +        SHA256_Init(&hash);
 +        while (!error && done < size) {
 +            const size_t n = size - done < chunk ? (size_t)(size - done) : chunk;
-+            error = wifi_fw_read(disk, context, buffer, (n + 511) & ~(size_t)511, WIFI_FW_BLOB + offset + done);
++            error = wifi_fw_read(disk, context, buffer, (n + 511) & ~(size_t)511, wifi_fw_blob + offset + done);
 +            if (error) break;
 +            if (!done) memcpy(first, buffer, sizeof(first));
 +            SHA256_Update(&hash, buffer, n);
@@ -760,7 +767,7 @@
 +        if (!error && !memcmp(digest, entry + 32, 32) && !strcmp(name, "mba.mbn") && size && size <= (1u << 20) && !wifi_mba_image) {
 +            const size_t rounded = ((size_t)size + 511) & ~(size_t)511;
 +            uint8_t *copy = kalloc_data(rounded, Z_WAITOK);
-+            if (copy && !wifi_fw_read(disk, context, copy, rounded, WIFI_FW_BLOB + offset)) {
++            if (copy && !wifi_fw_read(disk, context, copy, rounded, wifi_fw_blob + offset)) {
 +                wifi_mba_bytes = (size_t)size;
 +                wifi_mba_rounded = rounded;
 +                wifi_mba_image = copy;
@@ -770,7 +777,7 @@
 +        }
 +        if (!error && !memcmp(digest, entry + 32, 32) && !strcmp(name, "board-2.bin") && size && size <= (2u << 20) && !wifi_board) {
 +            uint8_t *copy = kalloc_data((size_t)((size + 511) & ~511ull), Z_WAITOK);
-+            if (copy && !wifi_fw_read(disk, context, copy, (size_t)((size + 511) & ~511ull), WIFI_FW_BLOB + offset)) {
++            if (copy && !wifi_fw_read(disk, context, copy, (size_t)((size + 511) & ~511ull), wifi_fw_blob + offset)) {
 +                wifi_board_bytes = (size_t)size;
 +                __atomic_store_n(&wifi_board, copy, __ATOMIC_RELEASE);
 +            } else if (copy) {
@@ -780,7 +787,7 @@
 +        /* The modem's EFS images for rmtfs (wg), kept in memory. */
 +        if (!error && !memcmp(digest, entry + 32, 32) && !strncmp(name, "modem_fs", 8) && size && size <= (4u << 20) && wifi_efs_count < 4) {
 +            uint8_t *copy = kalloc_data((size_t)size, Z_WAITOK);
-+            if (copy && !wifi_fw_read(disk, context, copy, (size_t)size, WIFI_FW_BLOB + offset)) {
++            if (copy && !wifi_fw_read(disk, context, copy, (size_t)size, wifi_fw_blob + offset)) {
 +                struct wifi_efs *efs = &wifi_efs[wifi_efs_count];
 +                strlcpy(efs->name, name, sizeof(efs->name));
 +                efs->data = copy;
@@ -791,7 +798,7 @@
 +            }
 +        }
 +        if (!error && !memcmp(digest, entry + 32, 32) && !strcmp(name, "qdsp6sw.mbn") && size >= 4096) {
-+            wifi_mpss_at = WIFI_FW_BLOB + offset;
++            wifi_mpss_at = wifi_fw_blob + offset;
 +            wifi_mpss_bytes = size;
 +            __atomic_store_n(&wifi_mpss_disk, (int)which, __ATOMIC_RELEASE);
 +        }
@@ -4056,6 +4063,59 @@
 +
 +/* One received MSDU: htt_rx_desc_v2 at the buffer's start, the frame at 360 (no L3 padding on this chip). Native Wi-Fi: a 3-address header, then
 + * LLC; the header's addresses are this subframe's even inside an A-MSDU. */
++/* What the data path carries, by kind: counts only. The DHCP type is option 53 after the 240-byte fixed part. */
++struct wj_class {
++    uint32_t group, to_me, to_other, sa_other, arp, arp_request, arp_reply, ip4, icmp, tcp, ip6, other, dhcp[9];
++};
++/* The option codes of the last DHCP ack, and its length: which answers it holds, never their values. */
++static uint8_t wj_ack_options[32];
++static uint32_t wj_ack_count, wj_ack_bytes;
++static struct wj_class wj_txc, wj_rxc;
++static void
++wj_classify(struct wj_class *c, const uint8_t *e, uint32_t n)
++{
++    if (e[0] & 1) c->group++;
++    else if (!memcmp(e, ws.mac, 6)) c->to_me++;
++    else c->to_other++;
++    if (memcmp(e + 6, ws.mac, 6)) c->sa_other++;
++    const uint32_t type = (uint32_t)e[12] << 8 | e[13];
++    if (type == 0x0806) {
++        c->arp++;
++        if (n >= 22u && e[20] == 0 && e[21] == 1) c->arp_request++;
++        if (n >= 22u && e[20] == 0 && e[21] == 2) c->arp_reply++;
++    }
++    else if (type == 0x86dd) c->ip6++;
++    else if (type != 0x0800) c->other++;
++    else {
++        c->ip4++;
++        if (n < 34u) return;
++        const uint32_t udp = 14u + (e[14] & 15u) * 4u;
++        if (e[23] == 1) c->icmp++;
++        else if (e[23] == 6) c->tcp++;
++        else if (e[23] == 17 && n >= udp + 8u) {
++            const uint32_t from = (uint32_t)e[udp] << 8 | e[udp + 1], to = (uint32_t)e[udp + 2] << 8 | e[udp + 3];
++            if ((from == 67 || from == 68) && (to == 67 || to == 68)) {
++                unsigned kind = 0;
++                for (uint32_t at = udp + 8u + 240u; at + 2u < n && e[at] != 255;) {
++                    if (!e[at]) { at++; continue; }
++                    if (e[at] == 53) { kind = e[at + 2]; break; }
++                    at += 2u + e[at + 1];
++                }
++                c->dhcp[kind < 9 ? kind : 0]++;
++                if (kind == 5) {
++                    wj_ack_count = 0;
++                    wj_ack_bytes = n;
++                    for (uint32_t at = udp + 8u + 240u; at + 1u < n && e[at] != 255;) {
++                        if (!e[at]) { at++; continue; }
++                        if (wj_ack_count < sizeof(wj_ack_options)) wj_ack_options[wj_ack_count++] = e[at];
++                        at += 2u + e[at + 1];
++                    }
++                }
++            }
++        }
++    }
++}
++
 +static void
 +wr_msdu(uint8_t *buf, uint32_t len)
 +{
@@ -4094,6 +4154,7 @@
 +        wj_eapol(eth + 14, bytes - 14u);
 +        return;
 +    }
++    if (wj.state == WJ_UP) wj_classify(&wj_rxc, eth, bytes);
 +    if (wj.state == WJ_UP && ws_events && ws_events->rx) ws_events->rx(eth, bytes);
 +}
 +
@@ -4495,6 +4556,8 @@
 +    }
 +    wj.started = wj.peer_mapped = 0;
 +    wj.keyed = wj.have_replay = 0;
++    memset(&wj_txc, 0, sizeof(wj_txc));
++    memset(&wj_rxc, 0, sizeof(wj_rxc));
 +    wj.stage = wj.tries = wj.waited_ms = 0;
 +    wj.up_on = wj.peer_on = 0;
 +    wj.vdev_on = 1;
@@ -4606,6 +4669,15 @@
 +        printf("COACHZ join: state %u, rx %u frames %u bytes (%u key, %u bad, %u not done; %u ind, %u in order), tx %u frames, %u acked %u no ack %u discarded %u no slot, mgmt %u/%u/%u, roam %u kickout %u\n",
 +            wj.state, wj.rx_frames, wj.rx_bytes, wj.rx_eapol, wj.rx_bad, wj.rx_undone, wj.rx_ind, wj.rx_in_ord, wj.tx_frames, wj.tx_acked, wj.tx_noack, wj.tx_discard, wj.tx_full,
 +            wj.mgmt_tx, wj.mgmt_ok, wj.mgmt_fail, wj.roam, wj.kickout);
++        printf("COACHZ join: tx group %u unicast %u, source not ours %u; arp %u (request %u reply %u) ip4 %u (icmp %u tcp %u) ip6 %u other %u; dhcp discover %u request %u decline %u release %u inform %u\n",
++            wj_txc.group, wj_txc.to_other, wj_txc.sa_other, wj_txc.arp, wj_txc.arp_request, wj_txc.arp_reply, wj_txc.ip4, wj_txc.icmp, wj_txc.tcp, wj_txc.ip6, wj_txc.other, wj_txc.dhcp[1], wj_txc.dhcp[3], wj_txc.dhcp[4], wj_txc.dhcp[7], wj_txc.dhcp[8]);
++        printf("COACHZ join: rx group %u to us %u to others %u, our own source %u; arp %u (request %u reply %u) ip4 %u (icmp %u tcp %u) ip6 %u other %u; dhcp offer %u ack %u nak %u untyped %u\n",
++            wj_rxc.group, wj_rxc.to_me, wj_rxc.to_other, wj_rxc.group + wj_rxc.to_me + wj_rxc.to_other - wj_rxc.sa_other, wj_rxc.arp, wj_rxc.arp_request, wj_rxc.arp_reply, wj_rxc.ip4, wj_rxc.icmp, wj_rxc.tcp, wj_rxc.ip6, wj_rxc.other, wj_rxc.dhcp[2], wj_rxc.dhcp[5], wj_rxc.dhcp[6], wj_rxc.dhcp[0]);
++        if (wj_ack_count) {
++            printf("COACHZ join: dhcp ack %u bytes, options", wj_ack_bytes);
++            for (uint32_t i = 0; i < wj_ack_count; i++) printf(" %u", wj_ack_options[i]);
++            printf("\n");
++        }
 +    }
 +}
 +
@@ -4643,6 +4715,7 @@
 +nw_wifi_tx(const uint8_t *eth, size_t len)
 +{
 +    if (len < 14 || len > 1600 || wj.state != WJ_UP) return -1;
++    wj_classify(&wj_txc, eth, (uint32_t)len);
 +    return wj_tx_put(eth, eth + 12, eth + 14, (uint32_t)len - 14u, 0);
 +}
 +

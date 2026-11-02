@@ -13,7 +13,7 @@
  	/* A one-second tone on the speaker (iokit/Kernel/CoachzSpeaker.cpp, coachz-speaker=1), once. */
 --- /dev/null
 +++ b/iokit/Kernel/CoachzMotion.cpp
-@@ -0,0 +1,214 @@
+@@ -0,0 +1,285 @@
 +// SPDX-License-Identifier: BSD-2-Clause
 +// Chrome EC sensor service. Pending only: no active build integration.
 +#include <IOKit/IOLib.h>
@@ -35,7 +35,9 @@
 +}
 +
 +namespace {
-+constexpr unsigned kPollMs = 200; // Host polling, not a promise of sensor ODR or fresh hardware samples.
++constexpr unsigned kPollMs = 40; // Host polling at the rate set below, not a promise of sensor time.
++constexpr unsigned kReportEvery = 125; // The registry snapshot and its log line, every 5 s.
++constexpr int32_t kRateMilliHz = 25000; // One of the rates Linux offers for these sensors (sampling_frequency_available).
 +int command(void *, uint16_t cmd, uint8_t version, const void *args, uint32_t size,
 +    void *reply, uint32_t room, uint32_t *length) {
 +    return coachz_ec_command(cmd, version, args, size, reply, room, length);
@@ -68,6 +70,15 @@
 +}
 +}
 +
++// What the sensor processor's HID devices report (NativeHidInput.cpp): written here, read there. An odd seq is a write in progress.
++// The frame is the panel's as the system shows it now: x along the long edge, y up the short edge, z out of the screen. On hardware the EC's
++// y reads +1 g with the panel upright, so x and y are negated; z is kept, which keeps the frame right-handed.
++extern "C" {
++struct coachz_motion_state { volatile uint32_t seq; int32_t orientation, accel[3], gyro[3]; };
++struct coachz_motion_state coachz_motion_state = {0, 1, {0, 0, 0}, {0, 0, 0}};
++volatile uint32_t coachz_motion_ready;
++}
++
 +class CoachzMotion : public IOService {
 +    OSDeclareDefaultStructors(CoachzMotion)
 +    IOWorkLoop *loop = nullptr;
@@ -78,6 +89,64 @@
 +    uint64_t sequence = 0;
 +    unsigned attempts = 0;
 +    bool discovered = false, stopping = false;
++    int accelSensor = -1, gyroSensor = -1;
++    int32_t accelRange = 0, gyroRange = 0, derived = 1;
++    unsigned ticks = 0;
++    bool followGravity = false;
++
++    // A sensor runs at the rate Linux would set, and its range is read once: the fast path then costs one EC command per sensor.
++    void startSensors() {
++        for (unsigned i = 0; i < topology.scanned; ++i) {
++            const cm_sensor &sensor = topology.sensors[i];
++            if (!cm_supported(&sensor)) continue;
++            const int set = cm_set_odr(&bus, sensor.id, kRateMilliHz);
++            int32_t range = 0;
++            const int read = cm_parameter(&bus, CM_RANGE, sensor.id, &range);
++            printf("COACHZ motion: sensor %u rate set %d, range %d read %d\n", sensor.id, set, range, read);
++            if (read || range <= 0) continue;
++            if (sensor.type == CM_ACCEL) {accelSensor = sensor.id; accelRange = range;}
++            else if (sensor.type == CM_GYRO) {gyroSensor = sensor.id; gyroRange = range;}
++        }
++        unsigned follow = 0;
++        followGravity = PE_parse_boot_argn("coachz-orientation", &follow, sizeof(follow)) && follow == 1;
++        if (accelSensor >= 0 && gyroSensor >= 0) coachz_motion_ready = 1;
++    }
++
++    // iio-sensor-proxy's decision, in integers: an axis wins when gravity leans more than 35 degrees along it out of the plane of the other two.
++    static int32_t orientationOf(int32_t previous, const int32_t accel[3]) {
++        const int64_t x = accel[0], y = accel[1], z = accel[2];
++        const bool alongX = 100 * x * x > 49 * (y * y + z * z), alongY = 100 * y * y > 49 * (x * x + z * z);
++        if (alongX == alongY) return previous;
++        if (alongX) return x > 0 ? 4 : 3;   // UIDeviceOrientationLandscapeRight, Left
++        return y > 0 ? 2 : 1;               // UIDeviceOrientationPortraitUpsideDown, Portrait
++    }
++
++    void fast() {
++        int32_t rawAccel[3] = {}, rawGyro[3] = {}, accel[3], gyro[3];
++        const int accelError = accelSensor >= 0 ? cm_read_axes(&bus, (uint8_t)accelSensor, rawAccel) : -1;
++        const int gyroError = gyroSensor >= 0 ? cm_read_axes(&bus, (uint8_t)gyroSensor, rawGyro) : -1;
++        if (accelError) return;
++        for (unsigned i = 0; i < 3; ++i) {
++            const int sign = i < 2 ? -1 : 1;
++            accel[i] = (int32_t)(sign * (int64_t)rawAccel[i] * accelRange * 1000 / 32768);                  // milli-g
++            gyro[i] = gyroError ? 0 : (int32_t)(sign * (int64_t)rawGyro[i] * gyroRange * 17453 / 32768 / 1000);   // milliradians per second
++        }
++        const int32_t next = orientationOf(derived, accel);
++        if (next != derived) {
++            derived = next;
++            printf("COACHZ motion: gravity says orientation %d (accel %d %d %d mg, gyro %d %d %d mrad/s)\n", next, accel[0], accel[1], accel[2], gyro[0], gyro[1], gyro[2]);
++        }
++        coachz_motion_state.seq = coachz_motion_state.seq + 1;
++        __asm__ volatile("dmb ish" ::: "memory");
++        for (unsigned i = 0; i < 3; ++i) {
++            coachz_motion_state.accel[i] = accel[i];
++            coachz_motion_state.gyro[i] = gyro[i];
++        }
++        // The panel is not presented upright for the other orientations yet: the interface stays in the one it lays out for unless asked to follow.
++        coachz_motion_state.orientation = followGravity ? derived : 1;
++        __asm__ volatile("dmb ish" ::: "memory");
++        coachz_motion_state.seq = coachz_motion_state.seq + 1;
++    }
 +
 +    bool discover() {
 +        int error = cm_discover(&bus, &topology);
@@ -151,7 +220,7 @@
 +                childPublished[i] = true;
 +                child->registerService(); // Initial state is visible before matching.
 +            }
-+            if (sequence == 1 || sequence % 50 == 0)
++            if (sequence == 1 || sequence % 12 == 0)
 +                printf("COACHZ motion: sensor %u %s error %d odr %d range %d raw %d/%d/%d host-seq %llu\n",
 +                    i, cm_status_name(sample.status), sample.error, sample.odr_millihz, sample.range,
 +                    sample.raw[0], sample.raw[1], sample.raw[2], (unsigned long long)sequence);
@@ -169,7 +238,9 @@
 +                return;
 +            }
 +        }
-+        self->refresh();
++        if (!self->ticks) self->startSensors();
++        self->fast();
++        if (!(self->ticks++ % kReportEvery)) self->refresh();
 +        sender->setTimeoutMS(kPollMs);
 +    }
 +
@@ -230,7 +301,7 @@
 +}
 --- /dev/null
 +++ b/iokit/Kernel/coachz_motion.h
-@@ -0,0 +1,163 @@
+@@ -0,0 +1,192 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/* Chrome EC motion host-command client. Register/protocol evidence: SOURCES.md.
 + * No FIFO consumption, sensor configuration, calibration or direct I2C access.
@@ -381,6 +452,35 @@
 +        sample->scaled[i] = (int64_t)sample->raw[i] * sample->range * 1000000 / 32768;
 +    }
 +    sample->status = CM_AVAILABLE;
++}
++
++/* MOTIONSENSE_CMD_SENSOR_ODR with a value, as cros_ec_sensors_core_write sets sampling_frequency: round up, data in mHz. */
++static inline int
++cm_set_odr(const struct cm_bus *bus, uint8_t sensor, int32_t millihz)
++{
++    uint8_t args[CM_PARAMS], reply[CM_REPLY];
++    uint32_t length = 0, value = (uint32_t)millihz;
++    cm_request(args, CM_ODR, sensor);
++    args[2] = 1;
++    for (unsigned i = 0; i < 4; ++i) args[5 + i] = (uint8_t)(value >> (8 * i));
++    return bus->command(bus->context, CM_COMMAND, 1, args, sizeof(args), reply, CM_REPLY, &length);
++}
++
++/* The latest axes alone, for the fast path: range and rate were read when the sensor started. */
++static inline int
++cm_read_axes(const struct cm_bus *bus, uint8_t sensor, int32_t raw[3])
++{
++    uint8_t reply[CM_REPLY];
++    uint32_t length = 0;
++    int error = cm_query(bus, CM_DATA, sensor, reply, &length);
++    if (!error && length != 8) error = CM_SHORT;
++    if (!error && reply[0]) error = CM_FRAME;
++    if (error) return error;
++    for (unsigned i = 0; i < 3; ++i) {
++        uint16_t n = cm_le16(reply + 2 + 2 * i);
++        raw[i] = n <= INT16_MAX ? (int16_t)n : (int16_t)(-1 - (int32_t)(UINT16_MAX - n));
++    }
++    return 0;
 +}
 +
 +static inline const char *cm_status_name(enum cm_status status) {

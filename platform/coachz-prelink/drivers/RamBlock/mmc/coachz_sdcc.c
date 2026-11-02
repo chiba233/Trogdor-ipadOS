@@ -1219,14 +1219,30 @@ int coachz_sdcc_prepare(void)
 }
 
 /*
- * The eMMC holds this machine's Debian, the way back to it, so the driver writes only the 1 GiB partition the owner agreed to: the GPT
- * entry named coachz-scratch at exactly the place it was carved. Anything else about the table and writes stay closed.
+ * The eMMC holds this machine's Debian, the way back to it, so the driver writes only the partitions the owner agreed to: each
+ * named here, at exactly the place it was carved. coachz-scratch for the write test; with the system on this disk
+ * (coachz-root-emmc=1) also the log ring and the Data volume. Anything else about the table and that window stays closed.
  */
-#define SCRATCH_START  242171904ull
-#define SCRATCH_BLOCKS 2097152ull
+static const struct { const char *name; uint64_t first, blocks; int root_only; } emmc_windows[] = {
+    {"coachz-scratch", 242171904ull, 2097152ull, 0},
+    {"coachz-log", 126803968ull, 524288ull, 1},
+    {"coachz-data", 127328256ull, 114843648ull, 1},
+};
+#define EMMC_WINDOWS (sizeof(emmc_windows) / sizeof(emmc_windows[0]))
+static uint64_t window_first[EMMC_WINDOWS], window_blocks[EMMC_WINDOWS];
+
+int coachz_emmc_root(void)
+{
+    static int root = -1;
+    if (root < 0) {
+        unsigned value = 0;
+        root = PE_parse_boot_argn("coachz-root-emmc", &value, sizeof(value)) && value == 1;
+    }
+    return root;
+}
+
 static void find_write_window(struct sdcc *s, int slot)
 {
-    static const char name[] = "coachz-scratch";
     void *data;
     if (!coachz_sdcc_read(slot, 1, 1, &data)) return;
     uint8_t header[512];
@@ -1244,23 +1260,57 @@ static void find_write_window(struct sdcc *s, int slot)
         if (!coachz_sdcc_read(slot, entries_lba + i / 4u, 1, &data)) return;
         uint8_t entry[128];
         __builtin_memcpy(entry, (const uint8_t *)data + (i % 4u) * 128u, sizeof(entry));
-        int same = 1;
-        for (unsigned k = 0; k < sizeof(name); k++)
-            if (entry[56 + 2 * k] != (uint8_t)name[k] || entry[57 + 2 * k]) same = 0;
-        if (!same) continue;
-        uint64_t first, last;
-        __builtin_memcpy(&first, entry + 32, 8);
-        __builtin_memcpy(&last, entry + 40, 8);
-        if (first == SCRATCH_START && last - first + 1u == SCRATCH_BLOCKS && last < s->sectors) {
-            s->write_start = first;
-            s->write_blocks = SCRATCH_BLOCKS;
-        } else {
-            printf("COACHZ mmc %s: %s at %llu..%llu is not where it was carved, writes stay closed\n", s->name, name,
-                (unsigned long long)first, (unsigned long long)last);
+        for (unsigned w = 0; w < EMMC_WINDOWS; w++) {
+            const char *name = emmc_windows[w].name;
+            int same = 1;
+            for (unsigned k = 0; k <= __builtin_strlen(name); k++)
+                if (entry[56 + 2 * k] != (uint8_t)name[k] || entry[57 + 2 * k]) same = 0;
+            if (!same) continue;
+            uint64_t first, last;
+            __builtin_memcpy(&first, entry + 32, 8);
+            __builtin_memcpy(&last, entry + 40, 8);
+            if (first != emmc_windows[w].first || last - first + 1u != emmc_windows[w].blocks || last >= s->sectors) {
+                printf("COACHZ mmc %s: %s at %llu..%llu is not where it was carved, that window stays closed\n", s->name, name,
+                    (unsigned long long)first, (unsigned long long)last);
+            } else if (!emmc_windows[w].root_only || coachz_emmc_root()) {
+                window_first[w] = first;
+                window_blocks[w] = emmc_windows[w].blocks;
+            }
         }
-        return;
     }
-    printf("COACHZ mmc %s: no %s partition, writes stay closed\n", s->name, name);
+    s->write_start = window_first[0];
+    s->write_blocks = window_blocks[0];
+    for (unsigned w = 0; w < EMMC_WINDOWS; w++)
+        printf("COACHZ mmc %s: window %s %llu blocks from %llu\n", s->name, emmc_windows[w].name,
+            (unsigned long long)window_blocks[w], (unsigned long long)window_first[w]);
+}
+
+/* A window find_write_window validated, by its GPT name: 0 until the eMMC has opened. */
+int coachz_sdcc_window(const char *name, uint64_t *first, uint64_t *blocks)
+{
+    for (unsigned w = 0; w < EMMC_WINDOWS; w++) {
+        if (__builtin_strcmp(name, emmc_windows[w].name) || !window_blocks[w]) continue;
+        *first = window_first[w];
+        *blocks = window_blocks[w];
+        return 1;
+    }
+    return 0;
+}
+
+/* Whether a write of these blocks is inside a window: the eMMC's named ones, or the whole of a removable card. */
+int coachz_sdcc_write_allowed(int slot, uint64_t block, uint32_t count)
+{
+    if (slot < 0 || slot > 1) return 0;
+    const struct sdcc *s = &slots[slot];
+    if (!s->opened) return 0;
+    if (!s->removable) {
+        for (unsigned w = 0; w < EMMC_WINDOWS; w++)
+            if (window_blocks[w] && block >= window_first[w] && block - window_first[w] < window_blocks[w] &&
+                count <= window_blocks[w] - (block - window_first[w])) return 1;
+        return 0;
+    }
+    return s->write_blocks && block >= s->write_start && block - s->write_start < s->write_blocks &&
+        count <= s->write_blocks - (block - s->write_start);
 }
 
 int coachz_sdcc_open(int slot, uint64_t *blocks)
@@ -1315,7 +1365,9 @@ int coachz_sdcc_read(int slot, uint64_t block, uint32_t count, void **data)
 
 int coachz_sdcc_writable(int slot)
 {
-    return slot >= 0 && slot <= 1 && slots[slot].opened && slots[slot].write_blocks != 0;
+    if (slot < 0 || slot > 1 || !slots[slot].opened) return 0;
+    if (slots[slot].write_blocks) return 1;
+    return slot == 0 && coachz_emmc_root() && window_blocks[2] != 0;
 }
 
 /* mmc_blk_card_busy: CMD13 until the card is ready for data and back in the transfer state. */
@@ -1341,8 +1393,7 @@ int coachz_sdcc_write(int slot, uint64_t block, uint32_t count, const void *sour
 {
     if (slot < 0 || slot > 1 || !source || !count || count > MAX_BLOCKS) return 0;
     struct sdcc *s = &slots[slot];
-    if (!s->opened || !s->write_blocks || block < s->write_start || block - s->write_start >= s->write_blocks ||
-        count > s->write_blocks - (block - s->write_start)) {
+    if (!coachz_sdcc_write_allowed(slot, block, count)) {
         s->writes_refused++;
         return 0;
     }
@@ -1386,6 +1437,8 @@ void coachz_sdcc_write_selftest(int slot)
 {
     if (!write_requested(slot) || !coachz_sdcc_writable(slot)) return;
     struct sdcc *s = &slots[slot];
+    /* With the system here the writes just outside the scratch window would land in the Data volume, which ends where it starts. */
+    if (slot == 0 && coachz_emmc_root()) return;
     const uint64_t start = s->write_start + s->write_blocks - TEST_BLOCKS;
     static uint32_t want[128], chunk[128 * TEST_BLOCKS_AT];
     void *data;

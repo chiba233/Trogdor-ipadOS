@@ -390,16 +390,25 @@
  /* CP_INDIRECT_BUFFER is opcode 0x3f with a 3-word payload: 64-bit GPU address
   * and IB_SIZE in dwords (bits 0..19), exactly as the pinned adreno_pm4.xml
   * domain states and Linux msm_gem_submit.c converts the userspace byte size. */
-@@ -56,7 +59,7 @@
+@@ -56,7 +59,8 @@
  /* [4] bus drains, [5] client halt acknowledge, [6] arbiter halt acknowledge, [7] the fence of the last drain, [8] drains after which that fence completed */
  extern "C" {volatile uint32_t native_adreno_unstick[15];}
  /* The IBs of the last submissions: [slot] fence, iova low/high, bytes, then the first 28 dwords of the first IB (read as the kernel maps it). */
 -extern "C" {volatile uint32_t native_adreno_ib_log[4][4+28];volatile uint32_t native_adreno_ib_log_count;}
++extern "C" {volatile uint64_t native_adreno_submit_ticks[64],native_adreno_submit_cost[3];}
 +extern "C" {volatile uint32_t native_adreno_ib_log[8][4+208];volatile uint32_t native_adreno_ib_log_count;}
  extern "C" volatile uint32_t native_adreno_table_switches[8];
  /* Where the last recover() stopped: [0] the step (1 fence read, 2 restart hook, 3 table write, 4 nop encode, 5 replay vm, 6 replay submit), [1] the IOReturn or value there, [2] fence, [3] last submitted. */
  extern "C" {volatile uint32_t native_adreno_recover_trace[4];}
-@@ -482,12 +485,14 @@
+@@ -367,6 +371,7 @@
+     uint64_t queue,uint32_t *fence,const NativeAdrenoRingClock *clock)
+ {
+     if(!fence)return kIOReturnBadArgument;*fence=0;
++    const uint64_t coachz_began=mach_absolute_time();
+     if(!vm)vm=vm_;
+     NativeAdrenoVm *const vm_=vm;   /* this submission's VM: every vm_ below is the job's own */
+     if(!attached_ || poisoned_)return kIOReturnNotReady;
+@@ -482,12 +487,14 @@
      for(const auto &earlier:jobs_)
          if(earlier.active && earlier.queue==queue) {index=earlier.ring;break;}
      NativeAdrenoRing *const target=ring(index);
@@ -418,7 +427,7 @@
          native_adreno_ib_log_count=native_adreno_ib_log_count+1;
      }
      target->useContext(ring(0)->context());
-@@ -502,6 +507,7 @@
+@@ -502,6 +509,7 @@
      uint32_t base=fence_issued_;
      for(unsigned i=0;i<ring_count_;++i)if((int32_t)(ring(i)->lastSubmitted()-base)>0)base=ring(i)->lastSubmitted();
      const uint32_t number=(value=base)+1;
@@ -426,6 +435,20 @@
      status=preemption()?target->submitFramed(words,word_count,number,&value):target->submitFramed(words,word_count,&value);
      if(status) {
          if(!value)fence_issued_=base;
+@@ -516,6 +524,13 @@
+         while(handle_count) {vm_->retireJobAfterCompletion(handles[--handle_count]);++stats_.references_retired;}
+         /* No room in the ring yet: the caller waits for an earlier job and submits again. */
+         return status==kIOReturnNoResources?kIOReturnBusy:status;
++    }
++    /* Coachz: when the kernel handed each submission over, and what the path up to here cost: [0] submissions, [1] ticks, [2] the longest. */
++    {
++        const uint64_t now=mach_absolute_time(),cost=now-coachz_began;
++        native_adreno_submit_ticks[value&63]=now;
++        native_adreno_submit_cost[0]=native_adreno_submit_cost[0]+1;native_adreno_submit_cost[1]=native_adreno_submit_cost[1]+cost;
++        if(cost>native_adreno_submit_cost[2])native_adreno_submit_cost[2]=cost;
+     }
+     for(size_t i=0;i<handle_count;++i)job->handles[i]=handles[i];
+     job->count=handle_count;job->fence=value;job->queue=queue;job->active=true;job->vm_next=vm_->nextHandle();job->vm=vm;
 --- a/NativeAdrenoUserClient.cpp
 +++ b/NativeAdrenoUserClient.cpp
 @@ -1,7 +1,9 @@

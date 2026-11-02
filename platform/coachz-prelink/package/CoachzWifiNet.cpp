@@ -222,7 +222,10 @@ void on_rx(const uint8_t *eth, size_t length) {
   }
   if (done != length) { gRxNoBuffer++; mbuf_freem(m); return; }
   mbuf_pkthdr_setlen(m, length); mbuf_pkthdr_setrcvif(m, gIf);
-  mbuf_pkthdr_setheader(m, mbuf_data(m)); mbuf_adj(m, 14);   // the stack wants the Ethernet header apart from the payload
+  const void *header = mbuf_data(m);
+  mbuf_pkthdr_setheader(m, const_cast<void *>(header)); mbuf_adj(m, 14);   // the stack wants the Ethernet header apart from the payload
+  // XNU leaves the packet filter's taps to each driver (if_fake.c); IPConfiguration's ARP client reads the router's and any conflicting reply only through it.
+  bpf_tap_in(gIf, DLT_EN10MB, m, const_cast<void *>(header), 14);
   struct ifnet_stat_increment_param inc; memset(&inc, 0, sizeof inc); inc.packets_in = 1; inc.bytes_in = static_cast<uint32_t>(length);
   const errno_t e = ifnet_input(gIf, m, &inc);
   if (e) { gRxErrors++; gRxLastError = e; } else gRxFrames++;
@@ -232,6 +235,7 @@ const struct nw_wifi_events gEvents = { on_scan_done, on_connect_done, on_link_l
 // ---- the interface ----
 errno_t if_output(ifnet_t, mbuf_t m) {
   size_t length = mbuf_pkthdr_len(m);
+  bpf_tap_out(gIf, DLT_EN10MB, m, nullptr, 0);
   if (length >= 14 && length <= 2000) {
     uint8_t frame[2000]; mbuf_copydata(m, 0, length, frame);
     if (!nw_wifi_tx(frame, length)) ifnet_stat_increment_out(gIf, 1, static_cast<uint32_t>(length), 0);
@@ -288,6 +292,8 @@ int copy_association(const apple80211req &rq, assoc_parameters &out) {
     } else {
       if (wire.legacy.version != 1) error = EINVAL;
       else { out = wire.legacy.network; log(6, "wifi-net: join auth lower %x upper %x", wire.legacy.auth_lower, wire.legacy.auth_upper); }
+      // IO80211 __performAssociation: bit 3 at 0x1d0 with a locally administered address at 0x1fc is the private MAC it asks for.
+      if (rq.req_len == sizeof wire.os17) log(6, "wifi-net: join: private address asked %d, local bit %d", (wire.os17[0x1d0] >> 3) & 1, (wire.os17[0x1fc] & 3) == 2);
     }
   }
   memset(&wire, 0, sizeof wire);

@@ -21,10 +21,22 @@ int coachz_sdcc_removable(int slot);
 int coachz_sdcc_enabled(int slot);
 int coachz_sdcc_write(int slot, uint64_t block, uint32_t count, const void *data);
 int coachz_sdcc_writable(int slot);
+int coachz_sdcc_write_allowed(int slot, uint64_t block, uint32_t count);
 void coachz_sdcc_write_selftest(int slot);
 void coachz_mmc_start(void);
 kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
 void thread_deallocate(thread_t);
+}
+
+// The eMMC's one gate: the log ring (NativeRamBlock.cpp) writes beside block I/O, and the driver serves one transfer at a time.
+static IOLock *emmc_gate;
+extern "C" int coachz_mmc_log_write(uint64_t block, uint32_t count, const void *data)
+{
+  if (!emmc_gate) return 0;
+  IOLockLock(emmc_gate);
+  const int done = coachz_sdcc_write(0, block, count, data);
+  IOLockUnlock(emmc_gate);
+  return done;
 }
 
 class CoachzMmcBlock : public IOBlockStorageDevice {
@@ -37,6 +49,7 @@ class CoachzMmcBlock : public IOBlockStorageDevice {
 public:
   bool setSlot(int which, uint64_t blocks) {
     slot = which; capacity = blocks; gate = IOLockAlloc();
+    if (which == 0) emmc_gate = gate;
     bounce = IOMalloc(coachz_sdcc_max_blocks() * 512u);
     online = gate && bounce && capacity;
     return online;
@@ -71,6 +84,7 @@ public:
     if (!buffer || !completion || !completion->action || !count || block >= capacity || count > capacity - block ||
         buffer->getLength() < count * 512) return kIOReturnBadArgument;
     const bool writing = buffer->getDirection() == kIODirectionOut;
+    if (writing && count <= UINT32_MAX && !coachz_sdcc_write_allowed(slot, block, static_cast<uint32_t>(count))) return kIOReturnNotWritable;
     if ((!writing && buffer->getDirection() != kIODirectionIn) || (writing && !coachz_sdcc_writable(slot))) return kIOReturnNotWritable;
     IOLockLock(gate);
     const uint32_t most = coachz_sdcc_max_blocks();

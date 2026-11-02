@@ -1,6 +1,6 @@
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -8445,7 +8445,91 @@
+@@ -8445,7 +8445,121 @@
  {
  	return coachz_watchdog_policy_check(path, bytes, length, true);
  }
@@ -9,6 +9,34 @@
 + * display service and holds no main-screen answers. Remove it before launchd so it is rebuilt.
 + */
 +int unlink1(vfs_context_t, vnode_t, user_addr_t, enum uio_seg, int);
++
++/* The calendar from the EC's RTC, before launchd, as rtc-cros-ec reads it (EC_CMD_RTC_GET_VALUE). BCM2837's configuration waits for no RTC
++ * service, so the calendar otherwise starts at the epoch, every TLS certificate fails and the system reports no internet.
++ */
++extern int coachz_ec_command(uint16_t, uint8_t, const void *, uint32_t, void *, uint32_t, uint32_t *);
++extern void clock_set_calendar_microtime(clock_sec_t, clock_usec_t);
++extern int coachz_rename_path(const char *, const char *);
++static void
++coachz_calendar_from_ec(void)
++{
++	uint32_t seconds = 0, length = 0;
++	const int error = coachz_ec_command(0x0044, 0, NULL, 0, &seconds, sizeof(seconds), &length);
++
++	if (!error && length >= sizeof(seconds) && seconds > 1577836800u) {
++		clock_set_calendar_microtime(seconds, 0);
++	}
++	printf("COACHZ clock: EC RTC error %d length %u, %u\n", error, length, seconds);
++}
++
++/* Icons generated while no GPU existed stay in the persistent cache. Moved aside once: the name it moves to then exists and later boots keep what the GPU drew. */
++static void
++coachz_icon_cache_reset(void)
++{
++	static const char from[] = "/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.lsd.iconscache/Library/Caches/com.apple.IconsCache";
++	static const char to[] = "/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.lsd.iconscache/Library/Caches/com.apple.IconsCache.coachz-old";
++
++	printf("COACHZ icons: cache moved aside: %d\n", coachz_rename_path(from, to));
++}
  
 +/* Diagnostic (coachz-dump-mgcache=1): the rebuilt cache in hex to the log ring, once it exists and its size held for ten seconds,
 + * read only. It shows the main-screen answers MobileGestalt gave this display.
@@ -78,6 +106,8 @@
 +	thread_t thread;
 +	int error;
 +
++	coachz_calendar_from_ec();
++	coachz_icon_cache_reset();
 +	if (!PE_parse_boot_argn("coachz-reset-mgcache", &reset, sizeof(reset)) || reset != 1) {
 +		return;
 +	}

@@ -1,0 +1,76 @@
+--- a/osfmk/device/iokit_rpc.c
++++ b/osfmk/device/iokit_rpc.c
+@@ -130,6 +130,26 @@
+ 	return iokit_lookup_io_object(port, IKOT_IOKIT_CONNECT);
+ }
+ 
++/* io_connect_map_memory_into_task (2863) and io_connect_unmap_memory_from_task (2864) on the GPU driver's own user
++ * clients pass the sandbox's kobject filter (ipc_kobject_server_internal), adapted from Droid-VM's bring-up patch
++ * (BSD-2-Clause-Patent): the original profiles never let a sandboxed Metal client reach them. Anything else: false. */
++extern boolean_t coachz_gpu_connect_granted(io_object_t obj);
++boolean_t coachz_kobj_map_grant(ipc_port_t port, mach_msg_id_t msgh_id);
++boolean_t
++coachz_kobj_map_grant(ipc_port_t port, mach_msg_id_t msgh_id)
++{
++	if ((msgh_id != 2863 && msgh_id != 2864) || !IP_VALID(port) || ip_kotype(port) != IKOT_IOKIT_CONNECT) {
++		return FALSE;
++	}
++	io_object_t obj = iokit_lookup_connect_port(port);
++	if (!obj) {
++		return FALSE;
++	}
++	boolean_t granted = coachz_gpu_connect_granted(obj);
++	iokit_remove_connect_reference(obj);
++	return granted;
++}
++
+ MIGEXTERN io_object_t
+ iokit_lookup_ident_port(
+ 	ipc_port_t      port)
+--- a/osfmk/kern/ipc_kobject.c
++++ b/osfmk/kern/ipc_kobject.c
+@@ -593,10 +593,12 @@
+ 	uint8_t *filter_mask = task_get_mach_kobj_filter_mask(curtask);
+ 
+ 	/* Check kobject mig filter mask, if exists. */
++	extern boolean_t coachz_kobj_map_grant(ipc_port_t port, mach_msg_id_t msgh_id);
+ 	if (filter_mask != NULL &&
+ 	    idx != KOBJ_IDX_NOT_SET &&
+ 	    !bitstr_test(filter_mask, idx) &&
+-	    mac_task_kobj_msg_evaluate != NULL) {
++	    mac_task_kobj_msg_evaluate != NULL &&
++	    !coachz_kobj_map_grant(port, request_msgh_id)) {
+ 		/* Not in filter mask, evaluate policy. */
+ 		kern_return_t kr = mac_task_kobj_msg_evaluate(curproc,
+ 		    request_msgh_id, idx);
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -4435,6 +4435,28 @@
+ 		at += length + (at[length] == ',' ? 1 : 0);
+ 	}
+ 	return false;
++}
++
++extern "C" boolean_t coachz_gpu_connect_granted(io_object_t obj);
++extern "C" boolean_t
++coachz_gpu_connect_granted(io_object_t obj)
++{
++	static int reported;
++	IOUserClient * client = OSDynamicCast(IOUserClient, (OSObject *) obj);
++	if (!client) {
++		return false;
++	}
++	const char * cls = client->getMetaClass()->getClassName();
++	if (strcmp(cls, "AGXDeviceUserClient") && strcmp(cls, "NativeAdrenoGpuClient")) {
++		return false;
++	}
++	if (reported < 12) {
++		char name[17] = {};
++		reported++;
++		proc_selfname(name, sizeof(name));
++		IOLog("COACHZ grant: %s maps through the filter on %s\n", name, cls);
++	}
++	return true;
+ }
+ 
+ kern_return_t

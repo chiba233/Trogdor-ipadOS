@@ -1,0 +1,41 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8418,7 +8418,7 @@
+ coachz_watchdog_policy_launchd_form(const char *path, vnode_t vnode, const struct vnode_attr *found,
+     vfs_context_t context)
+ {
+-	static const char *const keys[] = {"<key>com.apple.watchdogd</key>", "<key>com.apple.bluetoothd</key>"};
++	static const char *const keys[] = {"<key>com.apple.watchdogd</key>", "<key>com.apple.fairplayd.A2</key>", "<key>com.apple.accessoryupdaterd</key>", "<key>com.apple.identityservicesd</key>", "<key>com.apple.CommCenter</key>"};
+ 	uint64_t size = found->va_data_size;
+ 	char *data, *at;
+ 	bool accepted = false;
+@@ -8433,7 +8433,7 @@
+ 	    &residual, vfs_context_proc(context)) && !residual) {
+ 		data[size] = 0;
+ 		accepted = true;
+-		for (unsigned i = 0; i < 2 && accepted; i++) {
++		for (unsigned i = 0; i < sizeof(keys) / sizeof(keys[0]) && accepted; i++) {
+ 			at = strnstr(data, keys[i], (size_t)size);
+ 			accepted = false;
+ 			if (at) {
+@@ -8462,7 +8462,7 @@
+ 	int flags = FWRITE;
+ 	bool existing = false;
+ 	bool differs = false;
+-	char contents[256];
++	char contents[512];
+ 
+ 	if (length < 0 || length > (int)sizeof(contents)) return EINVAL;
+ 
+@@ -8919,7 +8919,10 @@
+ coachz_watchdog_policy_prepare(void)
+ {
+ 	const char policy[] = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+-	    "<plist version=\"1.0\"><dict><key>com.apple.watchdogd</key><true/><key>com.apple.bluetoothd</key><true/></dict></plist>\n";
++	    /* As Droid-VM on this same OS build. fairplayd exits at once without FairPlayIOKit while its MachServices stay
++	     * registered, so its first caller waits forever; identityservicesd and CommCenter are UniXNU's first-boot XPC wait
++	     * cycle; accessoryupdaterd keeps trustd checking certificates. A disabled job's clients get no answer at once. */
++	    "<plist version=\"1.0\"><dict><key>com.apple.watchdogd</key><true/><key>com.apple.fairplayd.A2</key><true/><key>com.apple.accessoryupdaterd</key><true/><key>com.apple.identityservicesd</key><true/><key>com.apple.CommCenter</key><true/></dict></plist>\n";
+ 	int disable = 0;
+ 	int error;
+ 

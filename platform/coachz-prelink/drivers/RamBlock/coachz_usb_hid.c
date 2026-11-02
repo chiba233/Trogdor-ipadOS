@@ -170,13 +170,13 @@ static void pad_report(const unsigned char *r) {
 		pad.carry_x -= mx * PAD_MOVE_DIVISOR;
 		pad.carry_y -= my * PAD_MOVE_DIVISOR;
 	} else if (fingers >= 2) {
-		/* Natural scrolling: content follows the fingers. */
+		/* A plain mouse wheel's direction: iPadOS applies its own natural scrolling setting on top, so inverting here too scrolled backwards. */
 		pad.scroll_x += dx / 2;
 		pad.scroll_y += dy / 2;
-		wheel = pad_clip(pad.scroll_y / PAD_SCROLL_DIVISOR);
-		sideways = pad_clip(-pad.scroll_x / PAD_SCROLL_DIVISOR);
-		pad.scroll_y -= wheel * PAD_SCROLL_DIVISOR;
-		pad.scroll_x += sideways * PAD_SCROLL_DIVISOR;
+		wheel = pad_clip(-pad.scroll_y / PAD_SCROLL_DIVISOR);
+		sideways = pad_clip(pad.scroll_x / PAD_SCROLL_DIVISOR);
+		pad.scroll_y += wheel * PAD_SCROLL_DIVISOR;
+		pad.scroll_x -= sideways * PAD_SCROLL_DIVISOR;
 	}
 	const int buttons = pressed ? (fingers >= 2 ? 2 : 1) : 0;
 	if (buttons != pad.buttons || mx || my || wheel || sideways) {

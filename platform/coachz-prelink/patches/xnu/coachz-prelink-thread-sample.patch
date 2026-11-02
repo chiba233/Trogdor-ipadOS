@@ -101,7 +101,7 @@
  	coachz_sample_main_thread(coachz_preferences_pid, "Preferences");
  	coachz_sample_main_thread(os_atomic_load(&coachz_sb_pid, relaxed), "SpringBoard");
 +	/* Who a Wi-Fi join is waiting on: Settings asks sharingd for 10 s on its main thread before the password sheet. */
-+	coachz_sample_threads(coachz_sharingd_pid, "sharingd", 16);
++	coachz_sample_threads(coachz_poster_pid, "PosterBoard", 16);
 +	coachz_sample_threads(coachz_wifid_pid, "wifid", 16);
 +	unsigned threads = 0;
 +	if (PE_parse_boot_argn("coachz-sample-bbd", &threads, sizeof(threads)) && threads) {

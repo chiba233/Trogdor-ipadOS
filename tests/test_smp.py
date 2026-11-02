@@ -97,18 +97,20 @@ class SmpTreeTests(unittest.TestCase):
         # Block I/O from the file system stays limited to the Data partition; only the flusher writes the ring.
         self.assertIn('if (write && (!persistent_data || !data_window.contains(block, count))) return kIOReturnNotWritable;', driver)
         if reader:
-            self.assertIn('first = (medium - 33 - LOG_BLOCKS) & ~2047', reader)
+            # The reader follows the eMMC partition the kernel writes through coachz_sdcc_window("coachz-log").
+            self.assertIn("LABEL = 'coachz-log'", reader)
             self.assertNotIn('O_RDWR', reader)
 
     def test_touch_keeps_the_kernel_event_driver(self):
         # Without this personality the AppleUserHIDDrivers dext takes the digitizer and backboardd never gets a client.
         hid = (Path(__file__).resolve().parents[1] / 'platform/coachz-prelink/package/CoachzHid.cpp').read_text()
-        self.assertLess(hid.index('addTouchPersonality();'), hid.index('native_hid_touch_allocate();'))
+        self.assertLess(hid.index('addEventDriverPersonality(0x0d,4,"SPI");'), hid.index('native_hid_touch_allocate();'))
 
     def test_settings_is_not_blocked_by_the_icon_agent(self):
         # Without a GPU CoreImage calls an empty OpenGL table; the agent's crash loop kept Settings waiting for its icons.
         root = Path(__file__).resolve().parents[1]
-        self.assertIn("coachz-null-call=1", (root / 'tools/xnu_screen.py').read_text())
+        # With the GPU up the agent has Metal: the image no longer asks for the resume, and its path stays in the kernel.
+        self.assertNotIn("coachz-null-call=1", (root / 'tools/xnu_screen.py').read_text())
         self.assertIn('coachz_null_call_resume', (root / 'platform/coachz-prelink/patches/xnu/coachz-prelink-software-render.patch').read_text())
 
     def test_migration_is_decided_by_last_system_version(self):

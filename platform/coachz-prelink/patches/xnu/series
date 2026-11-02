@@ -117,3 +117,9 @@ coachz-prelink-cpufreq.patch
 
 # coachz-emmc=1 / coachz-sd=1: the read-only SDHCI driver (sdhci-msm stage 1, drivers/RamBlock/mmc), started with the others.
 coachz-prelink-mmc.patch
+coachz-prelink-poster-trace.patch
+coachz-prelink-rename-path.patch
+coachz-prelink-gpu-grant-all.patch
+coachz-prelink-dataprotect.patch
+coachz-prelink-gpu-map-grant.patch
+coachz-prelink-disabled-jobs.patch

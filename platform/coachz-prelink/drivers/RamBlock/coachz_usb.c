@@ -129,6 +129,25 @@ int coachz_usb_keyboard_enabled(void) {
     return enabled;
 }
 
+/* The system on the eMMC: no disk to wait for; the controller, the hubs and the keyboard behind them. */
+int coachz_usb_open_keyboard(void) {
+    xhci_va = ml_io_map(XHCI_BASE, XHCI_BYTES);
+    pool_va = ml_io_map_wcomb(POOL_BASE, POOL_BYTES);
+    if (!xhci_va || !pool_va) return 0;
+    memset((void *)pool_va, 0, POOL_BYTES);
+    transfer = coachz_usb_memalign(4096, MAX_BLOCKS * 512);
+    hci_t *controller = xhci_init(XHCI_BASE);
+    kprintf("COACHZ USB: controller %d for the keyboard, USBSTS 0x%x\n", controller != NULL, usbsts());
+    if (!controller) return 0;
+    uint64_t start = now_us();
+    while (now_us() - start < 2000000 && !(usbsts() & USBSTS_ERRORS)) {
+        usb_poll();
+        mdelay(10);
+    }
+    if (coachz_usb_keyboard_enabled()) coachz_usb_enumerate_hubs(1000, NULL);
+    return 1;
+}
+
 int coachz_usb_open(uint64_t *blocks) {
     xhci_va = ml_io_map(XHCI_BASE, XHCI_BYTES);
     pool_va = ml_io_map_wcomb(POOL_BASE, POOL_BYTES);

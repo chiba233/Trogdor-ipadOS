@@ -38,6 +38,7 @@ extern volatile uint32_t native_adreno_ring_log[4][4 + 112];
 extern volatile uint32_t native_adreno_ring_log_count;
 extern volatile uint32_t native_adreno_ib_log[8][4 + 208];
 extern volatile uint32_t native_adreno_ib_log_count;
+extern volatile uint64_t native_adreno_submit_ticks[64], native_adreno_submit_cost[3], native_adreno_wait_outer[5], native_gop_wait_stats[7];
 }
 extern "C" unsigned NativeAdrenoGpuContextInputBits();
 // The framework's two weak board hooks. [1] of the first is the GPU's current level, which it notes per job. The second names a process still mapping a
@@ -414,25 +415,61 @@ void stuckReport() {
     if (printed == 1) cpDump("stuck");
 }
 
+uint64_t coreCounter(uint32_t reg);
 void stampReport() {
     static uint32_t reported;
     const uint32_t done = gRing.completedFence();
-    uint64_t gpu = 0, gpuMax = 0;
+    uint64_t gpu = 0, gpuMax = 0, queue = 0, queueMax = 0;
     unsigned n = 0, bins[7] = {};
+    // The stamps count the always-on counter, the kernel its own clock, both at 19.2 MHz: the offset is read here. A power cycle restarts the counter; such a stamp shows as no queue.
+    const int64_t offset = static_cast<int64_t>(mach_absolute_time()) - static_cast<int64_t>(coreCounter(0x980));
     for (uint32_t fence = done - reported > 64 ? done - 63 : reported + 1; fence && fence <= done; ++fence) {
         uint64_t start = 0, end = 0;
         if (gRing.timeline(fence, &start, &end) != 31 || !start || end < start) continue;
         const uint64_t g = (end - start) * 10 / 192;
         gpu += g; ++n;
         if (g > gpuMax) gpuMax = g;
+        const int64_t began = static_cast<int64_t>(start) + offset - static_cast<int64_t>(native_adreno_submit_ticks[fence & 63]);
+        const uint64_t q = began > 0 && began < 19200000 ? static_cast<uint64_t>(began) * 10 / 192 : 0;
+        queue += q;
+        if (q > queueMax) queueMax = q;
         unsigned bin = 0;
         while (bin < 6 && g >= (1000ull << bin)) ++bin;
         ++bins[bin];
     }
     reported = done;
     if (!n) return;
-    printf("COACHZ gpu stamps: %u submissions, gpu mean %llu max %llu us, gpu <1 %u <2 %u <4 %u <8 %u <16 %u <32 %u more %u ms\n", n, gpu / n, gpuMax,
+    printf("COACHZ gpu path: kernel submit mean %llu max %llu us over %llu; fence waits %llu mean %llu max %llu us; gop waits %llu done %llu mean %llu max %llu us\n",
+        native_adreno_submit_cost[0] ? native_adreno_submit_cost[1] * 10 / 192 / native_adreno_submit_cost[0] : 0, native_adreno_submit_cost[2] * 10 / 192, native_adreno_submit_cost[0],
+        native_adreno_wait_outer[0], native_adreno_wait_outer[0] ? native_adreno_wait_outer[1] / native_adreno_wait_outer[0] : 0, native_adreno_wait_outer[3],
+        native_gop_wait_stats[0], native_gop_wait_stats[1], native_gop_wait_stats[1] ? native_gop_wait_stats[6] / native_gop_wait_stats[1] / 1000 : 0, native_gop_wait_stats[5] / 1000);
+    printf("COACHZ gpu stamps: %u submissions, queue mean %llu max %llu us, gpu mean %llu max %llu us, gpu <1 %u <2 %u <4 %u <8 %u <16 %u <32 %u more %u ms\n", n, queue / n, queueMax, gpu / n, gpuMax,
         bins[0], bins[1], bins[2], bins[3], bins[4], bins[5], bins[6]);
+}
+
+// The firmware framebuffer as the panel scans it, 4096 pixels scattered over the frame: how many values each channel holds, which of its bits are ever set and green's most common
+// values. Bit depth lost anywhere before the panel shows here (a channel holding only multiples of 8, say); a smooth white scene with neighbouring values does not lose any.
+extern "C" volatile uint64_t native_gop_virtual;
+void frameSample() {
+    const volatile uint32_t *frame = reinterpret_cast<const volatile uint32_t *>(native_gop_virtual);
+    if (!frame) return;
+    uint32_t counts[3][256] = {}, bits = 0;
+    for (uint32_t i = 0; i < 4096; ++i) {
+        const uint32_t pixel = frame[(uint64_t(i) * 2654435761u) % (2160u * 1440u)];
+        bits |= pixel;
+        for (unsigned c = 0; c < 3; ++c) ++counts[c][(pixel >> (c * 8)) & 255];
+    }
+    unsigned distinct[3] = {};
+    for (unsigned c = 0; c < 3; ++c) for (unsigned v = 0; v < 256; ++v) if (counts[c][v]) ++distinct[c];
+    printf("COACHZ frame sample: distinct b %u g %u r %u, bits set 0x%06x, green top", distinct[0], distinct[1], distinct[2], bits & 0xffffffu);
+    for (unsigned n = 0; n < 12; ++n) {
+        unsigned best = 0;
+        for (unsigned v = 1; v < 256; ++v) if (counts[1][v] > counts[1][best]) best = v;
+        if (!counts[1][best]) break;
+        printf(" %u:%u", best, counts[1][best]);
+        counts[1][best] = 0;
+    }
+    printf("\n");
 }
 
 // Every ten seconds, what reached the driver: whether the plug-in opened it, what it reports, what the CP has run and what reached the screen.
@@ -457,6 +494,7 @@ void reportThread(void *, wait_result_t) {
         printf("COACHZ gpu irq: %u interrupts, %u fences; waits slept %u, timed out %u; errors ahb %u atb %u cp hw %u (0x%x) hang %u uche %u; gmu %u (0x%x) hfi %u (0x%x)\n",
             gIrqAll, gFlushTs, gIdleBlocks, gIdleTimeouts, gIrqAhb, gIrqAtb, gIrqCpHw, gCpHwStatus, gIrqHang, gIrqOob, gGmuAoIrqs, gGmuAoStatus, gHfiIrqs, gHfiInfo);
         stampReport();
+        frameSample();
         // Imported BOs the submit path left alone under IO coherence: [2] before submissions, [3] after completions.
         printf("COACHZ gpu9: coherent %u, maintenance skipped before submit %u after completion %u\n", native_adreno_io_coherent,
             native_adreno_coherent_skips[2], native_adreno_coherent_skips[3]);
@@ -987,10 +1025,10 @@ bool publishAccelerator() {
         if (accelerator) accelerator->release();
         return false;
     }
-    // The two keys the discovery reads, no Apple GPU identity; and who may open it in place of the sandbox verdict.
+    // The two keys the discovery reads, no Apple GPU identity; and who may open it in place of the sandbox verdict: every process.
     accelerator->setProperty("MetalPluginName", "NativeAdrenoMetal");
     accelerator->setProperty("MetalPluginClassName", "NativeAdrenoMetalDevice");
-    accelerator->setProperty("NativeSandboxGrantProcess", "backboardd,iconservicesagent,WidgetRenderer_Default,PosterBoard");
+    accelerator->setProperty("NativeSandboxGrantProcess", "*");
     if (!accelerator->attach(IOService::getPlatform())) {
         accelerator->release();
         return false;

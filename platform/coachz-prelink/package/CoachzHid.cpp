@@ -18,6 +18,8 @@
 extern kmod_info_t g_kernel_kmod_info;
 extern "C" void native_hid_static_init(void) __asm__("__GLOBAL__sub_I_NativeHidInput.cpp");
 extern "C" IOService *native_hid_touch_allocate(void);
+extern "C" IOService *coachz_motion_hid_allocate(unsigned kind);
+extern "C" volatile uint32_t coachz_motion_ready;
 extern "C" kern_return_t OSKextLoadKextWithIdentifier(const char *);
 extern "C" {
 char coachz_hid_status[160];
@@ -86,12 +88,12 @@ __attribute__((noinline)) void native_hid_live_checkpoint(IOService *device) {
 // com.apple.AppleUserHIDDrivers.dext, whose AppleUserHIDEventService takes the device and waits up to 120 s
 // (kIOUserServerCheckInTimeoutSecs) for a dext process. On hardware that process never started, so backboardd had nothing to open.
 // With the kernel driver started first the default match category is taken and the dext personality is skipped.
-static bool addTouchPersonality(void) {
+static bool addEventDriverPersonality(unsigned usagePage,unsigned usageValue,const char *transportName) {
     OSDictionary *personality=OSDictionary::withCapacity(7),*pair=OSDictionary::withCapacity(2);
     OSArray *pairs=OSArray::withCapacity(1),*drivers=OSArray::withCapacity(1);
-    OSNumber *page=OSNumber::withNumber(0x0d,32),*usage=OSNumber::withNumber(4,32),*score=OSNumber::withNumber(1000,32);
+    OSNumber *page=OSNumber::withNumber(usagePage,32),*usage=OSNumber::withNumber(usageValue,32),*score=OSNumber::withNumber(1000,32);
     OSString *bundle=OSString::withCString("com.apple.iokit.IOHIDFamily"),*driver=OSString::withCString("IOHIDEventDriver");
-    OSString *provider=OSString::withCString("IOHIDInterface"),*transport=OSString::withCString("SPI"),*behavior=OSString::withCString("");
+    OSString *provider=OSString::withCString("IOHIDInterface"),*transport=OSString::withCString(transportName),*behavior=OSString::withCString("");
     bool added=false;
     if(personality && pair && pairs && drivers && page && usage && score && bundle && driver && provider && transport && behavior) {
         pair->setObject("DeviceUsagePage",page);pair->setObject("DeviceUsage",usage);pairs->setObject(pair);
@@ -122,7 +124,9 @@ void coachz_hid_touch_start(void) {
     IOService *resource=match?IOService::waitForMatchingService(match,5000000000ULL):nullptr;
     OSSafeReleaseNULL(match);
     int registered=-1;bool attached=false,running=false;
-    const bool personality=addTouchPersonality();
+    const bool personality=addEventDriverPersonality(0x0d,4,"SPI");
+    // The motion sensors' pair, the same way: the stock "HID Sensor" personality would wait for the IOKit daemon as the digitizer's does.
+    const bool sensorPersonality=addEventDriverPersonality(0xff0c,3,"SPU");
     // The digitizer's metaclass is registered now rather than at boot: IOHIDFamily's own metaclasses must exist first.
     if(resource && size==208) {
         void *handle=OSMetaClass::preModLoad(g_kernel_kmod_info.name);
@@ -137,6 +141,21 @@ void coachz_hid_touch_start(void) {
             OSSafeReleaseNULL(touch);
         }
     }
+    // The motion sensors, once the EC service has read them (CoachzMotion.cpp): the devices the system looks for are useless without samples.
+    unsigned motionStarted=0;
+    for(unsigned tries=0;!registered && !coachz_motion_ready && tries<100;++tries)IOSleep(100);
+    if(!registered && coachz_motion_ready) {
+        for(unsigned kind=0;kind<3;++kind) {
+            IOService *motion=coachz_motion_hid_allocate(kind);
+            const bool motionAttached=motion && motion->metaCast("IOHIDDevice") && motion->init() && motion->attach(resource);
+            if(motionAttached && motion->start(resource))motionStarted++;
+            else {
+                if(motionAttached)motion->detach(resource);
+                OSSafeReleaseNULL(motion);
+            }
+        }
+    }
+    printf("COACHZ motion: HID devices %u of 3 (sensor personality %d, EC ready %u)\n",motionStarted,sensorPersonality,coachz_motion_ready);
     snprintf(coachz_hid_status,sizeof(coachz_hid_status),"K42 hid: family %d driver %d IOHIDDevice size %u resource %d meta %d personality %d attached %d started %d",
         family,driver,size,resource!=nullptr,registered,personality,attached,running);
     OSSafeReleaseNULL(resource);

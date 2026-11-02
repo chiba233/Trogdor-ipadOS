@@ -40,12 +40,12 @@
  coachz_launch_process(int pid, const char *name, int exited, int status)
  {
 +	{
-+		extern int coachz_preferences_pid, coachz_sharingd_pid, coachz_wifid_pid;
++		extern int coachz_preferences_pid, coachz_poster_pid, coachz_wifid_pid;
 +		if (!strcmp(name, "Preferences")) {
 +			coachz_preferences_pid = exited ? 0 : pid;
 +		}
-+		if (!strcmp(name, "sharingd")) {
-+			coachz_sharingd_pid = exited ? 0 : pid;
++		if (!strcmp(name, "PosterBoard")) {
++			coachz_poster_pid = exited ? 0 : pid;
 +		}
 +		if (!strcmp(name, "wifid")) {
 +			coachz_wifid_pid = exited ? 0 : pid;
@@ -126,7 +126,7 @@
 +}
 +
 +/* Each report, where the main threads of the tapped app and of SpringBoard are, for the disk log. */
-+int coachz_preferences_pid, coachz_sharingd_pid, coachz_wifid_pid;
++int coachz_preferences_pid, coachz_poster_pid, coachz_wifid_pid;
 +void coachz_sample_main_threads(void);
 +
 +static void

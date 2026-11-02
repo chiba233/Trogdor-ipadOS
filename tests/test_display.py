@@ -323,7 +323,7 @@ class DisplayTests(unittest.TestCase):
         self.assertIn('xcf\\xfa\\xed\\xfe',(platform/'patches/xnu/coachz-prelink-root.patch').read_text())
         root_patch=(platform/'patches/xnu/coachz-prelink-root.patch').read_text()
         self.assertIn('owner_authorized = (vfs_flags(root_mount) & MNT_RDONLY) && device != NODEV && coachz_usb_root_device(device);',root_patch)
-        self.assertIn('OSDynamicCast(NativeRamBlock, provider)',(platform/'drivers/RamBlock/NativeRamBlock.cpp').read_text())
+        self.assertIn('coachz_root_storage(provider)',(platform/'drivers/RamBlock/NativeRamBlock.cpp').read_text())
         self.assertIn('#define POOL_BYTES (1ul * 1024 * 1024)',(platform/'drivers/RamBlock/coachz_usb.c').read_text())
         self.assertIn('coachz-prelink-systemos.patch',series)
         systemos=(platform/'patches/xnu/coachz-prelink-systemos.patch').read_text()

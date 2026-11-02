@@ -1,0 +1,16 @@
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -9706,6 +9706,13 @@
+ 	kfree_type(typeof(*__rename_data), __rename_data);
+ 	return error;
+ }
++
++int coachz_rename_path(const char *from, const char *to);
++int
++coachz_rename_path(const char *from, const char *to)
++{
++	return renameat_internal(vfs_context_kernel(), AT_FDCWD, CAST_USER_ADDR_T(from), AT_FDCWD, CAST_USER_ADDR_T(to), UIO_SYSSPACE, 0);
++}
+ 
+ int
+ rename(__unused proc_t p, struct rename_args *uap, __unused int32_t *retval)
