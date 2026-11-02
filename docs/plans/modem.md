@@ -117,7 +117,7 @@ b9 用 drivers/RamBlock/coachz_modem.c 按上面的顺序接入，在 Wi-Fi 线�
 
 真机上服务、固件和两处挂载都通过。`compatible` 用 J121AP 后 CommCenter 走高通分支并启动 ABM，状态栏显示搜信号。发布 `AppleIPAppender` 和 `AppleBasebandPCIMAVPDPManager` 后 CommCenter 不再崩溃，“蜂窝网络”页面能打开，固件目录 bind 挂载到 ABM 要的路径后 BBUpdater 能加载全部镜像，走完 `pbl`（读寄存器、`SendImage`）和 `sahara`，ABM 报告启动成功并 engage，CommCenter 经 qmux 接到真实的 modem，识别到 SIM 卡。modem 的工厂数据（FSG：IMEI、射频校准）在 eMMC 硬件分区 `mmcblk1boot0`，ChromeOS 的 `verify_fsg.sh` 这样读它：头 `FSG`，偏移 4 处 8 字节 ASCII 大小，数据从偏移 512 开始，SHA-256 烧在 qfprom nvmem 偏移 0x750。Debian 的全 0 文件加 `rmtfs -r` 让 modem 停在 `factory-test`，没有 IMEI，能力也是空的。把它只读读出、对上熔丝、补零到 2 MiB，放到被忽略的 `.tools/modem/rmtfs/modem_fsg`，`linux_log.py --modem-firmware` 会把它打进固件块，所以内核分区和镜像都含设备数据，不能外传；不写 boot0，不改 IMEI。内核的 rmtfs 不加载长度为 0 的文件，读写超出文件末尾时报错，这两点和 Linux 的 rmtfs 不同，所以四个文件都要有内容。
 
-有了它，CommCenter 不再报 `num of IMEIs (0)`，`kSimStateReady`，“关于本机”显示 IMEI 和 ICCID，QMI 服务从 37 个变成 40 个。所用测试卡没有服务，modem 在 LTE 上搜网，CS、PS 都没有附着，注册成功还没有测到。
+有了它，CommCenter 不再报 `num of IMEIs (0)`，`kSimStateReady`，“关于本机”显示 IMEI 和 ICCID，QMI 服务从 37 个变成 40 个。所用测试卡没有服务，modem 在 LTE 上搜网，CS、PS 都没有附着。有效 SIM 的注册和附着见下面的第五、第六次上机。
 
 测试卡下 modem 收到 LTE 小区，CommCenter 报 `kEmergencyOnly`（仅限紧急呼叫）。
 

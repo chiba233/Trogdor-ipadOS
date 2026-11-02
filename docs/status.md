@@ -48,7 +48,7 @@
 | Adreno 618 | 真机通过 | mode 9 常驻驱动：GMU、SMMU、CP、ring／IB／fence 全部执行，界面由 Turnip 和 Metal 合成上屏；单 ring 无抢占，提交到完成约 23 ms，主帧 UBWC 未生效，卡顿未解决，见 [路线](plans/gpu.md) |
 | 温度、加速度计、陀螺仪 | 部分通过 | TSENS 25 路和 EC 加速度计、陀螺仪（25 Hz，3 个 SPU HID 服务）读进系统，thermalmonitord 读到 38 个温度服务；限频只有内核 80 °C 规则，没有 CLPC／PMGR 后端 |
 | Wi-Fi | 部分通过 | modem 经主线 `q6v5_mss` 启动，GLINK／QRTR／rmtfs、WLAN 固件握手、copy engine、HTC／WMI、HTT 全通；`en0` 能扫描、加入 WPA2、DHCP 和自动加入，见 [Wi-Fi 计划](plans/wifi.md) |
-| 蜂窝网络 | 部分通过 | 内核扮演苹果的 PCIe 基带接口，BBUpdater 走完启动，CommCenter 经 QMUX 接到 modem；用 eMMC boot 分区里的原厂 FSG 后“关于本机”显示 IMEI 和 ICCID，SIM 就绪，modem 在 LTE 上搜网。测试卡没有服务，注册和蜂窝数据未验证；`BindMuxDataPort` 回 `QMI_ERR_INVALID_ARG`，`vinyl=kNotCapable`，见 [蜂窝计划](plans/modem.md) |
+| 蜂窝网络 | 部分通过 | 内核扮演苹果的 PCIe 基带接口，BBUpdater 走完启动，CommCenter 经 QMUX 接到 modem；用 eMMC boot 分区里的原厂 FSG 后“关于本机”显示 IMEI 和 ICCID，SIM 就绪。激活指示带上服务已开通和两个卡槽已接受，DPM、WDA 设置和 `BindMuxDataPort` 都成功；有效 SIM 在 LTE 上注册（漫游）并完成 CS、PS 附着，状态栏显示运营商名和信号格，目前要开机后插拔一次 SIM 才显示，“关于本机”的运营商是未知。蜂窝数据和 eSIM 未验证，见 [蜂窝计划](plans/modem.md) |
 | eMMC、microSD | 部分通过 | sdhci-msm 移植走 HS400 增强选通，写入只开放给 scratch、日志和 Data 窗口；microSD 读写真机通过。连续读未写区域约 60 MB/s，低于 Debian 的约 152 MB/s，原因未查 |
 
 ## 已执行的主机验证

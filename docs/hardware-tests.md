@@ -1668,3 +1668,12 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 - **注册**：测试卡没有服务，屏幕显示无服务。CommCenter 在 `kNotRegistered` 和 `kSearching` 之间切换，RAT 是 LTE，modem 报告了 PLMN，CS、PS 都没有附着。注册成功和蜂窝数据没有测到。
 - **后面的卡点**：`BindMuxDataPort`、`BindDataPort` 回 `QMI_ERR_INVALID_ARG`；`vinyl=kNotCapable`；`No baseband activation ticket found`，`Activation register request failed: QMI_ERR_NOT_SUPPORTED`，`Operator name change aborted: not activated`。
 - **GPU**：这段约 250 秒，`CZ frames made 2 private 1 shown 0 plain 552`；提交到完成 1129 次，平均 23 ms，最长 190 ms；`gpu irq` 错误全 0，没有 `KMD fail`；backboardd、SpringBoard 没有退出。
+
+## 激活结果、数据口和有效 SIM 注册
+
+- **数据口**：DPM Open Port 和 WDA Set Data Format 都成功（raw IP，上下行 QMAPv4）。端点补成 `{4, 1}` 后，WDS 0xa2 和 QOS 0x2b 的绑定都返回成功。
+- **激活**：ActivationRegister 回 kActivated 后，CommCenter 认为基带已激活并发起附着。指示里再带 TLV 0x4f = 2、0x50 = 2 后，服务开通状态变成 kProvisioned。
+- **注册**：插入有效 SIM 后 modem 在 LTE 上注册（漫游），CS、PS 都附着上。开机后插拔一次 SIM，再开关飞行模式，状态栏显示运营商名和信号格。只带 0x4f、0x50 时，CommCenter 每次查询激活状态都判 `Baseband activation result is unexpected!`，又把开通状态改回 kUnknown；加上 0x56、0x57 = 1（两个卡槽都接受）后，仍要插拔一次 SIM 才显示。“关于本机”的运营商是未知。
+- **工作模式**：开机后 ABM 先读到 Shutdown，射频留在低功耗；之后基带重启一次，才请求 Online 成功。
+- **Wi-Fi**：开关飞行模式后重新加入 Wi-Fi，驱动加入时信号是 -44 dBm，SpringBoard 收到的却是 0 格，图标变空心。
+- **测试卡**：仍只有紧急服务。
