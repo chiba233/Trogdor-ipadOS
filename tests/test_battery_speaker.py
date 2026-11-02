@@ -36,8 +36,10 @@ class BatteryTests(unittest.TestCase):
         # The service reads; it never sends charger, PD or EC configuration commands.
         battery = new_file('coachz-prelink-battery.patch', 'iokit/Kernel/CoachzBattery.cpp')
         commands = set(re.findall(r'coachz_ec_command\((EC_CMD_\w+)', battery))
-        self.assertEqual(commands, {'EC_CMD_BATTERY_GET_DYNAMIC', 'EC_CMD_CHARGE_STATE', 'EC_CMD_USB_PD_POWER_INFO', 'EC_CMD_CONSOLE_SNAPSHOT', 'EC_CMD_CONSOLE_READ'})
+        self.assertEqual(commands, {'EC_CMD_BATTERY_GET_DYNAMIC', 'EC_CMD_CHARGE_STATE', 'EC_CMD_USB_PD_POWER_INFO', 'EC_CMD_USB_PD_CONTROL', 'EC_CMD_USB_PD_MUX_INFO', 'EC_CMD_I2C_PASSTHRU', 'EC_CMD_CONSOLE_SNAPSHOT', 'EC_CMD_CONSOLE_READ'})
         self.assertIn('uint8_t reply[EC_MAX_REPLY], index = 0, charge[10] = {0};', battery)   # GET_STATE is subcommand 0
+        self.assertIn('const uint8_t request[4] = {port, 0, 0, 0};', battery)   # USB_PD_CONTROL with no role, mux or swap to change
+        self.assertIn('const uint8_t args[11] = {0, 2, 0x0b, 0x00, 1, 0, 0x0b, 0x80, 2, 0, reg};', battery)   # the gauge: the register byte, then a read
         self.assertIn('if (!published) {', battery)
         transport = new_file('coachz-prelink-battery.patch', 'bsd/dev/coachz_ec.c')
         self.assertIn('(void)chip_select(OP_CS_DEASSERT);', transport)

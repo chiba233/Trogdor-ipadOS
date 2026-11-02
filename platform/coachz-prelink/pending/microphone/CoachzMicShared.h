@@ -22,8 +22,9 @@ enum CoachzMicError {
 /* Single kernel writer. All fields naturally aligned, no packed structures.
  * Mono S16 sample time t is at ring[t % ring_frames]. [first, written) is the
  * ONLY valid interval. A new start/rebase invalidates the previous interval.
- * seq covers both metadata AND sample stores. Readers must recheck it AFTER
- * copying samples, with acquire ordering, and discard a raced copy. */
+ * seq covers both metadata AND sample stores for a reader that wants one whole
+ * update. Samples inside the interval never change until the ring turns, so the
+ * HAL reads them while seq is odd: failing there zeroed whole input buffers. */
 typedef struct {
     uint32_t magic, version;
     uint32_t seq, state;
@@ -34,6 +35,7 @@ typedef struct {
     uint32_t source_channel, dma_current;
     uint32_t irq_periods, irq_faults;
     uint32_t peak[2], nonzero[2]; /* peaks are absolute S16 magnitudes */
+    uint32_t cursor_jumps, reserved; /* DMA cursor reads skipped as impossible */
 } CoachzMicShared;
 
 #endif

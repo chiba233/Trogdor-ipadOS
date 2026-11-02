@@ -18,7 +18,7 @@
  		/* Keep the captured note readable on the wrapping screen console. */
 --- /dev/null
 +++ b/bsd/dev/coachz_thermal.c
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,193 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent */
 +/* Copyright (c) 2026, UniXNU contributors. All rights reserved.
 + * Optional SC7180 TSENS sampler. Not enabled in the active kernel build.
@@ -123,6 +123,10 @@
 +    }
 +}
 +
++/* The last good reading of each channel, for the system's thermal service (NativeHidInput.cpp), and how often it has asked. */
++volatile int32_t coachz_tsens_mc[CT_BANKS][CT_SENSORS];
++volatile uint32_t coachz_temperature_reads;
++
 +static void
 +thermal_report(int detail)
 +{
@@ -133,6 +137,9 @@
 +        int32_t peak = 0;
 +        ct_collect(mappings[bank].srot && mappings[bank].tm ? &reader : NULL,
 +            ct_banks[bank].mask, &sample);
++        for (unsigned sensor = 0; sensor < CT_SENSORS; ++sensor) {
++            if (sample.status[sensor] == CT_OK) coachz_tsens_mc[bank][sensor] = sample.milli_c[sensor];
++        }
 +        if (ct_peak(&sample, &peak)) {
 +            if (peak > hottest) hottest = peak;
 +            printf("COACHZ thermal: bank %u version 0x%x control 0x%x ready 0x%x requested 0x%x enabled 0x%x valid 0x%x peak %d mC\n",
@@ -154,6 +161,7 @@
 +                    bank, sensor, ct_status_name(sample.status[sensor]), sample.raw[sensor]);
 +        }
 +    }
++    printf("COACHZ thermal: system service read the temperatures %u times\n", coachz_temperature_reads);
 +    thermal_policy(hottest);
 +}
 +

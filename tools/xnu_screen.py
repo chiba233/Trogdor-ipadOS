@@ -106,13 +106,13 @@ def read_tree(adt):
 # The Coachz has no Home button, so the display route presents a full-screen 11-inch iPad Pro (UniXNU guide/mobilegestalt).
 # Root compatible stays J120AP: original platform code and this IPSW's per-model resources key on it.
 FULL_SCREEN_IDENTITY = {
-    'root': {'string': {'model': 'iPad8,1', 'target-type': 'J317'}},
-    'product': {'string': {'product-name': 'iPad Pro (11-inch)', 'product-description': 'iPad Pro (11-inch)',
+    'root': {'string': {'model': 'iPad14,1', 'target-type': 'J310'}},
+    'product': {'string': {'product-name': 'iPad mini (6th generation)', 'product-description': 'iPad mini (6th generation)',
                            'compatible-device-fallback': 'iPad7,3',
                            # sRGB as the GopFramebuffer route needs (UniXNU devices/sheng): with Metal present and P3, the render server picks the b3a8
                            # surface the display driver refuses, and nothing reaches the screen.
                            'artwork-display-gamut': 'sRGB'},
-                'u32': {'artwork-device-subtype': 2388, 'thin-bezel': 1}},
+                'u32': {'artwork-device-subtype': 2266, 'thin-bezel': 1}},
     'buttons': {'string': {'compatible': 'buttons', 'device_type': 'buttons'},
                 'bytes': {'button-names': b'hold\0voldown\0volup\0'.hex()},
                 'u32': {'home-button-type': 2}},

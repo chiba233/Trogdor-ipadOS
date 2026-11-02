@@ -49,9 +49,11 @@ Wired by drivers/RamBlock/coachz_modem.c in the order above, polled from the Wi-
 
 Checked against mainline: requests 0x23 and 0x27 that the modem sends after INIT_COMPLETE have no handler in `ipa_server_msg_handlers` (only 0x20 and 0x35), and `qmi_invoke_handler` (drivers/soc/qcom/qmi_interface.c) returns without a response for an unhandled message, so logging them and not answering is mainline behaviour. `uc_loaded` 0 in the first INIT_DRIVER is expected: the modem loads the uC on its first boot, and `skip_uc_load` becomes 1 only for later modem boots. The response's `modem_driver_init_pending` 1 announces the second handshake (DRIVER_INIT_COMPLETE), which arrived; mainline decodes the response but uses only its result.
 
-## Data path integration (next hardware step)
+## Data path integration
 
 After the handshake (`ci_ready_step` asks for the modem start): `coachz_ipa_rx_init(&modem_rx, &ipa, &gsi, CIPA_EP_AP_MODEM_RX, virt, phys, 2 MiB)`, `coachz_ipa_modem_init(&m, &ipa, &gsi, &modem_rx, tx_virt, tx_phys, bytes)` (2 KiB per TX slot; 1 MiB gives 505, the channel's limit), then `coachz_ipa_modem_start(&m)` and `coachz_ipa_modem_open(&m)`. Poll `coachz_ipa_rx_poll(&modem_rx)` for event ring 3 and `coachz_ipa_modem_tx_poll(&m)` for ring 2. Opening without a data call is what Linux does when rmnet_ipa0 comes up; nothing flows until QMI control (WDA data format, WDS bind to a mux id, start network) sets up a call, which is not written. Expected: "rmnet_ipa0 up: TX channel 0 (505 slots), RX endpoint 9 with 251 buffers, IRQ_SUSPEND_EN 0x300".
+
+On hardware this passed: both rmnet_ipa0 lines matched, GSI channels 0 and 3 read state 2 (started) after open, and with no data call the modem RX counters stayed 0. No data has flowed yet.
 
 ## Next
 

@@ -1,6 +1,6 @@
 # LTE 基带（蜂窝数据）
 
-2026-11-02：已写好六块，放在 [pending/modem](../../platform/coachz-prelink/pending/modem/README.md)，由 drivers/RamBlock/coachz_modem.c 就地编译接入，真机已跑通到握手完成（见“真机结果”）：IPA 与 modem 的 QMI 握手层；IPA 探测期配置（主线 `ipa_config` 全部步骤）；GSI setup（主线 `gsi_setup`）；端点编程和命令通道（`ipa_setup` 里的 `ipa_endpoint_setup`、命令通道启动、`ipa_mem_setup`、`ipa_table_setup`）；LAN RX 和默认路由（`ipa_setup` 的最后一段）；`ipa_modem_start` 和数据通路（rmnet_ipa0 与 rmnet 的 QMAP）。主线 `ipa_setup` 到 `ipa_qmi_setup` 之前已全部写完。寄存器值已和 Debian 上主线驱动配好后的真值对照。
+2026-11-02：已写好六块，放在 [pending/modem](../../platform/coachz-prelink/pending/modem/README.md)，由 drivers/RamBlock/coachz_modem.c 就地编译接入，真机已跑通到握手完成（见“真机结果”），rmnet_ipa0 也已在真机上打开（见“数据通路接入”）：IPA 与 modem 的 QMI 握手层；IPA 探测期配置（主线 `ipa_config` 全部步骤）；GSI setup（主线 `gsi_setup`）；端点编程和命令通道（`ipa_setup` 里的 `ipa_endpoint_setup`、命令通道启动、`ipa_mem_setup`、`ipa_table_setup`）；LAN RX 和默认路由（`ipa_setup` 的最后一段）；`ipa_modem_start` 和数据通路（rmnet_ipa0 与 rmnet 的 QMAP）。主线 `ipa_setup` 到 `ipa_qmi_setup` 之前已全部写完。寄存器值已和 Debian 上主线驱动配好后的真值对照。
 
 ## 路线（照主线 Linux）
 
@@ -46,9 +46,11 @@ b9 用 drivers/RamBlock/coachz_modem.c 按上面的顺序接入，在 Wi-Fi 线�
 
 对照主线：INIT_COMPLETE 之后 modem 发来的 0x23 和 0x27 请求，在 `ipa_server_msg_handlers` 里没有处理函数（只有 0x20 和 0x35），而 `qmi_invoke_handler`（drivers/soc/qcom/qmi_interface.c）对没有处理函数的消息直接返回、不回应，所以只记日志不应答就是主线的行为。第一次 INIT_DRIVER 里 uc_loaded 为 0 是预期的：modem 首次启动时负责加载 uC，只有 modem 之后重启时 `skip_uc_load` 才为 1。INIT_DRIVER 回答里的 `modem_driver_init_pending` 为 1，表示还有第二次握手（DRIVER_INIT_COMPLETE），它也确实到了；主线解码回答，但只用其中的结果字段。
 
-## 数据通路接入（下一次上机）
+## 数据通路接入
 
 握手完成（`ci_ready_step` 要求启动 modem）后：`coachz_ipa_rx_init(&modem_rx, &ipa, &gsi, CIPA_EP_AP_MODEM_RX, virt, phys, 2 MiB)`、`coachz_ipa_modem_init(&m, &ipa, &gsi, &modem_rx, tx_virt, tx_phys, bytes)`（每个 TX 槽 2 KiB，1 MiB 正好是通道上限 505 个），再 `coachz_ipa_modem_start(&m)`、`coachz_ipa_modem_open(&m)`。事件环 3 调 `coachz_ipa_rx_poll(&modem_rx)`，事件环 2 调 `coachz_ipa_modem_tx_poll(&m)`。没有数据呼叫也先打开，这和 Linux 拉起 rmnet_ipa0 时一样；要等 QMI 控制（WDA 数据格式、WDS 绑定 mux id、拨号）建好呼叫才会有数据，这部分还没写。预期日志："rmnet_ipa0 up: TX channel 0 (505 slots), RX endpoint 9 with 251 buffers, IRQ_SUSPEND_EN 0x300"。
+
+真机已通过：rmnet_ipa0 两行日志符合预期，打开后 GSI 通道 0 和 3 的状态都是 2（已启动），没有数据呼叫时 modem RX 计数保持 0。还没有走过任何数据。
 
 ## 下一步
 

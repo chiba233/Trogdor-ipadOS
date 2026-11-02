@@ -19,6 +19,8 @@ extern kmod_info_t g_kernel_kmod_info;
 extern "C" void native_hid_static_init(void) __asm__("__GLOBAL__sub_I_NativeHidInput.cpp");
 extern "C" IOService *native_hid_touch_allocate(void);
 extern "C" IOService *coachz_motion_hid_allocate(unsigned kind);
+extern "C" unsigned coachz_temperature_hid_count(void);
+extern "C" IOService *coachz_temperature_hid_allocate(unsigned index);
 extern "C" volatile uint32_t coachz_motion_ready;
 extern "C" kern_return_t OSKextLoadKextWithIdentifier(const char *);
 extern "C" {
@@ -156,6 +158,18 @@ void coachz_hid_touch_start(void) {
         }
     }
     printf("COACHZ motion: HID devices %u of 3 (sensor personality %d, EC ready %u)\n",motionStarted,sensorPersonality,coachz_motion_ready);
+    // The temperatures for the system's thermal service, on the same personality.
+    unsigned temperatureStarted=0;
+    if(!registered && sensorPersonality) {
+        for(unsigned index=0;index<coachz_temperature_hid_count();++index) {
+            IOService *temperature=coachz_temperature_hid_allocate(index);
+            const bool temperatureAttached=temperature && temperature->metaCast("IOHIDDevice") && temperature->init() && temperature->attach(resource);
+            if(temperatureAttached && temperature->start(resource))temperatureStarted++;
+            else if(temperatureAttached)temperature->detach(resource);
+            OSSafeReleaseNULL(temperature);
+        }
+    }
+    printf("COACHZ thermal: HID temperature services %u of %u\n",temperatureStarted,coachz_temperature_hid_count());
     snprintf(coachz_hid_status,sizeof(coachz_hid_status),"K42 hid: family %d driver %d IOHIDDevice size %u resource %d meta %d personality %d attached %d started %d",
         family,driver,size,resource!=nullptr,registered,personality,attached,running);
     OSSafeReleaseNULL(resource);

@@ -191,13 +191,15 @@
  }
 --- a/osfmk/kern/debug.c
 +++ b/osfmk/kern/debug.c
-@@ -1139,6 +1139,10 @@
+@@ -1139,6 +1139,12 @@
  #if defined(__arm64__)
  	/* No CPU, thread or debugger state is required for this first panic copy. */
  	coachz_early_panic(panic_format_str, panic_args);
 +	{
 +		extern void coachz_log_panic_flush(void);
++		extern void coachz_scanout_home(void);
 +		coachz_log_panic_flush();
++		coachz_scanout_home();   /* the console draws in the firmware framebuffer */
 +	}
  #endif
  

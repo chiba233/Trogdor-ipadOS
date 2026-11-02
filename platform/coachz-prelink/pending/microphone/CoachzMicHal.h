@@ -7,6 +7,9 @@
 /* Bounded read for the existing HAL's mono Float32 input. No spin in RT code.
  * Returns 1 for a consistent copy (possibly silence), 0 for a raced copy.
  * Unsupported ABI, stopped input, expired/future samples all become silence.
+ * The kernel's copy runs every 10 ms and may overlap this read: frames already
+ * published are stable, so it only limits how much of this buffer is available.
+ * A new epoch (generation) or the ring overtaking a copied frame voids that copy.
  * Call only after the kernel driver and BOTH HAL hooks in INTEGRATION.md are
  * installed: this helper alone does not request or authorize capture. */
 static inline int coachz_mic_read(const CoachzMicShared *s,
@@ -15,12 +18,11 @@ static inline int coachz_mic_read(const CoachzMicShared *s,
     if (!out) return 0;
     for (uint32_t i = 0; i < count; ++i) out[i] = 0.0f;
     if (!s || !ring || s->magic != COACHZ_MIC_MAGIC || s->version != COACHZ_MIC_VERSION) return 0;
-    const uint32_t seq = __atomic_load_n(&s->seq, __ATOMIC_ACQUIRE);
-    if (seq & 1u) return 0;
+    const uint32_t generation = __atomic_load_n(&s->generation, __ATOMIC_ACQUIRE);
     const uint32_t state = __atomic_load_n(&s->state, __ATOMIC_RELAXED);
     const uint32_t capacity = __atomic_load_n(&s->ring_frames, __ATOMIC_RELAXED);
+    const uint64_t written = __atomic_load_n(&s->written, __ATOMIC_ACQUIRE);
     const uint64_t first = __atomic_load_n(&s->first, __ATOMIC_RELAXED);
-    const uint64_t written = __atomic_load_n(&s->written, __ATOMIC_RELAXED);
     if (state == CoachzMicRunning && capacity && written >= first && written - first <= capacity) {
         for (uint32_t i = 0; i < count; ++i) {
             const uint64_t t = frame + i;
@@ -29,8 +31,12 @@ static inline int coachz_mic_read(const CoachzMicShared *s,
         }
     }
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
-    if (seq == __atomic_load_n(&s->seq, __ATOMIC_RELAXED)) return 1;
-    for (uint32_t i = 0; i < count; ++i) out[i] = 0.0f;
-    return 0;
+    if (generation != __atomic_load_n(&s->generation, __ATOMIC_RELAXED)) {
+        for (uint32_t i = 0; i < count; ++i) out[i] = 0.0f;
+        return 0;
+    }
+    const uint64_t oldest = __atomic_load_n(&s->first, __ATOMIC_RELAXED);
+    for (uint32_t i = 0; i < count && frame + i < oldest; ++i) out[i] = 0.0f;
+    return 1;
 }
 #endif

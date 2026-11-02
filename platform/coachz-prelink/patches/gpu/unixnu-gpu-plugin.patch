@@ -1,6 +1,7 @@
 --- a/NativeAdrenoMetalPlugin.mm
 +++ b/NativeAdrenoMetalPlugin.mm
-@@ -94,7 +94,8 @@
+@@ -93,9 +93,10 @@
+     char args[1100] = {};
      size_t size = sizeof args - 1;
      return sysctlbyname("kern.bootargs", args, &size, nullptr, 0) == 0 && strstr(args, key);
  }
@@ -10,9 +11,11 @@
      const uintptr_t site = 0x184461928 + slide;
      uint32_t word = 0;
      if (!readTask(site, &word, sizeof word)) return 0x6E40;
+     if (word == 0xd503201f) return 0x6E42;
 --- a/GpuScanoutClient.h
 +++ b/GpuScanoutClient.h
-@@ -35,6 +35,7 @@
+@@ -34,8 +34,9 @@
+     uint64_t verified;  // frames whose scanout was read back and compared with the surface
      uint64_t mismatchRows;   // rows of those frames that differ (CPU reads only: nothing is rendered or copied by the CPU)
      uint32_t lastMs;    // the GPU copy's time for the last frame
      uint64_t totalMs;   // and for all frames (the mean is totalMs / (frames + failures))
@@ -20,27 +23,64 @@
  };
  
  class Client {
-@@ -99,7 +100,11 @@
+ public:
+@@ -55,10 +56,13 @@
+         status = transport_.mapScanout(transport_.context, &address, &length);
+         note(0x6713);
+         if (status || !address || length < mode.bytes) return fail(3, status);
+         // The mapping covers whole pages; the framebuffer allocation ends on a page boundary, the copy never writes past the last row.
+-        gpupresent::Scanout scanout = {(void *)(uintptr_t)address, (size_t)((mode.bytes + page - 1) & ~(page - 1)), (size_t)mode.stride,
+-                                       (uint32_t)mode.width, (uint32_t)mode.height};
++        // Coachz: a mapping of two page-rounded frames is the kernel's pair of scanout buffers.
++        const size_t oneBuffer = (size_t)((mode.bytes + page - 1) & ~(page - 1));
++        const bool pair = length >= 2 * (uint64_t)oneBuffer;
++        gpupresent::Scanout scanout = {(void *)(uintptr_t)address, pair ? 2 * oneBuffer : oneBuffer, (size_t)mode.stride,
++                                       (uint32_t)mode.width, (uint32_t)mode.height, pair ? oneBuffer : 0};
+         note(0x6714);
+         scanout_ = scanout;
+         presenter_ = new gpupresent::Presenter(device, scanout);
+         note(0x6715);
+@@ -98,31 +102,48 @@
+             stats_->lastMs = (uint32_t)(((mach_absolute_time() - began) * base.numer / base.denom) / 1000000);
              stats_->totalMs += stats_->lastMs;
          }
          stats_->lastResult = (int)r;
 -        if (r == gpupresent::kOk && swap.format == NGP_BGRX8888 && stats_->verified < 4) verify(swap);
-+        if (r == gpupresent::kOk && swap.format == NGP_BGRX8888 && stats_->verified < 4) {
++        if (r == gpupresent::kOk && swap.format == NGP_BGRX8888 && stats_->verified < 4 && swap.width == scanout_.width && swap.height == scanout_.height) {
 +            verify(swap);
 +            if (presenter_->lastWide() && !matchesIgnoringAlpha(swap)) presenter_->disableWide();
 +        }
 +        stats_->wide = presenter_->wideState();
          note(0x6731);   // the GPU copy returned
          const uint64_t copiedUs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000;
-         NGPComplete done = {swap.sequence, r == gpupresent::kOk ? 0u : 0xe00002bcu /* kIOReturnError */, 0};
-@@ -123,6 +128,18 @@
+-        NGPComplete done = {swap.sequence, r == gpupresent::kOk ? 0u : 0xe00002bcu /* kIOReturnError */, 0};
++        NGPComplete done = {swap.sequence, r == gpupresent::kOk ? 0u : 0xe00002bcu /* kIOReturnError */, r == gpupresent::kOk ? presenter_->flipRequest() : 0u};
+         const int completed = transport_.call(transport_.context, NGP_METHOD_COMPLETE_SWAP, &done, sizeof done, nullptr, 0);
+         if (NBTraceSwap) NBTraceSwap(offeredUs, copiedUs, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000, (uint32_t)swap.sequence, (uint32_t)r);
+         if (completed) {++stats_->failures; stats_->error = completed; return false;}
++        if (r == gpupresent::kOk) presenter_->flipped();
+         if (r == gpupresent::kOk) ++stats_->frames; else ++stats_->failures;
+         return true;
+     }
+ private:
+     // Reads the scanout back with aligned 32-bit loads (the framebuffer is device memory; wider loads can fault) and compares the top rows with the
+     // surface the GPU copied. The lower part of the panel is skipped: the diagnostic renderer paints there. Evidence only; nothing is written.
+     void verify(const NGPSwap &swap) {
+         const uint32_t rows = swap.height < 400 ? swap.height : 400, words = swap.width;
+-        const volatile uint32_t *shown = (const volatile uint32_t *)scanout_.base;
++        const volatile uint32_t *shown = (const volatile uint32_t *)((const uint8_t *)scanout_.base + presenter_->drawOffset());
+         const volatile uint32_t *surface = (const volatile uint32_t *)(uintptr_t)swap.address;
+         for (uint32_t y = 0; y < rows; ++y) {
+             const volatile uint32_t *a = shown + (size_t)y * (scanout_.stride / 4), *b = surface + (size_t)y * (swap.stride / 4);
+             for (uint32_t x = 0; x < words; ++x)
+                 if (a[x] != b[x]) {++stats_->mismatchRows; break;}
          }
          ++stats_->verified;
-     }
++    }
 +    // Coachz: the same rows as verify(), compared without the alpha byte the copy sets.
 +    bool matchesIgnoringAlpha(const NGPSwap &swap) const {
 +        const uint32_t rows = swap.height < 400 ? swap.height : 400, words = swap.width;
-+        const volatile uint32_t *shown = (const volatile uint32_t *)scanout_.base;
++        const volatile uint32_t *shown = (const volatile uint32_t *)((const uint8_t *)scanout_.base + presenter_->drawOffset());
 +        const volatile uint32_t *surface = (const volatile uint32_t *)(uintptr_t)swap.address;
 +        for (uint32_t y = 0; y < rows; ++y) {
 +            const volatile uint32_t *a = shown + (size_t)y * (scanout_.stride / 4), *b = surface + (size_t)y * (swap.stride / 4);
@@ -48,23 +88,36 @@
 +                if ((a[x] | 0xff000000u) != (b[x] | 0xff000000u)) return false;
 +        }
 +        return true;
-+    }
+     }
      void note(uint32_t value) {if (transport_.mark) transport_.mark(transport_.context, value);}
      bool fail(int step, int error) {stats_->step = step; stats_->error = error; return false;}
      Transport transport_ = {};
 --- a/GpuScanoutPresenter.h
 +++ b/GpuScanoutPresenter.h
-@@ -19,6 +19,9 @@
+@@ -18,8 +18,11 @@
+ 
  // The conversion kernel's AIR and the frontend's loader for bare AIR (both in the plugin; weak, so a device without them only blits).
  extern "C" const void *nmb_scanout_convert_air(size_t *length) __attribute__((weak_import));
  extern "C" id native_bridge_metal_library_with_air(const void *bytes, size_t length) __attribute__((weak_import));
 +// Coachz: the display's frames kept as private textures (coachzDisplayFrame in the frontend).
-+extern "C" id native_bridge_coachz_display_frame(const void *base) __attribute__((weak_import));
++extern "C" id native_bridge_coachz_display_frame(const void *base, size_t stride, uint32_t height, size_t bytes, bool *turned) __attribute__((weak_import));
 +extern "C" void native_bridge_coachz_scanout_ready(uint32_t width, uint32_t height) __attribute__((weak_import));
  
  namespace gpupresent {
  
-@@ -49,8 +52,13 @@
+ // Measurement only: when set, the copy covers the upper half of the rows (the GPU cost of the copy is what is being measured).
+@@ -29,8 +32,9 @@
+     void *base;       // writable mapping of the firmware framebuffer (page aligned)
+     size_t bytes;     // whole extent, a multiple of the page size
+     size_t stride;    // bytes per row
+     uint32_t width, height;
++    size_t flipStep;  // Coachz: the second buffer's offset when the mapping holds two (0: one buffer, the firmware's)
+ };
+ 
+ struct Frame {
+     const void *base; // page-aligned mapping of the surface pages
+@@ -48,30 +52,59 @@
+     Presenter(id<MTLDevice> device, const Scanout &scanout) : device_(device), scanout_(scanout) {
          queue_ = [device newCommandQueue];
          if (!validScanout() || !queue_) return;
          target_ = [device newBufferWithBytesNoCopy:scanout.base length:scanout.bytes options:MTLResourceStorageModeShared deallocator:nil];
@@ -78,14 +131,19 @@
      // One frame: encodes the GPU copy, commits, waits for the GPU. Rows are copied as whole rows of width*4 bytes.
      Result present(const Frame &frame) {
          if (!ready()) return kBadScanout;
-@@ -61,8 +69,30 @@
+         if (frame.format == NGP_RGBA16F_LINEAR || frame.format == NGP_RGBA16F_ENCODED) return convert(frame);
+         if (frame.format != NGP_BGRX8888) return kBadFrame;
++        if (rotated_ && frame.base) {
++            bool turned = false;
++            id<MTLTexture> own = native_bridge_coachz_display_frame(frame.base, frame.stride, frame.height, frame.bytes, &turned);
++            if (own) return draw(own, turned);
++        }
++        if (rotated_ && (frame.width != scanout_.width || frame.height != scanout_.height)) return drawSurface(frame);
+         const size_t page = (size_t)getpagesize(), row = (size_t)frame.width * 4;
+         if (!frame.base || ((uintptr_t)frame.base & (page - 1)) || !frame.bytes || (frame.bytes & (page - 1)) ||
              frame.width != scanout_.width || frame.height != scanout_.height || frame.stride < row ||
              (size_t)frame.height > frame.bytes / frame.stride || frame.stride * (frame.height - 1) + row > frame.bytes) return kBadFrame;
          const uint32_t rows = gHalfRows.load(std::memory_order_relaxed) ? frame.height / 2 : frame.height;
-+        if (rotated_) {
-+            id<MTLTexture> own = native_bridge_coachz_display_frame(frame.base);
-+            if (own) return presentRotated(own);
-+        }
          id<MTLBuffer> source = sourceFor(frame);
          if (!source) return kNoResource;
 +        lastWide_ = false;
@@ -97,7 +155,7 @@
 +            const uint32_t params[4] = {frame.width / 4, rows, (uint32_t)(frame.stride / 16), (uint32_t)(scanout_.stride / 16)};
 +            [encoder setComputePipelineState:opaque4_];
 +            [encoder setBuffer:source offset:0 atIndex:0];
-+            [encoder setBuffer:target_ offset:0 atIndex:1];
++            [encoder setBuffer:target_ offset:drawOffset() atIndex:1];
 +            [encoder setBytes:params length:sizeof params atIndex:3];
 +            [encoder dispatchThreadgroups:MTLSizeMake((frame.width / 4 + 15) / 16, (rows + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
 +            [encoder endEncoding];
@@ -109,30 +167,86 @@
          if (!(frame.stride & 3) && !(scanout_.stride & 3) && pipeline(opaque_, opaqueFailed_, @"scanout_opaque")) {
              id<MTLCommandBuffer> commands = [queue_ commandBuffer];
              id<MTLComputeCommandEncoder> encoder = commands ? [commands computeCommandEncoder] : nil;
-@@ -105,6 +135,48 @@
+             if (!encoder) return kNoResource;
+             const uint32_t params[4] = {frame.width, rows, (uint32_t)(frame.stride / 4), (uint32_t)(scanout_.stride / 4)};
+             [encoder setComputePipelineState:opaque_];
+             [encoder setBuffer:source offset:0 atIndex:0];
+-            [encoder setBuffer:target_ offset:0 atIndex:1];
++            [encoder setBuffer:target_ offset:drawOffset() atIndex:1];
+             [encoder setBytes:params length:sizeof params atIndex:3];
+             [encoder dispatchThreadgroups:MTLSizeMake((frame.width + 15) / 16, (rows + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+             [encoder endEncoding];
+             [commands commit];
+@@ -82,30 +115,105 @@
+         id<MTLBlitCommandEncoder> blit = commands ? [commands blitCommandEncoder] : nil;
+         if (!blit) return kNoResource;
+         if (frame.stride == scanout_.stride) {
+             // Equal pitch: the rows are one contiguous run.
+-            [blit copyFromBuffer:source sourceOffset:0 toBuffer:target_ destinationOffset:0 size:frame.stride * (rows - 1) + row];
++            [blit copyFromBuffer:source sourceOffset:0 toBuffer:target_ destinationOffset:drawOffset() size:frame.stride * (rows - 1) + row];
+         } else {
+             // A linear texture over the surface pages reads them with the surface's pitch and writes the scanout's pitch.
+             MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:frame.width
+                                                                                        height:frame.height mipmapped:NO];
+             d.storageMode = MTLStorageModeShared;
+             d.usage = MTLTextureUsageShaderRead;
+             if (frame.stride % [device_ minimumLinearTextureAlignmentForPixelFormat:MTLPixelFormatBGRA8Unorm]) {
+                 for (uint32_t y = 0; y < rows; ++y)
+-                    [blit copyFromBuffer:source sourceOffset:y * frame.stride toBuffer:target_ destinationOffset:y * scanout_.stride size:row];
++                    [blit copyFromBuffer:source sourceOffset:y * frame.stride toBuffer:target_ destinationOffset:drawOffset() + y * scanout_.stride size:row];
+             } else {
+                 id<MTLTexture> texture = [source newTextureWithDescriptor:d offset:0 bytesPerRow:frame.stride];
+                 if (!texture) {[blit endEncoding]; return kNoResource;}
+                 [blit copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+-                           sourceSize:MTLSizeMake(frame.width, rows, 1) toBuffer:target_ destinationOffset:0
++                           sourceSize:MTLSizeMake(frame.width, rows, 1) toBuffer:target_ destinationOffset:drawOffset()
+                     destinationBytesPerRow:scanout_.stride destinationBytesPerImage:scanout_.stride * frame.height];
+             }
+         }
+         [blit endEncoding];
          [commands commit];
          [commands waitUntilCompleted];
          return commands.status == MTLCommandBufferStatusCompleted ? kOk : kGpuFailed;
 +    }
-+    // Coachz: a frame kept as a private texture, drawn turned into the scanout by one full-screen triangle.
-+    Result presentRotated(id<MTLTexture> frame) {
-+        const uint32_t last = (uint32_t)frame.width - 1;
++    // Coachz: a frame drawn into the buffer that is not on screen, by one full-screen triangle that scales it to the panel: a private
++    // texture, or (drawSurface) the surface's own pages until its private texture exists. Only a frame of the render server's rotated kind is turned.
++    Result draw(id<MTLTexture> frame, bool turned) {
 +        MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
-+        pass.colorAttachments[0].texture = scanoutTexture_;
++        pass.colorAttachments[0].texture = scanoutTexture_[drawIndex()];
 +        pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
 +        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
 +        id<MTLCommandBuffer> commands = [queue_ commandBuffer];
 +        id<MTLRenderCommandEncoder> encoder = commands ? [commands renderCommandEncoderWithDescriptor:pass] : nil;
 +        if (!encoder) return kNoResource;
-+        [encoder setRenderPipelineState:rotated_];
++        [encoder setRenderPipelineState:turned ? rotated_ : plain_];
 +        [encoder setFragmentTexture:frame atIndex:0];
-+        [encoder setFragmentBytes:&last length:sizeof last atIndex:0];
++        [encoder setFragmentSamplerState:sampler_ atIndex:0];
 +        [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 +        [encoder endEncoding];
 +        [commands commit];
 +        [commands waitUntilCompleted];
 +        return commands.status == MTLCommandBufferStatusCompleted ? kOk : kGpuFailed;
 +    }
++    Result drawSurface(const Frame &frame) {
++        const size_t page = (size_t)getpagesize(), row = (size_t)frame.width * 4;
++        if (!frame.base || ((uintptr_t)frame.base & (page - 1)) || !frame.bytes || (frame.bytes & (page - 1)) || frame.stride < row ||
++            frame.stride * (frame.height - 1) + row > frame.bytes ||
++            (frame.stride % [device_ minimumLinearTextureAlignmentForPixelFormat:MTLPixelFormatBGRA8Unorm])) return kBadFrame;
++        id<MTLBuffer> source = sourceFor(frame);
++        if (!source) return kNoResource;
++        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:frame.width
++                                                                                   height:frame.height mipmapped:NO];
++        d.storageMode = MTLStorageModeShared;
++        d.usage = MTLTextureUsageShaderRead;
++        id<MTLTexture> texture = [source newTextureWithDescriptor:d offset:0 bytesPerRow:frame.stride];
++        return texture ? draw(texture, false) : kNoResource;
++    }
++    // Coachz: two scanout buffers (GopFramebuffer's handoffMemory). The frame goes into the one not on screen; after the GPU's fence the client asks
++    // the kernel to flip (the status of NGPComplete's reserved field: buffer + 1), and that returns once the display has latched it at vsync.
++    unsigned drawIndex() const { return scanout_.flipStep ? front_ ^ 1u : 0u; }
++    size_t drawOffset() const { return drawIndex() * scanout_.flipStep; }
++    uint32_t flipRequest() const { return scanout_.flipStep ? drawIndex() + 1 : 0; }
++    void flipped() { if (scanout_.flipStep) front_ ^= 1u; }
 +    void prepareRotated() {
 +        if (!native_bridge_coachz_display_frame || !native_bridge_coachz_scanout_ready || !nmb_scanout_convert_air || !native_bridge_metal_library_with_air ||
 +            (scanout_.stride % [device_ minimumLinearTextureAlignmentForPixelFormat:MTLPixelFormatBGRA8Unorm])) return;
@@ -140,40 +254,70 @@
 +        const void *air = nmb_scanout_convert_air(&length);
 +        id<MTLLibrary> library = air && length ? native_bridge_metal_library_with_air(air, length) : nil;
 +        id<MTLFunction> vertex = [library newFunctionWithName:@"scanout_rotated_vs"], fragment = [library newFunctionWithName:@"scanout_rotated_fs"];
-+        if (!vertex || !fragment) return;
++        id<MTLFunction> straight = [library newFunctionWithName:@"scanout_plain_vs"];
++        if (!vertex || !fragment || !straight) return;
 +        MTLRenderPipelineDescriptor *described = [MTLRenderPipelineDescriptor new];
 +        described.vertexFunction = vertex;
 +        described.fragmentFunction = fragment;
 +        described.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
 +        NSError *error = nil;
 +        id<MTLRenderPipelineState> state = [device_ newRenderPipelineStateWithDescriptor:described error:&error];
++        described.vertexFunction = straight;
++        id<MTLRenderPipelineState> plain = state ? [device_ newRenderPipelineStateWithDescriptor:described error:&error] : nil;
 +        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:scanout_.width
 +                                                                                   height:scanout_.height mipmapped:NO];
 +        d.storageMode = MTLStorageModeShared;
 +        d.usage = MTLTextureUsageRenderTarget;
-+        scanoutTexture_ = state ? [target_ newTextureWithDescriptor:d offset:0 bytesPerRow:scanout_.stride] : nil;
-+        if (!scanoutTexture_) return;
++        scanoutTexture_[0] = plain ? [target_ newTextureWithDescriptor:d offset:0 bytesPerRow:scanout_.stride] : nil;
++        scanoutTexture_[1] = plain && scanout_.flipStep ? [target_ newTextureWithDescriptor:d offset:scanout_.flipStep bytesPerRow:scanout_.stride] : nil;
++        MTLSamplerDescriptor *filter = [MTLSamplerDescriptor new];
++        filter.minFilter = MTLSamplerMinMagFilterLinear;
++        filter.magFilter = MTLSamplerMinMagFilterLinear;
++        filter.sAddressMode = MTLSamplerAddressModeClampToEdge;
++        filter.tAddressMode = MTLSamplerAddressModeClampToEdge;
++        sampler_ = [device_ newSamplerStateWithDescriptor:filter];
++        if (!scanoutTexture_[0] || (scanout_.flipStep && !scanoutTexture_[1]) || !sampler_) return;
 +        rotated_ = state;
-+        native_bridge_coachz_scanout_ready(scanout_.width, scanout_.height);
++        plain_ = plain;
++        // The mode the display driver reports (coachzModeSize in NativeLegacyDisplay.cpp): iPad mini 6's frame on this 3:2 panel.
++        const bool panel = scanout_.width == 2160 && scanout_.height == 1440;
++        native_bridge_coachz_scanout_ready(panel ? 2266 : scanout_.width, panel ? 1488 : scanout_.height);
      }
      // A half-float frame: one thread per pixel, 16 x 8 threads a group (the kernel skips threads past the edges).
      Result convert(const Frame &frame) {
-@@ -187,8 +259,10 @@
+         const size_t page = (size_t)getpagesize(), row = (size_t)frame.width * 8;
+@@ -121,9 +229,9 @@
+         if (!encoder) return kNoResource;
+         const uint32_t params[4] = {frame.width, frame.height, (uint32_t)(frame.stride / 4), (uint32_t)(scanout_.stride / 4)};
+         [encoder setComputePipelineState:convert_];
+         [encoder setBuffer:source offset:0 atIndex:0];
+-        [encoder setBuffer:target_ offset:0 atIndex:1];
++        [encoder setBuffer:target_ offset:drawOffset() atIndex:1];
+         [encoder setBuffer:tables_[encoded] offset:0 atIndex:2];
+         [encoder setBytes:params length:sizeof params atIndex:3];
+         [encoder dispatchThreadgroups:MTLSizeMake((frame.width + 15) / 16, (frame.height + 7) / 8, 1)
+                 threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+@@ -186,10 +294,14 @@
+     id<MTLDevice> device_;
      Scanout scanout_;
      id<MTLCommandQueue> queue_;
      id<MTLBuffer> target_;
 -    id<MTLComputePipelineState> convert_ = nil, opaque_ = nil;
 -    bool convertFailed_ = false, opaqueFailed_ = false;
 +    id<MTLComputePipelineState> convert_ = nil, opaque_ = nil, opaque4_ = nil;
-+    id<MTLRenderPipelineState> rotated_ = nil;
-+    id<MTLTexture> scanoutTexture_ = nil;
++    id<MTLRenderPipelineState> rotated_ = nil, plain_ = nil;
++    id<MTLTexture> scanoutTexture_[2] = {nil, nil};
++    unsigned front_ = 0;
++    id<MTLSamplerState> sampler_ = nil;
 +    bool convertFailed_ = false, opaqueFailed_ = false, opaque4Failed_ = false, wide_ = true, lastWide_ = false;
      id<MTLBuffer> tables_[2] = {nil, nil};
      Source sources_[kSources] = {};
      uint64_t uses_ = 0;
+ };
 --- a/NativeMetalBridgePhase.h
 +++ b/NativeMetalBridgePhase.h
-@@ -129,9 +129,9 @@
+@@ -128,11 +128,11 @@
+                 if (frame || (st.failures && !reportedFailures)) {
                      reportedFrames = st.frames ? st.frames : reportedFrames;
                      reportedFailures = st.failures ? st.failures : reportedFailures;
                      const uint64_t served = st.frames + st.failures;
@@ -185,9 +329,11 @@
                      streamText7(gpu, line);
                  }
              }
+             snprintf(line, sizeof line, "PX %llu/%llu r%d e%x", (unsigned long long)st.frames, (unsigned long long)st.failures, st.lastResult,
 --- a/shaders/scanout_convert.ll
 +++ b/shaders/scanout_convert.ll
-@@ -106,10 +106,94 @@
+@@ -105,12 +105,108 @@
+ done:
    ret void
  }
  
@@ -234,11 +380,10 @@
 +
  attributes #0 = { mustprogress nofree norecurse nosync nounwind willreturn "frame-pointer"="all" "min-legal-vector-width"="0" "no-builtins" "no-trapping-math"="true" "stack-protector-buffer-size"="8" }
  
-+; Coachz: a frame kept as a private texture, turned into the scanout. Hand-written AIR, the form Metal's front end emits:
-+;   vertex float4 scanout_rotated_vs(uint vid [[vertex_id]])   a full-screen triangle
-+;   fragment float4 scanout_rotated_fs(float4 position [[position]], constant uint &last [[buffer(0)]], texture2d<float, access::read> frame [[texture(0)]])
-+;     frame.read(uint2(last - position.y, position.x)), opaque: Metal's rotation 3 stores the frame's texel (x, y) at (y, last - x).
-+define <{ <4 x float> }> @scanout_rotated_vs(i32 noundef %vid) {
++; Coachz: a frame kept as a private texture, turned and scaled into the scanout. Hand-written AIR, the form Metal's front end emits:
++;   vertex: a full-screen triangle with uv = ((y + 1) / 2, (x + 1) / 2), which is Metal's rotation 3 from the frame to the panel
++;   fragment float4 scanout_rotated_fs(float2 uv [[stage_in]], texture2d<float> frame [[texture(0)]], sampler s [[sampler(0)]]): frame.sample(s, uv), opaque
++define <{ <4 x float>, <2 x float> }> @scanout_rotated_vs(i32 noundef %vid) {
 +entry:
 +  %twice = shl i32 %vid, 1
 +  %bx = and i32 %twice, 2
@@ -251,31 +396,44 @@
 +  %y = fadd float %ny, -1.000000e+00
 +  %p0 = insertelement <4 x float> <float 0.000000e+00, float 0.000000e+00, float 0.000000e+00, float 1.000000e+00>, float %x, i64 0
 +  %p1 = insertelement <4 x float> %p0, float %y, i64 1
-+  %r = insertvalue <{ <4 x float> }> undef, <4 x float> %p1, 0
-+  ret <{ <4 x float> }> %r
++  %uv0 = insertelement <2 x float> poison, float %fy, i64 0
++  %uv = insertelement <2 x float> %uv0, float %fx, i64 1
++  %r0 = insertvalue <{ <4 x float>, <2 x float> }> undef, <4 x float> %p1, 0
++  %r1 = insertvalue <{ <4 x float>, <2 x float> }> %r0, <2 x float> %uv, 1
++  ret <{ <4 x float>, <2 x float> }> %r1
 +}
 +
-+define <4 x float> @scanout_rotated_fs(<4 x float> noundef %position, ptr addrspace(2) noundef readonly "air-buffer-no-alias" %last, ptr addrspace(1) %frame) {
++define <{ <4 x float>, <2 x float> }> @scanout_plain_vs(i32 noundef %vid) {
 +entry:
-+  %l = load i32, ptr addrspace(2) %last, align 4
-+  %xy = shufflevector <4 x float> %position, <4 x float> poison, <2 x i32> <i32 0, i32 1>
-+  %pixel = tail call <2 x i32> @air.convert.u.v2i32.f.v2f32(<2 x float> %xy)
-+  %px = extractelement <2 x i32> %pixel, i64 0
-+  %py = extractelement <2 x i32> %pixel, i64 1
-+  %tx = sub i32 %l, %py
-+  %c0 = insertelement <2 x i32> poison, i32 %tx, i64 0
-+  %coord = insertelement <2 x i32> %c0, i32 %px, i64 1
-+  %sampler = tail call ptr addrspace(2) @air.get_read_sampler()
-+  %read = tail call { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1) %frame, ptr addrspace(2) %sampler, <2 x i32> %coord, <2 x i32> zeroinitializer, i32 0, i32 1)
++  %twice = shl i32 %vid, 1
++  %bx = and i32 %twice, 2
++  %by = and i32 %vid, 2
++  %fx = tail call float @air.convert.f.f32.u.i32(i32 %bx)
++  %fy = tail call float @air.convert.f.f32.u.i32(i32 %by)
++  %nx = fmul float %fx, 2.000000e+00
++  %ny = fmul float %fy, 2.000000e+00
++  %x = fadd float %nx, -1.000000e+00
++  %y = fadd float %ny, -1.000000e+00
++  %p0 = insertelement <4 x float> <float 0.000000e+00, float 0.000000e+00, float 0.000000e+00, float 1.000000e+00>, float %x, i64 0
++  %p1 = insertelement <4 x float> %p0, float %y, i64 1
++  %v = fsub float 1.000000e+00, %fy
++  %uv0 = insertelement <2 x float> poison, float %fx, i64 0
++  %uv = insertelement <2 x float> %uv0, float %v, i64 1
++  %r0 = insertvalue <{ <4 x float>, <2 x float> }> undef, <4 x float> %p1, 0
++  %r1 = insertvalue <{ <4 x float>, <2 x float> }> %r0, <2 x float> %uv, 1
++  ret <{ <4 x float>, <2 x float> }> %r1
++}
++
++define <4 x float> @scanout_rotated_fs(<2 x float> noundef %uv, ptr addrspace(1) %frame, ptr addrspace(2) %smp) {
++entry:
++  %read = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %frame, ptr addrspace(2) %smp, <2 x float> %uv, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
 +  %texel = extractvalue { <4 x float>, i8 } %read, 0
 +  %opaque = insertelement <4 x float> %texel, float 1.000000e+00, i64 3
 +  ret <4 x float> %opaque
 +}
 +
 +declare float @air.convert.f.f32.u.i32(i32)
-+declare <2 x i32> @air.convert.u.v2i32.f.v2f32(<2 x float>)
-+declare ptr addrspace(2) @air.get_read_sampler()
-+declare { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x i32>, <2 x i32>, i32, i32)
++declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
 +
  !llvm.module.flags = !{!0, !1, !2, !3, !4, !5, !6, !7, !8}
 -!air.kernel = !{!9, !22}
@@ -283,7 +441,9 @@
  !air.compile_options = !{!17, !18}
  !llvm.ident = !{!19}
  !air.version = !{!20}
-@@ -141,3 +225,21 @@
+ !air.language_version = !{!21}
+@@ -140,4 +236,24 @@
+ !22 = !{ptr @scanout_opaque, !10, !23}
  !23 = !{!12, !13, !25, !24}
  !24 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"gid"}
  !25 = !{i32 2, !"air.buffer", !"air.buffer_size", i32 16, !"air.location_index", i32 3, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"uint4", !"air.arg_name", !"p"}
@@ -291,20 +451,22 @@
 +!27 = !{!28, !29, !25, !24}
 +!28 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"uint4", !"air.arg_name", !"src"}
 +!29 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"uint4", !"air.arg_name", !"dst"}
-+!air.vertex = !{!30}
++!air.vertex = !{!30, !43}
 +!air.fragment = !{!31}
-+!30 = !{ptr @scanout_rotated_vs, !32, !34}
-+!31 = !{ptr @scanout_rotated_fs, !36, !38}
-+!32 = !{!33}
++!30 = !{ptr @scanout_rotated_vs, !32, !35}
++!31 = !{ptr @scanout_rotated_fs, !37, !39}
++!32 = !{!33, !34}
 +!33 = !{!"air.position", !"air.arg_type_name", !"float4", !"air.arg_name", !"position"}
-+!34 = !{!35}
-+!35 = !{i32 0, !"air.vertex_id", !"air.arg_type_name", !"uint", !"air.arg_name", !"vid"}
-+!36 = !{!37}
-+!37 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4", !"air.arg_name", !"color"}
-+!38 = !{!39, !40, !41}
-+!39 = !{i32 0, !"air.position", !"air.center", !"air.no_perspective", !"air.arg_type_name", !"float4", !"air.arg_name", !"position"}
-+!40 = !{i32 1, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"last"}
-+!41 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"texture2d<float, read>", !"air.arg_name", !"frame"}
++!34 = !{!"air.vertex_output", !"generated(2uvDv2_f)", !"air.arg_type_name", !"float2", !"air.arg_name", !"uv"}
++!35 = !{!36}
++!36 = !{i32 0, !"air.vertex_id", !"air.arg_type_name", !"uint", !"air.arg_name", !"vid"}
++!37 = !{!38}
++!38 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4", !"air.arg_name", !"color"}
++!39 = !{!40, !41, !42}
++!40 = !{i32 0, !"air.fragment_input", !"generated(2uvDv2_f)", !"air.center", !"air.perspective", !"air.arg_type_name", !"float2", !"air.arg_name", !"uv"}
++!41 = !{i32 1, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"frame"}
++!42 = !{i32 2, !"air.sampler", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"s"}
++!43 = !{ptr @scanout_plain_vs, !32, !35}
 --- a/NativeBridgeMetalFrontend.mm
 +++ b/NativeBridgeMetalFrontend.mm
 @@ -17,8 +17,10 @@
@@ -318,7 +480,7 @@
  #include <pthread.h>
  #include <functional>
  #include <string>
-@@ -1021,8 +1023,9 @@
+@@ -1021,14 +1023,23 @@
  - (void)replacePvrtcRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes length:(size_t)length;
  @property(nonatomic) NmbTextureDescriptor descriptor;
  @property(nonatomic,strong) NBBuffer *buffer;
@@ -328,7 +490,21 @@
  @property(nonatomic,strong) id<MTLTexture> parent;
  @property(nonatomic,strong) id<MTLHeap> parentHeap;
  @property(nonatomic) NSUInteger heapOffset;
-@@ -2983,9 +2986,22 @@
+ @property(nonatomic) BOOL counted;   // its surface counted in use (countUse)
+ - (void)countUse;
++@end
++// Coachz: one display surface (coachzFrameOf below).
++@interface CoachzFrame : NSObject
++@property(nonatomic,strong) NBTexture *texture;
++@property(nonatomic) uint32_t surfaceID;
++@property(nonatomic) BOOL shown,turned;
++@end
++@implementation CoachzFrame
+ @end
+ // The render server counts the surfaces it textures in use while the textures live (countUse).
+ static const bool gCountsSurfaceUse=!strcmp(getprogname(),"backboardd");
+ // A no-copy import keeps its pages until the runtime frees it, which can be after the buffer object goes (a command buffer still using
+@@ -2983,9 +2994,22 @@
   gBlits++;encodedWork.blits++;
   NmbCommandBuffer *handle=_handle;
   return [self encoder:[NBBlitEncoder new] make:^{return nmb_blit_encoder_new(handle);} what:@"blitCommandEncoder"];
@@ -351,7 +527,7 @@
   std::vector<SingleSampleCopy> resolveCopies;
   _dumpPasses++;
   if(dumpMaybe(self)) {
-@@ -4146,10 +4162,72 @@
+@@ -4146,10 +4170,151 @@
   gNoCopyAll++;if(context)gNoCopyMade++;
   NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;buffer.wrapped=pointer;
   return (id<MTLBuffer>)buffer;
@@ -370,52 +546,131 @@
 +  return;
 + }
 +}
-+// Coachz: the display's frames. /chosen/display-rotation makes the render server draw into a framebuffer-only texture of rotation 3 over each
-+// display surface, which the runtime can only serve through an image of the frame whose texels every pass copies in and back through a
-+// staging buffer and a rotation kernel, a dozen MiB several times over. Nothing but the scanout reads those surfaces, so the frame stays a
-+// private texture, which Turnip tiles and compresses, and the presenter draws it turned into the scanout once per frame. The surface's
-+// first word names its texture, because the display driver hands the presenter another mapping of the same pages.
++// Coachz: the display's frames as private textures, which Turnip tiles and compresses (UBWC): on this GPU that is the difference between about 760
++// and 330 frames per second in Debian's glmark2 at this size. Nothing but the display reads a display surface, and the presenter draws it into the
++// scanout once a frame. Which surface is a display surface shows only when the display first offers it (windows and snapshots have the same size and
++// usage), so each candidate gets a tag, in the allocation's bytes after its pixels because the display driver hands the presenter another mapping of
++// the same pages. The next time the render server imports a surface the display has offered, its earlier frame is finished: the private texture is made
++// then, seeded from the pixels, and every later import returns a view of it, whose lifetime counts the surface in use as a surface texture's does. The
++// render server's rotated framebuffer-only kind (rotation 3) goes private at once, since its rotated image can only be copied through a staging buffer.
 +static const uint64_t kCoachzFrameMagic=0x435a465200000000ull;
 +static os_unfair_lock gCoachzFrameLock=OS_UNFAIR_LOCK_INIT;
-+static NSMutableDictionary<NSNumber *,NBTexture *> *gCoachzFrames;
++static NSMutableDictionary<NSNumber *,CoachzFrame *> *gCoachzFrames;
 +static uint32_t gCoachzFrameCount;
-+static std::atomic<uint32_t> gCoachzScanoutWidth,gCoachzScanoutHeight;
++static std::atomic<uint32_t> gCoachzPromoted,gCoachzScanoutWidth,gCoachzScanoutHeight;
 +static std::atomic<uint64_t> gCoachzFramesShown,gCoachzFramesMissed;
-+static id<MTLTexture> coachzDisplayFrame(id<MTLDevice> device,MTLTextureDescriptor *d,IOSurfaceRef surface,size_t planes,NSUInteger plane,uint64_t rotation) {
++static size_t coachzTagOffset(size_t stride,size_t height) {return (stride*height+7)&~(size_t)7;}
++static volatile uint64_t *coachzSurfaceTag(IOSurfaceRef surface) {
++ const size_t offset=coachzTagOffset(IOSurfaceGetBytesPerRow(surface),IOSurfaceGetHeight(surface));
++ uint8_t *base=(uint8_t *)IOSurfaceGetBaseAddress(surface);
++ return base && IOSurfaceGetAllocSize(surface)>=offset+sizeof(uint64_t)?(volatile uint64_t *)(base+offset):nullptr;
++}
++// Under the lock: the frame of this surface, or nil. A surface recycled at the same address carries no stale tag, since its id is compared.
++static CoachzFrame *coachzFrameOf(IOSurfaceRef surface,volatile uint64_t *word) {
++ const uint64_t held=*word;
++ if((held>>32)!=(kCoachzFrameMagic>>32))return nil;
++ CoachzFrame *frame=gCoachzFrames[@(held)];
++ return frame && frame.surfaceID==IOSurfaceGetID(surface)?frame:nil;
++}
++// Under the lock: a new frame for this surface. Frames of surfaces that no longer exist go first, and their private textures with them.
++static CoachzFrame *coachzFrameNew(IOSurfaceRef surface,volatile uint64_t *word) {
++ if(!gCoachzFrames)gCoachzFrames=[NSMutableDictionary dictionary];
++ for(NSNumber *key in gCoachzFrames.allKeys) {
++  IOSurfaceRef alive=IOSurfaceLookup(gCoachzFrames[key].surfaceID);
++  if(alive)CFRelease(alive);else [gCoachzFrames removeObjectForKey:key];
++ }
++ CoachzFrame *frame=[CoachzFrame new];
++ frame.surfaceID=IOSurfaceGetID(surface);
++ const uint64_t tag=kCoachzFrameMagic|++gCoachzFrameCount;
++ gCoachzFrames[@(tag)]=frame;
++ *word=tag;
++ sys_dcache_flush((void *)word,sizeof(uint64_t));
++ return frame;
++}
++static id<MTLTexture> coachzFrameView(CoachzFrame *frame,IOSurfaceRef surface) {
++ NBTexture *view=(NBTexture *)[(id<MTLTexture>)frame.texture newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm];
++ if(!view)return nil;
++ view.coachzDirect=YES;
++ view.surface=(IOSurfaceRef)CFRetain(surface);
++ [view countUse];
++ return (id<MTLTexture>)view;
++}
++static NBTexture *coachzFrameTexture(id<MTLDevice> device,MTLTextureDescriptor *d) {
++ MTLTextureDescriptor *own=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:d.pixelFormat width:d.width height:d.height mipmapped:NO];
++ own.storageMode=MTLStorageModePrivate;
++ own.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;
++ return (NBTexture *)[device newTextureWithDescriptor:own];
++}
++// Rotation 3: private from its first import, so nothing to seed from.
++static id<MTLTexture> coachzTurnedFrame(id<MTLDevice> device,MTLTextureDescriptor *d,IOSurfaceRef surface,size_t planes,NSUInteger plane,uint64_t rotation) {
 + if(rotation!=3 || planes || plane || d.pixelFormat!=MTLPixelFormatBGRA8Unorm || !textureFlag(d,"framebufferOnly"))return nil;
 + // The presenter opens beside the render server's first device: give it a moment, since a surface imported before it stays on the slow path.
 + for(unsigned i=0;i<200 && !gCoachzScanoutWidth.load();i++)usleep(10000);
 + const uint32_t width=gCoachzScanoutWidth.load(),height=gCoachzScanoutHeight.load();
 + if(!width || IOSurfaceGetWidth(surface)!=width || IOSurfaceGetHeight(surface)!=height || d.width!=height || d.height!=width)return nil;
-+ volatile uint64_t *word=(volatile uint64_t *)IOSurfaceGetBaseAddress(surface);
++ volatile uint64_t *word=coachzSurfaceTag(surface);
 + if(!word)return nil;
-+ NBTexture *texture=nil;
 + os_unfair_lock_lock(&gCoachzFrameLock);
-+ const uint64_t held=*word;
-+ if((held>>32)==(kCoachzFrameMagic>>32))texture=gCoachzFrames[@(held)];
++ CoachzFrame *frame=coachzFrameOf(surface,word);
++ if(!frame) {
++  NBTexture *texture=coachzFrameTexture(device,d);
++  if(texture) {
++   NmbTextureDescriptor described=texture.descriptor;
++   described.rotation=rotation;
++   described.framebuffer_only=1;
++   texture.descriptor=described;
++   frame=coachzFrameNew(surface,word);
++   frame.texture=texture;
++   frame.turned=YES;
++   gCoachzPromoted++;
++  }
++ }
 + os_unfair_lock_unlock(&gCoachzFrameLock);
-+ if(texture)return (id<MTLTexture>)texture;
-+ MTLTextureDescriptor *own=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:d.pixelFormat width:d.width height:d.height mipmapped:NO];
-+ own.storageMode=MTLStorageModePrivate;
-+ own.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;
-+ texture=(NBTexture *)[device newTextureWithDescriptor:own];
-+ if(!texture)return nil;
-+ texture.coachzDirect=YES;
-+ texture.surface=(IOSurfaceRef)CFRetain(surface);
-+ [texture countUse];
-+ NmbTextureDescriptor described=texture.descriptor;
-+ described.rotation=rotation;
-+ described.framebuffer_only=1;
-+ texture.descriptor=described;
++ return frame?coachzFrameView(frame,surface):nil;
++}
++// Rotation 0 at the mode's size. Before the surface import: a view when the private texture exists.
++static bool coachzFrameCandidate(MTLTextureDescriptor *d,IOSurfaceRef surface,size_t planes,NSUInteger plane,uint64_t rotation) {
++ const uint32_t width=gCoachzScanoutWidth.load(),height=gCoachzScanoutHeight.load();
++ return width && !rotation && !planes && !plane && d.pixelFormat==MTLPixelFormatBGRA8Unorm && (d.usage&MTLTextureUsageRenderTarget) && d.width==width && d.height==height &&
++  IOSurfaceGetWidth(surface)==width && IOSurfaceGetHeight(surface)==height;
++}
++static id<MTLTexture> coachzFrameExisting(MTLTextureDescriptor *d,IOSurfaceRef surface,size_t planes,NSUInteger plane,uint64_t rotation) {
++ if(!coachzFrameCandidate(d,surface,planes,plane,rotation))return nil;
++ volatile uint64_t *word=coachzSurfaceTag(surface);
++ if(!word)return nil;
 + os_unfair_lock_lock(&gCoachzFrameLock);
-+ if(!gCoachzFrames)gCoachzFrames=[NSMutableDictionary dictionary];
-+ const uint64_t tag=kCoachzFrameMagic|++gCoachzFrameCount;
-+ gCoachzFrames[@(tag)]=texture;
-+ if(gCoachzFrameCount>8)[gCoachzFrames removeObjectForKey:@(kCoachzFrameMagic|(gCoachzFrameCount-8))];
-+ *word=tag;
-+ sys_dcache_flush((void *)word,64);
++ CoachzFrame *frame=coachzFrameOf(surface,word);
++ NBTexture *texture=frame.texture;
 + os_unfair_lock_unlock(&gCoachzFrameLock);
-+ return (id<MTLTexture>)texture;
++ return texture?coachzFrameView(frame,surface):nil;
++}
++// After the surface import: tag a new candidate, or give a surface the display has offered its private texture with the pixels the plain texture sees.
++static id<MTLTexture> coachzFrameBind(id<MTLDevice> device,MTLTextureDescriptor *d,IOSurfaceRef surface,size_t planes,NSUInteger plane,uint64_t rotation,id<MTLTexture> plain) {
++ if(!coachzFrameCandidate(d,surface,planes,plane,rotation))return nil;
++ volatile uint64_t *word=coachzSurfaceTag(surface);
++ if(!word)return nil;
++ os_unfair_lock_lock(&gCoachzFrameLock);
++ CoachzFrame *frame=coachzFrameOf(surface,word);
++ if(!frame)coachzFrameNew(surface,word);
++ const bool shown=frame.shown;
++ os_unfair_lock_unlock(&gCoachzFrameLock);
++ if(!shown)return nil;
++ NBTexture *texture=coachzFrameTexture(device,d);
++ static id<MTLCommandQueue> queue=[device newCommandQueue];
++ id<MTLCommandBuffer> commands=texture?[queue commandBuffer]:nil;
++ id<MTLBlitCommandEncoder> blit=[commands blitCommandEncoder];
++ if(!blit)return nil;
++ [blit copyFromTexture:plain sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(d.width,d.height,1)
++  toTexture:(id<MTLTexture>)texture destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
++ [blit endEncoding];
++ [commands commit];
++ [commands waitUntilCompleted];
++ if(commands.status!=MTLCommandBufferStatusCompleted)return nil;
++ os_unfair_lock_lock(&gCoachzFrameLock);
++ frame.texture=texture;
++ gCoachzPromoted++;
++ os_unfair_lock_unlock(&gCoachzFrameLock);
++ return coachzFrameView(frame,surface);
 +}
  - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
   NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
@@ -424,7 +679,7 @@
   if(gLogTextures && textureLogTurn())
    GLOG(@"native-metal: texture-log %llu texture %llux%llu fmt %llu type %llu levels %llu usage %llx options %llx %s",
          (unsigned long long)gTexturesLogged.load(),(unsigned long long)descriptor.width,(unsigned long long)descriptor.height,
-@@ -4162,13 +4240,15 @@
+@@ -4162,13 +4327,16 @@
  }
  // The surface's pages are the texels: its mapping in this process is imported without a copy (pinned by the kernel, mapped into the GPU's
  // 4 KiB context by Turnip), so every process that imports the surface renders and samples the same memory.
@@ -435,24 +690,44 @@
   const size_t planes=surface?IOSurfaceGetPlaneCount(surface):0;
   if(!surface || !d || (planes?plane>=planes:plane!=0)){refuseSurface(1,surface,d,plane,0,0);return nil;}
   const uint64_t rotation=textureRotation(d);if(rotation<5)gSurfaceRotations[rotation]++;
-+ if(id<MTLTexture> frame=coachzDisplayFrame((id<MTLDevice>)self,d,surface,planes,plane,rotation))return frame;
++ if(id<MTLTexture> frame=coachzTurnedFrame((id<MTLDevice>)self,d,surface,planes,plane,rotation))return frame;
++ if(id<MTLTexture> frame=coachzFrameExisting(d,surface,planes,plane,rotation))return frame;
   if(planes)gSurfacePlanar++;
   void *base=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);
   if(!page || (page&(page-1)) || !base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1)){refuseSurface(2,surface,d,plane,(uintptr_t)base,0);return nil;}
   uintptr_t start=planes?(uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,plane):(uintptr_t)base;
-@@ -4568,8 +4648,20 @@
+@@ -4180,9 +4348,11 @@
+  NBBuffer *buffer=surfaceBuffer(surface,base,bytes);if(!buffer){refuseSurface(4,surface,d,plane,start-(uintptr_t)base,row);return nil;}
+  NBTexture *texture=planes>=2?textureOnSurface(buffer,d,surface,plane,start-(uintptr_t)base,row):textureOnBuffer(buffer,d,start-(uintptr_t)base,row,true);
+  if(!texture){refuseSurface(5,surface,d,plane,start-(uintptr_t)base,row);return nil;}
+  if(gLogTextures)logTexture("iosurface",d,surface,plane,base,start-(uintptr_t)base,row,texture!=nil);
+- gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);[texture countUse];return (id<MTLTexture>)texture;
++ gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);[texture countUse];
++ if(id<MTLTexture> frame=coachzFrameBind((id<MTLDevice>)self,d,surface,planes,plane,rotation,(id<MTLTexture>)texture))return frame;
++ return (id<MTLTexture>)texture;
+ }
+ - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {
+  const void *bytes=nullptr;size_t size=0;dispatch_data_t mapped=dispatch_data_create_map(data,&bytes,&size);
+  const uint64_t libraryBegan=nowUs();
+@@ -4568,8 +4738,26 @@
   return gDeviceObject;
  }
  
  // Bare AIR bitcode (no metallib wrapper), which Metal itself refuses: for the bridge's own fixtures only.
 +extern "C" void native_bridge_coachz_scanout_ready(uint32_t width,uint32_t height) {gCoachzScanoutHeight=height;gCoachzScanoutWidth=width;}
-+extern "C" id native_bridge_coachz_display_frame(const void *base) {
-+ const uint64_t tag=*(const volatile uint64_t *)base;
++extern "C" id native_bridge_coachz_display_frame(const void *base,size_t stride,uint32_t height,size_t bytes,bool *turned) {
++ const size_t offset=coachzTagOffset(stride,height);
 + id texture=nil;
-+ if((tag>>32)==(kCoachzFrameMagic>>32)) {
-+  os_unfair_lock_lock(&gCoachzFrameLock);
-+  texture=gCoachzFrames[@(tag)];
-+  os_unfair_lock_unlock(&gCoachzFrameLock);
++ if(bytes>=offset+sizeof(uint64_t)) {
++  const uint64_t tag=*(const volatile uint64_t *)((const uint8_t *)base+offset);
++  if((tag>>32)==(kCoachzFrameMagic>>32)) {
++   os_unfair_lock_lock(&gCoachzFrameLock);
++   CoachzFrame *frame=gCoachzFrames[@(tag)];
++   frame.shown=YES;
++   texture=frame.texture;
++   *turned=frame.turned;
++   os_unfair_lock_unlock(&gCoachzFrameLock);
++  }
 + }
 + (texture?gCoachzFramesShown:gCoachzFramesMissed)++;
 + return texture;
@@ -461,12 +736,12 @@
   NmbLibrary *handle=gDevice?nmb_library_new(gDevice,bytes,length,true):nullptr;if(!handle)return nil;
   NBLibrary *library=[NBLibrary new];library.handle=handle;return library;
  }
-@@ -4839,8 +4931,18 @@
+@@ -4839,8 +5027,18 @@
     (unsigned long long)r.surfaceHeight,(unsigned long long)r.rotation,r.framebufferOnly);
    row("ROT imports 0=%llu 1=%llu 2=%llu 3=%llu 4=%llu",(unsigned long long)gSurfaceRotations[0].load(),
     (unsigned long long)gSurfaceRotations[1].load(),(unsigned long long)gSurfaceRotations[2].load(),
     (unsigned long long)gSurfaceRotations[3].load(),(unsigned long long)gSurfaceRotations[4].load());
-+  row("CZ frames made %u shown %llu plain %llu | passes %llu MPix direct %llu private %llu surface %llu buffer %llu",gCoachzFrameCount,
++  row("CZ frames made %u private %u shown %llu plain %llu | passes %llu MPix direct %llu private %llu surface %llu buffer %llu",gCoachzFrameCount,gCoachzPromoted.load(),
 +   (unsigned long long)gCoachzFramesShown.load(),(unsigned long long)gCoachzFramesMissed.load(),(unsigned long long)gCoachzPasses.load(),
 +   (unsigned long long)gCoachzDirectPixels.load()/1000000,(unsigned long long)gCoachzPrivate.load()/1000000,
 +   (unsigned long long)gCoachzSurface.load()/1000000,(unsigned long long)gCoachzBuffer.load()/1000000);

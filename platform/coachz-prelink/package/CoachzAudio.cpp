@@ -97,6 +97,7 @@ uint32_t outputOn;
 uint32_t badReads, adjustments;
 
 CoachzMic::XnuBinding *microphone;
+const unsigned kMicMix = 2;   // both microphones, CoachzMicCore.hpp's source 2
 CoachzMicShared *micStatus;
 void *micOwner;
 uint32_t micTicks, micRestartWait, micRestarts;
@@ -115,10 +116,10 @@ int micSupply(void *, bool on) {
 }
 
 void micReport(const char *why) {
-	printf("COACHZ mic: %s: state %u error %u generation %u frames %llu first %llu written %llu peak %u/%u nonzero %u/%u irq %u/%u misses %u restarts %u worst tick gap %llu ms\n",
+	printf("COACHZ mic: %s: state %u error %u generation %u frames %llu first %llu written %llu peak %u/%u nonzero %u/%u irq %u/%u misses %u restarts %u cursor jumps %u worst tick gap %llu ms\n",
 	    why, micStatus->state, micStatus->error, micStatus->generation, micStatus->frames_copied, micStatus->first, micStatus->written,
 	    micStatus->peak[0], micStatus->peak[1], micStatus->nonzero[0], micStatus->nonzero[1], micStatus->irq_periods, micStatus->irq_faults,
-	    reinterpret_cast<CoachzAudioDiag *>(reinterpret_cast<uint8_t *>(control) + COACHZ_AUDIO_DIAG_OFFSET)->in_misses, micRestarts, ticksPerFrame ? micWorstGap / (ticksPerFrame * 48) : 0);
+	    reinterpret_cast<CoachzAudioDiag *>(reinterpret_cast<uint8_t *>(control) + COACHZ_AUDIO_DIAG_OFFSET)->in_misses, micRestarts, micStatus->cursor_jumps, ticksPerFrame ? micWorstGap / (ticksPerFrame * 48) : 0);
 	micWorstGap = 0;
 }
 
@@ -138,7 +139,7 @@ void micSelfTest(uint64_t now) {
 	}
 	if (micTicks == kMicTestStartTick) {
 		began = now;
-		const int started = microphone->start(0);
+		const int started = microphone->start(kMicMix);
 		printf("COACHZ mic: self test start %d, DMA at 0x%llx, ring %u frames\n", started, kMicDmaPa, COACHZ_MIC_DMA_FRAMES);
 	} else if (micTicks == kMicTestStopTick) {
 		micReport("self test");
@@ -203,7 +204,7 @@ void tick(void *, void *) {
 			if (polled && micOwner && ++micRestartWait >= kMicRestartTicks) {
 				micRestartWait = 0;
 				micRestarts++;
-				const int started = microphone->start(0);
+				const int started = microphone->start(kMicMix);
 				if (started && micRestarts <= 8) {
 					printf("COACHZ mic: restart %u refused: %d\n", micRestarts, started);
 				}
@@ -346,7 +347,7 @@ public:
 			if (micOwner == this) {
 				return kIOReturnSuccess;
 			}
-			const int started = microphone->start(0);
+			const int started = microphone->start(kMicMix);
 			printf("COACHZ mic: input on: %d, state %u\n", started, micStatus->state);
 			if (started) {
 				micReport("start refused");

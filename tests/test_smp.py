@@ -169,14 +169,14 @@ class SmpTreeTests(unittest.TestCase):
         for name in ('product', 'buttons'):
             apply_identity(root.child(name), FULL_SCREEN_IDENTITY[name])
         props = {key: value for key, _, value in root.props}
-        self.assertEqual(props['model'], b'iPad8,1\0')
-        self.assertEqual(props['target-type'], b'J317\0')
+        self.assertEqual(props['model'], b'iPad14,1\0')
+        self.assertEqual(props['target-type'], b'J310\0')
         self.assertEqual(props['compatible'], b'J120AP\0')
         buttons = {key: value for key, _, value in root.child('buttons').props}
         self.assertEqual(buttons['home-button-type'], struct.pack('<I', 2))
         self.assertEqual(buttons['button-names'], b'hold\0voldown\0volup\0')
         product = {key: value for key, _, value in root.child('product').props}
-        self.assertEqual(product['artwork-device-subtype'], struct.pack('<I', 2388))
+        self.assertEqual(product['artwork-device-subtype'], struct.pack('<I', 2266))
 
     def test_diagnostics_never_use_group_0_gic_registers(self):
         # UniXNU's armcpu_sgi_selfprobe uses them, and on this firmware the machine resets.

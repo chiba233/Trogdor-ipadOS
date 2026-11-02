@@ -10,7 +10,7 @@
  bsd/dev/coachz_wifi.c		standard
 --- a/bsd/dev/coachz_bridge.c
 +++ b/bsd/dev/coachz_bridge.c
-@@ -0,0 +1,381 @@
+@@ -0,0 +1,472 @@
 +/*
 + * The SN65DSI86 eDP bridge's output depth. Coreboot's sn65dsi86_bridge_configure writes SN_DATA_FORMAT_REG 1 (18 bpp) whatever
 + * the panel says, and XNU keeps the firmware's display, so every channel reached the panel with 6 bits: white scenes and
@@ -281,6 +281,97 @@
 +	wr(se, SE_RX_RFR, ((rx >> 16) & 0x3fu) - 1u);
 +	wr(se, SE_IRQ_EN, SE_EVENTS);
 +	return true;
++}
++
++/*
++ * Two scanout buffers, as mainline's DPU flips a plane in video mode: SSPP_SRC0_ADDR (VIG0, sspp 0x4000 from the MDP's 0x0ae01000) is double buffered and
++ * takes effect at the vsync after CTL_FLUSH (0x18) has the pipe's bit, BIT(0) for VIG0 in dpu_hw_ctl_get_bitmask_sspp; the hardware clears the bit then, and
++ * the driver's wait_for_commit_done waits for that. The active CTL is the one whose CTL_INTF_ACTIVE (0xf4) is set. The buffers lie in low memory after the
++ * other DMA pools and before the LTE mpss_mem at 0x86000000. The firmware framebuffer stays the console's: a panic or a dead presenter goes back to it.
++ */
++#define FLIP_BASE 0x82400000ull
++#define FLIP_LIMIT 0x86000000ull
++#define FLIP_SSPP_SRC0 0x5014u
++#define FLIP_CTL(n) (0x2000u + (n) * 0x200u)
++#define FLIP_CTL_FLUSH 0x18u
++#define FLIP_CTL_INTF_ACTIVE 0xf4u
++static vm_offset_t flip_mdp;
++static uint32_t flip_ctl, flip_home_pa, flip_buffers[2];
++static volatile int flip_away;
++static uint32_t flip_count, flip_timeouts, flip_max_us;
++static uint64_t flip_total_us;
++extern void IOSleep(unsigned int);
++
++bool
++coachz_scanout_prepare(uint64_t firmware, uint64_t oneBuffer, uint64_t *base)
++{
++	if (firmware >> 32 || FLIP_BASE + 2 * oneBuffer > FLIP_LIMIT) {
++		return false;
++	}
++	flip_mdp = ml_io_map(0x0ae00000u, 0x8000);
++	if (!flip_mdp) {
++		return false;
++	}
++	unsigned ctl = 3;
++	for (unsigned n = 0; n < 3; ++n) {
++		if (rd(flip_mdp, FLIP_CTL(n) + FLIP_CTL_INTF_ACTIVE)) {
++			ctl = n;
++			break;
++		}
++	}
++	const uint32_t shown = rd(flip_mdp, FLIP_SSPP_SRC0);
++	printf("COACHZ flip: ctl %u, pipe scans 0x%x (firmware 0x%llx), buffers at 0x%llx, %llu bytes each\n", ctl, shown, firmware, FLIP_BASE, oneBuffer);
++	if (ctl == 3 || shown != (uint32_t)firmware) {
++		return false;
++	}
++	flip_ctl = FLIP_CTL(ctl);
++	flip_home_pa = (uint32_t)firmware;
++	flip_buffers[0] = (uint32_t)FLIP_BASE;
++	flip_buffers[1] = (uint32_t)(FLIP_BASE + oneBuffer);
++	*base = FLIP_BASE;
++	return true;
++}
++
++void
++coachz_scanout_flip(uint32_t buffer)
++{
++	if (!flip_ctl || buffer > 1) {
++		return;
++	}
++	const uint64_t began = mach_absolute_time();
++	flip_away = 1;
++	wr(flip_mdp, FLIP_SSPP_SRC0, flip_buffers[buffer]);
++	wr(flip_mdp, flip_ctl + FLIP_CTL_FLUSH, 1u);
++	unsigned waited = 0;
++	while ((rd(flip_mdp, flip_ctl + FLIP_CTL_FLUSH) & 1u) && waited < 34) {
++		IOSleep(1);
++		++waited;
++	}
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
++	const uint32_t us = (uint32_t)(ns / 1000);
++	flip_total_us += us;
++	if (us > flip_max_us) {
++		flip_max_us = us;
++	}
++	if (waited >= 34) {
++		++flip_timeouts;
++	}
++	if (++flip_count % 600 == 1) {
++		printf("COACHZ flip: %u flips, %u timeouts, wait mean %llu max %u us\n", flip_count, flip_timeouts, flip_total_us / flip_count, flip_max_us);
++		flip_max_us = 0;
++	}
++}
++
++/* Also from the panic path: registers only, no lock and no wait. */
++void
++coachz_scanout_home(void)
++{
++	if (flip_ctl && flip_away) {
++		flip_away = 0;
++		wr(flip_mdp, FLIP_SSPP_SRC0, flip_home_pa);
++		wr(flip_mdp, flip_ctl + FLIP_CTL_FLUSH, 1u);
++	}
 +}
 +
 +/* What a later direct scanout has to change, read only: the pipe the firmware left scanning, the controller, the interface and the

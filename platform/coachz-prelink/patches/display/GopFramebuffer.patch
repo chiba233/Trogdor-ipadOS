@@ -1,14 +1,20 @@
 --- a/NativeLegacyDisplay.cpp
 +++ b/NativeLegacyDisplay.cpp
-@@ -13,6 +13,7 @@
+@@ -13,6 +13,13 @@
  #include <libkern/c++/OSData.h>
  #include <pexpert/pexpert.h>
  extern "C" __attribute__((noreturn)) void native_legacy_backend_guard(unsigned,void *,void *);
 +extern "C" void native_legacy_timing_asked(void *);
++// Coachz: iPadOS has no home screen layout for this 3:2 panel's points. The system draws iPad mini 6's frame (744x1133 points, the nearest size it
++// knows), and the GPU client scales each frame onto the panel, as an iPhone Plus does. The surfaces then hold no picture of their own.
++static void coachzModeSize(uint32_t panelWidth,uint32_t panelHeight,uint32_t *width,uint32_t *height) {
++    const bool panel=panelWidth==2160 && panelHeight==1440;
++    *width=panel?2266:panelWidth;*height=panel?1488:panelHeight;
++}
  extern "C" IOService *native_legacy_display_allocate(void);
  extern "C" bool native_legacy_gop_mapping_observed(IOService *,IOMemoryMap *,uint32_t,uint32_t);
  extern "C" void native_legacy_registration_observed(IOService *);
-@@ -32,6 +33,8 @@
+@@ -32,6 +39,8 @@
  extern "C" bool native_legacy_prepare_scanout(void);
  extern "C" void native_legacy_transfer_observed(IOReturn,const void *,uint64_t);
  extern "C" void native_legacy_copy_timing_observed(uint64_t ticks,uint64_t bytes);
@@ -17,7 +23,7 @@
  extern "C" void native_legacy_retirement_observed(IOService *);
  // GPU hand-off (boot-arg sheng-fb-gpu=1): the frame is offered to the privileged GPU client instead of being copied; the swap retires when the
  // client reports the GPU copy done (native_legacy_gpu_complete). A refused offer or a failed copy uses the CPU copy below and is counted.
-@@ -57,7 +60,9 @@
+@@ -57,7 +66,9 @@
  class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
      OSDeclareDefaultStructors(NativeLegacyDisplay)
      IOMemoryMap *bootMapping=nullptr;
@@ -28,7 +34,51 @@
      void *shadow=nullptr;uint64_t shadowBytes=0;bool shadowValid=false;
      bool primary=false;
      bool logicalPM=false;
-@@ -318,6 +323,7 @@
+@@ -253,10 +264,11 @@
+         if(!surface) {
+             // Validated blank swap (all layers disabled over black): solid-fill the actual GOP.
+             PE_Video blank={};
+-            uint32_t bw=0,bh=0;getDisplayDimensions(&bw,&bh);
++            const bool console=!PE_current_console(&blank);
++            const uint32_t bw=(uint32_t)blank.v_width,bh=(uint32_t)blank.v_height;
+             uint64_t blankLength=(uint64_t)bw*bh*4;
+-            if(PE_current_console(&blank) || blank.v_baseAddr!=bootMapping->getPhysicalAddress() ||
+-               blank.v_width!=bw || blank.v_height!=bh || blank.v_depth!=32 || blank.v_rotate ||
++            if(!console || blank.v_baseAddr!=bootMapping->getPhysicalAddress() ||
++               blank.v_depth!=32 || blank.v_rotate ||
+                !native_legacy_surface_bounds(bw,bh,blank.v_rowBytes,bootMapping->getLength(),bootMapping->getLength())) {
+                 native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
+             }
+@@ -285,10 +297,12 @@
+            native_legacy_surface_width(surface)<width || native_legacy_surface_height(surface)<height ||
+            !nativeBgra(native_legacy_surface_format(surface),native_legacy_surface_planes(surface)) ||
+            PE_current_console(&video) || video.v_baseAddr!=bootMapping->getPhysicalAddress() ||
+-           video.v_width!=width || video.v_height!=height || video.v_depth!=32 || video.v_rotate ||
+-           !native_legacy_surface_bounds(width,height,video.v_rowBytes,bootMapping->getLength(),bootMapping->getLength())) {
++           video.v_depth!=32 || video.v_rotate ||
++           !native_legacy_surface_bounds((uint32_t)video.v_width,(uint32_t)video.v_height,video.v_rowBytes,bootMapping->getLength(),bootMapping->getLength())) {
+             native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
+         }
++        {uint32_t modeWidth=0,modeHeight=0;coachzModeSize((uint32_t)video.v_width,(uint32_t)video.v_height,&modeWidth,&modeHeight);
++         if(modeWidth!=width || modeHeight!=height){native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}}
+         // The diagnostic renderer repaints the page over the scanout until it is told the system owns the display; the GPU path needs that as much
+         // as the CPU copy (int-093: accepted swaps were GPU-copied under a page that kept drawing).
+         if(!gpuBypass) {
+@@ -308,6 +322,13 @@
+             }
+             return;
+         }
++        // Coachz: a scaled mode has no CPU copy. A frame the GPU client did not take is dropped and retires, so the compositor keeps going.
++        if(width!=video.v_width || height!=video.v_height) {
++            transferred=true;
++            native_legacy_transfer_observed(kIOReturnSuccess,request,0);
++            finishTransfer(request);
++            return;
++        }
+         IOMemoryMap *source=memory->map(kIOMapAnywhere|kIOMapReadOnly);
+         if(!source || !source->getVirtualAddress() || source->getLength()<allocation) {
+             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNoMemory,request,0);return;
+@@ -318,6 +339,7 @@
              OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
          }
          // The two content scans read every pixel again; they only describe the first frames (the probe keeps 32).
@@ -36,7 +86,7 @@
          if(scanBudget) {
              --scanBudget;
              uint64_t scan[5];
-@@ -327,6 +333,8 @@
+@@ -327,6 +349,8 @@
              if(native_legacy_frame_colors(reinterpret_cast<const void *>(source->getVirtualAddress()),source->getLength(),sourceStride,width,height,colors,counts,&other))
                  native_legacy_frame_colors_observed(colors,counts,other);
          }
@@ -45,7 +95,7 @@
          if(!native_legacy_prepare_scanout()) {
              OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
          }
-@@ -495,7 +503,8 @@
+@@ -495,17 +519,19 @@
             !video.v_width || !video.v_height || video.v_depth!=32 || video.v_rotate ||
             video.v_width>16384 || video.v_height>16384 || video.v_rowBytes<video.v_width*4 ||
             video.v_rowBytes>UINT64_MAX/video.v_height)return false;
@@ -55,7 +105,21 @@
          if(!mapping)return false;
          bool valid=mapping->getVirtualAddress() && mapping->getPhysicalAddress()==video.v_baseAddr &&
                     mapping->getLength()==video.v_rowBytes*video.v_height;
-@@ -517,8 +526,13 @@
+         if(valid) {
+-            installBootDimensions((uint32_t)video.v_width,(uint32_t)video.v_height);
++            uint32_t modeWidth=0,modeHeight=0;coachzModeSize((uint32_t)video.v_width,(uint32_t)video.v_height,&modeWidth,&modeHeight);
++            installBootDimensions(modeWidth,modeHeight);
+             uint32_t width=0,height=0;getDisplayDimensions(&width,&height);
+-            valid=width==video.v_width && height==video.v_height;
++            valid=width==modeWidth && height==modeHeight;
+             if(valid) {
+                 OSSafeReleaseNULL(bootMapping);bootMapping=mapping;mapping=nullptr;primary=video.v_display==1;
+-                valid=native_legacy_gop_mapping_observed(this,bootMapping,width,height);
++                valid=native_legacy_gop_mapping_observed(this,bootMapping,(uint32_t)video.v_width,(uint32_t)video.v_height);
+             }
+         }
+         OSSafeReleaseNULL(mapping);return valid;
+@@ -517,8 +543,13 @@
      LEAF(306)
      LEAF(307)
      LEAF(338)
@@ -70,3 +134,63 @@
  };
  OSDefineMetaClassAndStructors(NativeLegacyDisplay,IOMobileFramebufferLegacy)
  IOService *native_legacy_display_allocate(void) {return new NativeLegacyDisplay;}
+--- a/NativeGOPPresenter.cpp
++++ b/NativeGOPPresenter.cpp
+@@ -17,6 +17,10 @@
+  * and [5] the longest such wait (ns), [6] total ns waited in timed-out calls. A timed wait that returns long before its deadline shows here. */
+ volatile uint64_t native_gop_wait_stats[7];
+ IOService *native_gop_presenter_create(void);
++// Coachz: the display pipe's scanout address (bsd/dev/coachz_bridge.c).
++bool coachz_scanout_prepare(uint64_t firmware,uint64_t oneBuffer,uint64_t *base);
++void coachz_scanout_flip(uint32_t buffer);
++void coachz_scanout_home(void);
+ bool native_gop_gpu_offer(IOService *,void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height);
+ void native_gop_presenter_set_source(IOService *presenter,IOService *nub);
+ // Provided by the display driver: finishes (status 0) or fails the swap that was offered.
+@@ -29,6 +33,7 @@
+     OSDeclareDefaultStructors(NativeGOPPresenter)
+     friend class NativeGOPClient;
+     IOMemoryMap *mapping=nullptr;
++    IOMemoryDescriptor *flipMemory=nullptr;   // Coachz: the pair of scanout buffers
+     IOLock *gate=nullptr;
+     IOService *owner=nullptr;
+     NGPMode mode={};
+@@ -94,6 +99,12 @@
+     {unsigned v=0;PE_parse_boot_argn("sheng-fb-gpu",&v,sizeof v);gpuMode=(v==1);}
+     mode={NGP_VERSION,NGP_BGRX8888,video.v_width,video.v_height,video.v_rowBytes,mapping->getLength()};
+     native_gop_physical=mapping->getPhysicalAddress();native_gop_virtual=mapping->getVirtualAddress();
++    if(gpuMode) {
++        // Coachz: the GPU draws into a pair of buffers and the pipe flips at vsync; the firmware framebuffer stays the kernel console's.
++        uint64_t base=0;const uint64_t oneBuffer=(mode.bytes+PAGE_MASK)&~(uint64_t)PAGE_MASK;
++        if(coachz_scanout_prepare(video.v_baseAddr,oneBuffer,&base))
++            flipMemory=IOMemoryDescriptor::withPhysicalAddress(base,2*oneBuffer,kIODirectionInOut);
++    }
+     online=true;native_gop_ready=1;if(gpuMode)gHandoff=this;registerService();return true;
+ }
+ void NativeGOPPresenter::stop(IOService *provider) {
+@@ -193,6 +204,7 @@
+     gpuClient=false;
+     auto done=swap;swap={};
+     IOLockUnlock(gate);
++    coachz_scanout_home();
+     if(!done.offered)return;
+     OSSafeReleaseNULL(done.map);if(done.memory)done.memory->release();
+     __atomic_fetch_add(&native_gop_gpu_abandoned,1,__ATOMIC_RELAXED);
+@@ -224,6 +236,8 @@
+     case NGP_METHOD_COMPLETE_SWAP: {
+         if(!in || inSize!=sizeof(NGPComplete) || outSize)return kIOReturnBadArgument;
+         NGPComplete q={};memcpy(&q,in,sizeof(q));
++        // Coachz: the frame is finished (the GPU's fence), so it goes on screen before the swap retires; this returns at the vsync that latched it.
++        if(!q.status && p->flipMemory && (q.reserved==1 || q.reserved==2))coachz_scanout_flip(q.reserved-1);
+         return p->completeSwap(q.sequence,(int)q.status);
+     }
+     default:return kIOReturnUnsupported;
+@@ -233,7 +247,7 @@
+ IOMemoryDescriptor *NativeGOPPresenter::handoffMemory() {
+     NativeGOPPresenter *p=gHandoff;
+     if(!p || !p->gpuMode || !p->online || !p->mapping)return nullptr;
+-    IOMemoryDescriptor *memory=p->mapping->getMemoryDescriptor();
++    IOMemoryDescriptor *memory=p->flipMemory?p->flipMemory:p->mapping->getMemoryDescriptor();
+     if(memory)memory->retain();
+     return memory;
+ }

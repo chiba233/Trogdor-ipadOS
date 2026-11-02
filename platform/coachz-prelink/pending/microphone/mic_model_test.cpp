@@ -82,7 +82,7 @@ int main() {
         assert(m.step(90000) == 0 && m.shared.frames_copied == 480);
         float samples[4];
         assert(coachz_mic_read(&m.shared, m.mono, 3840, 4, samples));
-        assert(samples[0] == 0.125f);
+        assert(samples[0] == 0.0f); // the high-pass starts at the stream's own level
         assert(coachz_mic_read(&m.shared, m.mono, 0, 4, samples) && samples[0] == 0);
         assert(m.shared.peak[0] == 4096 && m.shared.peak[1] == 8192);
         // Cross the non-power-of-two physical ring boundary.
@@ -108,6 +108,41 @@ int main() {
     {
         Model m; m.rejectSupply = true;
         assert(m.engine.start(0) == CoachzMicSupply && m.writes.empty());
+    }
+    {
+        // A step in the input survives the high-pass, lifted 12 dB;
+        // a constant level then decays away, which is the offset removal.
+        Model m; m.warm();
+        for (unsigned i = 0; i < COACHZ_MIC_DMA_FRAMES; ++i) {
+            m.dma[2*i] = 0x10000000; m.dma[2*i+1] = 0x10000000;
+        }
+        assert(m.step(90000) == 0);
+        for (unsigned i = 0; i < COACHZ_MIC_DMA_FRAMES; ++i) {
+            m.dma[2*i] = 0x12000000; m.dma[2*i+1] = 0x12000000;
+        }
+        assert(m.step(100000) == 0);
+        const uint64_t edge = m.shared.written - 480;
+        float samples[1];
+        assert(coachz_mic_read(&m.shared, m.mono, edge, 1, samples));
+        assert(samples[0] > 0.06f && samples[0] <= 0.0625f);
+        for (uint64_t t = 110000; t <= 250000; t += 10000) assert(m.step(t) == 0);
+        assert(coachz_mic_read(&m.shared, m.mono, m.shared.written - 1, 1, samples));
+        assert(samples[0] >= 0.0f && samples[0] < 0.01f);
+        assert(m.shared.cursor_jumps == 0);
+    }
+    {
+        // An impossible cursor read is skipped and the stream goes on; the same
+        // read standing past the deadline is still an overrun.
+        Model m; m.warm();
+        assert(m.step(90000) == 0);
+        const uint64_t written = m.shared.written;
+        const uint32_t good = m.regs[Dma + 12];
+        m.regs[Dma + 12] = Model::Pa + (good - Model::Pa + COACHZ_MIC_DMA_BYTES - 64) % COACHZ_MIC_DMA_BYTES;
+        m.us = 100000;
+        assert(m.engine.poll(100000*24, 0, 500) == 0);
+        assert(m.shared.cursor_jumps == 1 && m.shared.written == written && m.shared.state == CoachzMicRunning);
+        m.regs[Dma + 12] = good;
+        assert(m.step(110000) == 0 && m.shared.written == written + 960);
     }
     {
         Model m; m.warm();

@@ -25,7 +25,7 @@ enum : uint32_t {
 static_assert(DmaFormat == 0x0022100e, "WRDMA fields differ from RDMA");
 static_assert(COACHZ_MIC_DMA_FRAMES == 32768, "256 KiB stereo S32 ring");
 // Half the ring is 341 ms: the worker must have copied before the producer can overwrite the oldest unread sample.
-enum : uint32_t {DeadlineUs = 320000u};
+enum : uint32_t {DeadlineUs = 320000u, CursorSlackFrames = 1024u};
 static_assert(sizeof(CoachzMicShared) + COACHZ_MIC_CONTROL_OFFSET <= 2048,
     "microphone status must not overlap existing diagnostics");
 
@@ -83,7 +83,7 @@ public:
     }
 
     int start(unsigned channel) {
-        if (!initialized_ || channel > 1) return CoachzMicArgument;
+        if (!initialized_ || channel > 2) return CoachzMicArgument;
         if (quarantined_) return shared_->error;
         if (owned_) return shared_->state == CoachzMicFault ? shared_->error : CoachzMicBusy;
         // The currently working speaker uses SECONDARY/RDMA1. Never retune
@@ -127,12 +127,12 @@ public:
         update(I2s, MicEnable, MicEnable);
         ops_.irqLeave(ops_.context, irqState);
         startedUs_ = lastUs_ = ops_.nowUs(ops_.context);
-        lastIndex_ = 0; stalledUs_ = startedUs_; source_ = channel;
+        lastIndex_ = 0; stalledUs_ = startedUs_; source_ = channel; filterPrimed_ = false;
         begin();
         ++shared_->generation;
         state(CoachzMicWarming); shared_->error = CoachzMicOK;
         range(0, 0); shared_->anchor_host = 0;
-        shared_->frames_copied = 0; shared_->source_channel = channel;
+        shared_->frames_copied = 0; shared_->source_channel = channel; shared_->cursor_jumps = 0;
         shared_->peak[0] = shared_->peak[1] = 0;
         shared_->nonzero[0] = shared_->nonzero[1] = 0;
         end();
@@ -170,6 +170,15 @@ public:
         // IRQs cannot manufacture another wrap. Ask the owner to restart.
         if (now < lastUs_ || now - lastUs_ >= DeadlineUs) return fail(CoachzMicOverrun);
         const uint32_t count = (index + COACHZ_MIC_DMA_FRAMES - lastIndex_) % COACHZ_MIC_DMA_FRAMES;
+        // CURRENT reads back behind or ahead of the DMA now and then: on hardware
+        // a jump tripped the half-ring test with ticks only 11 ms apart, and each
+        // restart left a gap of zeros in the recording. The time since the last
+        // accepted read bounds how far the DMA can have moved, so a larger step
+        // is a bad read: skip it. A real overrun still ends at DeadlineUs.
+        if (count > (now - lastUs_) * 48u / 1000u + CursorSlackFrames) {
+            ++shared_->cursor_jumps;
+            return CoachzMicOK;
+        }
         if (count >= COACHZ_MIC_DMA_FRAMES / 2) return fail(CoachzMicOverrun);
         if (count) stalledUs_ = now;
         else if (now - stalledUs_ >= DeadlineUs) return fail(CoachzMicStoppedDma);
@@ -183,6 +192,7 @@ public:
             // or playback-clock adjustment is exposed in the new epoch.
             begin();
             shared_->anchor_host = anchor;
+            filterPrimed_ = false;
             const uint64_t epoch = (host - anchor) / ticksPerFrame;
             range(epoch, epoch);
             if (shared_->state != CoachzMicWarming) ++shared_->generation;
@@ -200,7 +210,7 @@ public:
             const uint32_t f = (lastIndex_ + i) % COACHZ_MIC_DMA_FRAMES;
             const int16_t left = s16(region_.words[f * 2]);
             const int16_t right = s16(region_.words[f * 2 + 1]);
-            __atomic_store_n(&mono_[out++ % capacity_], source_ ? right : left, __ATOMIC_RELAXED);
+            __atomic_store_n(&mono_[out++ % capacity_], condition(left, right), __ATOMIC_RELAXED);
             measure(0, left); measure(1, right);
         }
         ops_.barrier(ops_.context);
@@ -261,6 +271,27 @@ public:
         return CoachzMicOK;
     }
     bool initialized() const {return initialized_;}
+    // The ADAU7002 output carries a large DC offset (about +730 of 32768 on this
+    // machine), so any discontinuity in the stream is a loud click. Remove it per
+    // channel with a one-pole high-pass at about 38 Hz, then mix the two
+    // microphones (source 2) and lift the average 12 dB: they peak near -26 dBFS
+    // at speaking level with no gain anywhere else in the path.
+    int32_t highPass(unsigned channel, int32_t sample) {
+        const int64_t value = (static_cast<int64_t>(sample - filterIn_[channel]) << 15) +
+            ((filterOut_[channel] * 32604) >> 15);
+        filterIn_[channel] = sample; filterOut_[channel] = value;
+        return static_cast<int32_t>(value >> 15);
+    }
+    int16_t condition(int16_t left, int16_t right) {
+        if (!filterPrimed_) {
+            filterIn_[0] = left; filterIn_[1] = right;
+            filterOut_[0] = filterOut_[1] = 0;
+            filterPrimed_ = true;
+        }
+        const int32_t l = highPass(0, left), r = highPass(1, right);
+        const int32_t value = source_ == 2 ? (l + r) * 2 : (source_ ? r : l) * 4;
+        return static_cast<int16_t>(value > 32767 ? 32767 : value < -32768 ? -32768 : value);
+    }
     static int16_t s16(uint32_t word) {return static_cast<int16_t>(static_cast<uint16_t>(word >> 16));}
 
 private:
@@ -272,6 +303,9 @@ private:
     uint32_t savedI2s_ = 0, savedPins_[6] = {}, savedClock_[4] = {};
     uint32_t periods_ = 0, faults_ = 0;
     uint64_t startedUs_ = 0, lastUs_ = 0, stalledUs_ = 0;
+    int64_t filterOut_[2] = {};
+    int32_t filterIn_[2] = {};
+    bool filterPrimed_ = false;
     bool initialized_ = false, owned_ = false, supplyOn_ = false, quarantined_ = false;
     uint32_t read(uint64_t pa) {return ops_.read32(ops_.context, pa);}
     void write(uint64_t pa, uint32_t v) {ops_.write32(ops_.context, pa, v);}

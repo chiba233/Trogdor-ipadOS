@@ -85,7 +85,7 @@
          report[1+TOUCH_FINGERS*6]=(unsigned char)slot;
          IOBufferMemoryDescriptor *buffer=IOBufferMemoryDescriptor::withBytes(report,sizeof(report),kIODirectionNone);
          IOReturn result=buffer?self->handleReport(buffer,0,0):kIOReturnNoMemory;
-@@ -318,3 +367,157 @@
+@@ -318,3 +367,299 @@
  OSDefineMetaClassAndStructors(NativeHidInput,IOHIDDevice)
  extern "C" IOService *native_hid_input_allocate(void) {return new NativeHidInput;}
  extern "C" IOService *native_hid_touch_allocate(void) {NativeHidInput *device=new NativeHidInput;if(device)device->setTouchOnly();return device;}
@@ -243,3 +243,145 @@
 +};
 +OSDefineMetaClassAndStructors(AppleSPUHIDDeviceUserClient,IOUserClient)
 +extern "C" IOService *coachz_motion_hid_allocate(unsigned kind) {AppleSPUHIDDevice *device=new AppleSPUHIDDevice;if(device)device->setKind(kind);return device;}
++// The temperatures thermalmonitord reads. Its product configuration names 38 hardware sensors it looks up by Product among the HID services
++// with primary usage {0xff00, 5}, and it asks each with IOHIDServiceClientCopyEvent for a temperature event (type 15, field 0xf0000, degrees C
++// in 16.16). The names are Apple's and the values this machine's. Die sensors take TSENS channels by mainline's sc7180.dtsi thermal zones: ACC,
++// the CPU sensors, cpu0 and cpu3 (A55) and cpu6 and cpu8 (A76); PMGR, the rest of the die, cpuss0, cpuss1, gpuss0 and gpuss1. The sensors the
++// configuration uses for the case and the battery all read the gauge, this machine's only temperature inside the case that XNU can read.
++// IOHIDEventDriver::copyEvent serves only types 1, 3 and 10, and the service its class overrides is the one hidd talks to, so each driver above
++// one of these devices gets a copy of its vtable with slot 201 (copyEvent) answering type 15. Addresses below are of the qualified original
++// IOHIDFamily (HID_TEXT_SHA in scripts/build-sheng-hid-input.py); the running image's slide comes from an event's own vptr.
++extern "C" {
++extern volatile int32_t coachz_tsens_mc[2][16];
++extern volatile int32_t coachz_battery_centi_c;
++extern volatile uint32_t coachz_temperature_reads;
++}
++enum {COACHZ_TEMP_BATTERY=0xff,kCopyEventSlot=201,kEventDriverSlots=220,kTemperatureEventBytes=20};
++static const uintptr_t kEventVptr=0xfffffff005d07318,kEventInitWithCapacity=0xfffffff004afb2dc;
++#define TSENS(bank,sensor) (uint8_t)((bank)<<4|(sensor))
++static const struct {const char *name;uint8_t source;} kTemperatureSensors[]={
++    {"gas gauge battery",COACHZ_TEMP_BATTERY},{"Charger tbat",COACHZ_TEMP_BATTERY},{"PMU tcal",COACHZ_TEMP_BATTERY},{"PMU tjunc",COACHZ_TEMP_BATTERY},
++    {"PMU tdev1",COACHZ_TEMP_BATTERY},{"PMU tdev2",COACHZ_TEMP_BATTERY},{"PMU tdev3",COACHZ_TEMP_BATTERY},{"PMU tdev4",COACHZ_TEMP_BATTERY},
++    {"PMU tdev5",COACHZ_TEMP_BATTERY},{"PMU tdev6",COACHZ_TEMP_BATTERY},{"PMU tdev7",COACHZ_TEMP_BATTERY},{"PMU tdev8",COACHZ_TEMP_BATTERY},
++    {"PMU2 tdev1",COACHZ_TEMP_BATTERY},{"PMU2 tdev2",COACHZ_TEMP_BATTERY},
++    {"PMGR SOC Die Temp Sensor0",TSENS(0,7)},{"Avg: PMGR SOC Die Temp Sensor0",TSENS(0,7)},{"Max: PMGR SOC Die Temp Sensor0",TSENS(0,7)},
++    {"PMGR SOC Die Temp Sensor1",TSENS(0,8)},{"Avg: PMGR SOC Die Temp Sensor1",TSENS(0,8)},{"Max: PMGR SOC Die Temp Sensor1",TSENS(0,8)},
++    {"PMGR SOC Die Temp Sensor2",TSENS(0,13)},{"Avg: PMGR SOC Die Temp Sensor2",TSENS(0,13)},{"Max: PMGR SOC Die Temp Sensor2",TSENS(0,13)},
++    {"PMGR SOC Die Temp Sensor3",TSENS(0,14)},{"Avg: PMGR SOC Die Temp Sensor3",TSENS(0,14)},{"Max: PMGR SOC Die Temp Sensor3",TSENS(0,14)},
++    {"ACC Temp Sensor0",TSENS(0,1)},{"Avg: ACC Temp Sensor0",TSENS(0,1)},{"Max: ACC Temp Sensor0",TSENS(0,1)},
++    {"ACC Temp Sensor1",TSENS(0,4)},{"Avg: ACC Temp Sensor1",TSENS(0,4)},{"Max: ACC Temp Sensor1",TSENS(0,4)},
++    {"ACC Temp Sensor2",TSENS(0,9)},{"Avg: ACC Temp Sensor2",TSENS(0,9)},{"Max: ACC Temp Sensor2",TSENS(0,9)},
++    {"ACC Temp Sensor3",TSENS(0,11)},{"Avg: ACC Temp Sensor3",TSENS(0,11)},{"Max: ACC Temp Sensor3",TSENS(0,11)},
++};
++#undef TSENS
++enum {kTemperatureSensorCount=sizeof(kTemperatureSensors)/sizeof(kTemperatureSensors[0])};
++typedef OSObject *(*CopyEventFunction)(IOService *,uint32_t,OSObject *,uint32_t);
++static CopyEventFunction gOriginalCopyEvent;
++static void **gTemperatureDriverVtable;
++static struct {IOService *driver;uint8_t source;} gTemperatureDrivers[kTemperatureSensorCount];
++static volatile uint32_t gTemperatureDriverCount;
++
++// As the original IOHIDEvent::keyboardEvent builds its event: the allocation and initWithCapacity, then time stamp +48, type mask +64, options +72
++// and in the data at +16 type +4, options +8 and the payload from +16.
++static OSObject *coachzTemperatureEvent(int32_t fixed) {
++    OSObject *event=OSMetaClass::allocClassWithName("IOHIDEvent");
++    if(!event)return nullptr;
++    const uintptr_t slide=*reinterpret_cast<uintptr_t *>(event)-kEventVptr;
++    auto init=reinterpret_cast<bool (*)(OSObject *,IOByteCount)>(kEventInitWithCapacity+slide);
++    if(!init(event,kTemperatureEventBytes)) {event->release();return nullptr;}
++    auto raw=reinterpret_cast<uint8_t *>(event);
++    auto data=*reinterpret_cast<uint8_t **>(raw+16);
++    *reinterpret_cast<uint64_t *>(raw+48)=mach_absolute_time();
++    *reinterpret_cast<uint64_t *>(raw+64)=1ull<<15;
++    *reinterpret_cast<uint32_t *>(raw+72)=1;
++    *reinterpret_cast<uint32_t *>(data+4)=15;
++    *reinterpret_cast<uint32_t *>(data+8)=1;
++    *reinterpret_cast<int32_t *>(data+16)=fixed;
++    return event;
++}
++static OSObject *coachzTemperatureCopyEvent(IOService *driver,uint32_t type,OSObject *matching,uint32_t options) {
++    if(type!=15)return gOriginalCopyEvent(driver,type,matching,options);
++    const uint32_t count=gTemperatureDriverCount;
++    for(uint32_t n=0;n<count;++n) {
++        if(gTemperatureDrivers[n].driver!=driver)continue;
++        const uint8_t source=gTemperatureDrivers[n].source;
++        const int64_t milli=source==COACHZ_TEMP_BATTERY?(int64_t)coachz_battery_centi_c*10:(int64_t)coachz_tsens_mc[source>>4][source&15];
++        coachz_temperature_reads=coachz_temperature_reads+1;
++        return coachzTemperatureEvent((int32_t)(milli*65536/1000));
++    }
++    return nullptr;
++}
++static bool coachzHookTemperatureDriver(IOService *driver,uint8_t source) {
++    auto object=reinterpret_cast<void ***>(driver);
++    if(!gTemperatureDriverVtable) {
++        auto copy=static_cast<void **>(IOMalloc(kEventDriverSlots*sizeof(void *)));
++        if(!copy)return false;
++        memcpy(copy,*object,kEventDriverSlots*sizeof(void *));
++        gOriginalCopyEvent=reinterpret_cast<CopyEventFunction>(copy[kCopyEventSlot]);
++        copy[kCopyEventSlot]=reinterpret_cast<void *>(coachzTemperatureCopyEvent);
++        gTemperatureDriverVtable=copy;
++    }
++    const uint32_t n=gTemperatureDriverCount;
++    if(n>=kTemperatureSensorCount)return false;
++    gTemperatureDrivers[n].driver=driver;
++    gTemperatureDrivers[n].source=source;
++    __sync_synchronize();
++    gTemperatureDriverCount=n+1;
++    __sync_synchronize();
++    *object=gTemperatureDriverVtable;
++    return true;
++}
++
++class CoachzTemperatureDevice : public IOHIDDevice {
++    OSDeclareDefaultStructors(CoachzTemperatureDevice)
++    static IOWorkLoop *sharedLoop;
++    IOTimerEventSource *timer=nullptr;
++    unsigned index=0,tries=0;
++    static void tick(OSObject *owner,IOTimerEventSource *sender) {
++        auto self=OSDynamicCast(CoachzTemperatureDevice,owner);
++        if(!self)return;
++        IOService *interface=self->getClient();
++        IOService *driver=interface?interface->getClient():nullptr;
++        if(driver && driver->metaCast("IOHIDEventDriver")) {
++            if(!coachzHookTemperatureDriver(driver,kTemperatureSensors[self->index].source))printf("COACHZ thermal: could not take over the '%s' driver\n",kTemperatureSensors[self->index].name);
++            return;
++        }
++        if(++self->tries<240)sender->setTimeoutMS(500);
++        else printf("COACHZ thermal: no driver above '%s'\n",kTemperatureSensors[self->index].name);
++    }
++public:
++    void setIndex(unsigned value) {index=value;}
++    IOWorkLoop *getWorkLoop() const override {return sharedLoop;}
++    OSString *newTransportString() const override {return OSString::withCString("SPU");}
++    OSString *newProductString() const override {return OSString::withCString(kTemperatureSensors[index].name);}
++    IOReturn newReportDescriptor(IOMemoryDescriptor **out) const override {
++        // The primary pair {0xff00, 5}; one vendor bit, which IOHIDEventDriver keeps so that it starts, in a report never sent; the motion sensors' empty
++        // collection {0xff0c, 3} that its personality attaches by.
++        static const unsigned char descriptor[]={0x06,0x00,0xff,0x09,0x05,0xa1,0x01,
++            0x06,0x01,0xff,0x09,0x01,0x15,0x00,0x25,0x01,0x75,0x01,0x95,0x01,0x81,0x02,0x95,0x07,0x81,0x03,0xc0,
++            0x06,0x0c,0xff,0x09,0x03,0xa1,0x01,0xc0};
++        if(!out)return kIOReturnBadArgument;
++        *out=IOBufferMemoryDescriptor::withBytes(descriptor,sizeof(descriptor),kIODirectionNone);
++        return *out?kIOReturnSuccess:kIOReturnNoMemory;
++    }
++    bool start(IOService *provider) override {
++        if(!sharedLoop)sharedLoop=IOWorkLoop::workLoop();
++        if(!sharedLoop)return false;
++        if(!setProperty("HIDDefaultBehavior",true))return false;
++        setProperty("Built-In",true);
++        if(!IOHIDDevice::start(provider))return false;
++        timer=IOTimerEventSource::timerEventSource(this,tick);
++        if(!timer || sharedLoop->addEventSource(timer)!=kIOReturnSuccess) {OSSafeReleaseNULL(timer);return false;}
++        timer->setTimeoutMS(100);
++        return true;
++    }
++    void stop(IOService *provider) override {
++        if(timer){timer->cancelTimeout();sharedLoop->removeEventSource(timer);OSSafeReleaseNULL(timer);}
++        IOHIDDevice::stop(provider);
++    }
++    void free() override {IOHIDDevice::free();}
++};
++IOWorkLoop *CoachzTemperatureDevice::sharedLoop=nullptr;
++OSDefineMetaClassAndStructors(CoachzTemperatureDevice,IOHIDDevice)
++extern "C" unsigned coachz_temperature_hid_count(void) {return kTemperatureSensorCount;}
++extern "C" IOService *coachz_temperature_hid_allocate(unsigned index) {auto device=new CoachzTemperatureDevice;if(device)device->setIndex(index);return device;}
