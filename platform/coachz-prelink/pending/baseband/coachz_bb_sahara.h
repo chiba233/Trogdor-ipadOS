@@ -90,6 +90,20 @@ static inline void cbs_hello(struct cbs_out *o, uint32_t mode)
     cbs_put32(p + 20, mode);
 }
 
+/* AppleBasebandPCIInterface method 5, the BHI registers BBUEUR13Loader reads (PCITransportRegister, libPCITransport): 0 the serial number, 3 the MSM
+ * hardware id with the chip id at offset 4, 4 the PK hash. Any other hash means fused, and BBUpdater then refuses to load images without a personalized
+ * manifest (kBBUReturnUnPersonalizedImageError), so this answers the loader's default (BBULoader::create), which reads as unfused. Nothing here checks
+ * an image: this modem runs its own firmware. Other registers read as zero. `out` holds `size` bytes. */
+static const uint8_t cbs_default_pk_hash[32] = { 0xcc, 0x31, 0x53, 0xa8, 0x02, 0x93, 0x93, 0x9b, 0x90, 0xd0, 0x2d, 0x3b, 0xf8, 0xb2, 0x3e, 0x02, 0x92, 0xe4, 0x52, 0xfe, 0xf6, 0x62, 0xc7, 0x49, 0x98, 0x42, 0x1a, 0xda, 0xd4, 0x2a, 0x38, 0x0f };
+
+static inline void cbs_read_register(uint32_t reg, uint8_t *out, uint32_t size)
+{
+    __builtin_memset(out, 0, size);
+    if (reg == 0u && size >= 4u) cbs_put32(out, CBS_SERIAL);
+    else if (reg == 3u && size >= 8u) cbs_put32(out + 4, CBS_CHIP_ID);
+    else if (reg == 4u) __builtin_memcpy(out, cbs_default_pk_hash, size < sizeof cbs_default_pk_hash ? size : sizeof cbs_default_pk_hash);
+}
+
 /* What an execute answers with; unknown commands answer empty. */
 static inline uint32_t cbs_execute_length(uint32_t command)
 {

@@ -1,79 +1,97 @@
-# GPU 主帧压缩与故障记录
+# GPU 性能修订与交付
 
-实机结果：诊断和 faults 基线都生效；主帧没有用上压缩（`CZ frames made 0`，表面 row 9216、高 1488，像素占满最后一页，标记被拒绝 35 次）。其余见 [硬件记录](../hardware-tests.md)。
+本批是后续集成用源码，未构建、写盘或上机。冻结固件及其 addon、信任缓存快照保持不变。主帧 private/UBWC 路径已在实机执行，但存在方向来回变化，像素一致性未通过。一次 Submit Timeout 已被原生探针捕获。新增的选择器读回另触发了同步外部读错误，不能把此前正常的一次计数输出当作稳定性通过。
 
-## 当前实现
+## 方向变化：缓存的表示与完成写入不一致
 
-- 主帧标记的边界与 IOSurface 导入一致：按进程 VM 页大小取整，只使用已映射末页的余量。像素占满整页时拒绝标记，不借用下一页。
-- rotation 0 表面先正常导入。presenter 首次见到标记后允许下一次导入提升；提升纹理仅有 RenderTarget 和 ShaderRead，用完成的 blit 保留原像素。之后的导入返回持有 IOSurface、线性 backing 和 countUse 租约的 view。
-- 私有帧参与命令缓冲后，末尾向线性 backing 回写一次；同一私有帧去重。这保留截图、快照和其他进程读取 IOSurface 的路径，也会增加一次全帧传输。不能仅凭提升成功宣称性能改善。
-- presenter 继续使用既有缩放和双缓冲翻转。翻转锁存、缓冲轮换和等待位置没有改变。
-- Darwin KMD 在设备创建时读取 faults 基线。状态值是全局计数加当前客户端 VM 的计数；以后发生变化才失去设备。状态读取错误仍返回错误，没有吞错或重试。
-- Vulkan Error 消息同步送入内核 Note 3，避免只保存在 NSLog 或超出固定表的行中。大图像初始化也报告最终布局选择。
-- 影子传输统计按 backing 和复制原因分组，按输入与输出的计划像素字节数之和降序。已知 bytes-per-texel 的二维影像计算精确 payload；其他表示、keep 和 merge 计入 unknown，不猜带宽。这不是完成字节数或 DRAM 流量。
+同一个 IOSurface 同时有 rotation 3 的竖向纹理和 rotation 0 的横向视图。旧代码在 `coachzTurnedFrame` 建立私有纹理时设置 `turned=YES`；之后 `coachzFrameBind` 可以把同一记录的 texture 替换为横向 seed，却没有清掉 turned。presenter 继续使用旋转 shader，内容被多转一次。另一条路径还会把已有的横向私有纹理直接返回给 rotation 3 请求。这两处都是源码中的确定错误；当次每帧的来源和完成顺序没有记录，因此不把全部闪屏归因于已经独立验证的单一分支。CoreMotion 保持 landscapeLeft 的事件不足以解释该现象。
 
-## 补丁和构建
+修订：
 
-`unixnu-gpu-plugin.patch` 只应用于插件构建。`unixnu-gpu-stack.patch` 临时注册运行时复制统计及 Mesa 诊断补丁，构建结束或失败后撤回；Mesa 和运行时也恢复原先的补丁序列。`Adreno740.patch` 增加 Note 3 的即时文本接收，必须和本批 EL0 代码一起集成。
+- 同一缓存记录的已发布私有纹理固定尺寸和方向，不能在已有视图存活时改换表示。rotation 3 请求只复用相符的竖向表示；rotation 0 seed 明确置 turned 为 NO。
+- presenter 再检查 texture 尺寸是否符合 turned，异常组合不进入绘制。`CZ orient` 分开统计 straight、turned、尺寸 mismatch 和交叉方向视图 conflict；conflict 是拒绝错误复用，不要求为 0。
+- 记录 render attachment、resolve destination 和 blit destination。命令完成后按写入选择有效内容，避免“最近导入的视图”冒充最后写入的内容；过期完成通知不覆盖较新的记录。
+- rotation 3 私有表示也保留对应的正常共享纹理作为写回目标。每个命令缓冲按同一表面的最后写入决定同步方向：private 写入后回共享图像，plain 写入后经同方向 backing 更新 resident private。没有可用 backing 时使 private 无效，显示共享像素；不是继续显示旧 private。
+- 完成前的资源持有继续覆盖同步两端。记录只弱持有 backing，避免它反过来永久保活 IOSurface。
+- 只读纹理绑定不再触发回写；一个表面在同一命令缓冲内只同步一次。没有跳过实际写入，也没有删除截图及共享像素可见性。
 
-编译入口（从项目根目录运行）：
+`CZ frame writer private/plain` 和 `CZ mirror` 用于核对上述生命周期。修订尚未实机验收，残影、局部更新、截图和切换快照都仍需观察。
 
-```sh
-python3 -B tools/xnu_gpu_userland.py --build --prime-list build/coachz-gpu-userland/prime-list.txt --wallpaper-root OS_ROOT
-python3 -B tools/kernel_source.py --platform coachz-prelink --output build/xnu-source-prelink --ipsw .tools/ipsw/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw --build
+## Submit Timeout：让行没有返回错误，时钟存在倒退
+
+16 ms 的 `coachzWaitForForeground()` 返回 void，到时只结束让行。它不直接把 Timeout 返回给 Submit。不能仅凭 18.2 ms 调用耗时把故障归因于这个门槛。
+
+GPU 的 `ringNow()` 原先使用 `clock_get_system_microtime()`。当前 XNU ARM 实现有整数截断：
+
+```c
+/* rtclock 初始化 */
+rtclock_sec_divisor = divisor;
+rtclock_usec_divisor = divisor / USEC_PER_SEC;
+/* absolutetime_to_microtime */
+*secs = t64 = abstime / rtclock_sec_divisor;
+abstime -= t64 * rtclock_sec_divisor;
+*microsecs = (uint32_t)(abstime / rtclock_usec_divisor);
 ```
 
-`OS_ROOT` 是已有的解包系统目录；cargo 需位于 PATH。已有匹配本批源码的 addon 时可直接复用，只编内核。镜像同时使用本批内核、addon 和对应的信任缓存，继续使用现有打包入口及启动参数，不增加启动参数。构建完成后进入实机验收，不要求全量回归或额外 host fixture。
+实机 counter 是 19,200,000 Hz，所以微秒除数为 19；秒尾的余数最多换出 1,010,526 微秒，进入下一秒后反而变为 1,000,000。旧 ringNow 因而每秒可能倒退约 10.5 ms。实机 gate 的 max `4294957407` 以有符号差值解释为 -9,889 微秒，直接支持此处发生过下溢。
 
-## 实机验收
+修订后的 ringNow 使用 `absolutetime_to_nanoseconds(mach_absolute_time()) / 1000`。该纳秒实现按完整的每秒除数进行乘除，不使用取整后的“每微秒 tick 数”。只修 GPU 提交时钟，不修改全局 XNU 时钟实现。
 
-本组件提供两个验收项；诊断数字本身不另计组件或验收项。
+当前正常的零 wait_fence Submit 路径中，Timeout 可从 mode 1 的 `useVm → waitAll → wait` 传回；时钟倒退使无符号 elapsed 突然变大，可以制造假超时。该次现场没有内核阶段和 table mode，故仍保留“具体返回分支待下一次现场确认”的边界。
 
-1. **主帧压缩与像素一致性**：`CZ frames` 中 private 和 shown 持续增加；对应主帧大小的 `IMG` 事件为 `ubwc1`、非线性 tile，不能只看纹理创建计数。`CZ seed` 的 fail 为 0。局部更新、滚动、弹窗、截图和 App 切换快照都保持完整、无旧帧残留。翻转仍须无超时和可见撕裂。任一条件不成立，本项未通过。
-2. **渲染稳定性**：在稳定运行后重复相同界面操作和小组件负载，连续至少五分钟；backboardd 不因 DeviceLost 退出，WidgetRenderer 不出现同一 Code 4 后的空地址调用。若再次出现故障，保留最早的 `COACHZ gpu event`、同 PID 的后续事件及内核故障记录，按其原始原因继续定位；不能把“现在有日志”算本项通过。
+另修正 mode 1 的提交契约：等待旧 VM 空闲超时发生在新任务 IB/WPTR 发布之前，先释放本次临时 job 引用，再返回 Busy，让既有 Turnip 环路重试。不会对可能已经发布的任务盲目重交；ring、映射及真实故障保留原来的错误路径。
 
-性能单独比较：避开首次启动的密集初始化，在相同稳定工作负载前后各取一份 `G commit-to-complete`、帧 GPU 直方图、GPU 频率/忙碌率和翻转统计。用累计 total 与 n 的差计算该窗口的均值，用直方图差比较长帧。没有这些数据不判断是否更流畅。
+新增故障阶段行：input-wait、retire、publish、vm、ring，以及最终 Submit 的完整 wait_fence/timeout_ns。`submit retry ... vm-idle` 保留原始 Timeout，重复重试按二次幂采样。修正时钟与安全的提交前重试是两个独立改动，不把重试当作时钟修复的替代。
 
-## 需要采集的数据
+## 选择器读回 panic：先取得硬件访问条件
 
-保留整次启动的内核日志环；若出现渲染进程退出，同时保留同次启动的统一日志归档。原始日志放在被忽略的本地目录，不进仓库。
+SP selector 0 的 dword offset 为 0xae10，字节偏移为 0x2b840，与实机 FAR 一致。faulting load 来自新增 `profileSample::check`；publisher 锁和 gPmAsleep 不能证明 GX/SP 域仍可访问。这是新增读回造成的回归。
 
-- 开机初始化结束、界面负载稳定后，记录一份统计；连续约五分钟重复主屏滑动、控制中心开关、App 开关与切换，再记录一份。给出这段操作的大致起止时间，以便从累计计数中分离稳定窗口。
-- 完整保留 `CZ frames`、`CZ seed`、`CZ tag`、`CZ mirror`、`CZ pass`、`CZ copy` 和所有 `COACHZ gpu event`。IMG 事件在创建时报告，不能只截取操作末尾的日志。
-- 同时保留 `G commit-to-complete`、`H frame-gpu`、GPU 忙碌率/频率、`gpu prof`、翻转次数/超时/等待统计，以及 CP、SMMU、hang、recovery 记录。
-- 记录滚动和局部更新是否有残影、截图及 App 切换快照是否正常、撕裂有无变化、流畅度的实际变化。渲染进程若退出，提供发生时间及当时操作；统一日志需要覆盖首次错误前后。
+主线的相关保证见 [a6xx_gmu.c](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/msm/adreno/a6xx_gmu.c)：
 
-即使主帧未提升或再次 DeviceLost，这份数据也足以定位下一步；无需为凑齐诊断数字反复启动。
+- `a6xx_gmu_sysprof_setup` 先取得 active runtime PM 引用并持有 GMU 锁；profiling 使用 PERFCOUNTER OOB vote 阻止 IFPC。
+- legacy OOB 的 PERFCOUNTER request/ack/clear 位分别为 17/25/25。`a6xx_gmu_set_oob` 等待确认，而非只设置一个软件标志。
+- `a6xx_gmu_gx_is_on` 与 `a6xx_gmu_sptprac_is_on` 读取 CX/GMU 的 SPTPRAC_PWR_CLK_STATUS，检查实际电源和时钟。
 
-## 日志含义与失败表现
+修订对应这些条件：publisher 锁排除本驱动的显式 PM 转换；另外取得并持有 PERFCOUNTER OOB，收到 ack 后检查 CX 侧 0x14340 的 A6XX 状态位。GX power/clock off、SP power/clock off 或转换中都不进入 GX 访问，还要求 SP power-on 位有效。OOB 或状态检查失败只输出 power skip，不读选择器。vote 保持到显式休眠，在 slumber 前释放；没有让每次采样主动唤醒已休眠的设备。
 
-| 记录 | 含义 / 失败表现 |
-|---|---|
-| `CZ frames made / private / shown / plain` | 标记、提升与 presenter 使用；made 为 0 时先核对 tag 边界和候选尺寸，private 为 0 时核对是否重导入及 seed |
-| `CZ seed / fail / tag rounded / refused` | 完成的种子、失败次数和标记边界选择；rounded 增加说明逻辑长度原本容不下标记 |
-| `CZ tag row / alloc / map / at` | 最近一次候选表面的行距、API 长度、页取整长度和标记偏移；用于核对真实表面，而非从分辨率猜行距 |
-| `CZ mirror n / bytes` | 编码的回写数和像素 payload 字节；失败拒绝该命令缓冲并报告 `frame writeback`，不返回陈旧画面冒充成功 |
-| `CZ pass ... direct / private / surface / buffer` | 各种目标的百万像素数；不是压缩率 |
-| `COACHZ gpu event ... IMG` | Vulkan format、尺寸、usage、flags、最终 tile/UBWC 和格式列表个数；每种大图像布局仅报告一次 |
-| `COACHZ gpu event ... VK` | 原始 Vulkan Error，每条消息有递增编号及分段序号，每行不超过 90 字符；包括 submit、释放、映射失败及 faults 变化 |
-| `CZ copy b / c / n / in / out / unknown` | 按字节排序的前三组计划传输；n 为次数，in/out 为字节，unknown 为无法精确计字节的次数 |
+A6XX 状态位来自 `a6xx_gmu.xml`：0/1 为 SP 电源转换，2 为 SP power off，3 为 SP power on，4 为 SP clock off，6/7 为 GX power/clock off。不能套用 A7XX 的位定义。所有新增 MMIO 仍为对齐 32 位。
 
-backing：0 image，1 private buffer，2 mapped buffer，3 host pages，4 aliased host pages，5 IOSurface。
+setup 和 sample 都经过同一硬件条件。rateThread 的 governor 时间基准改读 CX 的 19.2 MHz GMU always-on counter；DCVS 时钟测量的 GX 读取也使用受保护快照，跨 epoch 不相减。DCVS 请求与显式 PM 转换串行。resume 失败保持 GX 软件访问阻断，不再清掉 asleep 后继续初始化。
 
-cause：0 back，1 keep，2 merge，3 first，4 beyond held，5 bounded，6 other shadow，7 two ways，8 written，9 within，10 dropped，11 unspecified。
+该 OOB/硬件条件修订尚未上机，不能宣称 panic 已修复。冻结固件中已撤下的旧 profile 代码不因本交付而恢复。后续需要观察 `gpu prof power: vote on status ...`；若握手失败，应只出现 OOB timeout/status skip，并且没有 GX 选择器读取。`selector mismatches 0` 只描述读回结果，不替代电源访问条件或实机稳定性。
 
-## 风险和后续
+## host-pages 整帧拷贝
 
-末页余量、跨映射标记及私有帧在真实 iPadOS 上仍需验证。完整回写保留 IOSurface 的共享语义，但可能抵消部分压缩收益；后续只能根据复制统计和实际消费者优化，不能直接删掉。最初的 DeviceLost 原因尚未实机确认；faults 基线修正不等于该事件已解决。
+首要形状为 2266×1488、BGRA、row 9072，占所记录 host first payload 的约 97%。9064 像素字节向 16 字节取整为 9072；9072 除以 64 余 48。Mesa `buffer_texture::plane_copy_regions` 保留 BufferLayout 的 row_pitch，计数中的 row 来自该复制布局。
 
-下一批先按统计的主要 backing/cause 和创建拒绝原因减少影子传输，再扩大离屏目标的 UBWC 覆盖。提交调度、帧节奏、缓存和硬件扫描缩放仍留在后续批次。
+A6xx `fd6_layout_image` 对 explicit linear pitch 进行硬件对齐检查：
 
-## 源码依据
+```c
+fdl_set_pitchalign(layout, layout->pitchalign + 6);
+if (explicit_layout) {
+    layout->pitch0 = explicit_layout->pitch;
+    if (align(layout->pitch0, 1 << layout->pitchalign) != layout->pitch0)
+        return false;
+}
+```
 
-- `NativeBridgeMetalFrontend.mm` 的 IOSurface 导入将 allocation 按 getpagesize 取整；`NativeGOPPresenter::waitSwap` 将表面映射到 presenter 并传递映射长度。标记使用同一末页边界，不扩大物理分配。[IOSurfaceGetAllocSize API](https://developer.apple.com/documentation/iosurface/iosurfacegetallocsize(_:)) 描述的是 buffer allocation size，不能据此认定返回值已页对齐。
-- Mesa `tu_knl_drm_msm.cc`：设备初始化读取 MSM_PARAM_FAULTS；check_status 比较前后值。Darwin 的基线及变化判定沿用此语义。
-- `NativeAdrenoUserClient::status` 返回全局与客户端 VM 计数之和；`NativeAdrenoPublish.cpp` 只在无法恢复 GPU 时增加全局故障。
-- `NativeBridgeMetalFrontend.mm` 的 command buffer error 将 runtime code 11 在 iOS 映射为 AccessRevoked。Code 4 本身不能区分提交、内存和硬件故障。
-- Mesa `vk_device.c::_vk_device_set_lost` 经 `__vk_errorv` 报告原始消息；metal2vulkan 的 device/create debug-utils sink 将其送到 `observe_message`。本批桥接该现有消息，不改变失去设备的处理。
-- Mesa `tu_image.cc::tu_image_init` 及 `image_plan.rs` 决定 STORAGE、MUTABLE_FORMAT 和格式列表对 UBWC 的影响。`IMG` 读取布局建立后的结果，不按 Metal storageMode 推断。
-- metal2vulkan `EncoderCore::count_shadow_copies`、`ShadowCopy::texels_in/texels_back` 和 `ShadowTarget::Image::texel` 是计划 payload 统计的来源。
+不能通过放宽检查让 9072 直接绑定。对外的 `minimumLinearTextureAlignmentForPixelFormat:` 和 `requiredLinearTextureBytesPerRowForDescriptor:` 现在都至少按 64 字节计算，保留 runtime 原本更大的要求。新分配的同尺寸 BGRA 有机会得到 9088 行距，从源头避免创建不能直接别名的内存；已经分配的旧行距仍走原来的合法复制路径。是否调用这些查询并采用答案由框架决定，不能保证该形状下一轮消失。
+
+配合前述“只同步最后写入，不为只读绑定回写”，这是本批实际减少复制的两处代码改动。既有 host explicit layout/placement 尝试和 `CZ copy/shape`、`L host` 统计继续保留。新行距也不保证消除 placement 拒绝，需看 import 剩余长度和实际 requirements。
+
+## 编译与验收
+
+整批需要重新编译 addon、生成相应信任缓存并编译内核。只取 GPU 时钟、Submit 和电源保护修订时只需编内核；方向缓存和行距能力报告都在 addon，不能靠只编内核获得。
+
+使用原来的 addon/内核构建入口和完整启动参数，不新增参数。补丁以四行上下文生成；上游 checkout 未修改。没有构建、测试套件、写盘或自动上机，也没有提交。
+
+后续采集一轮正常操作即可，不为凑计数反复启动：
+
+- 首先确认无 rateThread abort、无方向来回变化。保留整次内核日志及统一日志，含 power vote/config/skip、CZ orient、frame writer、made/private/shown/plain。
+- 若 Submit 仍失败，保留同 PID 最早的 `submit failure/return/retry`、KMD、VK、CB lost，以及 table mode/时钟相关记录。Busy 重试不应被转成 DeviceLost；其他原始错误不要丢弃。
+- 初始化后操作约五分钟并记大致起止时间，采集前后 `CZ copy/shape`、`L inp/host`、`CZ mirror`、G/H/J、频率及翻转统计，用累计差比较。
+- 检查 9072 的整帧流量是否减少、新行距及 inplace/pitched 是否变化，并反馈局部更新、残影、截图、切换快照及撕裂。约三分钟且含初始化的累计数据不与较长启动直接比较。
+- 正常熄屏/亮屏时若实际发生 slumber/resume，检查 vote 的释放/重新取得及新 epoch。没有发生休眠无需重复操作。
+
+原始日志和环境详情不进公开产物。

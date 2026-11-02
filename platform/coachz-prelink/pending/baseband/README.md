@@ -5,7 +5,7 @@
 ## 文件
 
 - `coachz_bb_qmux.h`：qmux1/qmux2 上的 QMUX 与 modem 的 QRTR 互转。普通服务只去掉或加回 6 字节 QMUX 头；CTL 在这里应答（GetClientId 按通道和服务分配客户端号，每个客户端占一个本地 QRTR 端口，从 0x4100 起；ReleaseClientId 和 Sync 释放，释放的端口要发 DEL_CLIENT）。苹果私有服务（0xe1 到 0xea）的请求交回调用者，暂时一律回 `QMI_ERR_NOT_SUPPORTED`。
-- `coachz_bb_sahara.h`：sahara 通道上扮演 modem 的设备端。发 HELLO，按 ELF 头、程序头、各段请求列出的镜像，收到的数据丢弃，最后一个镜像的 DONE 应答报完成。
+- `coachz_bb_sahara.h`：sahara 通道上扮演 modem 的设备端。发 HELLO，按 ELF 头、程序头、各段请求列出的镜像，收到的数据丢弃，最后一个镜像的 DONE 应答报完成。 主机回模式 3 时走命令模式（芯片 ID、序列号，再切回模式 0）。`boot` 通道的方法 5 读 BHI 寄存器（0 序列号、3 MSM ID、4 PK hash），方法 4 `sendImage` 收下即丢。序列号是固定值，不用真实序列号。
 - `coachz_bb_control.h`：`AppleBaseband` UserClient 的方法表。供电、复位、复用等只记录，不动 modem；管理器状态和基带状态原样存取；SPMI、GNSS、时间同步回 unsupported。
 - `coachz_bb_channels.h`：通道名表、匹配用的类名和属性键、两个通道 UserClient 的方法号和参数个数。
 - `coachz_baseband.cpp`：内核 IOKit。发布 `AppleBaseband`、`AppleBasebandPCIControl` 和多个 `AppleBasebandPCIInterface`（属性 `ABPInterfaceProtocol` 为 sahara、qmux1、qmux2，以及目前没有后端的 diag、refs、at、trace、boot：能打开、写入只计数、读不到数据，第一次打开时记一行日志），UserClient 用苹果的类名（`AppleBasebandUserClient`、`AppleBasebandPCIControlUserClient`、`AppleBasebandPCIUserClient`），沙盒按类名放行。 `AppleIPAppender`（`AppleIPAppenderUserClient`）和 `AppleBasebandPCIMAVPDPManager` 是数据面服务：ABM 的 `data::TransportService` 不检查空指针就用 `ApplePDPHelperInterface`，少了它们 CommCenter 就崩溃。`pdp_ip` 接上之前所有方法回成功和全 0。读写分同步和异步两种，异步按 libIOABP 的约定完成：引用数组第 1 项是回调，第 2 项是 refcon，完成时带一个参数，为字节数。ABM 复位或给 modem 上电时，sahara 重新发 HELLO。调用方线程只排队；QRTR 收发都在 Wi-Fi 线程上。

@@ -349,6 +349,7 @@ public:
   }
   IOReturn write(IOExternalMethodArguments *args);
   IOReturn read(IOExternalMethodArguments *args);
+  IOReturn readRegister(IOExternalMethodArguments *args);
   IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *, OSObject *, void *) override;
 };
 OSDefineMetaClassAndStructors(AppleBasebandPCIUserClient, IOUserClient)
@@ -451,6 +452,37 @@ IOReturn AppleBasebandPCIUserClient::read(IOExternalMethodArguments *args)
   return result;
 }
 
+// IOABPClass::readRegister: one scalar, the register, and a structure output of the size asked for.
+IOReturn AppleBasebandPCIUserClient::readRegister(IOExternalMethodArguments *args)
+{
+  if (args->scalarInputCount < 1) return kIOReturnBadArgument;
+  const uint32_t reg = (uint32_t)args->scalarInput[0];
+  static uint32_t seen;
+  if (reg < 32 && !(__atomic_fetch_or(&seen, 1u << reg, __ATOMIC_RELAXED) & (1u << reg)))
+    printf("COACHZ baseband: %s register %u read, %u bytes\n", cbh_published[fChannel], reg,
+           args->structureOutputDescriptor ? (uint32_t)args->structureOutputDescriptor->getLength() : args->structureOutputSize);
+  if (args->structureOutput && args->structureOutputSize) {
+    cbs_read_register(reg, static_cast<uint8_t *>(args->structureOutput), args->structureOutputSize);
+    return kIOReturnSuccess;
+  }
+  if (IOMemoryDescriptor *memory = args->structureOutputDescriptor) {
+    const uint32_t size = (uint32_t)memory->getLength();
+    if (!size || size > BB_FRAME_MAX) return kIOReturnBadArgument;
+    uint8_t *data = static_cast<uint8_t *>(IOMallocData(size));
+    if (!data) return kIOReturnNoMemory;
+    cbs_read_register(reg, data, size);
+    IOReturn result = memory->prepare();
+    if (result == kIOReturnSuccess) {
+      memory->writeBytes(0, data, size);
+      memory->complete();
+      args->structureOutputDescriptorSize = size;
+    }
+    IOFreeData(data, size);
+    return result;
+  }
+  return kIOReturnBadArgument;
+}
+
 // Selectors and shapes: coachz_bb_channels.h (libIOABP's IOConnectCall* sites).
 IOReturn AppleBasebandPCIUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *,
                                                     OSObject *, void *)
@@ -477,8 +509,11 @@ IOReturn AppleBasebandPCIUserClient::externalMethod(uint32_t selector, IOExterna
   case 3:
     return read(args);
   case 4:     // sendImage (BHI): the modem is already running; the image is accepted and dropped
+    printf("COACHZ baseband: %s sendImage %llu bytes dropped\n", cbh_published[fChannel], args->scalarInputCount > 1 ? args->scalarInput[1] : 0ull);
     if (bb_async(args)) bb_reply(args, kIOReturnSuccess, 2, args->scalarInputCount > 1 ? args->scalarInput[1] : 0, 0);
     return kIOReturnSuccess;
+  case 5:
+    return readRegister(args);
   case 6:     // abort channel: pending reads end
     bb_abort_reads(fChannel, this, kIOReturnAborted);
     if (bb_async(args)) bb_reply(args, kIOReturnSuccess, 0);
@@ -491,7 +526,7 @@ IOReturn AppleBasebandPCIUserClient::externalMethod(uint32_t selector, IOExterna
     return kIOReturnSuccess;
   case 11:    // register time event: none is ever sent
     return kIOReturnSuccess;
-  default:    // 5 readRegister, 8 time sync: no MHI registers or time base behind this channel
+  default:    // 8 time sync: no time base behind this channel
     printf("COACHZ baseband: channel %s selector %u unsupported\n", cbh_published[fChannel], selector);
     return kIOReturnUnsupported;
   }

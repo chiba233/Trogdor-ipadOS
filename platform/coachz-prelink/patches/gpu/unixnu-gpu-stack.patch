@@ -2,10 +2,178 @@ diff --git a/drivers/AdrenoMetal/bridge/patches/0026-coachz-copy-profile.patch b
 new file mode 100644
 --- /dev/null
 +++ b/drivers/AdrenoMetal/bridge/patches/0026-coachz-copy-profile.patch
-@@ -0,0 +1,70 @@
+@@ -0,0 +1,310 @@
++--- a/crates/metal2vulkan-runtime/src/device/adopt.rs
+++++ b/crates/metal2vulkan-runtime/src/device/adopt.rs
++@@ -272,8 +272,9 @@
++                 .iter()
++                 .any(|name| name.as_c_str() == ash::ext::pipeline_creation_feedback::NAME),
++             dma_buf,
++             dma_buf_images,
+++            host_pitched_images: listed.contains(ash::ext::image_drm_format_modifier::NAME),
++             calibration: gpu_time::Extension::among(&raw.device_extensions.into_iter().collect()),
++             gpu_times_from_host: raw.gpu_times_from_host,
++             // An adopted device keeps no execution record: validation makes its own devices.
++             record_executions: false,
++--- a/crates/metal2vulkan-runtime/src/device/create.rs
+++++ b/crates/metal2vulkan-runtime/src/device/create.rs
++@@ -1288,16 +1288,25 @@
++         .any(|name| name.as_c_str() == feedback_name);
++     // The runtime's own needs, outside the vocabulary, where listed (`dma_buf.rs`).
++     let dma_buf = dma_buf_names(&listed);
++     let dma_buf_images = dma_buf_image_names(&listed);
+++    // HOST_ALLOCATION_EXT images need the modifier extension, not Linux dma-buf FDs
+++    // or FOREIGN queue ownership. Keep the two capabilities independent.
+++    let modifier_name = ash::ext::image_drm_format_modifier::NAME;
+++    let host_pitched_images = set.extensions.contains(&VkExtension::ExtExternalMemoryHost)
+++        && listed.contains(modifier_name);
+++    let modifier_asked = options.device_extensions.iter()
+++        .any(|name| name.as_c_str() == modifier_name);
++     let extra: Vec<CString> = options
++         .device_extensions
++         .iter()
++         .cloned()
++         .chain(calibration.map(|extension| extension.name().to_owned()))
++         .chain((creation_feedback && !feedback_asked).then(|| feedback_name.to_owned()))
++         .chain(dma_buf.into_iter().flatten().map(CStr::to_owned))
++         .chain(dma_buf_images.into_iter().flatten().map(CStr::to_owned))
+++        .chain((host_pitched_images && dma_buf_images.is_none() && !modifier_asked)
+++            .then(|| modifier_name.to_owned()))
++         .collect();
++     let mut enables = Enables::of(&set, api, &listed, &extra)?;
++     // The features of the caller's extensions whose structures the runtime knows, as the device
++     // has them: one it lacks refuses the device.
++@@ -1483,8 +1492,9 @@
++         ycbcr_444,
++         creation_feedback: creation_feedback || feedback_asked,
++         dma_buf: dma_buf.is_some(),
++         dma_buf_images: dma_buf_images.is_some(),
+++        host_pitched_images,
++         sparse_features,
++         memory_reads,
++         owned: true,
++         cache: cache.clone(),
++--- a/crates/metal2vulkan-runtime/src/device/mod.rs
+++++ b/crates/metal2vulkan-runtime/src/device/mod.rs
++@@ -1212,8 +1212,10 @@
++     /// `enabled`'s vocabulary (`dma_buf.rs`).
++     pub(super) dma_buf: bool,
++     /// It enables the route's image extensions (`create.rs`'s `dma_buf_image_names`), likewise.
++     pub(super) dma_buf_images: bool,
+++    /// Explicit linear pitches for HOST_ALLOCATION_EXT; independent of dma-buf FDs.
+++    pub(super) host_pitched_images: bool,
++     /// The sparse members of the core features it enables, outside `enabled`'s vocabulary
++     /// (`sparse/device.rs`).
++     pub(super) sparse_features: vk::PhysicalDeviceFeatures,
++     /// The reads its global memory barriers name (`image_barrier::MemoryReads`): those of the
++@@ -1262,8 +1264,9 @@
++             ycbcr_444,
++             creation_feedback,
++             dma_buf,
++             dma_buf_images,
+++            host_pitched_images,
++             sparse_features,
++             memory_reads,
++             owned,
++             cache,
++@@ -1631,8 +1634,9 @@
++                 super::buffer::usage(device_address),
++                 &loader_word,
++                 dma_buf,
++                 dma_buf_images,
+++                host_pitched_images,
++             )
++         };
++         // The host image copy functions, where the device enabled `hostImageCopy` and copies to
++         // and from `GENERAL` on the host: by their core names from Vulkan 1.4, else by the
++--- a/crates/metal2vulkan-runtime/src/encoder.rs
+++++ b/crates/metal2vulkan-runtime/src/encoder.rs
++@@ -1498,8 +1498,9 @@
++         let texels_back = copies.iter().map(ShadowCopy::texels_back).sum();
++         let counts = &self.device().shared().counts;
++         counts.shadow_copies_planned(copies.len(), texels_in, texels_back);
++         for copy in copies {
+++            if crate::stage_trace::diagnostics() { crate::shadow::coachz_count_copy(copy); }
++             counts.shadow_copy_in_planned(copy);
++         }
++         let bounded = (copies.iter())
++             .filter(|copy| copy.cause == Some(CopyCause::Bounded))
++--- a/crates/metal2vulkan-runtime/src/host_memory.rs
+++++ b/crates/metal2vulkan-runtime/src/host_memory.rs
++@@ -775,8 +775,10 @@
++     dma_buf: Option<ash::khr::external_memory_fd::DeviceFn>,
++     /// Whether the device also enables the route's image extensions (`create.rs`'s
++     /// `dma_buf_image_names`), for images of textures over dma-buf pages (`dma_buf.rs`).
++     dma_buf_images: bool,
+++    /// Explicit linear image pitches over host pointers, without Linux FD ownership.
+++    host_pitched_images: bool,
++     /// The granule a dma-buf source's chunks split at, where the device assembles a buffer of
++     /// several (`dma_buf.rs`): the alignment of a sparse buffer made for dma-bufs. Asked once,
++     /// the first time a pointer is refused and a source called; `None` where the device makes no
++     /// such buffer.
++@@ -791,9 +793,10 @@
++     /// # Safety
++     ///
++     /// `device` is a live device of `physical`, made from `instance` with `enabled` enabled, and
++     /// `loader_word` is its loader word; made with the dma-buf route's extensions where `dma_buf`,
++-    /// and its image extensions where `dma_buf_images` (`create.rs`).
+++    /// and its image extensions where `dma_buf_images` (`create.rs`); the modifier extension
+++    /// is enabled where `host_pitched_images`.
++     pub(super) unsafe fn new(
++         instance: &ash::Instance,
++         physical: vk::PhysicalDevice,
++         device: &ash::Device,
++@@ -801,8 +804,9 @@
++         usage: vk::BufferUsageFlags,
++         loader_word: &LoaderWord,
++         dma_buf: bool,
++         dma_buf_images: bool,
+++        host_pitched_images: bool,
++     ) -> Result<Importer, Unsupported> {
++         if !enabled
++             .extensions
++             .contains(&VkExtension::ExtExternalMemoryHost)
++@@ -850,8 +854,9 @@
++             page,
++             alignment,
++             dma_buf,
++             dma_buf_images,
+++            host_pitched_images,
++             sparse_granule: std::sync::OnceLock::new(),
++         })
++     }
++
++@@ -865,8 +870,13 @@
++     /// dma-bufs and enables `VK_EXT_image_drm_format_modifier` and `VK_EXT_queue_family_foreign`
++     /// (`create.rs`'s `dma_buf_image_names`).
++     pub(super) fn makes_dma_buf_images(&self) -> bool {
++         self.dma_buf_images
+++    }
+++
+++    /// Whether HOST_ALLOCATION_EXT images can request DRM_FORMAT_MOD_LINEAR pitches.
+++    pub(super) fn makes_host_pitched_images(&self) -> bool {
+++        self.host_pitched_images
++     }
++
++     /// The memory types the dma-buf `fd` can be imported into (`vkGetMemoryFdPropertiesKHR`);
++     /// `ERROR_FEATURE_NOT_PRESENT` where the device imports no dma-bufs.
++--- a/crates/metal2vulkan-runtime/src/lib.rs
+++++ b/crates/metal2vulkan-runtime/src/lib.rs
++@@ -355,4 +355,10 @@
++ pub use visibility::{VisibilityProblem, VisibilityResultMode};
++ pub use work_counts::{CopySite, MemoryFrees, WorkCounts};
++ pub use wrapped_buffer::{VkBufferMemory, WrappedBufferProblem};
++ pub use ycbcr::{IoSurfaceYCbCr, SurfaceYCbCrMatrix};
+++
+++/// Coachz planned shadow-copy payload, grouped by backing and cause.
+++pub fn coachz_copy_profile() -> Vec<[u64; 8]> { shadow::coachz_copy_profile() }
+++
+++/// Coachz payload by backing, cause and copy region layout, descending by bytes.
+++pub fn coachz_copy_shapes() -> Vec<[u64; 10]> { shadow::coachz_copy_shapes() }
 +--- a/crates/metal2vulkan-runtime/src/shadow.rs
 ++++ b/crates/metal2vulkan-runtime/src/shadow.rs
-+@@ -3083,3 +3083,48 @@
++@@ -3082,4 +3082,87 @@
++         }
 +         copies
 +     }
 + }
@@ -13,6 +181,8 @@ new file mode 100644
 ++// Coachz: planned payload bytes, not measured DRAM traffic or completed work.
 ++// Unknown representations are counted rather than converted with an assumed bytes-per-pixel.
 ++static COACHZ_COPIES: std::sync::Mutex<Vec<[u64; 8]>> = std::sync::Mutex::new(Vec::new());
+++// The overflow row uses backing 255; it preserves payload totals after the shape table fills.
+++static COACHZ_SHAPES: std::sync::Mutex<Vec<[u64; 10]>> = std::sync::Mutex::new(Vec::new());
 ++pub(super) fn coachz_count_copy(copy: &ShadowCopy) {
 ++    let backing = match copy.copies.backing {
 ++        Backing::Image => 0, Backing::PrivateBuffer => 1, Backing::MappedBuffer => 2,
@@ -35,6 +205,34 @@ new file mode 100644
 ++        },
 ++        _ => (None, None, 0, 0),
 ++    };
+++    if let Some(ShadowTarget::Image { texel: Some(bpp), regions, .. }) = copy.copies.target() {
+++        if matches!(copy.step, Step::Into | Step::Back) {
+++            if let Some(first) = regions.first() {
+++                let w = first.image_extent.width as u64;
+++                let h = first.image_extent.height as u64;
+++                let pitch = u64::from(if first.buffer_row_length == 0 {
+++                    first.image_extent.width
+++                } else { first.buffer_row_length }).saturating_mul(*bpp);
+++                if let Ok(mut shapes) = COACHZ_SHAPES.lock() {
+++                    if shapes.is_empty() { shapes.push([255, 0, 0, 0, 0, 0, 0, 0, 0, 0]); }
+++                    let key = [backing, cause, w, h, pitch, first.buffer_offset];
+++                    let i = match shapes.iter().position(|r| r[..6] == key) {
+++                        Some(i) => i,
+++                        None if shapes.len() < 129 => {
+++                            let mut r = [0; 10]; r[..6].copy_from_slice(&key);
+++                            shapes.push(r); shapes.len() - 1
+++                        },
+++                        None => 0,
+++                    };
+++                    let r = &mut shapes[i];
+++                    r[6] = r[6].saturating_add(1);
+++                    r[7] = r[7].saturating_add(copy.texels_in().saturating_mul(*bpp));
+++                    r[8] = r[8].saturating_add(copy.texels_back().saturating_mul(*bpp));
+++                    r[9] = r[9].saturating_add(regions.len() as u64);
+++                }
+++            }
+++        }
+++    }
 ++    let Ok(mut rows) = COACHZ_COPIES.lock() else { return; };
 ++    let index = match rows.iter().position(|r| r[0] == backing && r[1] == cause) {
 ++        Some(i) => i,
@@ -54,65 +252,76 @@ new file mode 100644
 ++    let Ok(rows) = COACHZ_COPIES.lock() else { return Vec::new(); };
 ++    let mut rows = rows.clone();rows.sort_by_key(|r| std::cmp::Reverse(r[3].saturating_add(r[4])));rows
 ++}
-+--- a/crates/metal2vulkan-runtime/src/encoder.rs
-++++ b/crates/metal2vulkan-runtime/src/encoder.rs
-+@@ -1499,6 +1499,7 @@
-+         let counts = &self.device().shared().counts;
-+         counts.shadow_copies_planned(copies.len(), texels_in, texels_back);
-+         for copy in copies {
-++            if crate::stage_trace::diagnostics() { crate::shadow::coachz_count_copy(copy); }
-+             counts.shadow_copy_in_planned(copy);
-+         }
-+         let bounded = (copies.iter())
-+--- a/crates/metal2vulkan-runtime/src/lib.rs
-++++ b/crates/metal2vulkan-runtime/src/lib.rs
-+@@ -356,3 +356,6 @@
-+ pub use work_counts::{CopySite, MemoryFrees, WorkCounts};
-+ pub use wrapped_buffer::{VkBufferMemory, WrappedBufferProblem};
-+ pub use ycbcr::{IoSurfaceYCbCr, SurfaceYCbCrMatrix};
 ++
-++/// Coachz planned shadow-copy payload, grouped by backing and cause.
-++pub fn coachz_copy_profile() -> Vec<[u64; 8]> { shadow::coachz_copy_profile() }
+++pub(super) fn coachz_copy_shapes() -> Vec<[u64; 10]> {
+++    let Ok(rows) = COACHZ_SHAPES.lock() else { return Vec::new(); };
+++    let mut rows = rows.clone();
+++    rows.retain(|r| r[6] != 0);
+++    rows.sort_by_key(|r| std::cmp::Reverse(r[7].saturating_add(r[8])));
+++    rows
+++}
++--- a/crates/metal2vulkan-runtime/src/texture/in_place_image.rs
+++++ b/crates/metal2vulkan-runtime/src/texture/in_place_image.rs
++@@ -133,19 +133,34 @@
++         let layout = texels.layout;
++         let (memory, buffer_offset, type_index) = texels.buffer.memory();
++         let at = buffer_offset + layout.offset;
++         let room = texels.buffer.memory_room().saturating_sub(layout.offset);
++-        let (made, pitched) = match self.in_place_unbound(plan, &layout, facts)? {
+++        let (mut made, mut pitched) = match self.in_place_unbound(plan, &layout, facts)? {
++             Ok(made) => made,
++             Err(refused) => return Ok(Err(refused)),
++         };
++-        let raw = made.raw;
++         let raw_device = self.shared().vk();
++         if let Err(refused) = placed(&made.requirements, at, room, type_index) {
++             // SAFETY: the image is live and unbound, and no command uses it.
++-            unsafe { release::object(raw_device, raw) };
++-            return Ok(Err(refused));
++-        }
+++            unsafe { release::object(raw_device, made.raw) };
+++            if pitched {
+++                return Ok(Err(refused));
+++            }
+++            // A matching default pitch can still have page-rounded trailing storage.
+++            // Ask the driver for the explicit layout before falling back to a shadow;
+++            // never shrink its requirements or extend the imported memory ourselves.
+++            made = match self.host_pitched_image(plan, &layout, facts)? {
+++                Ok(made) => made,
+++                Err((kind, why)) => return Ok(Err((kind, format!("{}; explicit: {why}", refused.1)))),
+++            };
+++            pitched = true;
+++            if let Err(refused) = placed(&made.requirements, at, room, type_index) {
+++                // SAFETY: the replacement is also live, unbound and unused.
+++                unsafe { release::object(raw_device, made.raw) };
+++                return Ok(Err(refused));
+++            }
+++        }
+++        let raw = made.raw;
++         // SAFETY: the image is live and unbound, made for host allocations; the memory is the
++         // buffer's import of host pages (or its fresh pages'), which the image holds, in a type the
++         // image takes, at an offset that meets its alignment, its size inside the memory
++         // (`placed`).
++@@ -405,9 +420,9 @@
++         use crate::dma_buf::{memory_plane_0, ModifierMemory, DRM_FORMAT_MOD_LINEAR};
++         let (row_pitch, slice_pitch) = (layout.row_pitch, layout.slice_pitch);
++         let raw_device = self.shared().vk();
++         let enabled = (self.shared().host_import.as_ref())
++-            .is_ok_and(|importer| importer.makes_dma_buf_images());
+++            .is_ok_and(|importer| importer.makes_host_pitched_images());
++         if !enabled {
++             return Ok(Err((
++                 Refusal::Pitch,
++                 "the device enables no VK_EXT_image_drm_format_modifier for an image at Metal's \
 diff --git a/patches/mesa/turnip-coachz-diagnostics.patch b/patches/mesa/turnip-coachz-diagnostics.patch
 new file mode 100644
 --- /dev/null
 +++ b/patches/mesa/turnip-coachz-diagnostics.patch
-@@ -0,0 +1,77 @@
-+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
-+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
-++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
-+@@ -1517,6 +1517,15 @@
-+       if (result != VK_SUCCESS)
-+          return result;
-+    }
-++   /* MSM_PARAM_FAULTS is a baseline, not an error simply because it is nonzero. */
-++   NativeAdrenoAbiStatus initial = {};
-++   kern_return_t initial_kr = dw_call(NativeAdrenoMethodGetStatus, NULL, 0, &initial, sizeof(initial));
-++   if (initial_kr != KERN_SUCCESS && initial_kr != kIOReturnUnsupported) {
-++      dw_close_connection();
-++      return vk_startup_errorf(dev->physical_device->instance, VK_ERROR_INITIALIZATION_FAILED,
-++                               "initial GPU status failed: 0x%x", initial_kr);
-++   }
-++   dev->fault_count = initial.faults;
-+    struct darwin_retire_state *retire = (struct darwin_retire_state *)
-+       vk_zalloc(&dev->vk.alloc, sizeof(*retire), 8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
-+    if (!retire) {
-+@@ -1592,8 +1601,10 @@
-+    if (kr != KERN_SUCCESS)
-+       return vk_device_set_lost(&device->vk, "error getting GPU status: 0x%x", kr);
-+    if (reply.faults != device->fault_count) {
-++      const uint64_t before = device->fault_count;
-+       device->fault_count = reply.faults;
-+-      return vk_device_set_lost(&device->vk, "GPU faulted or hung");
-++      return vk_device_set_lost(&device->vk, "GPU faults changed %llu -> %llu (global + client VM)",
-++                                (unsigned long long)before, (unsigned long long)reply.faults);
-+    }
-+    return VK_SUCCESS;
-+ }
-+diff --git a/src/freedreno/vulkan/tu_image.cc b/src/freedreno/vulkan/tu_image.cc
+@@ -0,0 +1,218 @@
 +--- a/src/freedreno/vulkan/tu_image.cc
 ++++ b/src/freedreno/vulkan/tu_image.cc
-+@@ -510,6 +510,32 @@
++@@ -509,8 +509,34 @@
++    }
 +
 +    return true;
 + }
@@ -145,7 +354,9 @@ new file mode 100644
 +
 + template <chip CHIP>
 + VkResult
-+@@ -829,6 +855,9 @@
++ tu_image_init(struct tu_device *device, struct tu_image *image,
++@@ -828,8 +854,11 @@
++       image->total_size = image->subsampled_metadata_offset +
 +          image->vk.array_layers * sizeof(struct tu_subsampled_metadata);
 +    }
 +
@@ -155,6 +366,176 @@ new file mode 100644
 +    return VK_SUCCESS;
 + }
 + TU_GENX(tu_image_init);
++
++--- a/src/freedreno/vulkan/tu_knl_darwin.cc
+++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
++@@ -139,9 +139,9 @@
++ static NativeAdrenoAbiPriority dw_priority;
++ static bool dw_priority_known;
++
++ static kern_return_t
++-dw_call(uint32_t method, const void *in, size_t in_size, void *out,
+++dw_call_raw(uint32_t method, const void *in, size_t in_size, void *out,
++         size_t out_size)
++ {
++    size_t out_bytes = out_size;
++    if (!dw.tunnel)
++@@ -155,8 +155,94 @@
++    if (in_size)
++       memcpy(buffer + sizeof(header), in, in_size);
++    return IOConnectCallStructMethod(dw.conn, dw.selector, buffer, sizeof(header) + in_size, out_size ? out : NULL,
++                                     out_size ? &out_bytes : NULL);
+++}
+++
+++/* Failure-only transport evidence. Never take dw.lock here: callers may already
+++ * hold it. Raw Note and status calls cannot recurse through this probe. */
+++static uint32_t dw_diag_calls, dw_diag_submitted, dw_diag_completed;
+++static uint32_t dw_diag_busy, dw_diag_timeouts;
+++static uint32_t dw_diag_errors[32], dw_diag_error_status[32];
+++static void
+++dw_note_text(const char *text)
+++{
+++   NativeAdrenoAbiNote note = {};
+++   note.kind = 3;
+++   note.count = NativeAdrenoNoteWords;
+++   memcpy(note.words, text, strnlen(text, sizeof(note.words) - 1));
+++   kern_return_t kr = dw.conn ? dw_call_raw(NativeAdrenoMethodNote, &note, sizeof(note), NULL, 0)
+++                              : kIOReturnNotOpen;
+++   if (kr != KERN_SUCCESS)
+++      fprintf(stderr, "COACHZ pid%d %s (Note rejected 0x%x)\n", getpid(), text, kr);
+++}
+++
+++static kern_return_t
+++dw_call(uint32_t method, const void *in, size_t in_size, void *out, size_t out_size)
+++{
+++   if (method == NativeAdrenoMethodNote)
+++      return dw_call_raw(method, in, in_size, out, out_size);
+++   const uint32_t call = p_atomic_inc_return(&dw_diag_calls);
+++   const uint64_t began = os_time_get_nano();
+++   kern_return_t kr = dw_call_raw(method, in, in_size, out, out_size);
+++   if (kr == KERN_SUCCESS) {
+++      if (method == NativeAdrenoMethodSubmit && out_size >= sizeof(NativeAdrenoAbiSubmitReply))
+++         p_atomic_set(&dw_diag_submitted, (uint32_t)((NativeAdrenoAbiSubmitReply *)out)->fence);
+++      if (method == NativeAdrenoMethodWaitFence && in_size >= sizeof(NativeAdrenoAbiWaitFence))
+++         p_atomic_set(&dw_diag_completed, ((const NativeAdrenoAbiWaitFence *)in)->fence);
+++      if (method == NativeAdrenoMethodSetPriority && in_size >= sizeof(NativeAdrenoAbiPriority)) {
+++         const NativeAdrenoAbiPriority *priority = (const NativeAdrenoAbiPriority *)in;
+++         char text[96];
+++         snprintf(text, sizeof(text), "KMD priority c%u fg%u bg%u", call, priority->foreground, priority->background);
+++         dw_note_text(text);
+++      }
+++      return kr;
+++   }
+++   // Ring pressure, deferred frees and sliced waits are normal protocol results.
+++   if (kr == kIOReturnBusy && (method == NativeAdrenoMethodSubmit || method == NativeAdrenoMethodBoFree)) {
+++      p_atomic_inc(&dw_diag_busy);
+++      return kr;
+++   }
+++   if (kr == kIOReturnTimeout && method == NativeAdrenoMethodWaitFence) {
+++      p_atomic_inc(&dw_diag_timeouts);
+++      return kr;
+++   }
+++   // Metadata absence is not device loss; do not let it fill the kernel log.
+++   if (method == NativeAdrenoMethodGetMetadata || method == NativeAdrenoMethodSetMetadata)
+++      return kr;
+++   const unsigned slot = MIN2(method, 31u);
+++   const uint32_t errors = p_atomic_inc_return(&dw_diag_errors[slot]);
+++   const uint32_t previous = p_atomic_xchg(&dw_diag_error_status[slot], (uint32_t)kr);
+++   // Keep first occurrences and changes; repeated pressure errors are sampled at powers of two.
+++   if (previous == (uint32_t)kr && errors > 4 && (errors & (errors - 1)))
+++      return kr;
+++   char text[96];
+++   snprintf(text, sizeof(text), "KMD fail c%u m%u kr%x us%llu", call, method, kr,
+++            (unsigned long long)((os_time_get_nano() - began) / 1000));
+++   dw_note_text(text);
+++   uint32_t words[4] = {};
+++   if (in) memcpy(words, in, MIN2(in_size, sizeof(words)));
+++   snprintf(text, sizeof(text), "KMD req c%u %08x %08x %08x %08x", call, words[0], words[1], words[2], words[3]);
+++   dw_note_text(text);
+++   snprintf(text, sizeof(text), "KMD ctx c%u sent%u done%u busy%u timeout%u", call,
+++            p_atomic_read(&dw_diag_submitted), p_atomic_read(&dw_diag_completed),
+++            p_atomic_read(&dw_diag_busy), p_atomic_read(&dw_diag_timeouts));
+++   dw_note_text(text);
+++   if (method == NativeAdrenoMethodSubmit && in_size >= sizeof(NativeAdrenoAbiSubmit)) {
+++      const NativeAdrenoAbiSubmit *submit = (const NativeAdrenoAbiSubmit *)in;
+++      if (submit->buffer_count) {
+++         const NativeAdrenoAbiSubmitBuffer *ib = &submit->buffers[0];
+++         snprintf(text, sizeof(text), "KMD ib c%u h%llx va%llx bytes%llu", call,
+++                  (unsigned long long)ib->handle, (unsigned long long)ib->iova, (unsigned long long)ib->bytes);
+++         dw_note_text(text);
+++      }
+++   }
+++   NativeAdrenoAbiStatus status = {};
+++   kern_return_t query = dw_call_raw(NativeAdrenoMethodGetStatus, NULL, 0, &status, sizeof(status));
+++   snprintf(text, sizeof(text), "KMD status c%u kr%x faults%llu suspends%llu", call, query,
+++            (unsigned long long)status.faults, (unsigned long long)status.suspends);
+++   dw_note_text(text);
+++   return kr;
++ }
++
++ /* Finds an admitted selector: the driver answers a tunnel probe (method 0xffffffff) with success for every selector the sandbox lets through. */
++ static bool
++@@ -216,8 +302,11 @@
++    }
++    dw.open = true;
++    dw.inflight_count = 0;
++    dw.last_fence = 0;
+++   p_atomic_set(&dw_diag_submitted, 0);
+++   p_atomic_set(&dw_diag_completed, 0);
+++   dw_note_text("KMD armed v1: raw failures, fences, status, priority");
++
++    /* Normal until Metal queues publish their current requests. An explicit environment override is also accepted. */
++    {
++       const char *want = getenv("METAL2VULKAN_QUEUE_PRIORITY");
++@@ -560,10 +649,15 @@
++ {
++    if (*token) {
++       if (*mapping) {
++          kern_return_t kr = IOConnectUnmapMemory64(dw.conn, *token, mach_task_self(), (mach_vm_address_t)(uintptr_t)*mapping);
++-         if (kr != KERN_SUCCESS)
+++         if (kr != KERN_SUCCESS) {
+++            char text[96];
+++            snprintf(text, sizeof(text), "KMD CPU unmap h%llx token%u kr%x",
+++                     (unsigned long long)handle, *token, kr);
+++            dw_note_text(text);
++             return retire->failure = vk_device_set_lost(&dev->vk, "deferred CPU unmap failed: 0x%x", kr);
+++         }
++          *mapping = NULL;
++       }
++       NativeAdrenoAbiBoCpuUnmap undo = {.handle = handle, .token = *token};
++       kern_return_t kr = dw_call(NativeAdrenoMethodBoCpuUnmap, &undo, sizeof(undo), NULL, 0);
++@@ -1516,8 +1610,17 @@
++       VkResult result = dw_open_connection(dev->physical_device->instance);
++       if (result != VK_SUCCESS)
++          return result;
++    }
+++   /* MSM_PARAM_FAULTS is a baseline, not an error simply because it is nonzero. */
+++   NativeAdrenoAbiStatus initial = {};
+++   kern_return_t initial_kr = dw_call(NativeAdrenoMethodGetStatus, NULL, 0, &initial, sizeof(initial));
+++   if (initial_kr != KERN_SUCCESS && initial_kr != kIOReturnUnsupported) {
+++      dw_close_connection();
+++      return vk_startup_errorf(dev->physical_device->instance, VK_ERROR_INITIALIZATION_FAILED,
+++                               "initial GPU status failed: 0x%x", initial_kr);
+++   }
+++   dev->fault_count = initial.faults;
++    struct darwin_retire_state *retire = (struct darwin_retire_state *)
++       vk_zalloc(&dev->vk.alloc, sizeof(*retire), 8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
++    if (!retire) {
++       dw_close_connection();
++@@ -1591,10 +1694,12 @@
++       return VK_SUCCESS; /* counters not attached in this kernel */
++    if (kr != KERN_SUCCESS)
++       return vk_device_set_lost(&device->vk, "error getting GPU status: 0x%x", kr);
++    if (reply.faults != device->fault_count) {
+++      const uint64_t before = device->fault_count;
++       device->fault_count = reply.faults;
++-      return vk_device_set_lost(&device->vk, "GPU faulted or hung");
+++      return vk_device_set_lost(&device->vk, "GPU faults changed %llu -> %llu (global + client VM)",
+++                                (unsigned long long)before, (unsigned long long)reply.faults);
++    }
++    return VK_SUCCESS;
++ }
++
 diff --git a/scripts/build-adreno-metal-bridge.py b/scripts/build-adreno-metal-bridge.py
 --- a/scripts/build-adreno-metal-bridge.py
 +++ b/scripts/build-adreno-metal-bridge.py

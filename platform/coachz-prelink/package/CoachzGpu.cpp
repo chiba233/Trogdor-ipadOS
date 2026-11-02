@@ -122,10 +122,11 @@ int ringBarrier(void *) {__asm__ volatile("dsb sy" ::: "memory"); return 0;}
 int ringPublish(void *, const volatile uint32_t *, size_t) {__asm__ volatile("dsb sy" ::: "memory"); return 0;}
 int ringAcquire(void *, volatile uint32_t *, size_t) {__asm__ volatile("dsb sy" ::: "memory"); return 0;}
 uint64_t ringNow(void *) {
-    clock_sec_t sec = 0;
-    clock_usec_t usec = 0;
-    clock_get_system_microtime(&sec, &usec);
-    return uint64_t(sec) * 1000000 + usec;
+    // ARM rtclock's microtime helper truncates 19.2 ticks/us to 19. Its
+    // fractional second can exceed one million us and run backwards at rollover.
+    uint64_t ns=0;
+    absolutetime_to_nanoseconds(mach_absolute_time(),&ns);
+    return ns/1000;
 }
 // The GPU's interrupts, as a6xx_irq, a6xx_gmu_irq and a6xx_hfi_irq take them (sc7180.dtsi: SPI 300, 305 and 304, level high). CACHE_FLUSH_TS ends
 // every submission, so it wakes the fence waiters. There is no hang recovery yet: the errors are counted for the report, and masked if they storm.
@@ -523,6 +524,14 @@ uint64_t gmuBusy() {
     } while (high != *top);
     return uint64_t(high) << 32 | value;
 }
+// CX-side 19.2 MHz timestamp, as a6xx_gmu_get_timestamp. The governor does
+// not need a GX CP register just to measure elapsed time.
+uint64_t gmuAlways() {
+    volatile uint32_t *low=reinterpret_cast<volatile uint32_t *>(gGmu+0x14220), *top=reinterpret_cast<volatile uint32_t *>(gGmu+0x14224);
+    uint32_t high,value;
+    do {high=*top;value=*low;} while(high!=*top);
+    return uint64_t(high)<<32|value;
+}
 // Where a busy second goes, by the A6xx performance counters (a6xx.xml countables; the selects are written once): SP busy, ALU, its stalls on
 // TP, UCHE and RB and its non-execution cycles; TP busy, its UCHE stall and L1 requests and misses; UCHE busy, arbiter stalls and the bus latency;
 // RB busy, its SP and CCU starvation and colour reads and writes; and the GBIF's AXI0/AXI1 read and write beats (kgsl's GBIF countables 34, 35,
@@ -535,6 +544,9 @@ const ProfileCounter kProfile[] = {
     {0x8e10, 0, 0x4d6}, {0x8e11, 5, 0x4d8}, {0x8e12, 7, 0x4da}, {0x8e13, 14, 0x4dc}, {0x8e14, 15, 0x4de},
 };
 enum : unsigned {ProfileCount = sizeof(kProfile) / sizeof(kProfile[0]), GbifSel = 0x3cc2, GbifEnable = 0x3cc0, GbifClear = 0x3cc1, GbifLow = 0x3cc4, GbifHigh = 0x3cc8};
+// Protected by the publisher lock. A GX restart loses the counter selectors too.
+uint32_t gProfileEpoch;
+constexpr uint32_t ProfileGbifSelection = 34u | 35u << 8 | 46u << 16 | 47u << 24;
 uint64_t gbifCounter(unsigned index) {
     uint32_t high, low;
     do {
@@ -543,12 +555,115 @@ uint64_t gbifCounter(unsigned index) {
     } while (high != coreRead(GbifHigh + index));
     return uint64_t(high) << 32 | low;
 }
+// Mainline a6xx_gmu_sysprof_setup: a persistent PERFCOUNTER OOB vote blocks
+// IFPC while profiling. Publisher lock serializes this vote with explicit PM;
+// the software asleep flag alone says nothing about GX/SP hardware availability.
+uint32_t gmuRead(uint32_t at);
+void gmuWrite(uint32_t at,uint32_t value);
+bool gProfileVote;
+uint32_t gProfilePowerSkips,gProfileOobFailures,gProfilePowerStatus;
+enum : uint32_t {ProfilePowerStatus=0x14340, ProfileHostSet=0x14650,
+    ProfileIntrInfo=0x14648, ProfileIntrClear=0x14644,
+    ProfileRequest=1u<<17, ProfileAck=1u<<25};
+void profilePowerPut() {
+    if(!gProfileVote)return;
+    // Legacy a6xx_gmu_clear_oob(PERFCOUNTER_SET): clear bit is also 25.
+    gmuWrite(ProfileHostSet,ProfileAck);
+    gProfileVote=false;
+}
+bool profilePowerGet() {
+    if(!gGmu || __atomic_load_n(&gPmAsleep,__ATOMIC_SEQ_CST))return false;
+    const bool acquiring=!gProfileVote;
+    if(acquiring) {
+        gmuWrite(ProfileHostSet,ProfileRequest);
+        bool acknowledged=false;
+        for(unsigned i=0;i<100;i++) {
+            if(gmuRead(ProfileIntrInfo)&ProfileAck){acknowledged=true;break;}
+            IODelay(100);
+        }
+        gmuWrite(ProfileIntrClear,ProfileAck);
+        if(!acknowledged) {
+            // Cancel the request even when firmware did not acknowledge it.
+            gmuWrite(ProfileHostSet,ProfileAck);
+            ++gProfileOobFailures;
+            printf("COACHZ gpu prof power: OOB timeout %u; GX untouched\n",gProfileOobFailures);
+            return false;
+        }
+        gProfileVote=true;
+    }
+    // a6xx_gmu_gx_is_on + a6xx_gmu_sptprac_is_on, A6XX (not A7XX)
+    // bit positions. Require the positive SP power-on bit too, not an all-zero
+    // status from an uninitialized block. Read only the CX/GMU window here.
+    constexpr uint32_t off=(1u<<0)|(1u<<1)|(1u<<2)|(1u<<4)|(1u<<6)|(1u<<7);
+    for(unsigned i=0;i<100;i++) {
+        const uint32_t status=gmuRead(ProfilePowerStatus);
+        gProfilePowerStatus=status;
+        if(!(status&off) && (status&(1u<<3))) {
+            if(acquiring)printf("COACHZ gpu prof power: vote on status 0x%x\n",status);
+            return true;
+        }
+        IODelay(100);
+    }
+    const uint32_t skipped=++gProfilePowerSkips;
+    if(skipped<=4 || !(skipped&(skipped-1)))
+        printf("COACHZ gpu prof power: status 0x%x skip %u; GX untouched\n",gProfilePowerStatus,skipped);
+    profilePowerPut();
+    return false;
+}
 void profileSetup() {
+    // All callers own the publisher lock; no GX MMIO precedes this guard.
+    if(!profilePowerGet())return;
+
     for (const ProfileCounter &c : kProfile) coreWrite(c.select, c.countable);
     coreWrite(GbifClear, 0xf);
     coreWrite(GbifClear, 0);
-    coreWrite(GbifSel, 34u | 35u << 8 | 46u << 16 | 47u << 24);
+    coreWrite(GbifSel, ProfileGbifSelection);
     coreWrite(GbifEnable, coreRead(GbifEnable) | 0xf);
+    unsigned bad = 0;
+    for (const ProfileCounter &c : kProfile) if (coreRead(c.select) != c.countable) bad++;
+    if (coreRead(GbifSel) != ProfileGbifSelection || (coreRead(GbifEnable) & 0xf) != 0xf) bad++;
+    printf("COACHZ gpu prof config: epoch %u selector mismatches %u\n", ++gProfileEpoch, bad);
+}
+struct ProfileSample {
+    uint64_t cycles, busy, always, counters[ProfileCount], gbif[4];
+    uint32_t epoch;
+};
+bool profileSample(ProfileSample &sample) {
+    // Keep all reads in one powered epoch; individual coreRead guards alone allow a
+    // suspend/resume between two counters and produce an invalid subtraction.
+    native_adreno_publisher_lock(1);
+    if (!profilePowerGet()) {
+        native_adreno_publisher_lock(0);
+        return false;
+    }
+    unsigned bad = 0;
+    uint32_t firstReg = 0, observed = 0, wanted = 0;
+    auto check = [&](uint32_t reg, uint32_t value, uint32_t mask) {
+        const uint32_t read = coreRead(reg) & mask;
+        if (read == value) return;
+        if (!bad) {firstReg = reg; observed = read; wanted = value;}
+        bad++;
+    };
+    for (const ProfileCounter &c : kProfile) check(c.select, c.countable, ~0u);
+    check(GbifSel, ProfileGbifSelection, ~0u);
+    check(GbifEnable, 0xf, 0xf);
+    const uint32_t epoch = gProfileEpoch;
+    if (!bad) {
+        sample.epoch = epoch;
+        sample.cycles = coreCounter(0x400);
+        sample.busy = gmuBusy();
+        sample.always = coreCounter(0x980);
+        for (unsigned i = 0; i < ProfileCount; i++) sample.counters[i] = coreCounter(kProfile[i].counter);
+        for (unsigned i = 0; i < 4; i++) sample.gbif[i] = gbifCounter(i);
+    }
+    native_adreno_publisher_lock(0);
+    // A bad selection is not a bandwidth or stall measurement. Report once per epoch.
+    static uint32_t lastBadEpoch = ~0u;
+    if (bad && lastBadEpoch != epoch) {
+        lastBadEpoch = epoch;
+        printf("COACHZ gpu prof invalid: epoch %u mismatches %u first 0x%x read 0x%x want 0x%x\n", epoch, bad, firstReg, observed, wanted);
+    }
+    return !bad;
 }
 
 // Dynamic GPU frequency, tried once 20 s after the driver starts: the DCVS request the bring-up sends (a6xx_gmu_set_freq for a legacy
@@ -563,8 +678,9 @@ void gmuWrite(uint32_t at, uint32_t value) {
     __asm__ volatile("dsb sy" ::: "memory");
 }
 unsigned dcvsSet(unsigned level, uint32_t *result) {
+    native_adreno_publisher_lock(1);
     native_gpu_dcvs[1] = level;
-    if (__atomic_load_n(&gPmAsleep, __ATOMIC_SEQ_CST)) return 0;   // no firmware to ask: the level is set again on resume
+    if (__atomic_load_n(&gPmAsleep, __ATOMIC_SEQ_CST)) {native_adreno_publisher_lock(0);return 0;}   // no firmware to ask
     gmuWrite(GmuDcvsAck, 0);
     gmuWrite(GmuDcvsPerf, 3u << 28 | level);
     gmuWrite(GmuDcvsBw, 0xff);
@@ -577,6 +693,7 @@ unsigned dcvsSet(unsigned level, uint32_t *result) {
     gmuWrite(GmuClearIrq, 1u << 31);
     gmuWrite(GmuHostSet, 1u << 31);
     *result = gmuRead(GmuDcvsReturn);
+    native_adreno_publisher_lock(0);
     return polls < 1000 ? polls + 1 : 0;
 }
 void dcvsTest() {
@@ -587,9 +704,11 @@ void dcvsTest() {
         const unsigned polls = dcvsSet(level, &result);
         uint64_t ns = 0;
         absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
-        const uint64_t cycles = coreCounter(0x400), always = coreCounter(0x980);
+        ProfileSample first{},last{};
+        if(!profileSample(first))continue;
         IOSleep(500);
-        const uint64_t dCycles = coreCounter(0x400) - cycles, dAlways = coreCounter(0x980) - always;
+        if(!profileSample(last) || first.epoch!=last.epoch)continue;
+        const uint64_t dCycles=last.cycles-first.cycles, dAlways=last.always-first.always;
         printf("COACHZ gpu dcvs: level %u acknowledged after %u polls in %llu us, return %u, clock %llu MHz\n", level, polls,
             static_cast<unsigned long long>(ns / 1000), result, static_cast<unsigned long long>(dAlways ? dCycles * 192 / dAlways / 10 : 0));
     }
@@ -622,6 +741,7 @@ void pmSleep() {
     coreWrite(RbbmInt0Mask, 0);
     __atomic_store_n(&gPmAsleep, 1u, __ATOMIC_SEQ_CST);
     while (__atomic_load_n(&gPmUsers, __ATOMIC_SEQ_CST)) IODelay(1);
+    profilePowerPut();
     const int status = coachz_gpu_pm_suspend();
     gPmSleeps = gPmSleeps + 1;
     printf("COACHZ gpu pm: slumber %u status %d in %llu us\n", gPmSleeps, status, (mach_absolute_time() - began) / 19);
@@ -632,6 +752,10 @@ void pmGet() {
     if (!__atomic_load_n(&gPmAsleep, __ATOMIC_SEQ_CST)) return;
     const uint64_t began = mach_absolute_time();
     const int status = coachz_gpu_pm_resume();
+    if(status) {
+        printf("COACHZ gpu pm: resume failed %d; GX access remains blocked\n",status);
+        return;
+    }
     __atomic_store_n(&gPmAsleep, 0u, __ATOMIC_SEQ_CST);
     coreWrite(CpSqeInstrBase, uint32_t(gBuffers[0].iova));
     coreWrite(CpSqeInstrBase + 1, uint32_t(gBuffers[0].iova >> 32));
@@ -649,6 +773,7 @@ void pmGet() {
     *reinterpret_cast<volatile uint32_t *>(gGmu + GmuHfiClr) = ~0u;
     *reinterpret_cast<volatile uint32_t *>(gGmu + GmuAoMask) = ~uint32_t(GmuAoErrors);
     *reinterpret_cast<volatile uint32_t *>(gGmu + GmuHfiMask) = ~uint32_t(GmuHfiFault);
+    if (!status) profileSetup();
     gPmWakes = gPmWakes + 1;
     printf("COACHZ gpu pm: resume %u status %d ring 0x%x ME_INIT 0x%x wait %d in %llu us, %u core accesses dropped asleep\n", gPmWakes, status, ring, sent,
         int(waited), (mach_absolute_time() - began) / 19, gPmDropped);
@@ -664,20 +789,30 @@ void pmThread(void *, wait_result_t) {
 }
 
 void rateThread(void *, wait_result_t) {
-    uint64_t cycles = coreCounter(0x400), busy = gmuBusy(), always = coreCounter(0x980), last[ProfileCount], lastGbif[4];
+    uint64_t busy=0,always=0;
     unsigned governed = 0, level = 7, changes = 0, lower = 0;
     PE_parse_boot_argn("coachz-gpu-dcvs", &governed, sizeof(governed));
-    profileSetup();
-    for (unsigned i = 0; i < ProfileCount; i++) last[i] = coreCounter(kProfile[i].counter);
-    for (unsigned i = 0; i < 4; i++) lastGbif[i] = gbifCounter(i);
+    native_adreno_publisher_lock(1);
+    if (!__atomic_load_n(&gPmAsleep, __ATOMIC_SEQ_CST)) profileSetup();
+    native_adreno_publisher_lock(0);
+    ProfileSample previous{};
+    bool havePrevious = false;
     uint64_t windowBusy = busy, windowAlways = always, boostUntil = 0, ticks = 0;
+    bool haveGovernorWindow=false;
     uint32_t touches = coachz_touch_reports;
     bool idle = true;
     for (unsigned seconds = 0;; seconds++) {
         for (unsigned tick = 0; tick < 10; tick++, ticks++) {
             IOSleep(100);
             if (!governed || seconds <= 20) continue;
-            const uint64_t nowBusy = gmuBusy(), nowAlways = coreCounter(0x980);
+            native_adreno_publisher_lock(1);
+            const bool active=!__atomic_load_n(&gPmAsleep,__ATOMIC_SEQ_CST);
+            const uint64_t nowBusy=active?gmuBusy():0,nowAlways=active?gmuAlways():0;
+            native_adreno_publisher_lock(0);
+            if(!active){haveGovernorWindow=false;continue;}
+            if(!haveGovernorWindow || nowBusy<windowBusy || nowAlways<windowAlways) {
+                windowBusy=nowBusy;windowAlways=nowAlways;haveGovernorWindow=true;continue;
+            }
             const uint64_t wBusy = nowBusy - windowBusy, wAlways = nowAlways - windowAlways;
             windowBusy = nowBusy;
             windowAlways = nowAlways;
@@ -697,22 +832,18 @@ void rateThread(void *, wait_result_t) {
             }
         }
         if (seconds == 20) dcvsTest();
-        const uint64_t newCycles = coreCounter(0x400), newBusy = gmuBusy(), newAlways = coreCounter(0x980);
-        const uint64_t dCycles = newCycles - cycles, dBusy = newBusy - busy, dAlways = newAlways - always;
+        ProfileSample current{};
+        if (!profileSample(current)) {havePrevious = false; continue;}
+        if (!havePrevious || current.epoch != previous.epoch) {
+            previous = current;
+            havePrevious = true;
+            continue;
+        }
+        const uint64_t dCycles = current.cycles - previous.cycles, dBusy = current.busy - previous.busy, dAlways = current.always - previous.always;
         uint64_t d[ProfileCount], g[4];
-        for (unsigned i = 0; i < ProfileCount; i++) {
-            const uint64_t now = coreCounter(kProfile[i].counter);
-            d[i] = now - last[i];
-            last[i] = now;
-        }
-        for (unsigned i = 0; i < 4; i++) {
-            const uint64_t now = gbifCounter(i);
-            g[i] = now - lastGbif[i];
-            lastGbif[i] = now;
-        }
-        cycles = newCycles;
-        busy = newBusy;
-        always = newAlways;
+        for (unsigned i = 0; i < ProfileCount; i++) d[i] = current.counters[i] - previous.counters[i];
+        for (unsigned i = 0; i < 4; i++) g[i] = current.gbif[i] - previous.gbif[i];
+        previous = current;
         if (!dAlways || dBusy * 20 < dAlways || !dCycles) continue;
         auto pct = [dCycles](uint64_t value) {return static_cast<unsigned long long>(value * 100 / dCycles);};
         // The CP counter counts every core cycle, idle ones too, so the second number is the clock itself.

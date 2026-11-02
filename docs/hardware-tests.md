@@ -1644,3 +1644,9 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 - **固件目录**：之前是指向 `/private/var/coachz` 的符号链接，BBU 报 `kBBUReturnFirmwareDataError`（`Miss images for bootupInternal`）。改成把目录 bind 挂载到 `/private/preboot/<hash>/usr/local/standalone/firmware/Baseband/Mav16` 后，restoreSBL1、SBL1、RPM、APPS、MBA、QDSP6SW、TZ、ACDB、BBCFG 都加载成功。
 - **下一步**：BBU 打开 `boot` 通道，`Connecting to Loader`、`Getting Version` 通过，读 PK hash 和 MSM ID 时方法 5 回 unsupported，报 `kBBUReturnGetChipIDFailure`。基带还没启动成功。
 
+## 芯片查询、SendImage 和 GPU 修订
+
+- **基带**：方法 5 应答后 BBU 报 `CHIPID=0x9540e1`。PK hash 不等于默认值时 `fusingState: 3`，报 `kBBUReturnUnPersonalizedImageError`；答默认值后 `fusingState: 1`，`Loading second stage bootloader`，`SendImage` 231424 字节成功。之后 BBU 在 `boot` 通道等 sahara HELLO，40 秒超时（`failed receiving sahara hello`）。
+- **界面**：“蜂窝数据”不再提示需要更新，显示转移 iPad 套餐和使用二维码；“关于本机”多了调制解调器固件一行，值为空；运营商和号码没有，SIM 卡没有识别。
+- **GPU**：方向来回变化修好后显示正常。这次 `CZ frames made 2 private 1 shown 0 plain 2365`，主帧基本没走私有纹理，压缩还没验证到。提交到完成平均 8.5 ms；host first 计划传输 175 MB。这段运行没有 slumber，也没有 Submit 超时。
+

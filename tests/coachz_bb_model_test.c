@@ -299,6 +299,19 @@ static void test_sahara_command(void)
     CHECK(o.count == 1 && cbs_get32(o.data[0]) == CBS_READ_DATA && cbs_get32(o.data[0] + 8) == 0x15 && d.state == CBS_WAIT_ELF);
 }
 
+static void test_registers(void)
+{
+    uint8_t r[0x60];
+    cbs_read_register(3, r, 0x18);
+    CHECK(cbs_get32(r + 4) == CBS_CHIP_ID && cbs_get32(r) == 0);
+    cbs_read_register(0, r, 4);
+    CHECK(cbs_get32(r) == CBS_SERIAL);
+    cbs_read_register(4, r, 0x60);
+    CHECK(!memcmp(r, cbs_default_pk_hash, 32) && r[0x20] == 0 && r[0x5f] == 0);
+    cbs_read_register(9, r, 8);
+    CHECK(cbs_get32(r) == 0 && cbs_get32(r + 4) == 0);
+}
+
 static void test_control(void)
 {
     static struct cbc_state s;
@@ -344,6 +357,7 @@ int main(void)
     test_qmux();
     test_sahara();
     test_sahara_command();
+    test_registers();
     test_control();
     test_channels();
     return failures ? 1 : 0;
