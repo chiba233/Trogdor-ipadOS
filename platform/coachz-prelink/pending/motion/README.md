@@ -1,6 +1,6 @@
-# Chrome EC 加速度计／陀螺仪（待接入）
+# Chrome EC 加速度计／陀螺仪
 
-本目录提供协议客户端和 IOKit 采样服务，**没有加入活动内核构建**。没有编译 XNU 对象、打包、连接设备或写盘，硬件结果尚未取得。
+本目录提供协议客户端和 IOKit 采样服务，由 `patches/xnu/coachz-prelink-motion.patch` 接入内核，`coachz-motion=1` 打开。真机上加速度计和陀螺仪以 25 Hz 发布为 3 个 `AppleSPUHIDDevice` 服务。
 
 ## 已实现
 
@@ -20,7 +20,7 @@
 - `coachz-prelink-motion.patch`：候选补丁，新增两个文件至 `iokit/Kernel`，登记 `iokit/conf/files`，在既有 sampler 调用 `coachz_motion_start()`；未加入活动 `series`。
 - [SOURCES.md](SOURCES.md)：固定版本源码、请求布局、DATA 字段差异及换算批注。
 
-接手者自行选择接入并构建时，在已有电池／公共 EC 补丁之后应用候选补丁，再决定是否加入 `coachz-motion=1`。不需要改 ADT，也不依赖待接入的 Wi-Fi／TSENS；没有启动参数时不访问 EC。此处不调用打包或写盘流程。
+补丁在电池／公共 EC 补丁之后应用。不需要改 ADT；没有启动参数时不访问 EC。
 
 ## 可读取的服务契约
 
@@ -50,14 +50,8 @@ DATA 是 EC 缓存的最新值，可能重复，且没有硬件时间戳或保�
 python3 -B -m unittest discover -s tests -p test_motion.py -v
 ```
 
-接入活动构建时，应同步更新该测试中“尚未启用”的阶段断言；协议和采样模型检查继续保留。
+协议和采样模型检查继续保留。
 
-后续由接手者编译并上机后：
+真机确认了服务发布、加速度计和陀螺仪读数及陀螺仪 ODR，见 [硬件记录](../../../../docs/hardware-tests.md)。CoreMotion 是否收到数据未验证，轮询开销没有单独测量。
 
-1. 记录命令版本、传感器数量及逐个 INFO 的 type／location／chip，确认工程板实际枚举。
-2. 检查 ODR 和量程；未启用的 gyro 先记录，不算采样已通过。
-3. 比较静止、翻面和倾斜时的加速度原始值及换算值；对照 Debian 同 sensor ID 的数据，确认坐标和约 1g 的重力幅值。
-4. 只有 gyro 已启用且有真实读数时，才验证其转动响应与 deg/s 单位。
-5. 观察电池、背光、按键持续工作及 EC 错误情况。轮询频率仅是初始选择，实际开销仍待实机测量。
-
-已提供定时器停止和子服务退出路径，但没有运行 IOKit 生命周期测试或验证睡眠恢复。自动旋转、CoreMotion 应用接口、FIFO 中断和硬件时间同步仍需后续适配；此轮不涉及蓝牙或手写笔。
+已提供定时器停止和子服务退出路径，但没有运行 IOKit 生命周期测试或验证睡眠恢复。CoreMotion 接口、FIFO 中断和硬件时间同步还没做；屏幕方向走 `/chosen/display-rotation` 和 rotation 补丁，不经过本服务。蓝牙和手写笔不在这里。

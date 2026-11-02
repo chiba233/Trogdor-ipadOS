@@ -1,23 +1,20 @@
 # EC motion 适配：加速度计与陀螺仪
 
-2026-11-01：已写待接入的 EC motion 客户端和 IOKit 采样服务。入口：[实现与接入说明](../../platform/coachz-prelink/pending/motion/README.md)，[固定源码与批注](../../platform/coachz-prelink/pending/motion/SOURCES.md)。尚未加入内核编译或进行实机验收。
+已接入：`patches/xnu/coachz-prelink-motion.patch`，`coachz-motion=1` 打开；源码和主机夹具在 [pending/motion](../../platform/coachz-prelink/pending/motion/README.md)。真机上加速度计和陀螺仪以 25 Hz 发布为 3 个 `AppleSPUHIDDevice` 服务。屏幕方向由 `/chosen/display-rotation` 和 rotation 补丁决定，不经过本服务；CoreMotion 是否消费这些数据未验证。
 
-## 本轮实现
+## 实现
 
 沿用已有公共 EC 通道，通过命令版本查询、count-only DUMP、INFO 枚举 BMI160／BMI260 的 lid 加速度计与陀螺仪。独立 IOService 工作循环约每 200 ms 查询 ODR、量程和最新三轴数据，并发布带状态、主机完成时间和轮询序号的完整快照。错误或停用状态不携带旧轴数据。
 
 直接 AP I2C 驱动会重复 EC 的芯片识别和管理；消费 FIFO／共享事件又需要协调现有输入消费者。本阶段选择查询式采样，不改传感器配置，提供后续 motion 前端可复用的底层读数。
 
-源码核对发现 DATA 的 flags 为 0，sensor_num 没有被 handler 回填；不能套用 DUMP 的 PRESENT 位或检查 echo ID。请求必须在 range／ODR 的 data 字段填 -1 才是查询；原始 EC 结构体的独立主机检查确认大小 13、该字段偏移 5。实现及基础模型检查均包含这些细节。
+源码核对发现 DATA 的 flags 为 0，sensor_num 没有被 handler 回填；不能套用 DUMP 的 PRESENT 位或检查 echo ID。请求必须在 range／ODR 的 data 字段填 -1 才是查询；原始 EC 结构体的独立主机检查确认大小 13、该字段偏移 5。
 
-## 当前证据
+## 证据
 
-四项主机检查通过：C 协议／采样模型（六组行为）、可移植头文件的 C++ 语法、候选补丁应用与源码一致性、活动构建未启用。另在当前组装后 XNU 上下文文件的临时副本应用补丁并逐字节核对新文件通过。IOKit C++ 层仅做源码/API 核对，未编译 XNU 对象；服务发布、生命周期、硬件读数和 EC 并发负载还没有实机证据。
+主机：C 协议／采样模型六组行为、可移植头文件的 C++ 语法、候选补丁应用与源码一致性。真机：3 个服务发布，加速度计和陀螺仪读数进入系统日志，陀螺仪 ODR 已打开；主机时间加轮询序号不冒充硬件采样时间。
 
-代码、候选补丁和文档保留未提交。没有修改现有公共 EC、活动补丁列表或装载器，没有打包／写盘／访问设备。
+## 还没做的
 
-## 下一阶段
+CoreMotion／CMMotionManager 是否收到数据未验证；自动旋转不依赖本服务。下一步按真实坐标和系统 ABI 核对 CoreMotion，再考虑 FIFO 和中断。蓝牙、手写笔保持排除。
 
-接手者接入、构建并启用 `coachz-motion=1` 后，先确认实机枚举与读数，再比较 Debian 同编号、静止重力幅值与倾斜方向。gyro ODR=0 时先记录停用，不算采样已验收，也不在本轮主动开启。
-
-现有服务是自定义底层采样接口，未接 CoreMotion 或自动旋转。DATA 是 EC 缓存最新值，没有传感器时间戳；主机时间和序号不冒充硬件采样时间。下一步应依据真实坐标与系统 ABI 决定旋转／motion 前端，再考虑 FIFO 和中断。蓝牙、手写笔保持排除。

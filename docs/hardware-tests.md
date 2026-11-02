@@ -1660,3 +1660,11 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 - **GPU**：读回 `0xae10` 在 GMU 投票和电源状态都正常时仍触发同步外部错误，两次 panic 都在这里。去掉读回后这次运行没有 panic。
 - **IMEI**：modem 进入 `kOnline`，DMS 的序列号查询（0x25）有应答，但 CommCenter 报 `MEID(ready=1) and IMEI(ready=0)` 和 `Evaluator does not support (1) SIMs, num of IMEIs (0)`，不启用这张 SIM。Debian 上 `qmicli --dms-get-ids` 也是 `IMEI: 'unknown'`、`MEID: 'unknown'`：modem 的 EFS 来自 Debian 的 `/lib/firmware/rmtfs`，内容全 0。
 
+## 原厂 FSG：IMEI 和 ICCID 显示
+
+- **根因**：modem 的工厂数据在 eMMC 硬件分区 `mmcblk1boot0`（格式见[蜂窝计划](plans/modem.md)）。ChromeOS 把它交给 rmtfs，另外三个文件是可写的空文件；Debian 的四个全 0 文件加 `rmtfs -r` 让 modem 停在 `factory-test`。ChromeOS 和 Debian 的 `qdsp6sw.mbn` 哈希相同，差别只在这份数据。
+- **Debian**：FSG 哈希和熔丝一致。喂给 modem 后 `qmicli` 报 IMEI 已设置，网络能力 `umts, lte`，设为 `online` 成功，SIM `present`、应用 `ready`，30 秒内注册状态是 `not-registered-searching`。全 0 FSG 下写回 fs1 依然是 `factory-test`。只读 boot0，没有写 boot0，也没有改 IMEI。
+- **iPadOS**：内核没改，只把 FSG 放进固件块。“关于本机”显示 IMEI 和 ICCID。40 个 QMI 服务（之前 37 个），53 个客户端，无丢弃，CommCenter 没有崩溃，`kSimStateReady`，`num of IMEIs (0)` 不再出现。
+- **注册**：测试卡没有服务，屏幕显示无服务。CommCenter 在 `kNotRegistered` 和 `kSearching` 之间切换，RAT 是 LTE，modem 报告了 PLMN，CS、PS 都没有附着。注册成功和蜂窝数据没有测到。
+- **后面的卡点**：`BindMuxDataPort`、`BindDataPort` 回 `QMI_ERR_INVALID_ARG`；`vinyl=kNotCapable`；`No baseband activation ticket found`，`Activation register request failed: QMI_ERR_NOT_SUPPORTED`，`Operator name change aborted: not activated`。
+- **GPU**：这段约 250 秒，`CZ frames made 2 private 1 shown 0 plain 552`；提交到完成 1129 次，平均 23 ms，最长 190 ms；`gpu irq` 错误全 0，没有 `KMD fail`；backboardd、SpringBoard 没有退出。

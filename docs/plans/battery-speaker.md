@@ -51,9 +51,8 @@
 
 ## 还没做的
 
-- 电池：温度、循环次数、设计容量（需要 `BATTERY_GET_STATIC` 和经 EC 的 SBS 读寄存器）、适配器详情（`USB_PD_POWER_INFO`）、剩余时间、EC 中断、低电量优雅关机、休眠。
-- 扬声器：持续播放（环形缓冲、周期中断、欠载）、AudioServerPlugIn 与 audioserver 接入、音量。参考 UniXNU-sheng 的 `ShengAudioService.cpp` / `ShengAudioPlugIn.c`。
-- 机身按键和键盘见 `docs/plans/input.md`，屏幕背光见 `docs/plans/backlight.md`（同样已写好、未接入构建）。
-- Wi-Fi（WCN3990，参考 ios-flame）和 GPU（A618，参考 UniXNU Adreno/AdrenoMetal 与 sweet 的 legacy HFI）尚未开始写代码。
+- 电池：剩余时间、EC 中断、低电量优雅关机、休眠。温度和循环次数已经由 SBS 读到，适配器详情已发布。
+- 扬声器：休眠恢复。持续播放和音频服务接入已由 `CoachzAudio.cpp` 完成。
+- 机身按键和键盘见 `docs/plans/input.md`，屏幕背光见 `docs/plans/backlight.md`。
 
 系统音频已经上机（`coachz-speaker=2`），记录在 `docs/hardware-tests.md` 的“系统音频（k63）”。`=1` 的一秒测试音代码还在。

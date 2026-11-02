@@ -1,6 +1,6 @@
-# EC 合盖／平板模式／键盘底座状态（待接入）
+# EC 合盖／平板模式／键盘底座状态
 
-这是复用公共 Chrome EC 通道的状态驱动。**没有加入活动内核构建、编译 XNU、打包、写盘或连接设备。** 代码和候选补丁留给接手者接入。
+这是复用公共 Chrome EC 通道的状态驱动，由 `patches/xnu/coachz-prelink-switches.patch` 接入内核，`coachz-switches=1` 打开。真机上合盖、平板模式和底座状态随实际状态变化；本服务不触发动作。
 
 ## 已实现
 
@@ -20,7 +20,7 @@
 - `coachz-prelink-switches.patch`：增加这两个文件、`iokit/conf/files` 登记和 sampler 启动钩子的独立补丁，未加入活动 `series`。
 - [SOURCES.md](SOURCES.md)：固定源码、EC handler、底座 ADC／支架 Hall 的区别及位语义批注。
 
-接手者自行决定接入时，在已有公共 EC／电池／输入／扬声器补丁之后应用候选补丁，再决定是否加入 `coachz-switches=1`。不需要改 ADT；没有该参数就不访问 EC。本补丁与上一轮 motion 补丁分别使用不同的相邻上下文，已在当前 XNU 文件的临时副本中按两种顺序组合应用并核对通过。
+补丁在公共 EC／电池／输入／扬声器补丁之后应用，不需要改 ADT；没有该参数就不访问 EC。
 
 ## `SwitchState` 契约
 
@@ -51,6 +51,6 @@ EC 底座内部有 UNKNOWN／DISCONNECTED／CONNECTED 三种状态，但 host �
 python3 -B -m unittest discover -s tests -p test_switches.py -v
 ```
 
-主机四项检查通过：六组查询／状态变化模型、可移植头文件 C++ 语法、候选补丁应用及源码一致性、活动构建未启用。没有编译 IOKit C++ 层；生命周期和真实通知尚未实机验证。接入后应同步更新测试里的“未启用”阶段断言。
+主机检查通过：六组查询／状态变化模型、可移植头文件 C++ 语法、候选补丁应用及源码一致性。IOKit 生命周期没有单独验证。
 
-接手者构建并上机后，先记录 supported/current，再分别测试键盘底座连接、拆卸、盖住屏幕、翻折平板模式；不要把移动支架代替底座拆卸。对照 Debian 的实际开关状态与 EC 能力，确认变化方向，并观察电池、背光、按键的公共 EC 访问持续正常。状态验收通过后再独立接入输入／显示／电源策略。
+真机上底座连接／拆卸、合盖与平板模式的状态变化都进入日志，见 [硬件记录](../../../../docs/hardware-tests.md)。合盖熄屏走 iPadOS 原生的 Smart Cover 路径（`coachz-prelink-smart-cover.patch`）。

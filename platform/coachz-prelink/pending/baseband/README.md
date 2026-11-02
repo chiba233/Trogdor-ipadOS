@@ -39,13 +39,13 @@ Data 卷的统一日志里看 ABM 和 BBUpdater：
 - `item not found in item list`；
 - `All images transferred`。
 
-还要看 CommCenter 是否起来、是否还在等 identityservicesd：UniXNU 记录过这两个进程首启时会互相等 XPC。
+## 真机结果
+
+BBUpdater 接受 SBL（镜像号 0x15）后报告启动成功，ABM engage，53 个 QMI 客户端接到 modem，`pbl`、`sahara`、`qmux1`、`qmux2` 都走自己的通道。modem 的工厂数据（FSG）放进固件块后，“关于本机”显示 IMEI 和 ICCID，SIM 就绪。注册和蜂窝数据没有通过，卡点见 [docs/plans/modem.md](../../../../docs/plans/modem.md)。
 
 ## 没核实的
 
-全部来自静态分析，没上机。
-- sahara 默认只请求 SBL1（镜像号 0x15）就报完成，主机是否接受未知；其余镜像（rpm、tz、apps、acdb、mba、qdsp6sw）按日志再加。
+来自静态分析，真机上还没有单独验证：
 - CTL 里除 GetClientId、ReleaseClientId、Sync、GetVersionInfo 以外的请求一律回成功。
-- 固件目录是按 MSU 的个性化路径规则推出来的，所以挂了两处。
 - 异步读写的回调参数个数是从 libIOABP 的调用处推出来的。
 - 时间事件从不发送；共享内存映射只回成功，不做实际映射。

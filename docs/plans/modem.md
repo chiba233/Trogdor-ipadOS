@@ -28,7 +28,7 @@ LAN RX：`coachz_ipa_rx_proto.h` 是可主机测试的部分：缓冲和 TRE 布
 
 主机测试 `test_ipa_qmi.py` 9 项通过：数据通路模型 3 组（数据格式与端点一致、MTU、TX TRE，上行封帧，含 IPv4、带填充的 IPv6、MAP 命令和截断尾部的聚合缓冲拆帧）、RX 模型 3 组（缓冲 TRE、251 个缓冲的门铃规则、每条状态解析规则、默认路由与 Debian 的 ROUTE 0x01100050 一致）、命令模型 4 组（端点 1、6、8、9 的十个端点寄存器都和 Debian 真值一致，TRE 和事件，各条命令载荷逐字段，内存和表 setup 的命令清单，含 Debian 的 LOCAL_PKT_PROC_CNTXT 0x5f0）、GSI 模型 4 组（四个 AP 通道的通道和事件环上下文、QOS、scratch、HW_PARAM_2、通用命令结果都和 Debian 真值一致）、握手模型 3 组、配置模型 4 组（含实机的 SHARED_MEM_SIZE 0x415 和 Debian 的 FLAVOR_0），`coachz_ipa_config.c`、`coachz_gsi.c`、`coachz_ipa_cmd.c`、`coachz_ipa_rx.c`、`coachz_ipa_modem.c` 用 XNU 桩头文件做类型检查（后三个还按 b9 的方式合成一个编译单元检查）、生成头标明 Linux 提交、现有构建不引用它们。
 
-## 交给接手者
+## 接入方式
 
 配置：Wi-Fi 补丁的 `wifi_ipa_power()` 之后调 `coachz_ipa_config(&ipa, zero_virt, zero_phys, wifi_qmp_send)`（8 KiB 设备可见内存；apps SMMU 处于旁路），主线是在 modem 启动之前的探测阶段做；MBA/PIL 开始启动 modem 时调 `coachz_ipa_modem_starting()` 并清掉 AP 的 SMP2P `ipa` 项（主线 `ipa_smp2p_notify_reset`）；GIC SPI 311 或轮询里调 `coachz_ipa_interrupt()`。另外 Wi-Fi 补丁打印 `ipa: setup ready` 时把 SHARED_MEM_SIZE 的高低 16 位读反了：主线 MEM_SIZE 在 15:0，MEM_BADDR 在 31:16，`mem_offset` = 8 × 高 16 位。
 
@@ -106,13 +106,21 @@ b9 用 drivers/RamBlock/coachz_modem.c 按上面的顺序接入，在 Wi-Fi 线�
 
 **QMUX。** 苹果的 `QMuxHeader` 前 6 字节就是标准 QMUX 头：I/F 类型 1、长度（不含 I/F 字节）、控制标志（主机发 0x00，服务发 0x80）、服务类型、客户端号，后面是 QMI SDU。普通服务的 SDU 头（标志、2 字节事务号、消息号、长度）和 QRTR 上 QMI 的头完全一样，所以转发只是去掉或加上这 6 字节；CTL 的事务号是 1 字节，由桥接层自己应答。苹果的解析库里 CTL 只有 GetClientId（0x22）、ReleaseClientId（0x23）、Sync（0x27，含指示）、ConfigPowerSaveMode，以及 RevokeClientId 指示。QMUX 服务类型号：标准服务和 QRTR 服务号相同（WDS 1、DMS 2、NAS 3、UIM 11、WDA 0x1a、COEX 0x22、PDC 0x24、DSD 0x2a、SSCTL 0x2b、DFS 0x30 等）；苹果私有服务 AUDIO 0xe1、BSP 0xe2、CIQ 0xe3、AWD 0xe4、VINYL 0xe5、MAVIMS 0xe6、ELQM 0xe7、P2P 0xe8、APPS 0xe9、SFT 0xea，modem 上没有，由桥接层分配客户端号并逐条应答。每个 QMUX 客户端在 QRTR 上占一个本地端口（libqmi 的 QRTR 后端也是每个客户端一个套接字），释放时发 DEL_CLIENT。
 
-## 下一步
+## iPadOS 蜂窝接入
 
-桥接层第 1 到 3 项已写完，放在 [pending/baseband](../../platform/coachz-prelink/pending/baseband/README.md)，集成步骤也在那里：
+桥接层放在 [pending/baseband](../../platform/coachz-prelink/pending/baseband/README.md)，已接入内核：
 1. 可移植部分：QMUX 与 QRTR 互转和 CTL、SAHARA 设备端、`AppleBaseband` 方法表。
 2. 内核 IOKit 服务和 UserClient（`coachz_baseband.cpp`）。
 3. Wi-Fi 线程的 QRTR 挂钩，以及 kern_exec.c 的固件写入、联合挂载和放行 CommCenter（`coachz-prelink-baseband.patch`）。
 
 打包是 `tools/xnu_screen.py --baseband`（设 `/chosen/coachz-baseband`、嫁接 J121AP 的 `/baseband` 节点和 `baseband-chipset`）加 `tools/linux_log.py --baseband`（把 Mav16 固件放到内核分区里 modem 固件之后）。launchd 按 `/baseband` 选 `com.apple.CommCenter.plist`（`_LimitLoadToDeviceTree`），没有这个节点时用 `-noncellular` 那份。
 
-真机上服务、固件和两处挂载都通过。`compatible` 用 J121AP 后 CommCenter 走高通分支并启动 ABM，状态栏显示搜信号。发布 `AppleIPAppender` 和 `AppleBasebandPCIMAVPDPManager` 后 CommCenter 不再崩溃，“蜂窝网络”页面能打开，固件目录 bind 挂载到 ABM 要的路径后 BBUpdater 能加载全部镜像，走完 `pbl`（读寄存器、`SendImage`）和 `sahara`，ABM 报告启动成功并 engage，CommCenter 经 qmux 接到真实的 modem，识别到 SIM 卡。modem 上线后报不出 IMEI（EFS 镜像全 0，Debian 上也是 unknown），CommCenter 因此不启用 SIM，这是注册网络之前的卡点。之后是 ICCID、注册网络和必须实现的私有消息，然后才轮到 sahara 的镜像清单 要请求哪些镜像、固件目录用哪一处、哪些私有消息必须实现，然后接 `pdp_ip` 和 VINYL（eSIM）。
+真机上服务、固件和两处挂载都通过。`compatible` 用 J121AP 后 CommCenter 走高通分支并启动 ABM，状态栏显示搜信号。发布 `AppleIPAppender` 和 `AppleBasebandPCIMAVPDPManager` 后 CommCenter 不再崩溃，“蜂窝网络”页面能打开，固件目录 bind 挂载到 ABM 要的路径后 BBUpdater 能加载全部镜像，走完 `pbl`（读寄存器、`SendImage`）和 `sahara`，ABM 报告启动成功并 engage，CommCenter 经 qmux 接到真实的 modem，识别到 SIM 卡。modem 的工厂数据（FSG：IMEI、射频校准）在 eMMC 硬件分区 `mmcblk1boot0`，ChromeOS 的 `verify_fsg.sh` 这样读它：头 `FSG`，偏移 4 处 8 字节 ASCII 大小，数据从偏移 512 开始，SHA-256 烧在 qfprom nvmem 偏移 0x750。Debian 的全 0 文件加 `rmtfs -r` 让 modem 停在 `factory-test`，没有 IMEI，能力也是空的。把它只读读出、对上熔丝、补零到 2 MiB，放到被忽略的 `.tools/modem/rmtfs/modem_fsg`，`linux_log.py --modem-firmware` 会把它打进固件块，所以内核分区和镜像都含设备数据，不能外传；不写 boot0，不改 IMEI。内核的 rmtfs 不加载长度为 0 的文件，读写超出文件末尾时报错，这两点和 Linux 的 rmtfs 不同，所以四个文件都要有内容。
+
+有了它，CommCenter 不再报 `num of IMEIs (0)`，`kSimStateReady`，“关于本机”显示 IMEI 和 ICCID，QMI 服务从 37 个变成 40 个。所用测试卡没有服务，modem 在 LTE 上搜网，CS、PS 都没有附着，注册成功还没有测到。
+
+接下来的卡点：
+- **蜂窝数据**：`BindMuxDataPort` 和 `BindDataPort` 回 `QMI_ERR_INVALID_ARG`；之后才是 `pdp_ip` 接 `rmnet_ipa0`。
+- **eSIM**：`vinyl=kNotCapable`，`Incomplete vinyl info, 0 elements instead of 2`，VINYL 服务 0xe5 要答真实内容。
+- **激活**：`No baseband activation ticket found`，`Activation register request failed: QMI_ERR_NOT_SUPPORTED`，`Operator name change aborted: not activated`，影响范围还没查。
+- **EFS 持久化**：modem 的写入只留在内核内存里，重启后从 FSG 重建。

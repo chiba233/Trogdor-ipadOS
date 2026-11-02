@@ -1,6 +1,6 @@
-# 接入说明（尚未应用）
+# 接入说明
 
-本文描述将来如何接入；当前没有任何活动文件包含这些头文件，也没有增加内核对象、编译开关或补丁项。
+接入以 `package/CoachzAudio.cpp` 为准（环 256 KiB，失败后为客户端重启）；本文保留最初的资源划分和挂钩说明。
 
 ## 1. 平台资源
 
@@ -89,12 +89,6 @@ const bool available = microphone.prepare(reservedPa, reservedLength,
 - `coachz_mic_read()` 检查 `[first,written)` 并在复制后复查 seq，避免环绕覆盖、停止后残留和新 capture epoch 混入。遇到不一致只输出静音，不在实时线程无限重试。可递增现有 `in_misses` 诊断。
 - 将输入 latency/safety offset 与 10 ms worker 延迟匹配；启动阶段约 80 ms 的 codec 唤醒会产生尚不可用的输入。保留已经修正的 CoreAudio host-clock 频率逻辑，不重新写它。
 
-## 4. 接入者后续验证
+## 4. 还要验证
 
-本轮只写文件，以下均未执行：
-
-- 编译 `mic_model_test.cpp`，检查寄存器字段、48 KiB 环绕、格式转换、有效区间、错误回收和共享资源保留；它不证明板上硬件可用。
-- 在选定 XNU 的真实头文件与导出符号下编译 binding，核对 IOLock、ArmCpu IRQ 和 late static-init。
-- 真机先检查 BCLK 3.072 MHz 对应的游标速率、80 ms 唤醒和左右路信号统计，再录制已知声音，确认 S32 对齐、声道和幅度。
-- 连续采集跨多次物理/共享环绕，重复启动/停止，检查应用停止后 DMA、MICEN、Primary BCLK 与独立 rail vote 已撤回；同时播放不得被打断。
-- 最后验证系统权限、录音应用、音频服务退出与休眠恢复。系统能看到输入设备、IRQ 有计数或寄存器能读，均不是录音验收。
+录音回放听感已通过。休眠恢复、与播放同时运行时的长时间稳定性，以及应用停止后 DMA、MICEN、Primary BCLK 和 rail vote 的撤回，没有单独验证。
