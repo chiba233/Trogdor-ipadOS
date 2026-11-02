@@ -52,6 +52,16 @@ class WifiTests(unittest.TestCase):
         self.assertIn('WS_PUT32(0x01u | 0x10u | 0x20u);', wifi)
         self.assertNotIn('%02x:%02x:%02x:%02x', wifi)
 
+    def test_network_side_never_logs_names_or_addresses(self):
+        net = (ROOT / 'platform/coachz-prelink/package/CoachzWifiNet.cpp').read_text()
+        wifi = (ROOT / 'platform/coachz-prelink/patches/xnu/coachz-prelink-wifi.patch').read_text()
+        for text in (net, wifi):
+            self.assertNotIn('%.*s', text)
+            self.assertNotIn('%02x:%02x:%02x:%02x:%02x:%02x', text)
+        # The system's side comes up before the modem: the network configuration waits for the network stack service.
+        self.assertLess(wifi.index('coachz_wifi_net_start(ws.mac);'), wifi.index('+    wifi_mpss_probe();\n+    wifi_power_probe();'))
+        self.assertIn('"build-coachz-wifi-net.py"', (ROOT / 'platform/coachz-prelink/board.toml').read_text())
+
     def test_candidate_patch_applies_and_matches_sources(self):
         patch = shutil.which('patch')
         self.assertIsNotNone(patch)

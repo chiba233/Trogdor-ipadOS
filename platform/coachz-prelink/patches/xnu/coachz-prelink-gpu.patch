@@ -10,7 +10,7 @@
  bsd/dev/unix_startup.c			standard
 --- a/bsd/dev/coachz_gpu.c
 +++ b/bsd/dev/coachz_gpu.c
-@@ -0,0 +1,221 @@
+@@ -0,0 +1,267 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/*
 + * Adreno 618 first stages on Coachz (coachz-gpu=1 inventory, =2 bounded CX + GMU clock window, =3 also the GMU firmware into
@@ -124,6 +124,47 @@
 +}
 +
 +/* Called once from the sampler thread (bsd/dev/coachz_sample.c). */
++static const struct coachz_gpu_io *gpu_pm_io;
++static struct coachz_gpu_report *gpu_pm_r;
++static const uint32_t *gpu_pm_image;
++static uint32_t gpu_pm_image_bytes;
++int coachz_gpu_pm_suspend(void);
++int coachz_gpu_pm_resume(void);
++
++/* a6xx_gmu_shutdown for this legacy firmware (a6xx_gmu_notify_slumber's boot OOB), the CP stopped and the bus quiet first: the slumber
++ * the GPU reaches 66 ms after its last submission under Linux's runtime power management. CX stays on, so the SMMU keeps its tables. */
++int
++coachz_gpu_pm_suspend(void)
++{
++	const struct coachz_gpu_io *io = gpu_pm_io;
++	struct coachz_gpu_report *r = gpu_pm_r;
++	if (!io || !r || r->stage != 8) {
++		return -1;
++	}
++	return gpu_pm_slumber(io, r);
++}
++
++/* a6xx_gmu_resume and a6xx_hw_init from a cold firmware: the same start the first boot ran, up to hw_init with GPU_SET held. */
++int
++coachz_gpu_pm_resume(void)
++{
++	const struct coachz_gpu_io *io = gpu_pm_io;
++	struct coachz_gpu_report *r = gpu_pm_r;
++	if (!io || !r) {
++		return -1;
++	}
++	r->error = NULL;
++	r->core_registers_done = 0;
++	r->fw_init_polls = 0;
++	r->gmu[0] = gpu_r(io, GPU_GMU, GMU_CM3_SYSRESET);
++	gmu_start(io, gpu_pm_image, gpu_pm_image_bytes, r);
++	if (r->error || !r->core_registers_done) {
++		printf("COACHZ gpu pm: resume failed: %s, core registers %u\n", r->error ? r->error : "no error", r->core_registers_done);
++		return -2;
++	}
++	return 0;
++}
++
 +void
 +coachz_gpu_start(void)
 +{
@@ -151,11 +192,16 @@
 +	volatile uint64_t *pool = mode >= 5 ? (volatile uint64_t *)ml_io_map(GMU_POOL_PA, GMU_POOL_BYTES) : NULL;
 +	uint32_t sqe_bytes = 0;
 +	const uint32_t *sqe = mode >= 8 ? gpu_firmware("CoachzSqeFirmware", 4u + GPU_SQE_MAX, &sqe_bytes) : NULL;
-+	const struct coachz_gpu_io io = {NULL, gpu_read, gpu_write, gpu_delay, gpu_read64, gpu_write64, pool, gpu_note, sqe, sqe_bytes};
++	static struct coachz_gpu_io io;
++	io = (struct coachz_gpu_io){NULL, gpu_read, gpu_write, gpu_delay, gpu_read64, gpu_write64, pool, gpu_note, sqe, sqe_bytes};
 +	static struct coachz_gpu_report r;
++	gpu_pm_r = &r;
 +	uint32_t image_bytes = 0;
 +	const uint32_t *image = mode == 3 || mode >= 6 ? gpu_firmware("CoachzGmuFirmware", GMU_TCM_BYTES, &image_bytes) : NULL;
 +	coachz_gpu_run(&io, mode, image, image_bytes, &r);
++	gpu_pm_io = &io;
++	gpu_pm_image = image;
++	gpu_pm_image_bytes = image_bytes;
 +	printf("COACHZ gpu: mode %u stage %u restored %u: %s\n", r.mode, r.stage, r.restored, r.error ? r.error : "ok");
 +	/* GCC: gpll0-mode gpll0-vote branch-vote cfg-ahb memnoc ddrss-axi snoc-dvm */
 +	gpu_print("gcc before", r.gcc_before, GPU_GCC_REGS);
@@ -1381,7 +1427,7 @@
 +#endif
 --- a/bsd/dev/coachz_gpu_core.h
 +++ b/bsd/dev/coachz_gpu_core.h
-@@ -0,0 +1,431 @@
+@@ -0,0 +1,455 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/*
 + * Adreno 618 core and CP (coachz-gpu=8), inside the GPU_SET OOB of coachz_gpu_gmu.h: the lowest GPU frequency, a stage-1 bank for the
@@ -1811,6 +1857,30 @@
 +	gpu_w(io, GPU_GMU, GMU_CGC_MODE_CNTL, r->cgc_before[0]);
 +	gpu_w(io, GPU_GMU, GMU_CGC_DELAY_CNTL, r->cgc_before[1]);
 +	gpu_w(io, GPU_GMU, GMU_CGC_HYST_CNTL, r->cgc_before[2]);
++}
++/* a6xx_gmu_shutdown for this legacy firmware (a6xx_gmu_notify_slumber's boot OOB), the CP stopped and the bus quiet first. */
++static inline int gpu_pm_slumber(const struct coachz_gpu_io *io, struct coachz_gpu_report *r) {
++	core_stop(io, r);
++	gpu_w(io, GPU_GMU, GMU_HOST2GMU_INTR_SET, 1u << GMU_OOB_GPU_ACK);   /* a6xx_gmu_clear_oob(GMU_OOB_GPU_SET) */
++	const uint32_t idle = gmu_poll_long(io, GMU_RPMH_POWER_STATE, ~0u, 0);
++	gpu_w(io, GPU_CC, GPUCC_GX_GDSCR, gpu_r(io, GPU_CC, GPUCC_GX_GDSCR) | (1u << 11));   /* a6xx_sptprac_disable: retention, then SPTP off */
++	gpu_w(io, GPU_GMU, GMU_GX_SPTPRAC_POWER_CONTROL, 0x778001u);
++	const uint32_t sptp = gmu_poll_long(io, GMU_SPTPRAC_PWR_CLK_STATUS, 4u, 4u);
++	gpu_w(io, GPU_GMU, GMU_BOOT_SLUMBER_OPTION, 1u);
++	gpu_w(io, GPU_GMU, GMU_HOST2GMU_INTR_SET, 1u << GMU_OOB_BOOT_SET);
++	const uint32_t oob = gmu_poll_long(io, GMU_GMU2HOST_INTR_INFO, 1u << GMU_OOB_BOOT_ACK, 1u << GMU_OOB_BOOT_ACK);
++	gpu_w(io, GPU_GMU, GMU_GMU2HOST_INTR_CLR, 1u << GMU_OOB_BOOT_ACK);
++	gpu_w(io, GPU_GMU, GMU_HOST2GMU_INTR_SET, 1u << GMU_OOB_BOOT_ACK);
++	const uint32_t state = gpu_r(io, GPU_GMU, GMU_RPMH_POWER_STATE);
++	const uint32_t quiet = gmu_poll_long(io, GMU_AO_GPU_CX_BUSY_STATUS, 1u << 23, 0);   /* GPUBUSYIGNAHB */
++	gpu_w(io, GPU_GMU, GMU_HFI_CTRL_INIT, 0);   /* a6xx_hfi_stop */
++	gpu_w(io, GPU_GMU, GMU_CM3_SYSRESET, 1u);
++	const uint32_t rsc = gmu_rsc_stop(io);
++	gpu_w(io, GPU_CC, GPUCC_GX_GDSCR, gpu_r(io, GPU_CC, GPUCC_GX_GDSCR) | GDSC_SW_COLLAPSE);
++	io->delay_us(io->cookie, 500);
++	gpu_w(io, GPU_CC, GPUCC_GX_GDSCR, r->cc_before[2]);
++	printf("COACHZ gpu pm: slumber polls idle %u sptp %u oob %u busy %u rsc %u, power state 0x%x\n", idle, sptp, oob, quiet, rsc, state);
++	return oob && state == 0xfu ? 0 : -2;
 +}
 +#endif
 --- a/bsd/dev/coachz_sample.c

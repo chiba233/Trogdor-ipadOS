@@ -16,8 +16,9 @@
 | 传输 | 已写：GLINK（AP 的 FIFO 479、版本和通道握手、intent）、QRTR（节点 1，hello 后通告 rmtfs）、rmtfs（QMI 服务 14，EFS 在内存里） | 真机：modem 不再超时，通告了 WLFW（69）等服务；还没向 WLFW 发过 QMI 请求 |
 | WLFW 握手 | 已写：照 ath10k `qmi.c`，到板级数据下发和 FW ready | 真机：芯片 0x320、板 0x67，BDF 来自 `board-2.bin` 的 `bus=snoc,qmi-board-id=67`，收到 FW ready |
 | WLAN 和 WMI | 已写：WCN3990 供电、WLAN 模式、12 个 copy engine、HTC，`wmi-tlv.c` 的 service ready 和 WMI_INIT | 真机：固件报告 READY，status 0 |
-| 无线扫描 | 待做：vdev、HTT、扫描、真实BSS，以及系统网络接口 | 重复扫描与错误回收 |
-| 联网与系统接入 | 待做：station/WPA2、ifnet/Apple80211、wifid/configd、DHCP和DNS | 系统网络栈联网，再验证设置操作和生命周期 |
+| 无线扫描 | 已写：HTT 初始化、vdev、被动扫描，beacon 和 probe response 记入 BSS 表 | 真机：约 70 帧、40 多个发射源，2.4 和 5 GHz 各半；重复扫描正常 |
+| 系统接入 | 已写：`CoachzWifiNet.cpp`（改编自 UniXNU-sheng 的 `WifiNet.cpp`），`en0`、Apple80211 请求、IONetworkStack；`nw_wifi_*` 是它和无线电之间的边界 | 真机：`en0` 打开，wifid 发出扫描并取走结果，设置显示 Wi-Fi 和网络列表；点击网络后设置卡住，日志里没有加入请求（类型 20），卡在驱动之上，原因未查明 |
+| 联网 | 待做：peer、vdev 启动、关联、WPA2 四次握手和密钥、HTT 收发、DHCP 和 DNS | 系统网络栈联网，再验证设置操作和生命周期 |
 
 真机（k78，只读）：TF-A 的 SMC64 SIP 调用可用，PAS 系列一个都没实现，`assign_mem` 实现了，所以 MPSS 只能走主线 trogdor 的 MBA 自认证（`qcom_q6v5_mss.c`，`qcom,sc7180-mss-pil`）。TCSR 0x01f60000 的 Q6/NC halt 空闲、无请求。`qdsp6sw.mbn` 有 65.6 MB，进不了 payload，需要另找传送方式；`mba.mbn` 283 KB 可以。
 

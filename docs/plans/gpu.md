@@ -206,9 +206,12 @@ GPU 核心寄存器不能用 64 位写。很多寄存器不是 8 字节对齐，
 
 SPI 300（`RBBM_INT_0`）、304（HFI）、305（GMU AO）已接（`CoachzGpu.cpp` 的 `gpuInterruptsOn`）。真机上 2312 次中断对应 2312 个 fence，错误位全 0；等 fence 的线程睡在 `CACHE_FLUSH_TS` 上，最多 1 ms 后重查，中断打开之前退回 `IODelay`。
 
+## 电源管理
+
+主线 a618 没有 IFPC，所以照 66 ms 自动挂起和 `a6xx_gmu_shutdown` 的顺序：停核心、清 GPU_SET、等空闲、SPTP 断电、BOOT_SLUMBER、等 CX 忙位、停 HFI、复位 CM3、停 RSC、断 GX。恢复走完整冷启动，重启环并发 ME_INIT。GX 断电后碰核心寄存器会卡死总线，所以 `coreRead`/`coreWrite` 都过 `pmEnter` 这道闸门；提交前的 `pmGet` 负责唤醒。真机上 slumber 约 1 ms、恢复约 11 ms，状态全 0，按电源键熄屏再点亮后界面正常。系统睡眠还没接。
+
 ## 还没做的
 
 表里的阶段都走通了，接下来是性能。另外：
-- 电源管理：主线 a618 没有 IFPC，靠 66 ms 自动挂起走 `a6xx_gmu_shutdown`（slumber HFI、CM3 复位、RPMh 停止），恢复时重跑 GMU 启动和 hw_init。
 - 迁移到上游按进程 VM 的 Adreno740 框架（去掉 4 个窗口的限制，带挂起恢复）。
 - 带宽投票（interconnect / BCM）还没有 RPMh 客户端。GX 的 ARC 投票不需要：表从 CMD DB 读，由 GMU 固件代投。

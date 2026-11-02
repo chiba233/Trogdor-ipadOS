@@ -13,7 +13,7 @@
  	/* A one-second tone on the speaker (iokit/Kernel/CoachzSpeaker.cpp, coachz-speaker=1), once. */
 --- a/iokit/Kernel/CoachzInput.cpp
 +++ b/iokit/Kernel/CoachzInput.cpp
-@@ -0,0 +1,216 @@
+@@ -0,0 +1,220 @@
 +// SPDX-License-Identifier: BSD-2-Clause
 +// Keyboard and Consumer input for iPadOS (coachz-buttons=1 volume, =3 volume and power): ShengHidInput's keyboard/Consumer device
 +// (native_hid_input_allocate, its descriptor's report 1 a boot keyboard and report 2 the Consumer bits Menu 0, Power 1, Volume
@@ -41,6 +41,7 @@
 +void coachz_input_start(void);
 +int coachz_input_keyboard_report(const uint8_t *boot);
 +int coachz_input_action_report(const uint8_t *bits);
++void coachz_gpu_pm_arm(void);
 +}
 +
 +namespace {
@@ -118,7 +119,10 @@
 +// EC bits to the device's report 2 bits; only the enabled buttons.
 +uint8_t consumerBits(uint32_t ec) {
 +	uint8_t bits = 0;
-+	if ((gEnabled & 2) && (ec & 1)) bits |= 1u << 1;   // power
++	if ((gEnabled & 2) && (ec & 1)) {   // power, which also arms the GPU's runtime power management (CoachzGpu.cpp)
++		bits |= 1u << 1;
++		coachz_gpu_pm_arm();
++	}
 +	if ((gEnabled & 1) && (ec & 2)) bits |= 1u << 2;   // volume up
 +	if ((gEnabled & 1) && (ec & 4)) bits |= 1u << 3;   // volume down
 +	return bits;

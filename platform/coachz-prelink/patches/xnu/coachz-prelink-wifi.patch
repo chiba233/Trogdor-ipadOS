@@ -13,7 +13,7 @@
  	extern void coachz_battery_start(void);
 --- /dev/null
 +++ b/bsd/dev/coachz_wifi.c
-@@ -0,0 +1,3883 @@
+@@ -0,0 +1,3998 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/* WCN3990 / SC7180: the modem that hosts the WLAN firmware, started as mainline's qcom_q6v5_mss does (coachz-wifi=4), and the SMEM
 + * inventory (coachz-wifi=1 plus an explicit /arm-io/coachz-wifi ADT node). With the modem up: SMP2P, GLINK over SMEM, QRTR and
@@ -35,6 +35,8 @@
 +#include <libkern/libkern.h>
 +#include <pexpert/arm64/boot.h>
 +#include "coachz_wifi_smem.h"
++#include "coachz_wifi_net.h"
++#include <kern/locks.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
@@ -543,6 +545,9 @@
 +{
 +    static const struct wifi_bcm bcms[] = {
 +        {"MC0", 4, 2, 0, 0, 8532000}, {"ACV", 4, 2, 8, 0, 0}, {"SH0", 16, 1, 0, 0, 8532000}, {"SH4", 16, 1, 0, 0, 8532000},
++        /* The eMMC's path to memory at its HS400 peak, as Debian's interconnect summary reads: xm_emmc (CN1), qnm_aggre1_noc (SN7),
++         * qns_gemnoc_sf (SN0). Without them sequential reads stayed near 50 MB/s where Debian reads 150 to 195. */
++        {"CN1", 8, 1, 0, 0, 5400000}, {"SN7", 16, 1, 0, 0, 5400000}, {"SN0", 16, 1, 0, 0, 5400000},
 +    };
 +    uint64_t now;
 +    absolutetime_to_nanoseconds(mach_absolute_time(), &now);
@@ -551,7 +556,7 @@
 +    if (mode == 2 && now < 150ull * NSEC_PER_SEC) delay((int)((150ull * NSEC_PER_SEC - now) / 1000));
 +    const vm_offset_t db = wifi_cmd_db();
 +    if (!db) { printf("COACHZ ddr: cmd-db map failed\n"); coachz_ddr_voted = 2; return; }
-+    coachz_ddr_voted = wifi_bcm_send(db, "ddr", bcms, 4) >= 0 ? 1 : 2;
++    coachz_ddr_voted = wifi_bcm_send(db, "ddr", bcms, sizeof(bcms) / sizeof(bcms[0])) >= 0 ? 1 : 2;
 +}
 +
 +/*
@@ -2918,10 +2923,6 @@
 +            WS_PUT32(6u | 40u << 8);          /* antenna 6 dBi, max tx */
 +        }
 +    } else if (command == params + 2) {
-+        /* A locally administered address for this boot, not the device's. */
-+        const uint64_t now = mach_absolute_time();
-+        ws.mac[0] = 0x02;
-+        for (unsigned b = 1; b < 6; b++) ws.mac[b] = (uint8_t)(now >> (b * 7));
 +        WS_PUT32(0x5001);   /* WMI_TLV_VDEV_CREATE_CMDID */
 +        WS_TLV(0x56, 20);
 +        WS_PUT32(0);
@@ -2945,7 +2946,7 @@
 +    uint32_t at = 0;
 +    WS_PUT32(0x3001);        /* WMI_TLV_START_SCAN_CMDID */
 +    WS_TLV(0x4d, 100);
-+    WS_PUT32(0xa000u | ws.number);   /* scan id */
++    WS_PUT32(0xa000u | (ws.number & 0xfffu));   /* scan id */
 +    WS_PUT32(0xa001);        /* requester */
 +    WS_PUT32(0);             /* vdev */
 +    WS_PUT32(1);             /* WMI_SCAN_PRIORITY_LOW */
@@ -3015,7 +3016,100 @@
 +    ws.chan_infos++;
 +}
 +
-+/* ath10k_wmi_event_mgmt_rx: counts beacons and probe responses per band and their distinct transmitters. */
++/* What the scan heard, for the network side (CoachzWifiNet.cpp). Names and addresses stay here and in the system's own requests: nothing
++ * prints them. */
++#define WS_BSS 96u
++static struct { struct nw_bss_info info; uint64_t seen; } ws_bss[WS_BSS];
++static unsigned ws_bss_count;
++static lck_grp_t *ws_group;
++static lck_mtx_t *ws_lock;
++static const struct nw_wifi_events *ws_events;
++static volatile uint32_t ws_scan_wanted;
++
++/* cfg80211_inform_bss from a beacon or probe response: the fixed fields and the elements after the 24-byte header and 12 fixed bytes. */
++static void
++ws_bss_note(const uint8_t *f, uint32_t n, uint32_t channel, int32_t snr)
++{
++    if (n < 36 || !ws_lock) return;
++    const uint8_t *bssid = f + 16, *ies = f + 36;
++    uint32_t ie_len = n - 36;
++    /* Whole elements only: a truncated last one would read as a malformed frame. */
++    uint32_t kept = 0;
++    while (kept + 2u <= ie_len && kept + 2u + ies[kept + 1] <= ie_len && kept + 2u + ies[kept + 1] <= sizeof(ws_bss[0].info.ie)) kept += 2u + ies[kept + 1];
++    lck_mtx_lock(ws_lock);
++    unsigned at = 0;
++    while (at < ws_bss_count && memcmp(ws_bss[at].info.bssid, bssid, 6)) at++;
++    if (at == ws_bss_count) {
++        if (at == WS_BSS) { lck_mtx_unlock(ws_lock); return; }
++        ws_bss_count++;
++    }
++    struct nw_bss_info *b = &ws_bss[at].info;
++    memset(b, 0, sizeof(*b));
++    memcpy(b->bssid, bssid, 6);
++    b->freq_mhz = channel == 14 ? 2484u : channel < 14 ? 2407u + 5u * channel : 5000u + 5u * channel;
++    /* ath10k_wmi_event_mgmt_rx: the signal is the SNR above the default noise floor. */
++    b->signal_dbm = (int8_t)(snr - 95);
++    b->beacon_int = (uint16_t)(f[32] | f[33] << 8);
++    b->caps = (uint16_t)(f[34] | f[35] << 8);
++    b->ie_len = (uint16_t)kept;
++    memcpy(b->ie, ies, kept);
++    if (kept >= 2 && ies[0] == 0 && ies[1] <= 32) {   /* the SSID element comes first */
++        b->ssid_len = ies[1];
++        memcpy(b->ssid, ies + 2, ies[1]);
++    }
++    ws_bss[at].seen = mach_absolute_time();
++    lck_mtx_unlock(ws_lock);
++}
++
++void nw_wifi_set_events(const struct nw_wifi_events *ev) { ws_events = ev; }
++
++/* Every scan here is passive and hears every network, so a request for one network is the same scan. The radio may not be up yet: the
++ * request waits, and fails at once only if the sequence has already stopped. */
++int
++nw_wifi_scan(const uint8_t *ssid, size_t len)
++{
++    (void)ssid;
++    (void)len;
++    if (wl.failed) {
++        if (ws_events && ws_events->scan_done) ws_events->scan_done();
++        return 0;
++    }
++    __atomic_store_n(&ws_scan_wanted, 1u, __ATOMIC_RELEASE);
++    return 0;
++}
++
++int nw_wifi_bss_count(void) { return (int)ws_bss_count; }
++
++int
++nw_wifi_bss_get(int i, struct nw_bss_info *out)
++{
++    if (!ws_lock || i < 0) return -1;
++    lck_mtx_lock(ws_lock);
++    const int found = (unsigned)i < ws_bss_count;
++    if (found) {
++        *out = ws_bss[i].info;
++        uint64_t ns = 0;
++        absolutetime_to_nanoseconds(mach_absolute_time() - ws_bss[i].seen, &ns);
++        out->age_ms = (uint32_t)(ns / 1000000u);
++    }
++    lck_mtx_unlock(ws_lock);
++    return found ? 0 : -1;
++}
++
++/* No data path yet: joining and sending fail plainly, so the system sees a network it cannot join rather than a hang. */
++int nw_wifi_connect(const uint8_t *ssid, size_t len, const uint8_t *bssid, const char *pass, size_t plen) { (void)ssid; (void)len; (void)bssid; (void)pass; (void)plen; return -1; }
++void nw_wifi_disconnect(void) {}
++int nw_wifi_tx(const uint8_t *eth, size_t len) { (void)eth; (void)len; return -1; }
++
++void
++nw_wifi_status_get(struct nw_wifi_status *st)
++{
++    memset(st, 0, sizeof(*st));
++    st->state = wl.state == 24 ? NW_STA_SCANNING : NW_STA_IDLE;
++    memcpy(st->mac, ws.mac, 6);
++}
++
++/* ath10k_wmi_event_mgmt_rx: counts beacons and probe responses per band and their distinct transmitters, and keeps them for the system. */
 +static void
 +ws_mgmt_rx(const uint8_t *m, uint32_t n)
 +{
@@ -3029,6 +3123,8 @@
 +    /* The header's channel is the IEEE number: ath10k_wmi_event_mgmt_rx takes 1..14 as 2.4 GHz. */
 +    if (wm_u32(h, 0) <= 14) ws.band2++; else ws.band5++;
 +    if (wm_u32(h, 1) > ws.snr_best) ws.snr_best = wm_u32(h, 1);
++    const uint32_t frame_bytes = wm_u32(h, 4) < lf ? wm_u32(h, 4) : lf;
++    if (!wm_u32(h, 5)) ws_bss_note(f, frame_bytes, wm_u32(h, 0), (int32_t)wm_u32(h, 1));   /* status: no error bits */
 +    uint32_t hash = 2166136261u;
 +    for (unsigned b = 16; b < 22; b++) hash = (hash ^ f[b]) * 16777619u;
 +    for (unsigned b = 0; b < ws.bss && b < 64; b++) {
@@ -3421,6 +3517,10 @@
 +                break;
 +            }
 +            memset((uint8_t *)&ws + __builtin_offsetof(__typeof__(ws), started), 0, sizeof(ws) - __builtin_offsetof(__typeof__(ws), started));
++            /* A fresh list: what no longer answers should not stay on the system's list. */
++            lck_mtx_lock(ws_lock);
++            ws_bss_count = 0;
++            lck_mtx_unlock(ws_lock);
 +            wl.waited_ms = 0;
 +            wl.state = 24;
 +        }
@@ -3428,23 +3528,27 @@
 +    case 24:
 +        /* ath10k_hw_scan waits for the started event, then the scan's own 20 s limit and a margin. */
 +        if (ws.completed || ++wl.waited_ms >= 30000) {
-+            printf("COACHZ wifi: scan %u %s after %u ms: started %u, reason %u, %u events, %u channels, last type 0x%x, %u bad\n", ws.number,
-+                ws.completed ? "done" : "timed out", wl.waited_ms, ws.started, ws.reason, ws.events, ws.channels, ws.last_type, ws.bad);
-+            printf("COACHZ wifi: scan %u heard %u frames, %u beacons or probe responses from %u transmitters, 2.4 GHz %u, 5 GHz %u, best snr %u\n",
-+                ws.number, ws.mgmt, ws.beacons, ws.bss, ws.band2, ws.band5, ws.snr_best);
-+            printf("COACHZ wifi: scan %u radio: %u channel reports, noise %d to %d, busiest %u%%, %u HTT messages\n", ws.number, ws.chan_infos, ws.noise_low,
-+                ws.noise_high, ws.busy_most, wh.htt_messages);
-+            for (unsigned i = 0; i < 32; i++) {
-+                if (ws.htt_types[i]) printf("COACHZ wifi: HTT message %u: %u\n", i, ws.htt_types[i]);
++            /* The system scans often: the first few in full, then one in 64. */
++            if (ws.number < 6 || !(ws.number % 64)) {
++                printf("COACHZ wifi: scan %u %s after %u ms: started %u, reason %u, %u events, %u channels, last type 0x%x, %u bad\n", ws.number,
++                    ws.completed ? "done" : "timed out", wl.waited_ms, ws.started, ws.reason, ws.events, ws.channels, ws.last_type, ws.bad);
++                printf("COACHZ wifi: scan %u heard %u frames, %u beacons or probe responses from %u transmitters, 2.4 GHz %u, 5 GHz %u, best snr %u\n",
++                    ws.number, ws.mgmt, ws.beacons, ws.bss, ws.band2, ws.band5, ws.snr_best);
++                printf("COACHZ wifi: scan %u radio: %u channel reports, noise %d to %d, busiest %u%%, %u HTT messages\n", ws.number, ws.chan_infos, ws.noise_low,
++                    ws.noise_high, ws.busy_most, wh.htt_messages);
++                for (unsigned i = 0; i < 32; i++) {
++                    if (ws.htt_types[i]) printf("COACHZ wifi: HTT message %u: %u\n", i, ws.htt_types[i]);
++                }
++                for (unsigned i = 0; i < 12 && ws.wmi_ids[i]; i++) printf("COACHZ wifi: WMI event 0x%x: %u\n", ws.wmi_ids[i], ws.wmi_counts[i]);
 +            }
-+            for (unsigned i = 0; i < 12 && ws.wmi_ids[i]; i++) printf("COACHZ wifi: WMI event 0x%x: %u\n", ws.wmi_ids[i], ws.wmi_counts[i]);
 +            ws.number++;
 +            wl.waited_ms = 0;
-+            wl.state = ws.number < 3 ? 25 : 19;
++            wl.state = 25;
++            if (ws_events && ws_events->scan_done) ws_events->scan_done();
 +        }
 +        break;
 +    case 25:
-+        if (++wl.waited_ms >= 30000) {
++        if (__atomic_exchange_n(&ws_scan_wanted, 0u, __ATOMIC_ACQ_REL)) {
 +            wl.waited_ms = 100;
 +            wl.state = 23;
 +        }
@@ -3829,6 +3933,17 @@
 +    unsigned mode = 0;
 +    if (started || !PE_parse_boot_argn("coachz-wifi", &mode, sizeof(mode)) || mode < 1 || mode > 4) return;
 +    started = 1;
++    if (mode == 4) {
++        /* The network configuration waits for the network stack service before it calls IOKit quiet, and the wireless daemon waits for
++         * that, so the system's side comes up at once and the radio's scans answer it when the modem is ready. A locally administered
++         * address for this boot, not the device's. */
++        const uint64_t now = mach_absolute_time();
++        ws.mac[0] = 0x02;
++        for (unsigned b = 1; b < 6; b++) ws.mac[b] = (uint8_t)(now >> (b * 7));
++        ws_group = lck_grp_alloc_init("coachz-wifi-scan", LCK_GRP_ATTR_NULL);
++        ws_lock = lck_mtx_alloc_init(ws_group, LCK_ATTR_NULL);
++        coachz_wifi_net_start(ws.mac);
++    }
 +    wifi_mpss_probe();
 +    wifi_power_probe();
 +    if (mode >= 2) {
@@ -4212,4 +4327,43 @@
 +    }
 +    return CW_OK;
 +}
++#endif
+--- /dev/null
++++ b/bsd/dev/coachz_wifi_net.h
+@@ -0,0 +1,36 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++/* The station interface between the radio (bsd/dev/coachz_wifi.c) and the system's network side (CoachzWifiNet.cpp), with the names and
++ * layouts of UniXNU Ath12kWifi's include/nw_abi.h, revision f6bf561, whose network side CoachzWifiNet.cpp adapts. */
++#ifndef COACHZ_WIFI_NET_H
++#define COACHZ_WIFI_NET_H
++#include <sys/types.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++struct nw_bss_info {
++    uint8_t bssid[6]; uint8_t ssid_len; uint8_t ssid[32];
++    uint32_t freq_mhz; int8_t signal_dbm; uint16_t caps, beacon_int; uint32_t age_ms;
++    uint16_t ie_len; uint8_t ie[384];   /* the information elements as the access point sent them */
++};
++enum { NW_STA_OFF, NW_STA_IDLE, NW_STA_SCANNING, NW_STA_AUTH, NW_STA_ASSOC, NW_STA_KEYS, NW_STA_UP };
++enum { NW_RES_OK = 0, NW_RES_NOT_FOUND = 1, NW_RES_TIMEOUT = 2, NW_RES_REJECTED = 3, NW_RES_BAD_KEY = 4, NW_RES_UNSUPPORTED = 5, NW_RES_FAILED = 6 };
++struct nw_wifi_status { uint32_t state; int32_t result; uint8_t bssid[6]; uint8_t ssid_len; uint8_t ssid[32]; uint32_t freq_mhz; int8_t signal_dbm; uint8_t mac[6]; };
++struct nw_wifi_events {
++    void (*scan_done)(void);
++    void (*connect_done)(int result);   /* NW_RES_* */
++    void (*link_lost)(int reason);
++    void (*rx)(const uint8_t *eth, size_t len);   /* a frame for the host network stack: Ethernet header and payload */
++};
++void nw_wifi_set_events(const struct nw_wifi_events *ev);
++int nw_wifi_scan(const uint8_t *ssid, size_t len);   /* every scan here is passive and sees all networks */
++int nw_wifi_bss_count(void);
++int nw_wifi_bss_get(int i, struct nw_bss_info *out);   /* 0 on success */
++int nw_wifi_connect(const uint8_t *ssid, size_t len, const uint8_t *bssid, const char *pass, size_t plen);
++void nw_wifi_disconnect(void);
++int nw_wifi_tx(const uint8_t *eth, size_t len);   /* 0 queued */
++void nw_wifi_status_get(struct nw_wifi_status *st);
++void coachz_wifi_net_start(const uint8_t mac[6]);   /* CoachzWifiNet.cpp */
++#ifdef __cplusplus
++}
++#endif
 +#endif

@@ -34,6 +34,11 @@ extern "C" IOService *native_adreno_accelerator_allocate(void);
 extern "C" unsigned native_adreno_accelerator_instance_size(void);
 extern "C" kern_return_t OSKextLoadKextWithIdentifier(const char *);
 extern "C" void native_adreno_metal_report(void);
+extern "C" void native_adreno_publisher_lock(int locked);
+extern "C" void (*volatile native_adreno_power_get)(void);
+extern "C" int coachz_gpu_pm_suspend(void);
+extern "C" int coachz_gpu_pm_resume(void);
+extern "C" void coachz_gpu_pm_arm(void);
 // NativeAdrenoPublish.cpp's per-process table (first eight process names that opened the plug-in type) and its latest mount failure:
 // [0] 1 no free slot, 2 the core's open, 3 the window scope; [1] IOReturn; [2] slot; [3] failures so far.
 extern "C" struct NativeAdrenoClientRecord {char name[20]; uint32_t opens, refused, closes, slot, peak_mib, last_refusal;} native_adreno_client_log[8];
@@ -77,15 +82,31 @@ IOMemoryMap *gMaps[GpuBufferCount];
 const NativeAdrenoAbiDeviceInfo gDeviceInfo = {0x06010800u, 0x80000u, 0x100000ull, 0x1fffffffff000ull, 0x20000000ull, 0x60000000ull,
     14u, 6u, 0u, 2u, NativeAdrenoDeviceClientIova, 0u};
 
+// Runtime power: with GX off an access to a core register stalls the bus and stops the machine, so every one passes this gate. The sleeping
+// side sets gPmAsleep and then waits for the users to leave.
+volatile uint32_t gPmAsleep, gPmUsers, gPmDropped;
+inline bool pmEnter() {
+    __atomic_fetch_add(&gPmUsers, 1, __ATOMIC_SEQ_CST);
+    if (!__atomic_load_n(&gPmAsleep, __ATOMIC_SEQ_CST)) return true;
+    __atomic_fetch_sub(&gPmUsers, 1, __ATOMIC_SEQ_CST);
+    gPmDropped = gPmDropped + 1;
+    return false;
+}
+inline void pmExit() {__atomic_fetch_sub(&gPmUsers, 1, __ATOMIC_SEQ_CST);}
+
 uint32_t coreRead(uint32_t reg) {
+    if (!pmEnter()) return 0;
     const uint32_t value = *reinterpret_cast<volatile uint32_t *>(gCore + size_t(reg) * 4);
     __asm__ volatile("dsb sy" ::: "memory");
+    pmExit();
     return value;
 }
 void coreWrite(uint32_t reg, uint32_t value) {
+    if (!pmEnter()) return;
     __asm__ volatile("dsb sy" ::: "memory");
     *reinterpret_cast<volatile uint32_t *>(gCore + size_t(reg) * 4) = value;
     __asm__ volatile("dsb sy" ::: "memory");
+    pmExit();
 }
 int ringWrite(void *, uint32_t reg, uint32_t value) {coreWrite(reg, value); return 0;}
 int ringRead(void *, uint32_t reg, uint32_t *value) {*value = coreRead(reg); return 0;}
@@ -332,6 +353,7 @@ void gmuWrite(uint32_t at, uint32_t value) {
     __asm__ volatile("dsb sy" ::: "memory");
 }
 unsigned dcvsSet(unsigned level, uint32_t *result) {
+    if (__atomic_load_n(&gPmAsleep, __ATOMIC_SEQ_CST)) return 0;   // no firmware to ask: the level is set again on resume
     gmuWrite(GmuDcvsAck, 0);
     gmuWrite(GmuDcvsPerf, 3u << 28 | level);
     gmuWrite(GmuDcvsBw, 0xff);
@@ -375,6 +397,59 @@ unsigned governorTarget(unsigned level, uint64_t dBusy, uint64_t dAlways, bool t
     while (target < 7 && kLevelMHz[target] < demand) target++;
     if (resumed && target < 5) target = 5;
     return target;
+}
+
+// Runtime power as Linux's msm driver has it for A618 (no IFPC): 66 ms after the last submission the GMU slumbers, and the next submission
+// brings it back through the whole start. Armed by the power button (coachz_gpu_pm_arm), so a failure can only follow that press.
+volatile uint32_t gPmArmed;
+volatile uint64_t gPmLastSubmit;
+uint32_t gPmSleeps, gPmWakes;
+void pmSleep() {
+    const uint64_t began = mach_absolute_time();
+    *reinterpret_cast<volatile uint32_t *>(gGmu + GmuAoMask) = ~0u;   // a6xx_gmu_irq_disable
+    *reinterpret_cast<volatile uint32_t *>(gGmu + GmuHfiMask) = ~0u;
+    coreWrite(RbbmInt0Mask, 0);
+    __atomic_store_n(&gPmAsleep, 1u, __ATOMIC_SEQ_CST);
+    while (__atomic_load_n(&gPmUsers, __ATOMIC_SEQ_CST)) IODelay(1);
+    const int status = coachz_gpu_pm_suspend();
+    gPmSleeps = gPmSleeps + 1;
+    printf("COACHZ gpu pm: slumber %u status %d in %llu us\n", gPmSleeps, status, (mach_absolute_time() - began) / 19);
+}
+// Under the publisher's lock, before a submission: the firmware and hw_init again, then what startCp does after them.
+void pmGet() {
+    gPmLastSubmit = mach_absolute_time();
+    if (!__atomic_load_n(&gPmAsleep, __ATOMIC_SEQ_CST)) return;
+    const uint64_t began = mach_absolute_time();
+    const int status = coachz_gpu_pm_resume();
+    __atomic_store_n(&gPmAsleep, 0u, __ATOMIC_SEQ_CST);
+    coreWrite(CpSqeInstrBase, uint32_t(gBuffers[0].iova));
+    coreWrite(CpSqeInstrBase + 1, uint32_t(gBuffers[0].iova >> 32));
+    const IOReturn ring = gRing.restart();
+    coreWrite(CpSqeCntl, 1);
+    uint32_t init[9] = {0, 0x2fu, 3u, 0x20000000u, 0, 0, 0, 0, 0};
+    uint32_t fence = 0, observed = 0;
+    const NativeAdrenoRingClock clock{nullptr, ringNow, ringIdle};
+    const IOReturn sent = AdrenoPM4Type7(Pm4MeInit, 8, &init[0]) == AdrenoPM4Success ? gRing.submit(init, 9, &fence) : kIOReturnError;
+    const NativeAdrenoRingFence waited = sent ? NativeAdrenoRingFenceArgument : gRing.wait(fence, &clock, 200000, &observed);
+    coreWrite(RbbmSecvidTrustCntl, 0);
+    coreWrite(RbbmIntClearCmd, ~0u);
+    coreWrite(RbbmInt0Mask, IrqMask);
+    *reinterpret_cast<volatile uint32_t *>(gGmu + GmuAoClr) = ~0u;
+    *reinterpret_cast<volatile uint32_t *>(gGmu + GmuHfiClr) = ~0u;
+    *reinterpret_cast<volatile uint32_t *>(gGmu + GmuAoMask) = ~uint32_t(GmuAoErrors);
+    *reinterpret_cast<volatile uint32_t *>(gGmu + GmuHfiMask) = ~uint32_t(GmuHfiFault);
+    gPmWakes = gPmWakes + 1;
+    printf("COACHZ gpu pm: resume %u status %d ring 0x%x ME_INIT 0x%x wait %d in %llu us, %u core accesses dropped asleep\n", gPmWakes, status, ring, sent,
+        int(waited), (mach_absolute_time() - began) / 19, gPmDropped);
+}
+void pmThread(void *, wait_result_t) {
+    for (;;) {
+        IOSleep(20);
+        if (!gPmArmed || gPmAsleep || mach_absolute_time() - gPmLastSubmit < 19200 * 66) continue;
+        native_adreno_publisher_lock(1);
+        if (!gRing.outstanding() && mach_absolute_time() - gPmLastSubmit >= 19200 * 66) pmSleep();
+        native_adreno_publisher_lock(0);
+    }
 }
 
 void rateThread(void *, wait_result_t) {
@@ -820,6 +895,13 @@ extern "C" int coachz_gpu_driver_start(volatile uint8_t *core, volatile uint8_t 
     if (kernel_thread_start(memoryProbeThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
     cacheSetup();
     if (kernel_thread_start(rateThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
+    native_adreno_power_get = pmGet;
+    if (kernel_thread_start(pmThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
     coachz_gpu_trace_start();
     return accelerator;
+}
+
+extern "C" void coachz_gpu_pm_arm(void) {
+    if (!gPmArmed) printf("COACHZ gpu pm: armed by the power button\n");
+    gPmArmed = 1;
 }

@@ -18,7 +18,7 @@ class InputTests(unittest.TestCase):
     def test_power_is_opt_in_and_bits_match_the_descriptor(self):
         source = new_file('coachz-prelink-input.patch', 'iokit/Kernel/CoachzInput.cpp')
         # EC bits power 0, volume up 1, volume down 2; NativeHidInput report 2: Power 1, Volume Increment 2, Decrement 3.
-        self.assertIn('if ((gEnabled & 2) && (ec & 1)) bits |= 1u << 1;', source)
+        self.assertIn('if ((gEnabled & 2) && (ec & 1)) {   // power', source)
         self.assertIn('if ((gEnabled & 1) && (ec & 2)) bits |= 1u << 2;', source)
         self.assertIn('if ((gEnabled & 1) && (ec & 4)) bits |= 1u << 3;', source)
         # handleReport is slot 181 of the original IOHIDDevice, as build-sheng-hid-input.py checks.

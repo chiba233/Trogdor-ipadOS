@@ -38,4 +38,4 @@
 
 ## 下一阶段（要等第一阶段的实机结果）
 
-查清连续读为什么只有约 50 MB/s（和 Debian 对比，带宽投票），SD UHS-I（CMD11、GPLL7、调谐），CQE，SD 热插拔。
+查清连续读为什么只有约 60 MB/s（路径带宽投票后；Debian 同样的 HS400 约 152 MB/s），SD UHS-I（CMD11、GPLL7、调谐），CQE，SD 热插拔。

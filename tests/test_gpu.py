@@ -43,6 +43,23 @@ class SequenceTests(unittest.TestCase):
                             (0x1f9c5, 'GMU_GENERAL_0'), (0x23b05, 'GMU_AO_HOST_INTERRUPT_STATUS')]:
             self.assertIn('%s 0x%xu' % (name, dword * 4 - 0x6a000), source)
 
+    def test_runtime_power_follows_mainline_and_gates_core_access(self):
+        core = new_file(PATCH, 'bsd/dev/coachz_gpu_core.h')
+        body = core[core.index('static inline int gpu_pm_slumber('):]
+        # a6xx_gmu_shutdown: CP and bus first, GPU_SET off, SPTP off, the slumber OOB, HFI stopped, CM3 in reset, the RSC stopped, GX collapsed.
+        order = [body.index(s) for s in ('core_stop(io, r);', '1u << GMU_OOB_GPU_ACK', 'GMU_GX_SPTPRAC_POWER_CONTROL, 0x778001u', 'GMU_BOOT_SLUMBER_OPTION, 1u',
+                                         '1u << GMU_OOB_BOOT_SET', 'GMU_HFI_CTRL_INIT, 0', 'GMU_CM3_SYSRESET, 1u', 'gmu_rsc_stop(io)', 'GDSC_SW_COLLAPSE')]
+        self.assertEqual(order, sorted(order))
+        board = (ROOT / 'platform/coachz-prelink/package/CoachzGpu.cpp').read_text()
+        # With GX off a core register access stops the machine: both accessors pass the gate, and sleeping waits for its users.
+        self.assertEqual(board.count('if (!pmEnter())'), 2)
+        self.assertLess(board.index('__atomic_store_n(&gPmAsleep, 1u'), board.index('while (__atomic_load_n(&gPmUsers'))
+        self.assertLess(board.index('while (__atomic_load_n(&gPmUsers'), board.index('const int status = coachz_gpu_pm_suspend();'))
+        # Only after the power button, and the first submission wakes it.
+        self.assertIn('if (!gPmArmed || gPmAsleep', board)
+        ring = (ROOT / 'platform/coachz-prelink/patches/gpu/Adreno740.patch').read_text()
+        self.assertLess(ring.index('+    if(native_adreno_power_get)native_adreno_power_get();'), ring.index('     status=ring_->submitFramed(words,word_count,&value);'))
+
     def test_no_power_votes_or_core_access(self):
         source = new_file(PATCH, 'bsd/dev/coachz_gpu_seq.h') + new_file(PATCH, 'bsd/dev/coachz_gpu.c')
         self.assertEqual(source.count('GPUCC_GX_GDSCR'), 2)   # its definition and the read list: GX is only read

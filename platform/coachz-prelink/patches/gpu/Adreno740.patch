@@ -687,3 +687,73 @@
      IOReturn emitFence(uint32_t at,uint32_t seqno,uint32_t *end);
      IOReturn emitFramedFence(uint32_t at,uint32_t seqno,uint32_t *end);
      IOReturn submitWords(const uint32_t *words,size_t word_count,uint32_t *fence,bool framed);
+--- a/NativeAdrenoRing.h
++++ b/NativeAdrenoRing.h
+@@ -81,6 +81,7 @@
+     /* Programs nothing. Refuses while submissions are unobserved or poisoned,
+      * because only the caller can establish real GPU quiescence and unmap. */
+     IOReturn detach();
++    IOReturn restart();   /* Coachz: the GPU lost power: the registers again, the fence numbers go on */
+     /* Emit an entire command stream followed by the timestamp fence and commit
+      * it with one WPTR update. Returns a nonzero fence value on success. The
+      * words are copied; the caller's buffer is never retained. */
+--- a/NativeAdrenoRing.cpp
++++ b/NativeAdrenoRing.cpp
+@@ -261,6 +261,22 @@
+     if(status)return status;
+     next_=rptr;seqno_=0;completed_=0;submissions_=0;stamp_seen_=0;
+     attached_=true;return kIOReturnSuccess;
++}
++IOReturn NativeAdrenoRing::restart()
++{
++    if(!attached_ || poisoned_)return kIOReturnNotReady;
++    if(outstanding())return kIOReturnBusy;
++    const uint32_t control=(uint32_t)(ilog2(ring_bytes_/8)&0x3f)|(ilog2(RingBlockBytes/8)<<8)|RingNoUpdate;
++    const uint32_t base_lo=(uint32_t)ring_iova_,base_hi=(uint32_t)(ring_iova_>>32);
++    const uint32_t rptr_lo=(uint32_t)fence_iova_,rptr_hi=(uint32_t)(fence_iova_>>32);
++    const uint32_t writes[]={RingBase,base_lo,RingBase+1,base_hi,RingControl,control,
++        RingRptrAddress,rptr_lo,RingRptrAddress+1,rptr_hi,RingWptr,0,RingScratch,0};
++    for(size_t i=0;i<sizeof(writes)/sizeof(writes[0]);i+=2)
++        if(io_.write32(io_.cookie,writes[i],writes[i+1]))return poison();
++    uint32_t rptr=0;IOReturn status=readRptr(&rptr);
++    if(status)return status;
++    next_=rptr;reset_pending_=true;
++    return kIOReturnSuccess;
+ }
+ IOReturn NativeAdrenoRing::detach()
+ {
+--- a/NativeAdrenoPublish.cpp
++++ b/NativeAdrenoPublish.cpp
+@@ -813,6 +813,12 @@
+ 
+ /* Publishes the service once. Everything passed in must outlive the system (the board probe keeps them in statics) and
+  * the VM, submit object and ring must already be attached to the live GPU context. The core must not be open. */
++extern "C" void native_adreno_publisher_lock(int locked)
++{
++    if(locked)IOLockLock(g.lock);
++    else IOLockUnlock(g.lock);
++}
++
+ extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit *submit,NativeAdrenoRing *ring,
+     const NativeAdrenoRingClock *clock,const NativeAdrenoTimer *timer,const NativeAdrenoAbiDeviceInfo *info,
+     uint32_t input_bits,uint32_t output_bits)
+--- a/NativeAdrenoSubmit.cpp
++++ b/NativeAdrenoSubmit.cpp
+@@ -2,6 +2,9 @@
+ #include "NativeAdrenoSubmit.h"
+ #include "AdrenoPM4.h"
+ #include <IOKit/IOLib.h>
++
++/* Coachz: set by the board code (CoachzGpu.cpp) once its runtime power management is ready. */
++extern "C" {void (*volatile native_adreno_power_get)(void);}
+ 
+ /* CP_INDIRECT_BUFFER is opcode 0x3f with a 3-word payload: 64-bit GPU address
+  * and IB_SIZE in dwords (bits 0..19), exactly as the pinned adreno_pm4.xml
+@@ -224,6 +227,7 @@
+         for(unsigned i=0;i<28;++i)native_adreno_ib_log[slot][4+i]=head[i];
+         native_adreno_ib_log_count=native_adreno_ib_log_count+1;
+     }
++    if(native_adreno_power_get)native_adreno_power_get();   /* Coachz: the GPU back up if it slept (a6xx_pm_resume) */
+     status=ring_->submitFramed(words,word_count,&value);
+     if(status) {
+         /* A poisoned ring may already have consumed the WPTR write, so the
