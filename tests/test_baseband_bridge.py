@@ -41,7 +41,7 @@ class BasebandBridgeTests(unittest.TestCase):
                             str(ROOT / 'tests/coachz_bb_model_test.c'), '-o', str(binary)], check=True)
             result = subprocess.run([str(binary)], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(result.stdout.count('PASS '), 4, result.stdout)
+            self.assertEqual(result.stdout.count('PASS '), 6, result.stdout)
 
     def test_headers_compile_as_cpp(self):
         """coachz_baseband.cpp includes the portable headers as C++."""
@@ -49,8 +49,8 @@ class BasebandBridgeTests(unittest.TestCase):
         self.assertIsNotNone(cxx)
         with tempfile.TemporaryDirectory(prefix='coachz-bb-cpp-') as directory:
             source = Path(directory) / 'tu.cpp'
-            source.write_text('#include "coachz_bb_qmux.h"\n#include "coachz_bb_sahara.h"\n#include "coachz_bb_control.h"\n'
-                              '#include "coachz_bb_channels.h"\nint main() { return 0; }\n')
+            source.write_text('#include "coachz_bb_qmux.h"\n#include "coachz_bb_sahara.h"\n#include "coachz_bb_control.h"\n#include "coachz_bb_data.h"\n'
+                              '#include "coachz_bb_channels.h"\n#include "coachz_bb_esim.h"\nint main() { return 0; }\n')
             result = subprocess.run([cxx, '-std=gnu++2b', '-fsyntax-only', '-Wall', '-Werror', '-I', str(PENDING), str(source)],
                                     capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)

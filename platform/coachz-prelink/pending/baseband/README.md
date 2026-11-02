@@ -5,6 +5,7 @@
 ## 文件
 
 - `coachz_bb_qmux.h`：qmux1/qmux2 上的 QMUX 与 modem 的 QRTR 互转。普通服务只去掉或加回 6 字节 QMUX 头；CTL 在这里应答（GetClientId 按通道和服务分配客户端号，每个客户端占一个本地 QRTR 端口，从 0x4100 起；ReleaseClientId 和 Sync 释放，释放的端口要发 DEL_CLIENT）。苹果私有服务（0xe1 到 0xea）的请求交回调用者，暂时一律回 `QMI_ERR_NOT_SUPPORTED`。
+- `coachz_bb_data.h`：这台 modem 的数据口和激活。CommCenter 绑定数据口时填苹果 PCIe 基带的端点 `{3, 4}` 或只给 mux id，这里换成或补上 IPA 的 `{4, 1}`（WDS 0xa2、QOS 0x2b、WDA 0x20/0x21）。CommCenter 第一次要 WDS 客户端时，桥接层用自己的客户端照 ModemManager 对 IPA 的顺序发 DPM Open Port 和 WDA Set Data Format（QMAPv4，不行再 QMAP）。BSP 的 ActivationRegister（0xb00c）回成功并发 kActivated 指示。
 - `coachz_bb_sahara.h`：sahara 通道上扮演 modem 的设备端。发 HELLO，按 ELF 头、程序头、各段请求列出的镜像，收到的数据丢弃，最后一个镜像的 DONE 应答报完成。 主机回模式 3 时走命令模式（芯片 ID、序列号，再切回模式 0）。`pbl` 通道的方法 5 读 BHI 寄存器（0 序列号、3 MSM ID、4 PK hash），方法 4 `sendImage` 收下即丢。序列号是固定值，不用真实序列号。
 - `coachz_bb_control.h`：`AppleBaseband` UserClient 的方法表。供电、复位、复用等只记录，不动 modem；管理器状态和基带状态原样存取；SPMI、GNSS、时间同步回 unsupported。
 - `coachz_bb_channels.h`：通道名表、匹配用的类名和属性键、两个通道 UserClient 的方法号和参数个数。
@@ -22,7 +23,7 @@
 
 ## 上机看什么
 
-`com.apple.telephony.abm` 子系统的 `%s` 消息默认是 `<private>`。`bsd/kern/kern_exec.c` 写 `/private/var/preferences/Logging/Subsystems/com.apple.telephony.abm.plist` 打开它。这些日志可能带设备标识，只留在本机。
+`com.apple.telephony.abm` 子系统的 `%s` 消息和 `com.apple.telephony.bb`（qmux 类别逐条打印 QMI 报文）的字节默认是 `<private>`。`bsd/kern/kern_exec.c` 在 `/private/var/preferences/Logging/Subsystems/` 下给这两个子系统写配置打开它们。这些日志可能带设备标识，只留在本机。
 
 日志环里以 `COACHZ baseband:` 开头的行：
 - 服务发布了几个；
@@ -49,3 +50,9 @@ BBUpdater 接受 SBL（镜像号 0x15）后报告启动成功，ABM engage，53 
 - CTL 里除 GetClientId、ReleaseClientId、Sync、GetVersionInfo 以外的请求一律回成功。
 - 异步读写的回调参数个数是从 libIOABP 的调用处推出来的。
 - 时间事件从不发送；共享内存映射只回成功，不做实际映射。
+
+## eSIM Tape 桥接
+
+`coachz_bb_esim.h` 已补齐并接入 `coachz_baseband.cpp`，随现有 baseband 构建复制：独立 UIM 客户端发现实际 eUICC，Get Card Status 添加每槽能力 TLV 0x21，VINYL 的 Tape 请求经 ISD-R 发送，真实结果分片回到 CommCenter。空闲发现不切槽；只有显式 Tape 操作可临时切槽，结束关闭通道并恢复原卡槽。切换期间普通 UIM 请求排队，临时卡状态指示不冒充原逻辑 SIM；恢复未确认时不把原 SIM 请求转给另一张卡。
+
+现有主机模型已覆盖 Tape/APDU 分段、能力字段、切槽恢复、续读和超时清理，ASan/UBSan 与 C/C++ 头文件检查通过；这不覆盖 IOKit 并发或真实卡片。尚未构建内核或实机验收，不能据此宣称 eSIM 菜单、下载、启停、删除或跨重启持久化已工作。下一次按 `COACHZ baseband: esim event` 的阶段读结果；日志不输出 EID、APDU 或 profile 内容。无需重编 GPU addon，也不改变镜像参数；现有 baseband 构建会带入这两个源码文件。详细状态与参考见 [modem 计划](../../../../docs/plans/modem.md#esim-tape-实现待实机)。

@@ -119,8 +119,47 @@ b9 用 drivers/RamBlock/coachz_modem.c 按上面的顺序接入，在 Wi-Fi 线�
 
 有了它，CommCenter 不再报 `num of IMEIs (0)`，`kSimStateReady`，“关于本机”显示 IMEI 和 ICCID，QMI 服务从 37 个变成 40 个。所用测试卡没有服务，modem 在 LTE 上搜网，CS、PS 都没有附着，注册成功还没有测到。
 
+测试卡下 modem 收到 LTE 小区，CommCenter 报 `kEmergencyOnly`（仅限紧急呼叫）。
+
+### 第四轮调研（数据口、激活、eSIM 能力）
+
+**数据口。** CommCenter 的 `QMIDataContextIPBase` 按能力二选一：WDS Bind Data Port（0x89，TLV 0x01 SIO 口）或 WDS Bind Mux Data Port（0xa2，TLV 0x11 mux id，有端点时另加 TLV 0x10）。它填的端点是常量 `{类型 3（PCIe）, 接口 4}`；休眠驱动的那次绑定只带 mux id 1。QOS Bind Data Port（0x2b）带 TLV 0x11 mux id 或 TLV 0x12 数据口，不带端点。这台 modem 的数据走 IPA，ModemManager 对 `ipa` 驱动用 `{类型 4（embedded）, 接口 1}`，并且在第一次绑定前先发 DPM Open Port（硬件口 `{4, 1, rx = AP_MODEM_TX 的端点号, tx = AP_MODEM_RX 的端点号}`，即 IPA v4.2 的 1 和 9）和 WDA Set Data Format（raw IP，上下行 QMAP，下行最多 32 个包、32768 字节，带端点；QMAP 版本依次试 v5、v4、QMAP，以 modem 回报的为准）。modem 公布了 WDA（26）和 DPM（47）。CommCenter 两样都不发。桥接层（`coachz_bb_data.h`）在 CommCenter 第一次要 WDS 客户端时用自己的客户端照这个顺序做一遍（IPA v4.2 是 MAPv4，所以从 QMAPv4 开始），并把 WDS 0xa2、QOS 0x2b、WDA 0x20/0x21 里的端点换成 `{4, 1}`，只有 mux id 时补上。
+
+**激活。** `/cc/props/baseband_activated` 为假时，`RegistrationModel` 不更新运营商名（`Operator name change aborted: not activated`），`DataServiceController` 也不激活数据上下文；`RegistrationController`、`TravelHandler` 同样等它。CommCenter 用 `QMIMav13ActivationCommandDriver`：BSP（0xe2）的 ActivationRegister 0xb00c 请求，之后读同号指示的 TLV 0x01（一字节 `bsp::ActivationState`：0 kActivated、1 kReady、2 kNotReady、3 kError；2 到 4 之间的值会等下一条指示）。苹果的基带在激活票据被接受后报 kActivated。这台 modem 没有激活锁，桥接层回成功并发 kActivated。指示里还有 IMEI、各槽 ICCID、IMSI、`Slot1IsEmbedded`（0x58）、`Slot2IsEmbedded`（0x59）、`DsdsAllowed`（0x53）等可选 TLV。
+
+**eSIM 能力。** `EURSimCommandDriver` 从 UIM Get Card Status（0x2f）应答的苹果私有 TLV 0x21（旧版 0x20）读每个卡槽的能力，每槽一字节：1 kVinylCapable、2 kTapeCapable、3 kHydraCapable、4 kVirtualHydraCapable，其它值和缺省都是 kNotCapable，CommCenter 期望两个元素。VINYL 服务的请求里有 Tape 系列（`TapeReqGetEid`、`TapeReqGetDeviceCapabilities`、`ReqTapeReqCommand` 和 `TapeRequestPayloadData`），即经基带转发给 eUICC 的 GSMA 指令。哪个槽是 eUICC 还没在这台机器上读到。
+
+### 第五次上机（数据口、激活、注册）
+
+- **数据口**：CommCenter 第一次要 WDS 客户端时，桥接层发的 DPM Open Port 返回成功；WDA Set Data Format 返回成功，link 2（raw IP），上下行都是 8（QMAPv4）。WDS 0xa2 和 QOS 0x2b 的请求都只带 mux id，桥接层补上 `{4, 1}`。绑定本身的结果内核没有记录。
+- **激活**：ActivationRegister 回 kActivated 后，CommCenter 记 `Activation state changing from kNotProvisioned to kActivated`、`Baseband activated, initiating network attach`。
+- **工作模式**：这次开机 ABM 第一次读到的工作模式是 Shutdown，CommCenter 把射频留在低功耗；约 40 s 时基带重启一次，之后请求 Online 成功。
+- **注册**：插入有效 SIM 后，modem 在 LTE 上报 `kRegisteredRoaming`，CS 和 PS 都附着上，信号格（3 到 4 格）传到 SpringBoard。界面仍是无服务：CommCenter 的基带服务开通状态停在 `kUnknown`，每次评估运营商名都记 `Operator name change aborted: not provisioned`，给界面的显示状态一直是 `kNotRegistered`。开通状态最早由 `set.cdma.qmi` 报 `kUnavailable`。测试卡仍只有紧急服务。
+
 接下来的卡点：
-- **蜂窝数据**：`BindMuxDataPort` 和 `BindDataPort` 回 `QMI_ERR_INVALID_ARG`；之后才是 `pdp_ip` 接 `rmnet_ipa0`。
-- **eSIM**：`vinyl=kNotCapable`，`Incomplete vinyl info, 0 elements instead of 2`，VINYL 服务 0xe5 要答真实内容。
-- **激活**：`No baseband activation ticket found`，`Activation register request failed: QMI_ERR_NOT_SUPPORTED`，`Operator name change aborted: not activated`，影响范围还没查。
+- **服务开通状态**：查 CommCenter 的基带服务开通状态从哪条消息来，让注册状态显示到界面上。
+- **蜂窝数据**：数据口设置已被接受；要看 `BindMuxDataPort` 的应答，之后才是 `pdp_ip` 接 `rmnet_ipa0`。蜂窝数据和数据漫游默认关闭，开数据通路前先确认。
+- **eSIM**：在 UIM 0x2f 应答里补 TLV 0x21，VINYL 0xe5 的 Tape 请求转成 UIM 逻辑通道上对 ISD-R 的 APDU。
 - **EFS 持久化**：modem 的写入只留在内核内存里，重启后从 FSG 重建。
+
+### eSIM Tape 实现（待实机）
+
+补齐的 `coachz_bb_esim.h` 已接入现有 QMUX 收发，不改数据口和激活实现，不增编译参数：
+
+- 独立 UIM 客户端用 Get Slot Status 识别物理 eUICC、当前映射及真实 EID；初次 Get Card Status 在发现期间排队，成功应答才补能力 TLV 0x21。未发现 eUICC 不宣称支持。
+- VINYL 0x1002 收集 1500-byte Tape 分段，按 command、transaction、slot 保持归属；逐段应答只是接收确认，执行结果由 0x1003 指示返回。0x1004 返回实际 EID，0x1005 返回桥接声明的 radio releases。
+- ISD-R 用 UIM Open Logical Channel，STORE DATA 用短 APDU 分片、P1 0x11/0x91 和分片序号，响应 61xx 续读；Bound Profile Package 按其 DER 结构拆分。每个命令有三分钟整体上限，每次 QMI 等待十秒，错误和 SW 状态返回失败，不伪造卡片成功。
+- 暂时切到 eUICC 后等六秒、重新读卡槽再开通道；结束关闭逻辑通道，恢复原物理映射、等六秒并重新读取确认。普通 UIM 请求在此期间排队，临时 Card Status 指示不传给 CommCenter。恢复未确认时保留错误状态，不继续把原 SIM 请求发给另一张卡。
+- 删除草稿中的每次启动十六次切槽总限制；标准 eSIM 交互可包含多条命令，该限制会截断流程。卡状态轮询只查询，不触发切槽。
+- 日志只含阶段、命令号、长度、QMI 错误和 SW，不含 EID、ICCID、APDU 或 profile 内容。事件编号与字段见头文件 `cbe_event_kind`。
+
+现有主机模型已覆盖卡槽发现和能力 TLV 替换、两段 Tape 合并、255-byte APDU 分片、61xx 续读、多段结果、BPP 结构分片、超时后的关闭/恢复、迟到应答及恢复失败；C/C++ 头文件检查与模型的 ASan/UBSan 检查通过。IOKit/QMUX 的实际并发、真实 eUICC 和 RSP 服务不在这个模型内。没有编译内核、写盘或实机验收。菜单是否出现、完整 RSP 会话中的逻辑通道生命周期、真实分片、profile 下载及启停、恢复后的 SIM 行为都需要实机确认，不能将上述源码覆盖当作完整 eSIM 验收。
+
+下次只需正常构建内核，现有 baseband 路径会复制这些源码；无需重编 GPU addon或改变镜像参数。首先看 eSIM 事件的卡槽/eUICC/EID 长度与两个能力字节，然后看 CommCenter 的 VINYL 能力和实际 Tape 请求。保留首条失败前后的阶段日志；原始标识与 profile 材料留在本地。
+
+参考：
+
+- [Hermes modem_qrtr.cc](https://chromium.googlesource.com/chromiumos/platform2/+/main/hermes/modem_qrtr.cc)：切槽、ISD-R 通道、APDU 和恢复流程；[modem.h](https://chromium.googlesource.com/chromiumos/platform2/+/main/hermes/modem.h) 的 `kSimRefreshDelay` 为六秒。
+- [Hermes apdu.cc](https://chromium.googlesource.com/chromiumos/platform2/+/main/hermes/apdu.cc)、[uim_cmd.qmi](https://chromium.googlesource.com/chromiumos/platform2/+/main/hermes/uim_cmd.qmi)、[sgp_22.h](https://chromium.googlesource.com/chromiumos/platform2/+/main/hermes/sgp_22.h)：短 APDU 分片、UIM wire schema 和 ISD-R AID。
+- [libqmi UIM schema](https://github.com/linux-mobile-broadband/libqmi/blob/main/data/qmi-service-uim.json)：Logical Channel 0x003f 的 Slot 和 Channel ID TLV，用于关闭已打开的通道。
+- VINYL 和能力字段沿用已核对的 `EURSimCommandDriver`、`VinylQMICommandDriver`、TLV writer/parser 结论；此处仅实现桥接，不复制原始二进制或设备标识。

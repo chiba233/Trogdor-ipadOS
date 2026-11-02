@@ -176,24 +176,26 @@
  			at = strnstr(data, keys[i], (size_t)size);
  			accepted = false;
  			if (at) {
-@@ -8445,6 +8450,13 @@
+@@ -8443,7 +8448,14 @@
+ 					at++;
+ 				}
  				accepted = !strncmp(at, "<true/>", 7);
- 			}
- 		}
++			}
++		}
 +		if (accepted && baseband && (at = strnstr(data, keys[4], (size_t)size))) {
 +			at += strlen(keys[4]);
 +			while (*at == ' ' || *at == '\t' || *at == '\n' || *at == '\r') {
 +				at++;
-+			}
+ 			}
 +			accepted = strncmp(at, "<true/>", 7) != 0;
-+		}
+ 		}
  	}
  	kfree_data(data, (size_t)size + 1);
- 	if (accepted) {
-@@ -8888,8 +8900,192 @@
+@@ -8887,9 +8899,200 @@
+ 	native_gpu_addon_mount(p, scratch, 0xa00, small_source, sizeof(small_source), small_point, sizeof(small_point), COACHZ_SMALL "/assets/Background Light.HEIC",
  	    COACHZ_SMALL "/Background-Light.jpg", &small_stage, &small_status);
  	printf("COACHZ gpu: wallpaper overlays: flat stage %d status %d, 834 stage %d status %d\n", native_gpu_addon3_stage, native_gpu_addon3_status, small_stage, small_status);
- }
++}
 +
 +/*
 + * The cellular bridge (/chosen/coachz-baseband, drivers/RamBlock coachz_baseband.cpp). BBUpdater serves the Mav16 firmware from a folder of the
@@ -205,8 +207,8 @@
 + */
 +extern int coachz_baseband_archive(uint8_t **, uint64_t *, size_t *);
 +static volatile int coachz_baseband_files = -1, coachz_baseband_written, coachz_baseband_same, coachz_baseband_failed, coachz_baseband_error;
- 
- static void
++
++static void
 +coachz_baseband_unpack(proc_t p, user_addr_t scratch, const uint8_t *archive, uint64_t bytes)
 +{
 +	uint64_t declared = 0, at = 24;
@@ -299,8 +301,8 @@
 +	}
 +	coachz_baseband_unpack(p, scratch, archive, bytes);
 +	kfree_data(archive, allocated);
-+}
-+
+ }
+ 
 +/* `entry` becomes an empty directory, with its missing parents, for the firmware folder to be mounted on. CommCenter's sandbox allows the path ABM
 + * asks for and not /private/var/coachz, so a symbolic link there reads as no files at all; one left by an older boot goes first. */
 +static int
@@ -318,7 +320,7 @@
 +	return error;
 +}
 +
-+static void
+ static void
 +coachz_baseband_prepare(proc_t p, user_addr_t scratch)
 +{
 +	static volatile int preboot_stage, preboot_status = -1, standalone_stage, standalone_status = -1;
@@ -331,20 +333,27 @@
 +	const void *value = NULL;
 +	unsigned int value_size = 0;
 +	int error;
-+	/* ABM and BBUpdater say why a boot failed only in %s messages, private unless logd is told otherwise for the subsystem. With this those
-+	 * logs can hold device identifiers: they stay on this machine. */
-+	static const char logging_path[] = "/private/var/preferences/Logging/Subsystems/com.apple.telephony.abm.plist";
++	/* ABM and BBUpdater say why a boot failed only in %s messages, and CommCenter's QMUX trace (com.apple.telephony.bb, category qmux) prints
++	 * every QMI message as private bytes; both stay private unless logd is told otherwise for the subsystem. With this those logs can hold
++	 * device identifiers: they stay on this machine. */
++	static const char *const logging_paths[] = {"/private/var/preferences/Logging/Subsystems/com.apple.telephony.abm.plist",
++	                                            "/private/var/preferences/Logging/Subsystems/com.apple.telephony.bb.plist"};
 +	static const char logging[] = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict><key>DEFAULT-OPTIONS</key><dict>"
 +	    "<key>Enable-Private-Data</key><true/><key>Privacy-Enable-Level</key><string>Private</string></dict></dict></plist>\n";
-+	int logging_error;
++	int logging_error = 0;
 +
 +	if (!coachz_baseband_enabled()) {
 +		return;
 +	}
 +	coachz_baseband_install(p, scratch);
-+	logging_error = native_gpu_addon_write(logging_path, (const uint8_t *)logging, sizeof(logging) - 1, 0644, vfs_context_current());
-+	if (logging_error == ENOENT && !(logging_error = native_gpu_addon_parents(p, scratch, logging_path))) {
-+		logging_error = native_gpu_addon_write(logging_path, (const uint8_t *)logging, sizeof(logging) - 1, 0644, vfs_context_current());
++	for (unsigned i = 0; i < sizeof(logging_paths) / sizeof(logging_paths[0]); i++) {
++		int written = native_gpu_addon_write(logging_paths[i], (const uint8_t *)logging, sizeof(logging) - 1, 0644, vfs_context_current());
++		if (written == ENOENT && !(written = native_gpu_addon_parents(p, scratch, logging_paths[i]))) {
++			written = native_gpu_addon_write(logging_paths[i], (const uint8_t *)logging, sizeof(logging) - 1, 0644, vfs_context_current());
++		}
++		if (written > 0 && !logging_error) {
++			logging_error = written;
++		}
 +	}
 +	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
 +	    SecureDTGetProperty(chosen, "boot-manifest-hash", &value, &value_size) == kSuccess && value_size && value_size <= 48) {
@@ -383,7 +392,7 @@
  coachz_audio_prepare(proc_t p, user_addr_t scratch)
  {
  	static const char *const directories[] = {"/private/var/coachz", "/private/var/coachz/audio", "/private/var/coachz/audio/CoachzAudio.driver",
-@@ -8965,6 +9161,10 @@
+@@ -8965,6 +9168,10 @@
  	     * registered, so its first caller waits forever; identityservicesd and CommCenter are UniXNU's first-boot XPC wait
  	     * cycle; accessoryupdaterd keeps trustd checking certificates. A disabled job's clients get no answer at once. */
  	    "<plist version=\"1.0\"><dict><key>com.apple.watchdogd</key><true/><key>com.apple.fairplayd.A2</key><true/><key>com.apple.accessoryupdaterd</key><true/><key>com.apple.identityservicesd</key><true/><key>com.apple.CommCenter</key><true/></dict></plist>\n";
@@ -394,7 +403,7 @@
  	int disable = 0;
  	int error;
  
-@@ -8972,7 +9172,7 @@
+@@ -8972,7 +9179,7 @@
  		return 0;
  	}
  	error = coachz_watchdog_policy_file("/private/var/db/com.apple.xpc.launchd/disabled.plist",
@@ -403,7 +412,7 @@
  	if (!error) {
  		/* Prevent first-boot migration from replacing the deliberately installed override. */
  		error = coachz_watchdog_policy_file("/private/var/db/com.apple.xpc.launchd/disabled.migrated", "", 0);
-@@ -9282,6 +9482,7 @@
+@@ -9282,6 +9489,7 @@
  		coachz_setup_prepare();
  		coachz_audio_prepare(p, scratch);
  		coachz_gpu_prepare(p, scratch);

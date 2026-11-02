@@ -15,7 +15,10 @@
  *
  * Apple's private services (AUDIO 0xe1 to SFT 0xea, numbers from libQMIParser's serviceTypeFromString) do not exist on this modem. A
  * client of one gets an id like any other; its requests come back to the caller as CBQ_PRIVATE so the bridge can implement a message
- * (VINYL over UIM APDUs, for one), and cbq_private_unsupported answers the rest with QMI_ERR_NOT_SUPPORTED.
+ * (cbq_private_answer, cbq_private_indication), and cbq_private_unsupported answers the rest with QMI_ERR_NOT_SUPPORTED.
+ *
+ * The bridge also takes modem clients of its own (channel CBQ_INTERNAL), for what the modem needs and ABM never asks, as the data port
+ * setup of coachz_bb_data.h. Their answers come back from cbq_from_modem with that channel and are not ABM's.
  */
 #ifndef COACHZ_BB_QMUX_H
 #define COACHZ_BB_QMUX_H
@@ -48,6 +51,7 @@
 #define CBQ_ERR_NOT_SUPPORTED 94u
 
 #define CBQ_CHANNELS 2u                /* qmux1, qmux2 */
+#define CBQ_INTERNAL CBQ_CHANNELS      /* clients the bridge itself holds */
 #define CBQ_MAX_SERVERS 64u
 #define CBQ_MAX_CLIENTS 64u
 #define CBQ_PORT_BASE 0x4100u          /* local QRTR ports: base + client slot (Wi-Fi and IPA use 0x4000..0x4003) */
@@ -59,7 +63,7 @@ struct cbq_client { uint8_t used, channel, service, cid, private_service, releas
 struct cbq_bridge {
     struct cbq_server server[CBQ_MAX_SERVERS];
     struct cbq_client client[CBQ_MAX_CLIENTS];
-    uint8_t last_cid[CBQ_CHANNELS][256];
+    uint8_t last_cid[CBQ_CHANNELS + 1][256];
     uint32_t ctl_other, dropped;
 };
 
@@ -317,19 +321,38 @@ static inline struct cbq_result cbq_from_modem(struct cbq_bridge *b, uint32_t lo
     return r;
 }
 
-/* The answer to a private-service request nobody implements: same message id and transaction, QMI_ERR_NOT_SUPPORTED. */
+/* A private-service message from the bridge: `type` CBQ_QMI_RESPONSE (result `error`, then `tlvs`) or CBQ_QMI_INDICATION (`tlvs` only,
+   transaction 0). */
+static inline uint32_t cbq_private_message(uint32_t type, uint32_t txn, uint32_t message, uint32_t service, uint32_t cid, uint32_t error,
+                                           const uint8_t *tlvs, uint32_t tlv_len, uint8_t *out, uint32_t room)
+{
+    const uint32_t body = (type == CBQ_QMI_RESPONSE ? 7u : 0u) + tlv_len, total = CBQ_HDR + CBQ_SDU_HDR + body;
+    if (room < total || body > 0xffffu - CBQ_HDR - CBQ_SDU_HDR) return 0;
+    cbq_frame_header(out, CBQ_SDU_HDR + body, service, cid);
+    uint8_t *s = out + CBQ_HDR, *t = s + CBQ_SDU_HDR;
+    s[0] = (uint8_t)type;
+    cbq_wr16(s + 1, txn);
+    cbq_wr16(s + 3, message);
+    cbq_wr16(s + 5, body);
+    if (type == CBQ_QMI_RESPONSE) t += cbq_tlv_result(t, error);
+    for (uint32_t i = 0; i < tlv_len; i++) t[i] = tlvs[i];
+    return total;
+}
+/* The answer to a private-service request: same message id and transaction. */
+static inline uint32_t cbq_private_answer(const uint8_t *request_sdu, uint32_t service, uint32_t cid, uint32_t error, const uint8_t *tlvs,
+                                          uint32_t tlv_len, uint8_t *out, uint32_t room)
+{
+    return cbq_private_message(CBQ_QMI_RESPONSE, cbq_rd16(request_sdu + 1), cbq_rd16(request_sdu + 3), service, cid, error, tlvs, tlv_len, out, room);
+}
+static inline uint32_t cbq_private_indication(uint32_t message, uint32_t service, uint32_t cid, const uint8_t *tlvs, uint32_t tlv_len,
+                                              uint8_t *out, uint32_t room)
+{
+    return cbq_private_message(CBQ_QMI_INDICATION, 0, message, service, cid, 0, tlvs, tlv_len, out, room);
+}
+/* The answer to a private-service request nobody implements: QMI_ERR_NOT_SUPPORTED. */
 static inline uint32_t cbq_private_unsupported(const uint8_t *request_sdu, uint32_t service, uint32_t cid, uint8_t *out, uint32_t room)
 {
-    const uint32_t total = CBQ_HDR + CBQ_SDU_HDR + 7u;
-    if (room < total) return 0;
-    cbq_frame_header(out, CBQ_SDU_HDR + 7u, service, cid);
-    uint8_t *s = out + CBQ_HDR;
-    s[0] = CBQ_QMI_RESPONSE;
-    s[1] = request_sdu[1]; s[2] = request_sdu[2];
-    s[3] = request_sdu[3]; s[4] = request_sdu[4];
-    cbq_wr16(s + 5, 7);
-    cbq_tlv_result(s + CBQ_SDU_HDR, CBQ_ERR_NOT_SUPPORTED);
-    return total;
+    return cbq_private_answer(request_sdu, service, cid, CBQ_ERR_NOT_SUPPORTED, 0, 0, out, room);
 }
 
 #endif /* COACHZ_BB_QMUX_H */

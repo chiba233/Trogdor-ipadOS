@@ -1,11 +1,13 @@
 /* Host model of the pending baseband bridge: QMUX and CTL against QRTR, the SAHARA device end, the AppleBaseband methods, the channel
-   table. Built with -fsanitize=address,undefined by tests/test_baseband_bridge.py. */
+   table, the data port, activation answers and eSIM Tape transport. Built with -fsanitize=address,undefined by tests/test_baseband_bridge.py. */
 #include <stdio.h>
 #include <string.h>
 #include "coachz_bb_qmux.h"
 #include "coachz_bb_sahara.h"
 #include "coachz_bb_control.h"
 #include "coachz_bb_channels.h"
+#include "coachz_bb_data.h"
+#include "coachz_bb_esim.h"
 
 static int failures;
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
@@ -352,6 +354,245 @@ static void test_channels(void)
     if (!failures) printf("PASS channel table\n");
 }
 
+/* ------------------------------------------------------------------ data port and activation */
+static void test_data(void)
+{
+    static struct cbq_bridge b;
+    uint8_t out[256], sdu[128];
+    uint32_t len = 0;
+    cbq_init(&b);
+
+    /* CommCenter's Bind Mux Data Port names Apple's PCIe endpoint: it becomes the embedded one, everything else kept */
+    const uint8_t bind_pcie[] = { 0, 3, 0, 0xa2, 0, 15, 0, 0x10, 8, 0, 3, 0, 0, 0, 4, 0, 0, 0, 0x11, 1, 0, 2 };
+    struct cbd_fix f = cbd_endpoint_fix(CBD_SVC_WDS, bind_pcie, sizeof bind_pcie, out, sizeof out);
+    const uint8_t bind_ipa[] = { 0, 3, 0, 0xa2, 0, 15, 0, 0x10, 8, 0, 4, 0, 0, 0, 1, 0, 0, 0, 0x11, 1, 0, 2 };
+    CHECK(f.len == sizeof bind_ipa && !memcmp(out, bind_ipa, sizeof bind_ipa) && f.before_type == 3 && f.before_interface == 4 && !f.inserted);
+    CHECK(!cbd_endpoint_fix(CBD_SVC_WDS, bind_ipa, sizeof bind_ipa, out, sizeof out).len);   /* already right */
+
+    /* a mux id alone (the dormancy driver's bind, QOS bind): the endpoint is added */
+    const uint8_t bind_mux[] = { 0, 9, 0, 0x2b, 0, 4, 0, 0x11, 1, 0, 1 };
+    f = cbd_endpoint_fix(CBD_SVC_QOS, bind_mux, sizeof bind_mux, out, sizeof out);
+    const uint8_t bind_mux_ipa[] = { 0, 9, 0, 0x2b, 0, 15, 0, 0x11, 1, 0, 1, 0x10, 8, 0, 4, 0, 0, 0, 1, 0, 0, 0 };
+    CHECK(f.len == sizeof bind_mux_ipa && !memcmp(out, bind_mux_ipa, sizeof bind_mux_ipa) && f.inserted);
+    /* a data port without a mux id, other messages and malformed ones go as they are */
+    const uint8_t bind_sio[] = { 0, 9, 0, 0x2b, 0, 5, 0, 0x12, 2, 0, 1, 0x0e };
+    CHECK(!cbd_endpoint_fix(CBD_SVC_QOS, bind_sio, sizeof bind_sio, out, sizeof out).len);
+    CHECK(!cbd_endpoint_fix(CBD_SVC_WDS, bind_mux, sizeof bind_mux, out, sizeof out).len);   /* WDS 0x2b is another message */
+    const uint8_t broken[] = { 0, 9, 0, 0xa2, 0, 9, 0, 0x11, 9, 0, 1 };
+    CHECK(!cbd_endpoint_fix(CBD_SVC_WDS, broken, sizeof broken, out, sizeof out).len);
+    CHECK(!cbd_endpoint_fix(CBD_SVC_WDS, bind_pcie, sizeof bind_pcie, out, 16).len);         /* no room: unchanged */
+
+    /* the setup: DPM Open Port, then WDA Set Data Format with QMAPv4, then QMAP when the modem keeps another */
+    struct cbd_setup st;
+    memset(&st, 0, sizeof st);
+    st.has_dpm = st.has_wda = 1;
+    uint32_t service = 0, n = cbd_next(&st, sdu, sizeof sdu, &service);
+    const uint8_t dpm[] = { 0, 1, 0, 0x20, 0, 20, 0, 0x11, 17, 0, 1, 4, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 9, 0, 0, 0 };
+    CHECK(service == CBD_SVC_DPM && n == sizeof dpm && !memcmp(sdu, dpm, sizeof dpm) && st.step == CBD_DPM);
+    const uint8_t dpm_ok[] = { 2, 1, 0, 0x20, 0, 7, 0, 2, 4, 0, 0, 0, 0, 0 };
+    CHECK(!cbd_answer(&st, CBD_SVC_WDA, dpm_ok, sizeof dpm_ok) && cbd_answer(&st, CBD_SVC_DPM, dpm_ok, sizeof dpm_ok) && st.dpm_error == 0);
+    n = cbd_next(&st, sdu, sizeof sdu, &service);
+    CHECK(service == CBD_SVC_WDA && n == 7 + 5 * 7 + 11 && cbd_rd16(sdu + 3) == CBD_WDA_SET_DATA_FORMAT && cbd_u32(sdu, n, 0x11) == 2 &&
+          cbd_u32(sdu, n, 0x12) == CBD_DAP_QMAPV4 && cbd_u32(sdu, n, 0x13) == CBD_DAP_QMAPV4 && cbd_u32(sdu, n, 0x15) == 32 &&
+          cbd_u32(sdu, n, 0x16) == 32768 && cbd_find(sdu, n, 0x17, &len) && len == 8 && cbd_rd32(cbd_find(sdu, n, 0x17, &len)) == 4);
+    uint8_t wda_other[] = { 2, 2, 0, 0x20, 0, 21, 0, 2, 4, 0, 0, 0, 0, 0, 0x11, 4, 0, 2, 0, 0, 0, 0x13, 4, 0, 0, 0, 0, 0 };
+    wda_other[1] = (uint8_t)st.txn;
+    CHECK(cbd_answer(&st, CBD_SVC_WDA, wda_other, sizeof wda_other) && st.wda_error == 0 && st.dl_dap == 0 && st.llp == 2);
+    n = cbd_next(&st, sdu, sizeof sdu, &service);
+    CHECK(service == CBD_SVC_WDA && n && cbd_u32(sdu, n, 0x13) == CBD_DAP_QMAP && st.dap_index == 1);
+    uint8_t wda_qmap[] = { 2, 0, 0, 0x20, 0, 21, 0, 2, 4, 0, 0, 0, 0, 0, 0x11, 4, 0, 2, 0, 0, 0, 0x13, 4, 0, 5, 0, 0, 0 };
+    wda_qmap[1] = (uint8_t)st.txn;
+    CHECK(cbd_answer(&st, CBD_SVC_WDA, wda_qmap, sizeof wda_qmap) && st.dl_dap == CBD_DAP_QMAP);
+    CHECK(!cbd_next(&st, sdu, sizeof sdu, &service) && st.step == CBD_DONE);
+    /* without DPM on the modem the setup starts at WDA; without either it ends at once */
+    memset(&st, 0, sizeof st);
+    st.has_wda = 1;
+    CHECK(cbd_next(&st, sdu, sizeof sdu, &service) && service == CBD_SVC_WDA && st.step == CBD_WDA);
+    memset(&st, 0, sizeof st);
+    CHECK(!cbd_next(&st, sdu, sizeof sdu, &service) && st.step == CBD_DONE);
+
+    /* the bridge's own clients: answers come back on the internal channel, not to ABM */
+    CHECK(cbq_server_new(&b, CBD_SVC_WDA, 1, 0, 0x30));
+    const int slot = cbq_client_alloc(&b, CBQ_INTERNAL, CBD_SVC_WDA);
+    CHECK(slot >= 0);
+    struct cbq_result r = cbq_from_modem(&b, CBQ_PORT_BASE + (uint32_t)slot, 0, wda_qmap, sizeof wda_qmap, out, sizeof out);
+    CHECK(r.kind == CBQ_TO_HOST && r.channel == CBQ_INTERNAL && r.service == CBD_SVC_WDA);
+
+    /* activation register: success with the request's transaction, then the indication with kActivated */
+    const uint8_t act[] = { 0, 0x34, 0x12, 0x0c, 0xb0, 0, 0 };
+    n = cbq_private_answer(act, CBD_SVC_BSP, 3, 0, 0, 0, out, sizeof out);
+    const uint8_t act_ok[] = { 1, 19, 0, 0x80, 0xe2, 3, 2, 0x34, 0x12, 0x0c, 0xb0, 7, 0, 2, 4, 0, 0, 0, 0, 0 };
+    CHECK(n == sizeof act_ok && !memcmp(out, act_ok, sizeof act_ok));
+    uint8_t tlvs[8];
+    const uint32_t t = cbd_activation_state(tlvs, sizeof tlvs);
+    n = cbq_private_indication(CBD_BSP_ACTIVATION_REGISTER, CBD_SVC_BSP, 3, tlvs, t, out, sizeof out);
+    const uint8_t act_ind[] = { 1, 16, 0, 0x80, 0xe2, 3, 4, 0, 0, 0x0c, 0xb0, 4, 0, 1, 1, 0, 0 };
+    CHECK(n == sizeof act_ind && !memcmp(out, act_ind, sizeof act_ind));
+    n = cbq_private_unsupported(act, 0xe5, 2, out, sizeof out);
+    CHECK(n == 20 && out[4] == 0xe5 && cbq_rd16(out + 16) == 1 && cbq_rd16(out + 18) == CBQ_ERR_NOT_SUPPORTED);
+    if (!failures) printf("PASS data port and activation\n");
+}
+
+/* Synthetic wire data only; this checks transport/state, not an eUICC or RSP server. */
+static struct cbe esim;
+static uint8_t esim_in[8192], esim_resp[8192];
+static void esim_answer(uint32_t now, const uint8_t *tlvs, uint32_t n, uint32_t error)
+{
+    uint8_t s[2048] = { CBQ_QMI_RESPONSE };
+    cbd_wr16(s + 1, esim.wait_txn); cbd_wr16(s + 3, esim.wait_msg);
+    s[7] = 2; s[8] = 4;
+    cbd_wr16(s + 10, error != 0); cbd_wr16(s + 12, error);
+    if (n) memcpy(s + 14, tlvs, n);
+    cbd_wr16(s + 5, 7 + n);
+    esim.req_len = 0;
+    CHECK(cbe_answer(&esim, s, 14 + n, now));
+}
+static void esim_slots(uint32_t now, uint32_t active)
+{
+    uint8_t t[96], st[21] = { 2 }, info[15] = { 2 }, eid[19] = { 2, 0, 16 };
+    for (unsigned i = 0; i < 2; i++) {
+        cbd_wr32(st + 1 + 10 * i, 2); cbd_wr32(st + 5 + 10 * i, i == active);
+        st[9 + 10 * i] = i == active ? 1 : 0;
+    }
+    /* Two present cards, slot two an eUICC. Its EID is a synthetic byte sequence. */
+    info[14] = 1;
+    for (unsigned i = 3; i < sizeof eid; i++) eid[i] = (uint8_t)(0xa0 + i);
+    uint32_t n = cbd_tlv(t, sizeof t, 0x10, st, sizeof st);
+    n += cbd_tlv(t + n, sizeof t - n, 0x11, info, sizeof info);
+    n += cbd_tlv(t + n, sizeof t - n, 0x12, eid, sizeof eid);
+    esim_answer(now, t, n, 0);
+}
+static void esim_reset(void)
+{
+    cbe_init(&esim, esim_in, sizeof esim_in, esim_resp, sizeof esim_resp);
+    cbe_tick(&esim, 0);
+    CHECK(esim.step == CBE_S_SLOTS);
+    esim_slots(1, 0);
+    CHECK(esim.slots.euicc == 2 && esim.slots.active == 1 && esim.slots.eid_len == 16);
+}
+static void esim_tape(const uint8_t *data, uint32_t n, uint32_t total, uint32_t index)
+{
+    uint8_t s[1600] = { 0 }, out[128], header[6] = { 1, 0x12, 0x34, 0x56, 0x78, 2 }, payload[1505] = { 0 };
+    cbd_wr16(payload + 1, total); cbd_wr16(payload + 3, index); memcpy(payload + 5, data, n);
+    uint32_t w = cbd_tlv(s + 7, sizeof s - 7, 1, header, sizeof header);
+    w += cbd_tlv(s + 7 + w, sizeof s - 7 - w, 0x10, payload, n + 5);
+    cbd_request(s, 9 + index, 0x1002, w);
+    const uint32_t answer = cbe_host(&esim, 1, 9, s, 7 + w, out, sizeof out, 2);
+    CHECK(answer && answer != CBE_DEFERRED && !cbd_error(out + 6, answer - 6));
+    CHECK(cbd_rd16(out + 7) == 9 + index && out[4] == 0xe5 && out[5] == 9);
+}
+static void esim_open(void)
+{
+    cbe_tick(&esim, 3);
+    CHECK(esim.step == CBE_S_SWITCH && esim.freeze);
+    uint8_t caps[2]; cbe_caps(&esim, caps);
+    CHECK(caps[0] == 0 && caps[1] == 2);
+    esim_answer(4, NULL, 0, 0);
+    cbe_tick(&esim, 6003); CHECK(esim.step == CBE_S_SETTLE);
+    cbe_tick(&esim, 6004); CHECK(esim.step == CBE_S_RESLOT);
+    esim_slots(6005, 1);
+    const uint8_t ch[] = { 0x10, 1, 0, 1 };
+    esim_answer(6006, ch, sizeof ch, 0);
+    CHECK(esim.step == CBE_S_APDU && esim.channel_open);
+}
+static void esim_restore(uint32_t now)
+{
+    CHECK(esim.step == CBE_S_CLOSE);
+    esim_answer(now, NULL, 0, 0);
+    CHECK(esim.step == CBE_S_RESTORE);
+    esim_answer(now + 1, NULL, 0, 0);
+    cbe_tick(&esim, now + 6001);
+    esim_slots(now + 6002, 0);
+    CHECK(esim.step == CBE_S_IDLE && !esim.freeze && !esim.route_failed && esim.slots.active == 1);
+}
+static void esim_apdu_response(uint32_t now, const uint8_t *data, uint32_t n, uint8_t sw1, uint8_t sw2)
+{
+    uint8_t t[1600];
+    t[0] = 0x10; cbd_wr16(t + 1, n + 4); cbd_wr16(t + 3, n + 2);
+    if (n) memcpy(t + 5, data, n);
+    t[5 + n] = sw1; t[6 + n] = sw2;
+    esim_answer(now, t, n + 7, 0);
+}
+static void test_esim(void)
+{
+    esim_reset();
+    /* Card status retains its transaction/other TLVs; the capability array is replaced, not duplicated. */
+    const uint8_t card[] = { 2, 0x34, 0x12, 0x2f, 0, 16, 0, 2, 4, 0, 0, 0, 0, 0,
+                             0x10, 1, 0, 0xaa, 0x21, 2, 0, 0xff, 0xff };
+    uint8_t out[2048], channel = 0; uint32_t len = 0;
+    uint32_t n = cbe_card_status_fix(&esim, 11, card, sizeof card, out, sizeof out);
+    const uint8_t *caps = cbd_find(out, n, 0x21, &len);
+    CHECK(n == sizeof card && out[1] == 0x34 && out[2] == 0x12 && caps && len == 2 && !caps[0] && caps[1] == 2);
+    const uint8_t *kept = cbd_find(out, n, 0x10, &len);
+    CHECK(kept && len == 1 && kept[0] == 0xaa);
+
+    /* A two-part command does not run before its last segment. Short APDUs preserve its full DER. */
+    uint8_t der[1505] = { 0xbf, 0x20, 0x82, 0x05, 0xdc };
+    for (unsigned i = 5; i < sizeof der; i++) der[i] = (uint8_t)i;
+    esim_tape(der, 1500, 2, 0); cbe_tick(&esim, 2); CHECK(esim.step == CBE_S_IDLE);
+    esim_tape(der + 1500, 5, 2, 1); esim_open();
+    uint32_t at = 0, block = 0;
+    while (esim.step == CBE_S_APDU && at < sizeof der) {
+        const uint8_t *a = cbd_find(esim.req, esim.req_len, 2, &len);
+        const uint32_t take = sizeof der - at < 255 ? sizeof der - at : 255;
+        CHECK(a && len == 2 + 5 + take + (at + take == sizeof der));
+        if (!a) return;
+        CHECK(a[2] == 0x80 && a[3] == 0xe2 && a[4] == (at + take == sizeof der ? 0x91 : 0x11) && a[5] == block);
+        CHECK(a[6] == take && !memcmp(a + 7, der + at, take));
+        at += take; block++;
+        if (at < sizeof der) esim_apdu_response(6010 + block, NULL, 0, 0x90, 0);
+    }
+    CHECK(at == sizeof der && block == 6);
+    /* 61xx continuation assembles a response bigger than one Tape indication. */
+    uint32_t received = 0, now = 6030;
+    while (received < sizeof der) {
+        const uint32_t take = sizeof der - received < 255 ? sizeof der - received : 255;
+        if (received) {
+            const uint8_t *a = cbd_find(esim.req, esim.req_len, 2, &len);
+            CHECK(a && a[3] == 0xc0 && a[len - 1] == 0xff);
+        }
+        esim_apdu_response(now++, der + received, take, received + take < sizeof der ? 0x61 : 0x90,
+                           received + take < sizeof der ? 0xff : 0);
+        received += take;
+    }
+    esim_restore(now);
+    CHECK(!esim.done_status && esim.done_len == sizeof der);
+    for (unsigned index = 0; index < 2; index++) {
+        n = cbe_output(&esim, &channel, out, sizeof out);
+        CHECK(n && channel == 1 && out[4] == 0xe5 && out[5] == 9 && out[6] == 4 && cbd_rd16(out + 9) == 0x1003);
+        const uint8_t *info = cbd_find(out + 6, n - 6, 1, &len);
+        CHECK(info && len == 9 && !info[1] && cbd_rd32(info + 3) == 0x78563412 && !info[7] && !info[8]);
+        const uint8_t *data = cbd_find(out + 6, n - 6, 0x10, &len);
+        CHECK(data && len == 4 + (index ? 5 : 1500) && cbd_rd16(data) == 2 && cbd_rd16(data + 2) == index);
+        CHECK(data && !memcmp(data + 4, der + index * 1500, index ? 5 : 1500));
+    }
+    CHECK(!esim.done_pending);
+
+    /* BPP's structural pieces stay in order; no cryptography or real profile is modelled. */
+    const uint8_t bpp[] = { 0xbf, 0x36, 17, 0xbf, 0x23, 0, 0xa0, 0, 0xa1, 3, 0x88, 1, 0xaa, 0xa2, 0, 0xa3, 3, 0x86, 1, 0xbb };
+    const uint32_t offsets[] = { 0, 6, 8, 10, 13, 15, 17 }, lengths[] = { 6, 2, 2, 3, 2, 2, 3 };
+    struct cbe_seg segments[8];
+    CHECK(cbe_segments(bpp, sizeof bpp, segments, 8) == 7);
+    for (unsigned i = 0; i < 7; i++) CHECK(segments[i].off == offsets[i] && segments[i].len == lengths[i]);
+
+    /* A timed-out APDU still closes and restores; its late response cannot complete the close. */
+    const uint8_t small[] = { 0xbf, 0x20, 0 };
+    esim_reset(); esim_tape(small, sizeof small, 1, 0); esim_open();
+    uint8_t late[14] = { 2, 0, 0, 0x3b, 0, 7, 0, 2, 4, 0, 0, 0, 0, 0 };
+    cbd_wr16(late + 1, esim.wait_txn);
+    cbe_tick(&esim, 16006); CHECK(esim.step == CBE_S_CLOSE && esim.done_status == 1);
+    CHECK(!cbe_answer(&esim, late, sizeof late, 16007) && esim.step == CBE_S_CLOSE);
+    esim_restore(16008); CHECK(esim.done_status == 1);
+
+    /* A failed restoration is not reported as a successful operation. */
+    esim_reset(); esim_tape(small, sizeof small, 1, 0); esim_open();
+    esim_apdu_response(6007, small, sizeof small, 0x90, 0);
+    esim_answer(6008, NULL, 0, 0); CHECK(esim.step == CBE_S_RESTORE);
+    esim_answer(6009, NULL, 0, CBE_ERR_INTERNAL);
+    CHECK(esim.done_status == 1 && esim.route_failed && !esim.slots.known);
+    if (!failures) printf("PASS esim tape transport and cleanup\n");
+}
+
 int main(void)
 {
     test_qmux();
@@ -360,5 +601,7 @@ int main(void)
     test_registers();
     test_control();
     test_channels();
+    test_data();
+    test_esim();
     return failures ? 1 : 0;
 }
