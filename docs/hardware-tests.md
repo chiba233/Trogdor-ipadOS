@@ -1533,3 +1533,11 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 - **GPU 中断**：9074 次中断对应 9074 个 fence。
 - **PosterBoard**：3 次 SIGTRAP，都在 `-[PBFModalRootViewController initWithScene:dataStore:behaviorAssertionProvider:]`，来自场景连接时的断言。原因没查，k107 里没有出现。
 
+## eMMC HS400 增强选通（k109）
+
+- `coachz-emmc=3` 照 `mmc_select_hs400es` 切换：GPLL6 投票后激活，先切 DDR 8 位加选通，再切 HS400 时序，然后把时钟升到 200 MHz（核心时钟 384 MHz，CX 投 nom），`msm_init_cm_dll` 加 SDC4 校准。日志：`HS400 enhanced strobe at 200000000 Hz (rcg 384000000), DLL status 0x985`，切换后第一条 CMD13 正常。Debian 在同一张卡上也是这个模式。
+- 写入窗口内的自检：上次写的 2048 块重启后完整，窗口外 5 次写全部拒绝，新写 2048 块读回 0 处不符。写 53989 KB/s，读 60190 KB/s，连续读 64 MiB 用 1288 ms（52089 KB/s）。
+- 按连续读算，每条 64 KiB 的命令约 1.26 ms，而总线上的数据只要约 0.16 ms，所以目前受每条命令约 1.1 ms 的开销限制，不是总线的上限。还没有带宽投票。
+- Wi-Fi 频段统计改正后，三轮扫描各听到 66、56、57 帧，2.4 GHz 和 5 GHz 大约各半。
+- 外接盘：这几次开机盘突然不见，机主确认是插充电线把 U 盘带松，不是驱动或 USB 栈的问题。
+

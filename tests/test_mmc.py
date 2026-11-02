@@ -3,6 +3,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import re
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -65,6 +66,20 @@ class MmcTests(unittest.TestCase):
         check = write.index('s->writes_refused++;')
         self.assertLess(check, write.index('request(s, &cmd, &d)'))   # the window is checked before any command
 
+    def test_hs400_follows_the_mainline_sequence(self):
+        source = (ROOT / 'platform/coachz-prelink/drivers/RamBlock/mmc/coachz_sdcc.c').read_text()
+        body = source[source.index('static int mmc_select_hs400es('):source.index('static int mmc_attach(')]
+        # mmc_select_hs400es: the PLL, 1.8 V, DDR with strobe, HS400 timing, then the rate; only the volatile EXT_CSD bytes.
+        order = [body.index(s) for s in ('gpll6_enable()', 'set_signal_voltage(s, CM_SIGNAL_180)', 'CM_EXT_CSD_DDR_BUS_WIDTH_8 | CM_EXT_CSD_BUS_WIDTH_STROBE',
+                                         'CM_EXT_CSD_TIMING_HS400', 'set_clock(s, CM_MMC_HS200_MAX_DTR)')]
+        self.assertEqual(order, sorted(order))
+        self.assertEqual(set(re.findall(r'CM_EXT_CSD_(BUS_WIDTH|HS_TIMING|PART_CONFIG|ERASE\w*),', body)), {'BUS_WIDTH', 'HS_TIMING'})
+        # msm_init_cm_dll's reset order, and the calibration only above 100 MHz.
+        init = source[source.index('static int dll_init('):source.index('static int dll_calibrate(')]
+        steps = [init.index(s) for s in ('| CM_MSM_DLL_RST', '| CM_MSM_DLL_PDN', '& ~CM_MSM_DLL_RST', '& ~CM_MSM_DLL_PDN', '| CM_MSM_DLL_EN', '| CM_MSM_CK_OUT_EN', 'CM_MSM_DLL_LOCK')]
+        self.assertEqual(steps, sorted(steps))
+        self.assertIn('s->host_clock > CM_MSM_CORE_FREQ_100MHZ && s->enhanced_strobe && !s->calibration_done', source)
+
     def test_in_the_build(self):
         series = (ROOT / 'platform/coachz-prelink/patches/xnu/series').read_text().split()
         self.assertIn('coachz-prelink-mmc.patch', series)
@@ -72,7 +87,7 @@ class MmcTests(unittest.TestCase):
         build = (ROOT / 'platform/coachz-prelink/drivers/RamBlock/build-usb-stack.py').read_text()
         self.assertIn("mmc / 'coachz_sdcc.c'", build)
         self.assertIn("'CoachzMmcBlock.o'", build)
-        self.assertIn("' coachz-emmc=2 coachz-sd=2'", (ROOT / 'tools/xnu_screen.py').read_text())
+        self.assertIn("' coachz-emmc=3 coachz-sd=2'", (ROOT / 'tools/xnu_screen.py').read_text())
         # The shared RPMh client of coachz_rpmh_iface.h lives in the Wi-Fi patch, with cx aggregated over its consumers.
         wifi = (ROOT / 'platform/coachz-prelink/patches/xnu/coachz-prelink-wifi.patch').read_text()
         for name in ('coachz_cmd_db_address', 'coachz_cmd_db_aux', 'coachz_rpmh_write', 'coachz_rpmh_cx_request'):

@@ -103,6 +103,7 @@
 #define CM_AUTO_CMD_TIMEOUT 0x0002u
 
 #define CM_CTRL2_UHS_MASK 0x0007u
+#define CM_CTRL2_UHS_SDR104 0x0003u
 #define CM_CTRL2_UHS_SDR12 0x0000u
 #define CM_CTRL2_UHS_SDR25 0x0001u
 #define CM_CTRL2_VDD_180  0x0008u
@@ -135,6 +136,30 @@
 
 /* ---------------------------------------------------------------- sdhci-msm v5 (offsets from the HC base) */
 #define CM_MSM_DLL_CONFIG       0x200u
+#define CM_MSM_DLL_STATUS       0x208u
+#define CM_MSM_DDR_200_CFG      0x224u
+#define CM_MSM_DLL_CONFIG_2     0x254u
+#define CM_MSM_DLL_CONFIG_3     0x258u
+#define CM_MSM_DDR_CONFIG       0x25cu
+#define CM_MSM_DLL_USR_CTL      0x388u
+/* sdhci_msm's DLL bits, v5 (sdhci-msm.c). */
+#define CM_MSM_CLK_PWRSAVE         (1u << 1)   /* VENDOR_SPEC */
+#define CM_MSM_DLL_LOCK            (1u << 7)   /* DLL_STATUS */
+#define CM_MSM_DDR_DLL_LOCK        (1u << 11)
+#define CM_MSM_DLL_EN              (1u << 16)  /* DLL_CONFIG */
+#define CM_MSM_CK_OUT_EN           (1u << 18)
+#define CM_MSM_CMUX_SHIFT_PHASE_SHIFT 24u
+#define CM_MSM_CMUX_SHIFT_PHASE_MASK  (7u << 24)
+#define CM_MSM_DDR_CAL_EN          (1u << 0)   /* DLL_CONFIG_2 */
+#define CM_MSM_FLL_CYCLE_CNT       (1u << 18)
+#define CM_MSM_DLL_CLOCK_DISABLE   (1u << 21)
+#define CM_MSM_CMDIN_RCLK_EN       (1u << 1)   /* DDR_200_CFG */
+#define CM_MSM_DDR_CONFIG_POR      0x80040873u
+#define CM_MSM_DLL_USR_CTL_VALUE   (0x10800u | (1u << 26) | (1u << 27) | (1u << 29))   /* POR, lock status, fine tune, bias ok */
+#define CM_MSM_DLL_CONFIG_3_HIGH   0x10u       /* clk_rate from 150 MHz */
+#define CM_MSM_DLL_CONFIG_3_LOW    0x08u
+#define CM_MSM_HC_MCLK_SEL_HS400   (3u << 8)
+#define CM_MSM_HC_SELECT_IN_HS400  (6u << 19)
 #define CM_MSM_VENDOR_SPEC      0x20cu
 #define CM_MSM_VENDOR_CAPS0     0x21cu
 #define CM_MSM_PWRCTL_STATUS    0x240u
@@ -258,6 +283,11 @@
 #define CM_EXT_CSD_BUS_WIDTH_8 2u
 #define CM_EXT_CSD_TIMING_HS   1u
 #define CM_EXT_CSD_PART_CONFIG_ACC_MASK 0x7u
+#define CM_EXT_CSD_CARD_TYPE_HS400_1_8V (1u << 6)
+#define CM_EXT_CSD_DDR_BUS_WIDTH_8 6u
+#define CM_EXT_CSD_BUS_WIDTH_STROBE (1u << 7)
+#define CM_EXT_CSD_TIMING_HS400    3u
+#define CM_MMC_HS200_MAX_DTR       200000000u
 #define CM_EXT_CSD_CARD_TYPE_HS_26 (1u << 0)
 #define CM_EXT_CSD_CARD_TYPE_HS_52 (1u << 1)
 #define CM_MMC_SWITCH_MODE_WRITE_BYTE 3u
@@ -281,7 +311,7 @@
 
 /* host->ios (include/linux/mmc/host.h) */
 enum { CM_BUS_WIDTH_1 = 0, CM_BUS_WIDTH_4 = 2, CM_BUS_WIDTH_8 = 3 };
-enum { CM_TIMING_LEGACY = 0, CM_TIMING_MMC_HS = 1, CM_TIMING_SD_HS = 2 };
+enum { CM_TIMING_LEGACY = 0, CM_TIMING_MMC_HS = 1, CM_TIMING_SD_HS = 2, CM_TIMING_MMC_HS400 = 3 };
 enum { CM_SIGNAL_330 = 0, CM_SIGNAL_180 = 1 };
 
 /* ---------------------------------------------------------------- bit fields of card registers */
@@ -470,6 +500,7 @@ static inline int cm_msm_should_wait(uint32_t req, int host_pwr, uint32_t curr_p
 static inline uint16_t cm_msm_uhs_ctrl2(uint16_t ctrl2, unsigned timing)
 {
     ctrl2 &= (uint16_t)~CM_CTRL2_UHS_MASK;
+    if (timing == CM_TIMING_MMC_HS400) return (uint16_t)(ctrl2 | CM_CTRL2_UHS_SDR104);
     (void)timing;   /* legacy/HS map to no UHS mode in the msm switch: the field stays SDR12 (0) */
     return ctrl2;
 }
@@ -505,6 +536,7 @@ static const int8_t cm_sdcc1_parent_cfg[] = { 0, 1, 6, 2, -1 };
 static const int8_t cm_sdcc2_parent_cfg[] = { 0, 1, 6, -1, 3 };
 /* Stage 1 drives only sources that are already running for the rest of the SoC. */
 #define CM_STAGE1_SOURCES ((1u << CM_SRC_XO) | (1u << CM_SRC_GPLL0_EVEN))
+#define CM_HS400_SOURCES (CM_STAGE1_SOURCES | (1u << CM_SRC_GPLL6_MAIN))
 
 /* clk_rcg2_floor_ops (qcom_find_freq_floor): the fastest entry not above the rate, among the allowed sources. */
 static inline const struct cm_freq *cm_rcg_floor(const struct cm_freq *t, size_t n, uint32_t rate, uint32_t sources)

@@ -11,12 +11,14 @@
  *   sdhci-msm power irq  every POWER_CONTROL / HOST_CONTROL2 / RESET_ALL write that changes the bus or IO level waits
  *                        for PWRCTL, whose handler switches vmmc/vqmmc through RPMh and the SDC pins, then acknowledges
  *
- * Stage limits, chosen and not discovered: the core clock stays on sources already running (XO, GPLL0 even, so at most
- * 100 MHz); no HS200/HS400/DDR52/UHS-I, tuning, DLL calibration, CQE, ICE or SDIO probe; no interconnect bandwidth vote;
- * no write, erase, cache, RPMB or boot-partition access. EXT_CSD is changed only where reading needs it (BUS_WIDTH,
- * HS_TIMING); a PART_CONFIG that selects a boot partition is reported and left alone, so the card is not used.
+ * Limits, chosen and not discovered: below HS400 the core clock stays on sources already running (XO, GPLL0 even, so at most
+ * 100 MHz); no HS200/DDR52/UHS-I, tuning, CQE, ICE or SDIO probe; no interconnect bandwidth vote; no erase, cache, RPMB or
+ * boot-partition access. EXT_CSD is changed only where the bus needs it (BUS_WIDTH, HS_TIMING), both lost at power-off; a
+ * PART_CONFIG that selects a boot partition is reported and left alone, so the card is not used.
  *
- * Boot arguments: coachz-emmc=1 and coachz-sd=1 (each slot separately). Without them nothing is mapped.
+ * Boot arguments: coachz-emmc=1 reads at high speed, =2 also writes inside the window, =3 also takes HS400 with enhanced strobe, as
+ * Debian does on this card (mmc_select_hs400es, GPLL6 at 384 MHz, CX nominal). coachz-sd=1 reads a card, =2 also writes to it. Without
+ * them nothing is mapped.
  */
 #include <sys/param.h>
 #include <sys/systm.h>
@@ -102,6 +104,8 @@ struct sdcc {
     uint32_t caps, caps1, mci_version, caps0, max_current;
     uint32_t ocr_avail, f_max, f_min, timeout_khz;
     int adma64, auto12, auto23, signaling_330, signaling_180, cdclp533;
+    int gpll6, enhanced_strobe, calibration_done, calibration_err, hs400_wanted;
+    uint32_t clk_rate;
     struct { unsigned clock, power_mode, vdd, bus_width, timing, signal, drv_type; } ios;
     unsigned host_clock, host_timing;
     uint8_t host_pwr;
@@ -209,7 +213,7 @@ static int branch_enable(uint32_t cbcr)
 
 static int rcg_set(struct sdcc *s, uint32_t rate)
 {
-    const struct cm_freq *f = cm_rcg_floor(s->freqs, s->nfreqs, rate, CM_STAGE1_SOURCES);
+    const struct cm_freq *f = cm_rcg_floor(s->freqs, s->nfreqs, rate, s->gpll6 ? CM_HS400_SOURCES : CM_STAGE1_SOURCES);
     struct cm_rcg_regs r;
     if (!f || !cm_rcg_regs(f, s->parents, 8, 5, &r)) return 0;
     if (s->rcg_hz == f->hz) return 1;
@@ -232,8 +236,9 @@ static int rcg_set(struct sdcc *s, uint32_t rate)
 /* dev_pm_opp_set_rate: the rate the RCG can make (floor), CX for its OPP first when going up, then the clock. */
 static uint32_t opp_set_rate(struct sdcc *s, uint32_t target)
 {
-    const struct cm_freq *f = cm_rcg_floor(s->freqs, s->nfreqs, target, CM_STAGE1_SOURCES);
-    if (!f) f = cm_rcg_floor(s->freqs, s->nfreqs, 0xffffffffu, CM_STAGE1_SOURCES);
+    const uint32_t sources = s->gpll6 ? CM_HS400_SOURCES : CM_STAGE1_SOURCES;
+    const struct cm_freq *f = cm_rcg_floor(s->freqs, s->nfreqs, target, sources);
+    if (!f) f = cm_rcg_floor(s->freqs, s->nfreqs, 0xffffffffu, sources);
     const unsigned level = cm_sdcc_opp_level(s->sdcc1, f->hz);
     if (level > s->cx_level) { if (coachz_rpmh_cx_request(s->cx_consumer, level)) printf("COACHZ mmc %s: cx vote failed\n", s->name); }
     if (!rcg_set(s, f->hz)) return 0;
@@ -448,17 +453,83 @@ static void enable_clk(struct sdcc *s, uint16_t clk)
     wr16(s->hc, CM_SDHCI_CLOCK_CONTROL, clk | CM_CLOCK_CARD_EN);
 }
 
-/* sdhci_msm_set_clock: hc_select_mode (default), the GCC rate for the bus mode, then the SDHCI clock without a divider. */
+/* msm_cm_dll_set_freq: the MCLK range of host->clock, 112 MHz and up in steps. */
+static void dll_set_freq(struct sdcc *s)
+{
+    static const uint32_t top[] = {112000000u, 125000000u, 137000000u, 150000000u, 162000000u, 175000000u, 187000000u, 200000000u};
+    uint32_t mclk = 0;
+    for (unsigned i = 0; i < 8; i++) {
+        if (s->host_clock <= top[i]) { mclk = i; break; }
+    }
+    wr32(s->hc, CM_MSM_DLL_CONFIG, (rd32(s->hc, CM_MSM_DLL_CONFIG) & ~CM_MSM_CMUX_SHIFT_PHASE_MASK) | mclk << CM_MSM_CMUX_SHIFT_PHASE_SHIFT);
+}
+
+/* msm_init_cm_dll for this controller (MCI version 0x72: 14lpp DLL reset, tassadar DLL), no qcom,dll-config in its device tree. */
+static int dll_init(struct sdcc *s)
+{
+    wr32(s->hc, CM_MSM_VENDOR_SPEC, rd32(s->hc, CM_MSM_VENDOR_SPEC) & ~CM_MSM_CLK_PWRSAVE);
+    wr32(s->hc, CM_MSM_DLL_CONFIG, rd32(s->hc, CM_MSM_DLL_CONFIG) & ~CM_MSM_CK_OUT_EN);
+    wr32(s->hc, CM_MSM_DLL_CONFIG_2, rd32(s->hc, CM_MSM_DLL_CONFIG_2) | CM_MSM_DLL_CLOCK_DISABLE);
+    wr32(s->hc, CM_MSM_DLL_CONFIG, rd32(s->hc, CM_MSM_DLL_CONFIG) | CM_MSM_DLL_RST);
+    wr32(s->hc, CM_MSM_DLL_CONFIG, rd32(s->hc, CM_MSM_DLL_CONFIG) | CM_MSM_DLL_PDN);
+    dll_set_freq(s);
+    uint32_t config = rd32(s->hc, CM_MSM_DLL_CONFIG_2);
+    const uint64_t cycles = (uint64_t)s->host_clock * (config & CM_MSM_FLL_CYCLE_CNT ? 8u : 4u);
+    const uint32_t mclk = (uint32_t)((cycles + 19200000u / 2u) / 19200000u);   /* DIV_ROUND_CLOSEST_ULL by XO */
+    wr32(s->hc, CM_MSM_DLL_CONFIG_2, (config & ~(0xffu << 10)) | mclk << 10);
+    spin_us(5);
+    wr32(s->hc, CM_MSM_DLL_CONFIG, rd32(s->hc, CM_MSM_DLL_CONFIG) & ~CM_MSM_DLL_RST);
+    wr32(s->hc, CM_MSM_DLL_CONFIG, rd32(s->hc, CM_MSM_DLL_CONFIG) & ~CM_MSM_DLL_PDN);
+    dll_set_freq(s);
+    wr32(s->hc, CM_MSM_DLL_CONFIG_2, rd32(s->hc, CM_MSM_DLL_CONFIG_2) & ~CM_MSM_DLL_CLOCK_DISABLE);
+    wr32(s->hc, CM_MSM_DLL_USR_CTL, CM_MSM_DLL_USR_CTL_VALUE);
+    wr32(s->hc, CM_MSM_DLL_CONFIG_3, (rd32(s->hc, CM_MSM_DLL_CONFIG_3) & ~0xffu) | (s->clk_rate < 150000000u ? CM_MSM_DLL_CONFIG_3_LOW : CM_MSM_DLL_CONFIG_3_HIGH));
+    wr32(s->hc, CM_MSM_DLL_CONFIG, rd32(s->hc, CM_MSM_DLL_CONFIG) | CM_MSM_DLL_EN);
+    wr32(s->hc, CM_MSM_DLL_CONFIG, rd32(s->hc, CM_MSM_DLL_CONFIG) | CM_MSM_CK_OUT_EN);
+    for (unsigned waited = 0; !(rd32(s->hc, CM_MSM_DLL_STATUS) & CM_MSM_DLL_LOCK); waited++) {
+        if (waited >= 50) { printf("COACHZ mmc %s: DLL failed to lock (0x%x)\n", s->name, rd32(s->hc, CM_MSM_DLL_STATUS)); return -ETIMEDOUT; }
+        spin_us(1);
+    }
+    return 0;
+}
+
+/* sdhci_msm_hs400_dll_calibration with enhanced strobe: no tuning phase, then sdhci_msm_cm_dll_sdc4_calibration. */
+static int dll_calibrate(struct sdcc *s)
+{
+    const int err = dll_init(s);
+    if (err) return err;
+    wr32(s->hc, CM_MSM_DDR_CONFIG, CM_MSM_DDR_CONFIG_POR);
+    wr32(s->hc, CM_MSM_DDR_200_CFG, rd32(s->hc, CM_MSM_DDR_200_CFG) | CM_MSM_CMDIN_RCLK_EN);
+    wr32(s->hc, CM_MSM_DLL_CONFIG_2, rd32(s->hc, CM_MSM_DLL_CONFIG_2) | CM_MSM_DDR_CAL_EN);
+    for (unsigned waited = 0; !(rd32(s->hc, CM_MSM_DLL_STATUS) & CM_MSM_DDR_DLL_LOCK); waited += 10) {
+        if (waited >= 1000) { printf("COACHZ mmc %s: CM_DLL_SDC4 calibration not completed (0x%x)\n", s->name, rd32(s->hc, CM_MSM_DLL_STATUS)); return -ETIMEDOUT; }
+        spin_us(10);
+    }
+    mb();
+    return 0;
+}
+
+/* sdhci_msm_set_clock: hc_select_mode (msm_hc_select_hs400 or default), the GCC rate for the bus mode, then the SDHCI clock without a divider. */
 static void msm_set_clock(struct sdcc *s, unsigned clock)
 {
     if (clock) {
-        if (!s->cdclp533) wr32(s->hc, CM_MSM_VENDOR_SPEC3, rd32(s->hc, CM_MSM_VENDOR_SPEC3) & ~CM_MSM_PWRSAVE_DLL);
-        uint32_t spec = rd32(s->hc, CM_MSM_VENDOR_SPEC);
-        spec = (spec & ~CM_MSM_HC_MCLK_SEL_MASK) | CM_MSM_HC_MCLK_SEL_DFLT;
-        wr32(s->hc, CM_MSM_VENDOR_SPEC, spec);
-        wr32(s->hc, CM_MSM_VENDOR_SPEC, rd32(s->hc, CM_MSM_VENDOR_SPEC) & ~(CM_MSM_HC_SELECT_IN_EN | CM_MSM_HC_SELECT_IN_MASK));
+        const int hs400 = s->ios.timing == CM_TIMING_MMC_HS400;
+        if (hs400) {
+            uint32_t spec = (rd32(s->hc, CM_MSM_VENDOR_SPEC) & ~CM_MSM_HC_MCLK_SEL_MASK) | CM_MSM_HC_MCLK_SEL_HS400;
+            wr32(s->hc, CM_MSM_VENDOR_SPEC, spec);
+            if (s->enhanced_strobe && !s->calibration_done) wr32(s->hc, CM_MSM_VENDOR_SPEC, spec | CM_MSM_HC_SELECT_IN_HS400 | CM_MSM_HC_SELECT_IN_EN);
+        } else {
+            if (!s->cdclp533) wr32(s->hc, CM_MSM_VENDOR_SPEC3, rd32(s->hc, CM_MSM_VENDOR_SPEC3) & ~CM_MSM_PWRSAVE_DLL);
+            uint32_t spec = rd32(s->hc, CM_MSM_VENDOR_SPEC);
+            spec = (spec & ~CM_MSM_HC_MCLK_SEL_MASK) | CM_MSM_HC_MCLK_SEL_DFLT;
+            wr32(s->hc, CM_MSM_VENDOR_SPEC, spec);
+            wr32(s->hc, CM_MSM_VENDOR_SPEC, rd32(s->hc, CM_MSM_VENDOR_SPEC) & ~(CM_MSM_HC_SELECT_IN_EN | CM_MSM_HC_SELECT_IN_MASK));
+        }
         mb();
-        if (!opp_set_rate(s, s->ios.clock)) printf("COACHZ mmc %s: failed to set clock at rate %u\n", s->name, s->ios.clock);
+        /* msm_get_clock_mult_for_bus_mode: HS400 is DDR off a clock of twice the bus rate. */
+        const uint32_t rate = opp_set_rate(s, s->ios.clock * (hs400 ? 2u : 1u));
+        if (!rate) printf("COACHZ mmc %s: failed to set clock at rate %u\n", s->name, s->ios.clock);
+        s->clk_rate = s->ios.clock * (hs400 ? 2u : 1u);
     }
     wr16(s->hc, CM_SDHCI_CLOCK_CONTROL, 0);
     if (clock) enable_clk(s, rd16(s->hc, CM_SDHCI_CLOCK_CONTROL));
@@ -469,10 +540,19 @@ static void msm_set_uhs(struct sdcc *s)
 {
     uint16_t ctrl2 = cm_msm_uhs_ctrl2(rd16(s->hc, CM_SDHCI_HOST_CONTROL2), s->ios.timing);
     if (s->host_clock <= CM_MSM_CORE_FREQ_100MHZ) {
+        /* Below 100 MHz the feedback clock is used, not the DLL, whatever the timing. */
+        ctrl2 &= (uint16_t)~CM_CTRL2_UHS_MASK;
         wr32(s->hc, CM_MSM_DLL_CONFIG, rd32(s->hc, CM_MSM_DLL_CONFIG) | CM_MSM_DLL_RST);
         wr32(s->hc, CM_MSM_DLL_CONFIG, rd32(s->hc, CM_MSM_DLL_CONFIG) | CM_MSM_DLL_PDN);
+        s->calibration_done = 0;
     }
     msm_write16(s, CM_SDHCI_HOST_CONTROL2, ctrl2);
+    /* sdhci_msm_hs400 */
+    if (s->ios.timing == CM_TIMING_MMC_HS400 && s->host_clock > CM_MSM_CORE_FREQ_100MHZ && s->enhanced_strobe && !s->calibration_done) {
+        s->calibration_err = dll_calibrate(s);
+        s->calibration_done = !s->calibration_err;
+        if (s->calibration_err) printf("COACHZ mmc %s: failed to calibrate DLL for HS400 (%d)\n", s->name, s->calibration_err);
+    }
 }
 
 /* sdhci_set_power_noreg with SDHCI_QUIRK_SINGLE_POWER_WRITE */
@@ -513,7 +593,7 @@ static void set_ios(struct sdcc *s)
     set_bus_width(s);
     if (!reinit_uhs && turning_on_clk && s->host_timing == s->ios.timing && s->version >= CM_SPEC_300) return;
     uint8_t ctrl = rd8(s->hc, CM_SDHCI_HOST_CONTROL);
-    if (s->ios.timing == CM_TIMING_SD_HS || s->ios.timing == CM_TIMING_MMC_HS) ctrl |= CM_CTRL_HISPD;
+    if (s->ios.timing == CM_TIMING_SD_HS || s->ios.timing == CM_TIMING_MMC_HS || s->ios.timing == CM_TIMING_MMC_HS400) ctrl |= CM_CTRL_HISPD;
     else ctrl &= (uint8_t)~CM_CTRL_HISPD;
     if (s->version >= CM_SPEC_300) {
         uint16_t clk = rd16(s->hc, CM_SDHCI_CLOCK_CONTROL);
@@ -798,8 +878,60 @@ static int mmc_switch(struct sdcc *s, unsigned index, unsigned value, unsigned t
     return err;
 }
 
+/* clk_alpha_pll_fixed_fabia, in FSM mode: vote for GPLL6 (enable_reg 0x52010 bit 6, gcc-sc7180.c) and wait for its active flag. */
+static int gpll6_enable(void)
+{
+    const vm_offset_t vote = ml_io_map(0x152000u, 0x1000);
+    if (!vote) return 0;
+    const uint32_t mode = rd32(gcc, GCC_OFF(0x13000u));
+    if (!(mode & (1u << 20))) {   /* PLL_VOTE_FSM_ENA */
+        printf("COACHZ mmc: GPLL6 mode 0x%x is not in FSM mode, not used\n", mode);
+        return 0;
+    }
+    wr32(vote, 0x10, rd32(vote, 0x10) | 1u << 6);
+    for (unsigned waited = 0; waited < 200; waited++) {
+        if (rd32(gcc, GCC_OFF(0x13000u)) & (1u << 31)) return 1;   /* PLL_ACTIVE_FLAG */
+        spin_us(5);
+    }
+    printf("COACHZ mmc: GPLL6 did not become active (mode 0x%x)\n", rd32(gcc, GCC_OFF(0x13000u)));
+    return 0;
+}
+
+/* mmc_select_hs400es from 8-bit high-speed, then mmc_set_bus_speed: no tuning, the card clocks data out on its strobe. The switches
+   only change BUS_WIDTH and HS_TIMING, which are lost at power-off and reset. */
+static int mmc_select_hs400es(struct sdcc *s)
+{
+    if (!(s->ext.card_type & CM_EXT_CSD_CARD_TYPE_HS400_1_8V) || !s->ext.strobe_support || !s->signaling_180 ||
+        s->ios.bus_width != CM_BUS_WIDTH_8 || s->ios.timing != CM_TIMING_MMC_HS) {
+        printf("COACHZ mmc %s: HS400 not possible: card type 0x%x, strobe %u, 1.8 V %d, width %u, timing %u\n", s->name, s->ext.card_type,
+            s->ext.strobe_support, s->signaling_180, s->ios.bus_width, s->ios.timing);
+        return 0;
+    }
+    if (!gpll6_enable()) return 0;
+    s->gpll6 = 1;
+    s->f_max = cm_rcg_max(s->freqs, s->nfreqs, CM_HS400_SOURCES);   /* sdhci_get_max_clock: the fastest the RCG can now make */
+    int err = set_signal_voltage(s, CM_SIGNAL_180);
+    if (!err) err = mmc_switch(s, CM_EXT_CSD_BUS_WIDTH, CM_EXT_CSD_DDR_BUS_WIDTH_8 | CM_EXT_CSD_BUS_WIDTH_STROBE, s->ext.generic_cmd6_ms, 0);
+    if (!err) err = mmc_switch(s, CM_EXT_CSD_HS_TIMING, CM_EXT_CSD_TIMING_HS400, s->ext.generic_cmd6_ms, CM_TIMING_MMC_HS400);
+    if (err) {
+        printf("COACHZ mmc %s: switch to HS400 failed (%d)\n", s->name, err);
+        return err;
+    }
+    s->enhanced_strobe = 1;
+    set_clock(s, CM_MMC_HS200_MAX_DTR);
+    if (s->calibration_err) return s->calibration_err;
+    /* The switch status at the new rate: the first command through the calibrated DLL. */
+    uint32_t status = 0;
+    err = mmc_send_status(s, &status);
+    printf("COACHZ mmc %s: HS400 enhanced strobe at %u Hz (rcg %u), DLL status 0x%x, card status 0x%x (%d)\n", s->name, s->ios.clock, s->rcg_hz,
+        rd32(s->hc, CM_MSM_DLL_STATUS), status, err);
+    return err;
+}
+
 static int mmc_attach(struct sdcc *s)
 {
+    unsigned emmc_mode = 0;
+    s->hs400_wanted = s->sdcc1 && PE_parse_boot_argn("coachz-emmc", &emmc_mode, sizeof(emmc_mode)) && emmc_mode == 3;
     struct sdcc_cmd op = { CM_MMC_SEND_OP_COND, 0, CM_RSP_R3, {0}, 0, 0 };
     set_ios(s);   /* mmc_set_bus_mode(OPENDRAIN): SDHCI has no open-drain control; the call still runs set_ios */
     int err = poll_ready(s, 0, &op, 0, CM_MMC_OP_COND_PERIOD_US, CM_MMC_OP_COND_TIMEOUT_MS);
@@ -873,9 +1005,10 @@ static int mmc_attach(struct sdcc *s)
         printf("COACHZ mmc %s: switch to bus width %u failed\n", s->name, 1u << widths[i]);
     }
     s->cmd23 = 1;   /* mmc_card_mmc: MMC_BLK_CMD23 */
+    if (s->hs400_wanted && (err = mmc_select_hs400es(s))) return err;
     printf("COACHZ mmc %s: ready at %u Hz (rcg %u), %u-bit, %s timing, %s addressing\n", s->name, s->ios.clock, s->rcg_hz,
         s->ios.bus_width == CM_BUS_WIDTH_8 ? 8u : s->ios.bus_width == CM_BUS_WIDTH_4 ? 4u : 1u,
-        s->ios.timing == CM_TIMING_MMC_HS ? "high-speed" : "legacy", s->blockaddr ? "sector" : "byte");
+        s->ios.timing == CM_TIMING_MMC_HS400 ? "HS400" : s->ios.timing == CM_TIMING_MMC_HS ? "high-speed" : "legacy", s->blockaddr ? "sector" : "byte");
     return 0;
 }
 
@@ -1055,14 +1188,14 @@ static int rescan(struct sdcc *s)
 int coachz_sdcc_enabled(int slot)
 {
     unsigned value = 0;
-    return (slot == 0 && PE_parse_boot_argn("coachz-emmc", &value, sizeof(value)) && (value == 1 || value == 2)) ||
+    return (slot == 0 && PE_parse_boot_argn("coachz-emmc", &value, sizeof(value)) && (value >= 1 && value <= 3)) ||
            (slot == 1 && PE_parse_boot_argn("coachz-sd", &value, sizeof(value)) && (value == 1 || value == 2));
 }
 /* 2 asks for writes: to the whole card in the microSD slot, on the eMMC only inside the window find_write_window validates. */
 static int write_requested(int slot)
 {
     unsigned value = 0;
-    return PE_parse_boot_argn(slot == 0 ? "coachz-emmc" : "coachz-sd", &value, sizeof(value)) && value == 2;
+    return PE_parse_boot_argn(slot == 0 ? "coachz-emmc" : "coachz-sd", &value, sizeof(value)) && value >= 2;
 }
 int coachz_sdcc_removable(int slot) { return slot == 1; }
 uint32_t coachz_sdcc_max_blocks(void) { return MAX_BLOCKS; }
@@ -1295,6 +1428,18 @@ void coachz_sdcc_write_selftest(int slot)
         "read back %u mismatches; write %llu KB/s, read %llu KB/s\n", s->name, (unsigned long long)start, survived, TEST_BLOCKS, single, multi,
         mismatches, (unsigned long long)(TEST_BLOCKS * 512ull * 1000u / (wrote - began ? wrote - began : 1u)),
         (unsigned long long)(TEST_BLOCKS * 512ull * 1000u / (read_back - wrote ? read_back - wrote : 1u)));
+    /* A longer sequential read inside the window, without copying the buffer: the bus and the driver alone. */
+    const uint64_t blocks = 64ull * 2048u;
+    const uint64_t read_began = now_us();
+    for (uint64_t at = 0; at < blocks; at += MAX_BLOCKS) {
+        if (!coachz_sdcc_read(slot, start - blocks + at, MAX_BLOCKS, &data)) {
+            printf("COACHZ mmc %s: read test stopped at block %llu\n", s->name, (unsigned long long)at);
+            return;
+        }
+    }
+    const uint64_t read_took = now_us() - read_began;
+    printf("COACHZ mmc %s: read 64 MiB in %llu ms, %llu KB/s\n", s->name, (unsigned long long)(read_took / 1000u),
+        (unsigned long long)(blocks * 512ull * 1000u / (read_took ? read_took : 1u)));
     return;
 failed:
     printf("COACHZ mmc %s: write test stopped at block %u (%u single, %u multi written)\n", s->name, b, single, multi);

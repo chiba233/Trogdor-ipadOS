@@ -1,6 +1,6 @@
 # eMMC 与 microSD（sdhci-msm）
 
-驱动已编进预链接内核（RamBlock 的归档、采样线程启动、`coachz-emmc=2 coachz-sd=2`）。真机上 eMMC 以 52 MHz、8 位总线识别，只向机主切出的 1 GiB 分区 `coachz-scratch` 写入，窗口外的写被拒绝，2048 块写后读回无错，重启后内容还在；GPT 分区都已发布；microSD 槽没插卡时报告无卡，读写卡未测。入口：[实现与接入说明](../../platform/coachz-prelink/drivers/RamBlock/mmc/README.md)，[固定源码](../../platform/coachz-prelink/drivers/RamBlock/mmc/SOURCES.md)。
+驱动已编进预链接内核（RamBlock 的归档、采样线程启动、`coachz-emmc=3 coachz-sd=2`）。真机上 eMMC 走 HS400 增强选通（200 MHz、8 位，和 Debian 相同），只向机主切出的 1 GiB 分区 `coachz-scratch` 写入，窗口外的写被拒绝，2048 块写后读回无错，重启后内容还在；GPT 分区都已发布；microSD 槽没插卡时报告无卡，读写卡未测。入口：[实现与接入说明](../../platform/coachz-prelink/drivers/RamBlock/mmc/README.md)，[固定源码](../../platform/coachz-prelink/drivers/RamBlock/mmc/SOURCES.md)。
 
 ## 路线
 
@@ -38,4 +38,4 @@
 
 ## 下一阶段（要等第一阶段的实机结果）
 
-eMMC HS400ES 384 MHz（GPLL6、CX nom、DLL 校准、增强选通），SD UHS-I（CMD11、GPLL7、调谐），带宽投票，CQE，SD 热插拔。
+降低每条命令的开销和加大单次传输（现在约写 54、读 52 MB/s），带宽投票，SD UHS-I（CMD11、GPLL7、调谐），CQE，SD 热插拔。

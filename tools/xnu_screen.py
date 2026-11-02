@@ -305,7 +305,7 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         command_line += ' coachz-modem-fw=1'
         # The SDHCI driver (sdhci-msm, platform/coachz-prelink/drivers/RamBlock/mmc): eMMC and microSD block devices. 2 opens writes: the
         # microSD card whole, the eMMC only inside the 1 GiB coachz-scratch partition, with a write test on that window's last MiB.
-        command_line += ' coachz-emmc=2 coachz-sd=2'
+        command_line += ' coachz-emmc=3 coachz-sd=2'
     if gpu:
         # Adreno 618 bring-up stages (docs/plans/gpu.md): 1 inventory, 2 CX + GMU clock window, 3 also the GMU firmware into TCM,
         # 4 the window with a read-only GPU SMMU inventory.
