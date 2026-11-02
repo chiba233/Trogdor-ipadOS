@@ -284,6 +284,9 @@ static void test_control(void)
     nout = 0; CHECK(cbc_call(&s, CBC_RESET_MODEM, in, 1, out, &nout) == CBC_OK && s.resets == 1);
     nout = 0; CHECK(cbc_call(&s, CBC_SPMI_RAW_READ, in, 3, out, &nout) == CBC_UNSUPPORTED && s.last_unsupported == CBC_SPMI_RAW_READ);
     nout = 0; CHECK(cbc_call(&s, CBC_TIMESYNC, in, 0, out, &nout) == CBC_UNSUPPORTED);
+    /* ABM powercycles after an unclean stop, and every client names itself first (structure input, no scalars). */
+    nout = 0; CHECK(cbc_call(&s, CBC_POWERCYCLE, in, 0, out, &nout) == CBC_OK && s.powered == 1);
+    nout = 0; CHECK(cbc_call(&s, CBC_SELF_IDENTIFY, in, 0, out, &nout) == CBC_OK && nout == 0);
     if (!failures) printf("PASS baseband methods\n");
 }
 

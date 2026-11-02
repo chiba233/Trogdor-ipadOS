@@ -1632,3 +1632,9 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 - **基带通道**：还没有进程打开通道，sahara 0 次请求，崩溃在这之前。
 - **U 盘**：两个口插入后，`COACHZ USB: mass storage at N` 都记录到内核的 USB 栈枚举 U 盘，拔出后也有记录。系统里还没有发布成磁盘。
 
+## ABM 走到启动基带
+
+- **CommCenter**：发布 `AppleIPAppender` 和 `AppleBasebandPCIMAVPDPManager`、应答方法 6 和 15 后不再崩溃，ABM 的 9 个服务都初始化，`AppleIPAppender` 收到方法 4、6、8、11、15、16、17 的调用。
+- **设置**：能打开，“蜂窝网络”页面能打开，提示需要更新才能使用蜂窝数据；“关于本机”的基带固件版本为空。
+- **基带启动**：ABM 启动基带失败 15 次后报 `Baseband is declared dead`。复位记录的原因是 `BBUpdater error 2 - Assertion failure ( fPhases.size() )`（`BBUConsoleFeedback.cpp:93`）。它之前的 20 多行 BBU 日志都是 `<private>`，还没有进程打开基带通道。
+

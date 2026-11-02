@@ -621,7 +621,7 @@ public:
     IOLockLock(bb_lock);
     const int result = cbc_call(&bb_control, selector, args->scalarInput, args->scalarInputCount, out, &nout);
     // A reset or power-on starts the boot loader again: it greets BBUpdater on sahara.
-    if (!result && (selector == CBC_RESET_MODEM || (selector == CBC_POWER && args->scalarInputCount && args->scalarInput[0])))
+    if (!result && (selector == CBC_RESET_MODEM || selector == CBC_POWERCYCLE || (selector == CBC_POWER && args->scalarInputCount && args->scalarInput[0])))
       bb_sahara_restart();
     IOLockUnlock(bb_lock);
     if (result == CBC_UNSUPPORTED) printf("COACHZ baseband: AppleBaseband selector %u unsupported\n", selector);
@@ -642,6 +642,60 @@ public:
   IOReturn newUserClient(task_t t, void *s, UInt32 type, IOUserClient **out) override { return newUserClient(t, s, type, nullptr, out); }
 };
 OSDefineMetaClassAndStructors(AppleBaseband, IOService)
+
+// ------------------------------------------------------------------ the data plane's kernel services
+// ABM's data::TransportService calls ApplePDPHelperInterface::getInstance()->enableMetadataTrailer() without a null check, and getInstance
+// is null without an AppleIPAppender service to open. ApplePDPHelper picks its variant by which PDP manager is registered; this is the Mav
+// one. Nothing is behind them until pdp_ip exists: every AppleIPAppender method (0 addFlow ... 20 registerFilterRuleCallBack, libApplePDPHelper)
+// succeeds with zeroed outputs, and the first use of each selector is logged.
+class AppleIPAppenderUserClient : public IOUserClient {
+  OSDeclareDefaultStructors(AppleIPAppenderUserClient)
+public:
+  IOReturn clientClose() override
+  {
+    terminate();
+    return kIOReturnSuccess;
+  }
+  IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *, OSObject *, void *) override
+  {
+    if (!args) return kIOReturnBadArgument;
+    static uint32_t seen;
+    if (selector < 32 && !(__atomic_fetch_or(&seen, 1u << selector, __ATOMIC_RELAXED) & (1u << selector)))
+      printf("COACHZ baseband: AppleIPAppender selector %u answered with zeros\n", selector);
+    for (uint32_t i = 0; i < args->scalarOutputCount; i++) args->scalarOutput[i] = 0;
+    if (args->structureOutput && args->structureOutputSize) bzero(args->structureOutput, args->structureOutputSize);
+    if (args->structureOutputDescriptor) args->structureOutputDescriptorSize = 0;
+    return kIOReturnSuccess;
+  }
+};
+OSDefineMetaClassAndStructors(AppleIPAppenderUserClient, IOUserClient)
+
+class AppleIPAppender : public IOService {
+  OSDeclareDefaultStructors(AppleIPAppender)
+public:
+  IOReturn newUserClient(task_t t, void *s, UInt32 type, OSDictionary *p, IOUserClient **out) override
+  {
+    return bb_open<AppleIPAppenderUserClient>(this, t, s, type, p, out);
+  }
+  IOReturn newUserClient(task_t t, void *s, UInt32 type, IOUserClient **out) override { return newUserClient(t, s, type, nullptr, out); }
+};
+OSDefineMetaClassAndStructors(AppleIPAppender, IOService)
+
+// libPCITransport's pci::event::PDPListener matches the base class, ApplePDPHelper the leaf and AppleBasebandPCIPDPManager.
+class AppleBasebandPCIPDPManagerBase : public IOService {
+  OSDeclareDefaultStructors(AppleBasebandPCIPDPManagerBase)
+};
+OSDefineMetaClassAndStructors(AppleBasebandPCIPDPManagerBase, IOService)
+
+class AppleBasebandPCIPDPManager : public AppleBasebandPCIPDPManagerBase {
+  OSDeclareDefaultStructors(AppleBasebandPCIPDPManager)
+};
+OSDefineMetaClassAndStructors(AppleBasebandPCIPDPManager, AppleBasebandPCIPDPManagerBase)
+
+class AppleBasebandPCIMAVPDPManager : public AppleBasebandPCIPDPManager {
+  OSDeclareDefaultStructors(AppleBasebandPCIMAVPDPManager)
+};
+OSDefineMetaClassAndStructors(AppleBasebandPCIMAVPDPManager, AppleBasebandPCIPDPManager)
 
 // ------------------------------------------------------------------ publication and the Wi-Fi thread's entry points
 template <class Service>
@@ -678,8 +732,10 @@ extern "C" void coachz_baseband_configure(void (*send)(uint32_t, uint32_t, uint3
   made += provider && bb_publish<AppleBaseband>(provider);
   made += provider && bb_publish<AppleBasebandPCIControl>(provider);
   for (uint32_t c = 0; c < CBH_PUBLISHED; c++) made += provider && bb_publish<AppleBasebandPCIInterface>(provider, c);
+  made += provider && bb_publish<AppleBasebandPCIMAVPDPManager>(provider);
+  made += provider && bb_publish<AppleIPAppender>(provider);
   bb_published = 1;
-  printf("COACHZ baseband: %d of %u services published (AppleBaseband, AppleBasebandPCIControl and %u channels)\n", made, 2u + CBH_PUBLISHED, CBH_PUBLISHED);
+  printf("COACHZ baseband: %d of %u services published (AppleBaseband, AppleBasebandPCIControl, %u channels, the PDP manager, AppleIPAppender)\n", made, 4u + CBH_PUBLISHED, CBH_PUBLISHED);
 }
 
 extern "C" void coachz_baseband_new_server(uint32_t service, uint32_t version_instance, uint32_t node, uint32_t port)

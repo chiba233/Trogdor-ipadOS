@@ -20,7 +20,7 @@
 #define CBC_PROPERTIES 16u
 
 enum {
-    CBC_RESET_MODEM = 0, CBC_POWER = 1, CBC_MUX = 2, CBC_GET_RESET = 3, CBC_VBUS = 8, CBC_GET_PMU_EXTON = 11, CBC_GET_DIAG_READY = 16,
+    CBC_RESET_MODEM = 0, CBC_POWER = 1, CBC_MUX = 2, CBC_GET_RESET = 3, CBC_POWERCYCLE = 6, CBC_VBUS = 8, CBC_GET_PMU_EXTON = 11, CBC_SELF_IDENTIFY = 15, CBC_GET_DIAG_READY = 16,
     CBC_GET_EFS_ERASE_DONE = 17, CBC_GET_RESET_REQUEST = 18, CBC_COREDUMP_GPIO = 19, CBC_TIMESYNC = 20, CBC_SET_MANAGER_STATE = 22,
     CBC_GET_MANAGER_STATE = 23, CBC_CHARGER_DESENSE = 25, CBC_GET_BASEBAND_STATE = 26, CBC_SET_BASEBAND_STATE = 27,
     CBC_GET_PROPERTY = 28, CBC_SET_PROPERTY = 29, CBC_CLEAR_FREQ_LIST = 32, CBC_REMOVE_FREQ_LIST = 34, CBC_RESET_SPMI = 35,
@@ -48,6 +48,8 @@ static inline int cbc_call(struct cbc_state *s, uint32_t selector, const uint64_
     switch (selector) {
     case CBC_RESET_MODEM: CBC_NEED(1, 0); s->resets++; return CBC_OK;
     case CBC_POWER: CBC_NEED(1, 0); s->powered = in[0] != 0; return CBC_OK;
+    case CBC_POWERCYCLE: s->resets++; s->powered = 1; return CBC_OK;
+    case CBC_SELF_IDENTIFY: return CBC_OK;                                      /* each client names itself in a structure; nothing here keys on it */
     case CBC_MUX: CBC_NEED(1, 0); s->mux = in[0] != 0; return CBC_OK;
     case CBC_VBUS: CBC_NEED(1, 0); s->vbus = in[0] != 0; return CBC_OK;
     case CBC_COREDUMP_GPIO: CBC_NEED(1, 0); s->coredump_gpio = in[0] != 0; return CBC_OK;
