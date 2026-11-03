@@ -63,7 +63,10 @@ def gpu_stack_overlay():
     stack = ROOT / 'platform/coachz-prelink/patches/gpu/unixnu-gpu-stack.patch'
     mesa = UNIXNU / '.cache/mesa-work'
     runtime = UNIXNU / '.cache/gpu-reference/metal2vulkan'
-    mesa_patch = UNIXNU / 'patches/mesa/turnip-coachz-diagnostics.patch'
+    # The overlay's Mesa patches in the order adreno-compiler-inputs.json records them: UniXNU's transient attachments in GMEM with lazily
+    # allocated memory under TU_DEBUG=sysmem (b95b4c9) and the memory-side colour swap of GMEM transfers (93ad2ce), then the diagnostics.
+    mesa_patches = [UNIXNU / 'patches/mesa' / name for name in ('turnip-transient-attachments-in-gmem.patch',
+                                                                 'turnip-gmem-memory-side-swap.patch', 'turnip-coachz-diagnostics.patch')]
     runtime_patch = UNIXNU / 'drivers/AdrenoMetal/bridge/patches/0026-coachz-copy-profile.patch'
     def apply(tree, patch, reverse=False, check=False):
         command = ['git', '-C', str(tree), 'apply']
@@ -74,10 +77,11 @@ def gpu_stack_overlay():
         return subprocess.run([*command, str(patch)], check=not check, capture_output=check)
     # git apply is atomic: a rejected overlay leaves the tree as it was.
     apply(UNIXNU, stack)
-    mesa_applied = False
+    mesa_applied = []
     try:
-        apply(mesa, mesa_patch)
-        mesa_applied = True
+        for patch in mesa_patches:
+            apply(mesa, patch)
+            mesa_applied.append(patch)
         yield
     finally:
         # The bridge builder applies its exact recorded patch sequence. Remove this
@@ -87,8 +91,8 @@ def gpu_stack_overlay():
                 apply(runtime, runtime_patch, reverse=True)
         finally:
             try:
-                if mesa_applied:
-                    apply(mesa, mesa_patch, reverse=True)
+                for patch in reversed(mesa_applied):
+                    apply(mesa, patch, reverse=True)
             finally:
                 apply(UNIXNU, stack, reverse=True)
 

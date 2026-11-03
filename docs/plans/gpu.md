@@ -200,6 +200,10 @@ GPU 核心寄存器不能用 64 位写。很多寄存器不是 8 字节对齐，
 - k75 起，上层（Turnip、运行时、插件）从 `upstream/unixnu-gpu` 构建，`tools/xnu_gpu_userland.py --build`。内核框架不变，只补了新上层的两个方法。上游这个版本有两处在 iOS 17 上编不过，构建时临时绕开，构建完撤回：主机仿真改用固定版本树里编好的那份（新框架的源码在主机上编不过），插件里只给 iOS 27 用的一个函数加 `[[maybe_unused]]`（`patches/gpu/unixnu-gpu-plugin.patch`）。
 - k78 的硬件计数器（`--diagnostics` 下每秒一行 `COACHZ gpu prof`）：GPU 忙时 SP 大多在等 RB 和 UCHE，ALU 只占 4～15%，UCHE 延迟 180～370 周期，总线不到 2 GB/s。LLCC 在 XNU 下完全没配置。下一步照主线 `llcc-qcom.c` 配置 sc7180 的切片，再照 `a6xx_llc_activate` 激活 GPU 和 GPUHTW 切片。
 - k79 照主线配置 LLCC 后，提交到完成快了约 25%。k80 的前台优先排队在 ring 前生效，但这台机器上和渲染服务器抢 GPU 的主要是它自己每帧之后的那次复制，别的进程很少。
+- k82 让 Turnip 自选 tile 内存时不更快，而且红蓝互换，所以一直保留 `sysmem`。UniXNU 之后修了两处，这里经 `unixnu-gpu-stack.patch` 带进 Mesa overlay，排在诊断补丁前：
+  - `b95b4c9`、`2d0d39f`：开着 `sysmem` 时，带 transient（Metal 的 memoryless）附件、附件还没有内存的 pass 也在 GMEM 渲染，附件用惰性分配的内存，一直不分配。之前这些附件是普通显存，每次新分配 32～112 MiB。
+  - `93ad2ce`：GMEM 和线性图像之间的传输，内存一侧保留图像自己的 swap，tile 一侧仍是 WZYX。我们没有它依赖的追踪补丁，`r3d_src_gmem_load` 里那一行上下文按锁定版本改写。
+  - k148 上机：29892 个 pass 走 GMEM，9418 个仍走系统内存；`GM`、`GMb` 里 tile 一侧非 WZYX 的计数全为 0；画面没有红蓝互换，明显更流畅，没有 DeviceLost 或 panic。同样开机 300 秒，提交和翻转次数是 k147 的两倍，每次翻转的整帧镜像从 0.35 次升到 0.81 次，`frame-gpu` 超过 16 ms 的比例从 19.6% 升到 37.7%，原因还没查。
 - 上游的 GPU 调度是按前后台优先级分到两条 ring，靠 CP 抢占切换。主线 Linux 不给 A6xx 开抢占，只有一条 ring，所以 A618 只能在这一条 ring 前按优先级排队，不能打断正在跑的作业。
 
 ## 中断

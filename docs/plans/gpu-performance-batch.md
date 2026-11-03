@@ -1,8 +1,52 @@
 # GPU 主帧、提交与拷贝修订
 
-两次后续启动已实际显示 private 主帧，分别 shown 1908 和 767；两次主机纹理 shadow 和 placement/pitch 拒绝均为 0，后一次还取得 319 次同尺寸 host 图像成功绑定记录。提交前 Busy 准入在两次都触发，三次恢复均返回成功，所给内核日志没有 DeviceLost 或 panic。这些是路径执行证据，没有画面反馈或固定操作窗口，尚不代表方向、截图、流畅度和长期稳定性全部通过。
+最新提供的启动记录已执行到 rotation 3 seed 和实际显示，stage 1 错误为 0；Busy 等待整理也取得 reaped/pauses 的原始记录，没有记录到 DeviceLost。host texture shadow/copy 计数均为 0。局部镜像虽命中 3 次，但只少编码 2.82 MB，镜像仍约 14.56 GB；因此尚不能称为有效解决了写回成本。
 
-本次继续推进局部镜像写回与 Busy 等待整理，均在 addon 及其 Mesa 依赖内。另修订 rotation 3 的独立物理平面：内部错误调用 Metal 的公开 `buffer` getter，它对 IOSurface 纹理刻意返回 nil，导致 stage 1 在进入 runtime 前失败。改为内部 backing 访问方法；公开 API 行为不变。**这次修订需重编 addon 与配套信任缓存，内核可沿用。** 未自行编译或实机验收，不提交调试迭代。
+本次修订 plain 回退的 backing 生命周期和完成判定，并把 shader 相关保护按表面隔离；不改已发布 private 的方向。它和 GMEM 修订（见 [GPU 路线](gpu.md) 的性能一节）在同一个 addon 里，内核沿用，k148 上机：画面颜色正常、明显更流畅，没有 DeviceLost 或 panic。
+
+k148 开机约 307 秒的最后记录：`CZ seed 16 fail 0`，`CZ frames made 16 private 16 shown 2640 plain 1008`，方向 `straight1328 turned1312 mismatch0 conflict1`；`CZ sync out1517 in1388 miss0 attach1`；`CZ miss tag1008 frame0 invalid0 shape0`，plain 全部是没有有效标记；镜像 2905 次共 39.2 GB，局部写回 4 次、省 3.5 MB；`KMD pressure n32 busy9 reaped8 pauses1`。同样到 307 秒，k147 是提交 3647 次、翻转 1801 次、镜像 627 次，k148 是 7735、3601、2905 次，每次翻转的整帧镜像从 0.35 次升到 0.81 次，原因还没查。
+
+## 最新启动记录
+
+每项取其最后打印；没有固定操作窗口或画面反馈，不能与其他启动的累计耗时直接比较：
+
+| 字段 | 最后记录 |
+|---|---|
+| made / private / seed / fail | 2 / 2 / 2 / 0 |
+| shown / plain | 1071 / 1955 |
+| straight / turned / mismatch / conflict | 1069 / 2 / 0 / 1 |
+| private writer / plain writer | 2512 / 2474 |
+| mirror / bytes / part / skip / save | 1080 / 14,563,388,768 / 3 / 0 / 2,821,792 |
+| damage load / full / guarded / mask | 2511 / 2475 / 490 / 2 |
+| alias | f44, 2266×1488, row9216, n1960, pitch0, size=room=13,713,408 |
+| host shadow / copies / 拒绝 | 全为 0；没有 copy、shape、place 行 |
+| commit-to-complete | n6080，累计均值 15164 us，max195 ms，包含初始化 |
+| 翻转 | 3001，0 超时，mean9608 us，max17071 us |
+
+局部镜像相对该行整帧策略的编码字节估算只减少约 0.019%，不是 DRAM 或端到端性能收益。load/full 是附件数，guarded 是镜像数，不能相减归因。mask2 表示原命令级主帧 shader 纹理保护实际触发；日志没有保留具体表面关系，不能把 490 次全部说成不必要的保护。
+
+stage 1/shape/plane/alloc/dim 和 seed fail 都为 0；最初有一次 turned private，之后出现一次方向冲突和大量 plain writer。保留跨方向拒绝是必要约束，不能据此重新切换同一记录的 private 方向。旧记录没有 backing-miss 和显示回退细分，1955 次 plain 的准确构成仍未知。
+
+Busy 整理取得 20 条采样记录，例如 `busy17 reaped4 pauses13 us1937`，确认既清理了已完成 fence，也实际进入过无本地 fence 的休眠重试。vm-admit 采样到 256；没有 Submit/KMD/VK 失败、DeviceLost 或 panic。恢复序号到 8、slumber 到 9，所见恢复 status/ring/ME_INIT/wait 全为 0；core accesses dropped asleep 最后为 14。这仍不证明较早方法 5 Timeout 的根因已全部闭环。
+
+## 本次 plain 回退与同步修订
+
+源码可达缺口：private 发布后拒绝跨方向导入，原导入会作为 plain 纹理返回，却未持有规范物理平面。frame 表的 backing 是弱引用；最后一个 private 视图释放后，plain 写入仍可能继续，而其同步不能依赖已过期的弱引用。完成回调此前也仅凭 `frame.backing` 的当时状态猜测是否已同步，既不是本命令的镜像回执，也可能被另一导入替换。该缺口有明确源码依据，但现有日志不足以把每次 plain 显示都归到它。
+
+修订对仍有 resident 的 plain 回退建立当前导入自己的规范平面。物理 Unorm 根纹理可直接作为 backing；旋转或 sRGB 视图另建 raw BGRA8Unorm 平面并由回退视图强持有，避免 sRGB 传输发生颜色转换。不会让一个纹理强持有自己的子视图或自身，也不把 frame 表改为强持有 IOSurface。所有导入范围、对齐和类型检查保留。
+
+镜像优先使用最后写入视图持有的 backing 或其物理根，最后才取 frame 表的弱引用。每个写入记录增加本命令的 coherent 标记，仅在镜像成功编码或已确认无更新时设置；命令成功完成且有该标记，才把 private 标为有效。失败命令仍无效，已有 serial 顺序检查保留。若最后写入缺少 backing，不允许转而选择更早写入的方向；该记录保持无效并计入 miss。
+
+## 按表面隔离未知写入保护
+
+原 mask2/4/8 是整个命令的标志：读取或声明表面 B，就会使同一命令写入 A 的局部镜像也失效。改为按 IOSurface ID 汇总 shader 纹理、surface buffer 和显式资源写入的保护；只影响同一表面的镜像。即使声明只读，目标表面自身的 shader 绑定仍保守保持完整同步。未界定的 compute 保留全命令保护，Clear/DontCare、resolve、plain 或无界写入继续整帧，不取消保护条件。
+
+新增前部记录：
+
+- `CZ sync out/in/miss/attach`：private→共享、共享→private 的镜像次数、最后写入没有 backing 的次数，以及 plain 回退 backing 附加次数。
+- `CZ miss tag/frame/invalid/shape`：显示回退时无有效标记/输入、找不到记录、resident 尚未有效、尺寸不符的次数。它们对应 plain 的不同原因；状态行不是原子快照。
+
+这些记录用于区分真正减少写回与同步失败。下一次需要 attach/in 的覆盖、miss=0、invalid 的实际变化、part/save/guarded，以及截图、切换快照和两个方向的画面一致性。不能只看 shown 增加。新增两条前部行，尾部可选摘要会受 48 行上限影响，FR/KMD 独立 Note 3 不依赖该表。
 
 ## 此前未 seed 阶段的记录
 
@@ -35,7 +79,7 @@
 
 GPU package 改为打印 `timeouts`、`timeout mean` 和请求的超时毫秒数，保留原始统计及其语义；不改 presenter、显示硬件或等待行为。后续启动已打印 `timeouts 158 ... timeout mean 500843 ... req 500 ms`，标签修订已实际进入。
 
-## private 主帧已实际显示
+## 此前两次 private 主帧记录
 
 两份后续启动的最后记录如下；每个字段取其最后打印，不构成同一时刻的原子快照，也没有可比较的固定操作窗口。
 
@@ -200,7 +244,7 @@ private 路径走通后，两份记录仍分别编码 26.6 GB 和 10.5 GB 的全
 
 普通方向用相同 origin/size 做局部 blit。rotation 3 仍用完整 viewport/UV 变换，只将目标 scissor 从 private 的 `(x,y,w,h)` 转成物理平面的 `(y,W-x-w,h,w)`；部分旋转写回的目标 load action 必须为 Load，以保留范围外像素。seed 和整帧传输仍沿用原来的完整路径。
 
-以下情况保持整帧同步：Clear/DontCare、resolve、其他 mip/layer、plain 写入、缓存无效、同一表面出现任一无界记录或其他表示的写入。命令内出现 compute、已标记主帧的 shader 纹理绑定、IOSurface buffer 绑定或显式主帧资源写入时，也不缩小范围；shader 对资源的任意写入不能用 raster scissor 作边界。只缩小现有写回，不延后到 CPU 读取时，也不删除截图/外部读取所依赖的共享像素同步。
+以下情况保持整帧同步：Clear/DontCare、resolve、其他 mip/layer、plain 写入、缓存无效、同一表面出现任一无界记录或其他表示的写入。命令内的 compute 保留全命令整帧保护；已标记主帧的 shader 纹理绑定、IOSurface buffer 和显式资源写入按对应表面保护，不能因为绑定了表面 B 就强制 A 整帧。shader 对资源的任意写入仍不能用 raster scissor 作边界。只缩小现有写回，不延后到 CPU 读取时，也不删除截图/外部读取所依赖的共享像素同步。
 
 写入表、scissor 数组只为符合条件的主帧 pass 分配，普通 pass 不持有区域跟踪数组。纯 Load+Store 且没有 draw 的可界定记录可以跳过镜像；一旦同一命令里还有完整写入，仍恢复整帧。
 
@@ -240,13 +284,13 @@ CPU 读取 0xae10 曾在 GMU vote 存在、检查状态正常时产生同步外�
 
 ## 集成和下一次数据
 
-**功能修订需要重编 addon 和配套信任缓存；可先沿用本轮内核。** 首次导入 seed、有效主帧复用、内部 backing 访问、局部镜像、Busy 等待整理、FR 记录、显式 host FDL 布局和成功绑定记录都在 addon/其 Mesa 静态依赖内；只编内核或继续冻结 addon 都不会带入。GOP 诊断标签已在后续内核记录中出现，不是本次 addon 修订的前置条件。不要将新 addon 配上旧信任缓存。
+**功能修订需要重编 addon 和配套信任缓存；可先沿用本轮内核。** 首次导入 seed、有效主帧复用、内部 backing 访问、plain 回退租约、完成回执、按表面保护、局部镜像、Busy 等待整理、FR 记录、显式 host FDL 布局和成功绑定记录都在 addon/其 Mesa 静态依赖内；只编内核或继续冻结 addon 都不会带入。GOP 诊断标签已在后续内核记录中出现，不是本次 addon 修订的前置条件。不要将新 addon 配上旧信任缓存。
 
 addon 跟进只改四行上下文的 `unixnu-gpu-plugin.patch` 和 `unixnu-gpu-stack.patch`；Mesa 修改仍在既有 diagnostics overlay 中，沿用原构建应用和撤回路径。本次不再改 `Adreno740.patch` 和板级 package；既有 `CoachzGpu.cpp` 增量只纠正 GOP 诊断标签。上游 checkout 和已有二进制不改，不自行编译、写盘或上机。运行时 warning 仍在前部；FR 失败通过独立 Note 3 保留，按字段前缀查找，不依赖固定 row 编号。
 
 下一次需要：
 
-1. `CZ promote start`、seed、reuse、实际 private writer、shown，以及方向、残影、截图、切换快照和撕裂；不能只看 private 分配或同尺寸 IMG。若仍 start 0，保留 plane/alloc/dim 和第一组完整 `FR stage`。
+1. `CZ promote start`、seed、reuse、实际 private writer、shown、`CZ sync` 和 `CZ miss`，以及方向、残影、截图、切换快照和撕裂；不能只看 private 分配或同尺寸 IMG。若仍 start 0，保留 plane/alloc/dim 和第一组完整 `FR stage`。
 2. `gpu submit policy` 的实际 mode、`vm-admit`、`KMD pressure` 或首条 Submit/KMD/VK 错误。没有压力记录只表示没有触发；不能宣称准入分支通过。
 3. 两行 `CZ place` 和新增 `CZ alias`，连同 CZ copy/shape、L host、mirror 的 part/skip/save 和 `CZ damage`。确认整帧 alias 的 size≤room，n/pitch 增加，再检查边缘像素、截图与缓存一致性。保留初始化结束后正常操作的大致起止时间及前后计数，避免跨启动负载比较总量。
 4. 显式 frame transfer 失败时保留第一条错误及整份内核、统一日志；归档留在本地，不将原始环境标识放入公开产物。

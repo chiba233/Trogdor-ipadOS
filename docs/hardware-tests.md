@@ -1677,3 +1677,13 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 - **工作模式**：开机后 ABM 先读到 Shutdown，射频留在低功耗；之后基带重启一次，才请求 Online 成功。
 - **Wi-Fi**：开关飞行模式后重新加入 Wi-Fi，驱动加入时信号是 -44 dBm，SpringBoard 收到的却是 0 格，图标变空心。
 - **测试卡**：仍只有紧急服务。
+
+## memoryless pass 走 GMEM（k148）
+
+内核同 k147，只换 GPU 上层（Turnip、运行时和插件）：UniXNU `b95b4c9`、`2d0d39f`、`93ad2ce` 的 Turnip 修订，加上 plain 回退和按表面保护的插件修订。
+
+- **渲染模式**：`RM gmem 29892 33543M | sys auto 0 0M other 9418 25524M`，k147 是 GMEM 0 个。开着 `sysmem` 时只有带未分配 memoryless 附件的 pass 会选 GMEM。
+- **颜色**：`GM s3d 0/0/0/0 l3d 7950/0/0/7950`、`GMb s2d 10504/0/0/6213 in 146336/0/0/23230`，tile 一侧非 WZYX 的计数全为 0；画面没有红蓝互换。
+- **流畅度**：明显更流畅。约 307 秒，没有 panic、`@crash`、DeviceLost，故障寄存器全 0，统一日志没有 command buffer 错误。
+- **计数**：同样到 307 秒，k147 提交 3647 次、翻转 1801 次、镜像 627 次，`frame-gpu` 超过 16 ms 占 19.6%；k148 是 7735、3601、2905 次，占 37.7%，commit-to-complete 平均 18.1 ms。为什么提交和翻转是两倍还没查。
+- **binary archive**：QuartzCore 和 CoreImage 自带的预编译库被拒（`InvalidFile`），k147 同样有。

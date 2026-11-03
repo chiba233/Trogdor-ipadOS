@@ -375,6 +375,8 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
             command_line += ' sheng-fb-gpu=1'
             # Every pass in system memory (the plug-in sets TU_DEBUG from it). Turnip's own tile-memory choice (k82) halved SP busy and cut the
             # UCHE latency by a quarter on hardware, but commit to complete did not fall and every colour came out with red and blue swapped.
+            # A pass whose memoryless attachment has no memory yet still renders in GMEM (Mesa overlay of tools/xnu_gpu_userland.py), with
+            # the colour order fixed: about three quarters of the passes on hardware.
             command_line += ' sheng-tu-debug=sysmem,nocb'
             # The temperature clamp (coachz-prelink-thermal.patch) and the GPU governor on sheng's rules (coachz-gpu-dcvs=1, CoachzGpu.cpp:
             # about half busy, level 3 at least, the top level for 1 s after a touch).
