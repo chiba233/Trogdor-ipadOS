@@ -6,8 +6,8 @@
  * byte per slot (1 Vinyl, 2 Tape, 3 Hydra, 4 virtual Hydra, anything else none), and expects two. A modem that is not Apple's leaves it
  * out, so the bridge adds it. Tape is GSMA SGP.22: VinylQMICommandDriver sends each ES10 command as whole DER on VINYL (0xe5) message
  * 0x1002 (TLV 0x01 {command, transaction, slot}, TLV 0x10 {flag, segment count, segment index, at most 1500 bytes}, each segment after
- * the previous one's response) and takes the eUICC's answer from indication 0x1003 (TLV 0x01 {command, status (1 failure), 0,
- * transaction, two error bytes}, then TLV 0x10 {segment count, index from 0, data} per segment). 0x1004 answers the EID in its response
+ * the previous one's response) and takes the eUICC's answer from indication 0x1003 (TLV 0x01 {u8 command, u16 status (1 failure), u16 reserved,
+ * u32 transaction, two error bytes}, then TLV 0x10 {segment count, index from 0, data} per segment). 0x1004 answers the EID in its response
  * (TLV 0x11, 16 bytes), 0x1005 the radio releases the eUICC is told about (TLV 0x10 transaction, 0x11 six bytes, 0x12 three bytes).
  *
  * The eUICC side follows ChromeOS's Hermes on this same modem (modem_qrtr.cc, apdu.cc; BSD): UIM Get Slot Status (0x47) finds the
@@ -16,6 +16,10 @@
  * ISD-R; each command as STORE DATA (CLA 0x80, INS 0xE2, P1 0x11 or 0x91 on the last block, P2 the block number, at most 255 bytes) by
  * Send APDU (0x3b, intermediate procedure bytes on), and 61xx answered with GET RESPONSE. A Bound Profile Package (BF36) is split as
  * SGP.22 2.5.5 does before ES10b.LoadBoundProfilePackage: BF36 header with BF23, A0, A1 header, each 88, A2, A3 header, each 86.
+ *
+ * Challenge/authenticate/prepare keep the same ISD-R channel and slot for the owning VINYL client until
+ * load/cancel/clear, an error, disconnect or 180 seconds without a command. Ordinary UIM stays queued during that session.
+ * GetSessionData/ClearSessionData are modem-local recovery-record operations, not ES10 APDUs. This bridge has no stored records.
  *
  * Which CommCenter slot is the eUICC: the logical slot it is in while active, otherwise slot two. While the bridge has switched for
  * a command the capability bytes stay as they were before the switch.
@@ -30,6 +34,7 @@
 #define CBE_SVC_UIM 0x0bu
 #define CBE_SVC_VINYL 0xe5u
 #define CBE_UIM_GET_CARD_STATUS 0x002fu
+#define CBE_UIM_CARD_STATUS_CHANGE 0x0032u
 #define CBE_UIM_SEND_APDU 0x003bu
 #define CBE_UIM_OPEN_LOGICAL_CHANNEL 0x0042u
 #define CBE_UIM_CLOSE_LOGICAL_CHANNEL 0x003fu
@@ -42,6 +47,11 @@
 #define CBE_ERR_NO_EFFECT 26u
 #define CBE_ERR_INVALID_ARG 48u
 
+#define CBE_VINYL_COMMAND 0x1000u
+#define CBE_VINYL_GET_CSN 1u
+/* Apple legacy Vinyl CSN is not the GSMA EID, and is unavailable on this Tape transport. */
+#define CBE_ERR_VINYL_NOCAPABLE_UICC 0x0204u
+
 #define CBE_VINYL_TAPE 0x1002u
 #define CBE_VINYL_TAPE_INFO 0x1003u
 #define CBE_VINYL_TAPE_EID 0x1004u
@@ -51,7 +61,11 @@
 #define CBE_CAP_TAPE 2u
 
 /* vinyl::TapeCommand */
+#define CBE_TAPE_CHALLENGE 0x03u
+#define CBE_TAPE_PREPARE_DOWNLOAD 0x05u
 #define CBE_TAPE_LOAD_BPP 0x06u
+#define CBE_TAPE_AUTHENTICATE 0x0bu
+#define CBE_TAPE_CANCEL 0x0cu
 #define CBE_TAPE_ENABLE 0x0eu
 #define CBE_TAPE_DISABLE 0x0fu
 #define CBE_TAPE_DELETE 0x10u
@@ -67,6 +81,7 @@
 #define CBE_APDU_DATA 255u
 #define CBE_TIMEOUT_MS 10000u
 #define CBE_SETTLE_MS 6000u
+#define CBE_SESSION_IDLE_MS 180000u
 #define CBE_EVENTS 32u
 #define CBE_DEFERRED UINT32_MAX
 
@@ -189,6 +204,8 @@ enum cbe_event_kind {
     CBE_EV_DONE,         /* a: command, b: status, c: SW1 << 8 | SW2, d: bytes out; e: segments */
     CBE_EV_FAILED,       /* a: command, b: step, c: QMI error or SW, d: reason (cbe_reason) */
     CBE_EV_CAPS,         /* a: slot one, b: slot two: the capability bytes changed */
+    CBE_EV_LEGACY_CSN,   /* a: command, b: CommCenter slot, c: QMI result; no card identifier */
+    CBE_EV_SESSION,      /* a: 1 held, 2 released; b: slot, c: trigger command, d: reason (0 explicit, 1 idle, 2 disconnect, 3 error) */
 };
 enum cbe_reason { CBE_R_NO_SLOTS = 1, CBE_R_NO_EUICC, CBE_R_SWITCH_LIMIT, CBE_R_QMI, CBE_R_SW, CBE_R_TIMEOUT, CBE_R_ROOM, CBE_R_INACTIVE, CBE_R_SEGMENTS };
 struct cbe_event { uint32_t kind, a, b, c, d, e; };
@@ -210,6 +227,8 @@ enum cbe_step step;
 int active;                       /* job index, -1 none */
 uint8_t channel_id, channel_open, switched, restore_phys, get_more, sw1, sw2, route_failed;
 uint32_t deadline, wait_txn, wait_msg, txn, switches;
+uint8_t session, session_channel, session_cid, session_slot;
+uint32_t session_deadline;
 struct cbe_seg seg[CBE_SEGMENTS];
 uint32_t seg_count, seg_index, frag_pos, block;
 /* the request for the modem, when req_len is set */
@@ -261,12 +280,15 @@ cbe_caps(e, c);
 if (c[0] != e->caps[0] || c[1] != e->caps[1]) { e->caps[0] = c[0]; e->caps[1] = c[1]; cbe_event(e, CBE_EV_CAPS, c[0], c[1], 0, 0, 0); }
 }
 
-/* A Get Card Status response for CommCenter with TLV 0x21 added (or replaced). Returns the new SDU length, 0 to leave it as it is. */
+/* Both card-status responses and indications replace the complete Vinyl capability vector in CommCenter.
+ * Keep TLV 0x21 on both, or a hotplug indication silently removes Tape support until the next query.
+ * Returns the new SDU length, 0 to leave it as it is. Card/application status bytes are never changed. */
 static inline uint32_t cbe_card_status_fix(struct cbe *e, uint32_t service, const uint8_t *sdu, uint32_t n, uint8_t *out, uint32_t room)
 {
-if (service != CBE_SVC_UIM || n < 7u || sdu[0] != CBQ_QMI_RESPONSE || cbd_rd16(sdu + 3) != CBE_UIM_GET_CARD_STATUS ||
-!cbd_sdu_ok(sdu, n) || cbd_error(sdu, n) || !e->slots.known)
-return 0;
+if (service != CBE_SVC_UIM || n < 7u || !cbd_sdu_ok(sdu, n) || !e->slots.known) return 0;
+const uint32_t message = cbd_rd16(sdu + 3);
+if (!((sdu[0] == CBQ_QMI_RESPONSE && message == CBE_UIM_GET_CARD_STATUS && !cbd_error(sdu, n)) ||
+      (sdu[0] == CBQ_QMI_INDICATION && message == CBE_UIM_CARD_STATUS_CHANGE))) return 0;
 uint8_t caps[2];
 cbe_caps(e, caps);
 const uint32_t end = 7u + cbd_rd16(sdu + 5);
@@ -361,6 +383,7 @@ static inline void cbe_send_close(struct cbe *e, uint32_t now)
 }
 static inline void cbe_restore(struct cbe *e, uint32_t now)
 {
+    e->session = 0;
     if (e->switched && e->restore_phys) {
         e->step = CBE_S_RESTORE;
         cbe_send_switch(e, e->restore_phys, now);
@@ -368,6 +391,24 @@ static inline void cbe_restore(struct cbe *e, uint32_t now)
         e->step = CBE_S_IDLE; e->freeze = 0;
         cbe_caps_note(e);
     }
+}
+/* Drop the channel lease only when no APDU is executing. Cleanup still finishes before queued SIM traffic resumes. */
+static inline void cbe_session_release(struct cbe *e, uint32_t now, uint32_t reason)
+{
+    if (!e->session || e->active >= 0 || e->step != CBE_S_IDLE) return;
+    cbe_event(e, CBE_EV_SESSION, 2, e->session_slot, 0, reason, 0);
+    e->session = 0;
+    if (e->channel_open) cbe_send_close(e, now);
+    else cbe_restore(e, now);
+}
+static inline int cbe_session_owner(const struct cbe *e, const struct cbe_job *j)
+{
+    return j->channel == e->session_channel && j->cid == e->session_cid && j->slot == e->session_slot;
+}
+static inline int cbe_session_terminal(uint32_t cmd)
+{
+    return cmd == CBE_TAPE_LOAD_BPP || cmd == CBE_TAPE_CANCEL || cmd == CBE_TAPE_CLEAR_SESSION ||
+        cmd == CBE_TAPE_ENABLE || cmd == CBE_TAPE_DISABLE || cmd == CBE_TAPE_DELETE || cmd == CBE_TAPE_MEMORY_RESET;
 }
 static inline void cbe_finish(struct cbe *e, uint32_t status, uint32_t reason, uint32_t detail, uint32_t now)
 {
@@ -380,6 +421,18 @@ static inline void cbe_finish(struct cbe *e, uint32_t status, uint32_t reason, u
         e->active = -1;
     }
     e->req_len = e->wait_msg = 0;
+    const uint32_t cmd = e->done.cmd;
+    if (!status && e->channel_open && !cbe_session_terminal(cmd) &&
+        (e->session || cmd == CBE_TAPE_CHALLENGE || cmd == CBE_TAPE_AUTHENTICATE || cmd == CBE_TAPE_PREPARE_DOWNLOAD)) {
+        if (!e->session) {
+            e->session_channel = e->done.channel; e->session_cid = e->done.cid; e->session_slot = e->done.slot;
+            cbe_event(e, CBE_EV_SESSION, 1, e->done.slot, cmd, 0, 0);
+        }
+        e->session = 1; e->session_deadline = now + CBE_SESSION_IDLE_MS;
+        e->step = CBE_S_IDLE; return;
+    }
+    if (e->session) cbe_event(e, CBE_EV_SESSION, 2, e->session_slot, cmd, status ? 3 : 0, 0);
+    e->session = 0;
     if (e->channel_open) cbe_send_close(e, now);
     else cbe_restore(e, now);
 }
@@ -398,6 +451,11 @@ static inline void cbe_begin(struct cbe *e, uint32_t now)
     j->deadline = now + 180000u;
     e->resp_len = e->seg_index = e->frag_pos = e->block = 0;
     e->get_more = e->sw1 = e->sw2 = 0;
+    /* No BB recovery records are stored here. Match the driver's explicit empty-session result,
+     * without inventing eUICC data or forwarding an opaque recovery token as DER. */
+    if (j->cmd == CBE_TAPE_GET_SESSION || j->cmd == CBE_TAPE_CLEAR_SESSION) {
+        cbe_finish(e, 0, 0, 0, now); return;
+    }
     if (j->cmd == CBE_TAPE_EID) {
         e->seg[0] = (struct cbe_seg){ 0, sizeof cbe_get_eid }; e->seg_count = 1;
     } else {
@@ -407,6 +465,9 @@ static inline void cbe_begin(struct cbe *e, uint32_t now)
     /* A short APDU numbers at most 256 fragments in one STORE DATA sequence. */
     for (uint32_t i = 0; i < e->seg_count; i++)
         if (e->seg[i].len > 256u * CBE_APDU_DATA) { cbe_finish(e, 1, CBE_R_SEGMENTS, i, now); return; }
+    if (e->session && e->channel_open && cbe_session_owner(e, j) && e->slots.active == e->slots.euicc) {
+        e->step = CBE_S_APDU; cbe_send_block(e, now); return;
+    }
     if (e->slots.active != e->slots.euicc) {
         e->restore_phys = e->slots.active;
         e->frozen[0] = caps[0]; e->frozen[1] = caps[1]; e->freeze = 1;
@@ -444,12 +505,32 @@ static inline uint32_t cbe_host(struct cbe *e, uint32_t channel, uint32_t cid,
 {
     if (!cbd_sdu_ok(sdu, n) || sdu[0] != CBQ_QMI_REQUEST) return 0;
     const uint32_t message = cbd_rd16(sdu + 3);
+    if (message == CBE_VINYL_COMMAND) {
+        uint32_t len = 0;
+        const uint8_t *command = cbd_find(sdu, n, 0x02, &len);
+        uint32_t error = CBQ_ERR_MALFORMED_MESSAGE;
+        if (command && len == 6u) {
+            if (command[5] < 1 || command[5] > 2) error = CBE_ERR_INVALID_ARG;
+            else if (command[0] != CBE_VINYL_GET_CSN) return 0;
+            else {
+                /* VinylQMICommandDriver::queryCsn_sync accepts this exact error as no legacy CSN:
+                 * asVinylDriverError(0x204) -> 6; handleClientStarted_sync's callback then emits
+                 * Ready for this slot. Generic NOT_SUPPORTED (0x5e) leaves the driver unready.
+                 * Do not invent a CSN from the EID or report a successful legacy Vinyl operation. */
+                error = CBE_ERR_VINYL_NOCAPABLE_UICC;
+                cbe_event(e, CBE_EV_LEGACY_CSN, command[0], command[5], error, 0, 0);
+            }
+        }
+        return cbq_private_answer(sdu, CBE_SVC_VINYL, cid, error, 0, 0, out, room);
+    }
     if (message != CBE_VINYL_TAPE && message != CBE_VINYL_TAPE_EID && message != CBE_VINYL_TAPE_CAPS) return 0;
     uint32_t l = 0, error = 0, w = 0;
-    const uint8_t *h = cbd_find(sdu, n, message == CBE_VINYL_TAPE ? 0x01 : 0x10, &l);
+    const uint8_t *h = cbd_find(sdu, n, 0x01, &l);
     uint8_t extra[48];
     if (!h || l != (message == CBE_VINYL_TAPE ? 6u : 5u)) error = CBQ_ERR_MALFORMED_MESSAGE;
-    else if (h[message == CBE_VINYL_TAPE ? 5 : 4] < 1 || h[message == CBE_VINYL_TAPE ? 5 : 4] > 2)
+    /* Device capabilities are not slot-specific: the native writer leaves this byte zero. */
+    else if (message != CBE_VINYL_TAPE_CAPS &&
+        (h[message == CBE_VINYL_TAPE ? 5 : 4] < 1 || h[message == CBE_VINYL_TAPE ? 5 : 4] > 2))
         error = CBE_ERR_INVALID_ARG;
     else if (message == CBE_VINYL_TAPE_CAPS) {
         w = cbd_tlv(extra, sizeof extra, 0x10, h, 4);
@@ -474,8 +555,10 @@ static inline uint32_t cbe_host(struct cbe *e, uint32_t channel, uint32_t cid,
             if (!j->state) free_job = (int)i;
             else if (j->channel == channel && j->cid == cid && j->txid == txid) found = (int)i;
         }
+        const int empty_session = message == CBE_VINYL_TAPE && cmd == CBE_TAPE_GET_SESSION && !payload;
         if (slot < 1 || slot > 2 || !total || total > CBE_SEGMENTS || index >= total || bytes > CBE_CHUNK ||
-            (message == CBE_VINYL_TAPE && (cmd == CBE_TAPE_EID || !payload || plen < 5 || !bytes || (index + 1 < total && bytes != CBE_CHUNK))))
+            (message == CBE_VINYL_TAPE && !empty_session &&
+             (cmd == CBE_TAPE_EID || !payload || plen < 5 || !bytes || (index + 1 < total && bytes != CBE_CHUNK))))
             error = CBE_ERR_INVALID_ARG;
         else if (found < 0 && index) error = CBE_ERR_INVALID_ARG;
         else {
@@ -532,15 +615,19 @@ static inline void cbe_tick(struct cbe *e, uint32_t now)
         else if (e->active >= 0) cbe_finish(e, 1, CBE_R_TIMEOUT, 0, now);
         else { if (e->switched) e->route_failed = 1; e->done_status = 1; e->slots.known = 0; e->freeze = 0; e->switched = 0; e->step = CBE_S_IDLE; e->deadline = now + 5000u; }
     }
-    if (e->step != CBE_S_IDLE || e->done_pending) return;
+    if (e->step != CBE_S_IDLE) return;
+    if (e->session && (int32_t)(now - e->session_deadline) >= 0) {
+        cbe_session_release(e, now, 1); return;
+    }
+    if (e->done_pending) return;
     int next = -1;
     for (uint32_t i = 0; i < CBE_JOBS; i++)
-        if (e->job[i].state == CBE_J_READY && (next < 0 || (int32_t)(e->job[i].seq - e->job[next].seq) < 0)) next = (int)i;
+        if (e->job[i].state == CBE_J_READY && (!e->session || cbe_session_owner(e, &e->job[i])) && (next < 0 || (int32_t)(e->job[i].seq - e->job[next].seq) < 0)) next = (int)i;
     if (next >= 0) {
         e->active = next; e->job[next].deadline = now + 180000u;
         if (e->slots.known) cbe_begin(e, now);
         else { e->step = CBE_S_SLOTS; cbe_send_slot_status(e, now); }
-    } else if (!e->slots.known && (int32_t)(now - e->deadline) >= 0) {
+    } else if (!e->session && !e->slots.known && (int32_t)(now - e->deadline) >= 0) {
         e->step = CBE_S_SLOTS; cbe_send_slot_status(e, now);
     }
 }
@@ -646,9 +733,19 @@ static inline uint32_t cbe_output(struct cbe *e, uint8_t *channel, uint8_t *out,
         if (n) e->done_pending = 0;
         return n;
     }
-    uint8_t info[9] = { e->done.cmd, e->done_status, 0, 0, 0, 0, 0, (uint8_t)(e->done_status ? e->done_sw1 : 0), (uint8_t)(e->done_status ? e->done_sw2 : 0) };
-    cbd_wr32(info + 3, e->done.txid);
+    /* IndTapeIndResult is 11 wire bytes, not the legacy Info result's 8-byte layout.
+     * The native parser reads u16 at 1, u16 at 3, u32 transaction at 5, SW bytes at 9/10. */
+    uint8_t info[11] = { 0 };
+    info[0] = e->done.cmd; cbd_wr16(info + 1, e->done_status);
+    cbd_wr32(info + 5, e->done.txid);
+    info[9] = e->done_status ? e->done_sw1 : 0; info[10] = e->done_status ? e->done_sw2 : 0;
     w = cbd_tlv(tlvs, sizeof tlvs, 0x01, info, sizeof info);
+    /* The native handler explicitly accepts a successful GetSessionData with no payload TLV. */
+    if (e->done.cmd == CBE_TAPE_GET_SESSION || e->done.cmd == CBE_TAPE_CLEAR_SESSION) {
+        n = cbq_private_indication(CBE_VINYL_TAPE_INFO, CBE_SVC_VINYL, e->done.cid, tlvs, w, out, room);
+        if (n) e->done_pending = 0;
+        return n;
+    }
     const uint32_t count = e->done_len ? (e->done_len + CBE_CHUNK - 1u) / CBE_CHUNK : 1;
     const uint32_t at = e->done_chunk * CBE_CHUNK;
     const uint32_t bytes = e->done_len - at < CBE_CHUNK ? e->done_len - at : CBE_CHUNK;

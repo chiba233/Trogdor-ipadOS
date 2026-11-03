@@ -42,7 +42,7 @@ Data 卷的统一日志里看 ABM 和 BBUpdater：
 
 ## 真机结果
 
-BBUpdater 接受 SBL（镜像号 0x15）后报告启动成功，ABM engage，53 个 QMI 客户端接到 modem，`pbl`、`sahara`、`qmux1`、`qmux2` 都走自己的通道。modem 的工厂数据（FSG）放进固件块后，“关于本机”显示 IMEI 和 ICCID，SIM 就绪。激活指示带上服务已开通和两个卡槽已接受后，有效 SIM 在 LTE 上注册（漫游）并完成 CS、PS 附着，状态栏显示运营商名和信号格（目前要开机后插拔一次 SIM）；DPM、WDA 设置和数据口绑定都成功。蜂窝数据和 eSIM 还没有通过，卡点见 [docs/plans/modem.md](../../../../docs/plans/modem.md)。
+BBUpdater 接受 SBL（镜像号 0x15）后报告启动成功，ABM engage，53 个 QMI 客户端接到 modem，`pbl`、`sahara`、`qmux1`、`qmux2` 都走自己的通道。modem 的工厂数据（FSG）放进固件块后，“关于本机”显示 IMEI 和 ICCID，SIM 就绪。激活指示带上服务已开通和两个卡槽已接受后，有效 SIM 在 LTE 上注册（漫游）并完成 CS、PS 附着，状态栏显示运营商名和信号格（目前要开机后插拔一次 SIM）；DPM、WDA 设置和数据口绑定都成功。eSIM 在设置里出现了，页面显示还不对；蜂窝数据还没有通过，卡点见 [docs/plans/modem.md](../../../../docs/plans/modem.md)。
 
 ## 没核实的
 
@@ -53,6 +53,10 @@ BBUpdater 接受 SBL（镜像号 0x15）后报告启动成功，ABM engage，53 
 
 ## eSIM Tape 桥接
 
-`coachz_bb_esim.h` 已补齐并接入 `coachz_baseband.cpp`，随现有 baseband 构建复制：独立 UIM 客户端发现实际 eUICC，Get Card Status 添加每槽能力 TLV 0x21，VINYL 的 Tape 请求经 ISD-R 发送，真实结果分片回到 CommCenter。空闲发现不切槽；只有显式 Tape 操作可临时切槽，结束关闭通道并恢复原卡槽。切换期间普通 UIM 请求排队，临时卡状态指示不冒充原逻辑 SIM；恢复未确认时不把原 SIM 请求转给另一张卡。
+`coachz_bb_esim.h` 已补齐并接入 `coachz_baseband.cpp`，随现有 baseband 构建复制：独立 UIM 客户端发现实际 eUICC，Get Card Status 应答及 Card Status Change 指示均添加每槽能力 TLV 0x21，VINYL 的 Tape 请求经 ISD-R 发送，真实结果分片回到 CommCenter。空闲发现不切槽；只有显式 Tape 操作可临时切槽，普通操作结束关闭通道并恢复原卡槽；下载会话按下述生命周期保持通道。切换期间普通 UIM 请求排队，临时卡状态指示不冒充原逻辑 SIM；恢复未确认时不把原 SIM 请求转给另一张卡。
 
-现有主机模型已覆盖 Tape/APDU 分段、能力字段、切槽恢复、续读和超时清理，ASan/UBSan 与 C/C++ 头文件检查通过；这不覆盖 IOKit 并发或真实卡片。尚未构建内核或实机验收，不能据此宣称 eSIM 菜单、下载、启停、删除或跨重启持久化已工作。下一次按 `COACHZ baseband: esim event` 的阶段读结果；日志不输出 EID、APDU 或 profile 内容。无需重编 GPU addon，也不改变镜像参数；现有 baseband 构建会带入这两个源码文件。详细状态与参考见 [modem 计划](../../../../docs/plans/modem.md#esim-tape-实现待实机)。
+现有主机模型已覆盖 Tape/APDU 分段、能力字段、切槽恢复、续读和超时清理，ASan/UBSan 与 C/C++ 头文件检查通过；这不覆盖 IOKit 并发或真实卡片。卡槽发现及能力发布已有实机日志，本次初始化兼容修订仍待内核构建和实机验收，不能据此宣称 eSIM 菜单、下载、启停、删除或跨重启持久化已工作。下一次按 `COACHZ baseband: esim event` 的阶段读结果；日志不输出 EID、APDU 或 profile 内容。无需重编 GPU addon，也不改变镜像参数；现有 baseband 构建会带入这两个源码文件。详细状态与参考见 [modem 计划](../../../../docs/plans/modem.md#esim-tape-实现待实机)。
+
+初始化兼容修订（待实机）：原版 Vinyl 驱动启动时先用 `0x1000 / GetCsn` 查询两个槽，通用 `NOT_SUPPORTED (0x5e)` 不会完成 ready 回调。桥接返回明确的 `VINYL_NOCAPABLE_UICC (0x204)`：原版 `asVinylDriverError` 将它映射到 6，`handleClientStarted_sync` 的 CSN 回调明确接受此结果并发布对应槽的 Ready。这里没有 Apple legacy Vinyl CSN，GSMA EID 仍只由 Tape EID 请求读取；不伪造 CSN、不改 SIM Ready 或激活结论。卡状态指示与查询应答保留同一套能力字段，避免插拔后丢失 Tape 能力。这两处已有便携模型覆盖；是否消除冷启动等待及能否继续 ES10 初始化，仍需实机日志确认。
+
+Tape 后续链修订（待实机）：EID/设备能力请求按原版 writer 从 TLV `0x01` 读取，设备能力查询允许不指定槽（原版填 0）。TapeInfo 结果头按原版 parser 的 11 字节布局返回：命令 1、状态 2、保留 2、事务号 4、错误字节 2；原来的 9 字节布局会使结果解析失败。`GetSessionData` 的空请求由桥接返回空恢复记录，`ClearSessionData` 只处理桥接的空记录集合，二者不转成卡片 APDU，不表示已支持跨重启恢复。挑战、服务端认证、准备下载沿用同一 VINYL 客户端的 ISD-R 通道；装载/取消/清理结束、错误、客户端断开或 180 秒无新命令时关闭并恢复原卡槽。其它客户端不插入这一会话。状态日志仍不输出 APDU、EID 或 profile 内容。

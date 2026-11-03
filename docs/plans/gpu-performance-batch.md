@@ -1,97 +1,223 @@
-# GPU 性能修订与交付
+# GPU 主帧、提交与拷贝修订
 
-本批是后续集成用源码，未构建、写盘或上机。冻结固件及其 addon、信任缓存快照保持不变。主帧 private/UBWC 路径已在实机执行，但存在方向来回变化，像素一致性未通过。一次 Submit Timeout 已被原生探针捕获。新增的选择器读回另触发了同步外部读错误，不能把此前正常的一次计数输出当作稳定性通过。
+两次后续启动已实际显示 private 主帧，分别 shown 1908 和 767；两次主机纹理 shadow 和 placement/pitch 拒绝均为 0，后一次还取得 319 次同尺寸 host 图像成功绑定记录。提交前 Busy 准入在两次都触发，三次恢复均返回成功，所给内核日志没有 DeviceLost 或 panic。这些是路径执行证据，没有画面反馈或固定操作窗口，尚不代表方向、截图、流畅度和长期稳定性全部通过。
 
-## 方向变化：缓存的表示与完成写入不一致
+本次继续修订 rotation 3 的独立物理平面：内部错误调用 Metal 的公开 `buffer` getter，它对 IOSurface 纹理刻意返回 nil，导致 stage 1 在进入 runtime 前失败。改为内部 backing 访问方法；公开 API 行为不变。**这次修订需重编 addon 与配套信任缓存，内核可沿用。** 未自行编译或实机验收，不提交调试迭代。
 
-同一个 IOSurface 同时有 rotation 3 的竖向纹理和 rotation 0 的横向视图。旧代码在 `coachzTurnedFrame` 建立私有纹理时设置 `turned=YES`；之后 `coachzFrameBind` 可以把同一记录的 texture 替换为横向 seed，却没有清掉 turned。presenter 继续使用旋转 shader，内容被多转一次。另一条路径还会把已有的横向私有纹理直接返回给 rotation 3 请求。这两处都是源码中的确定错误；当次每帧的来源和完成顺序没有记录，因此不把全部闪屏归因于已经独立验证的单一分支。CoreMotion 保持 landscapeLeft 的事件不足以解释该现象。
+## 此前未 seed 阶段的记录
 
-修订：
+本轮最后记录为 made 15、private 0、shown 0、seed 0、start 0、shape 1、plain 2508、plain writer 4208。新状态机确实进入镜像，但主帧压缩没有通过。最早 shape 1 时，tag rowpad/refused 都还是 0；按源码顺序，失败位于 `coachzFramePlane()` 创建规范物理平面，尚未进入会先读取 tag 的 `coachzFrameSeed()`。现有记录没有保留它的完整创建错误，不能猜作容量或尺寸原因。
 
-- 同一缓存记录的已发布私有纹理固定尺寸和方向，不能在已有视图存活时改换表示。rotation 3 请求只复用相符的竖向表示；rotation 0 seed 明确置 turned 为 NO。
-- presenter 再检查 texture 尺寸是否符合 turned，异常组合不进入绘制。`CZ orient` 分开统计 straight、turned、尺寸 mismatch 和交叉方向视图 conflict；conflict 是拒绝错误复用，不要求为 0。
-- 记录 render attachment、resolve destination 和 blit destination。命令完成后按写入选择有效内容，避免“最近导入的视图”冒充最后写入的内容；过期完成通知不覆盖较新的记录。
-- rotation 3 私有表示也保留对应的正常共享纹理作为写回目标。每个命令缓冲按同一表面的最后写入决定同步方向：private 写入后回共享图像，plain 写入后经同方向 backing 更新 resident private。没有可用 backing 时使 private 无效，显示共享像素；不是继续显示旧 private。
-- 完成前的资源持有继续覆盖同步两端。记录只弱持有 backing，避免它反过来永久保活 IOSurface。
-- 只读纹理绑定不再触发回写；一个表面在同一命令缓冲内只同步一次。没有跳过实际写入，也没有删除截图及共享像素可见性。
+同一片段已出现 mode 1 `vm-admit`，采样序号到 2048，没有 Submit failure、KMD fail 或 DeviceLost。最高记录为 slumber 67、resume 66，所见恢复 status、ring、ME_INIT、wait 都为 0。该路径比此前只触发一次 slumber 的覆盖更完整，但不是长期稳定性结论。另有 MobileSlideShow 的 SIGABRT；统一日志给出的断言为 `!PXPixelSizeAreaIsZero(roundedSize)`，不能把它算作 DeviceLost。
 
-`CZ frame writer private/plain` 和 `CZ mirror` 用于核对上述生命周期。修订尚未实机验收，残影、局部更新、截图和切换快照都仍需观察。
+提供的文本本身带有截断标记，阶段计数的最后打印时刻也不同。没有完整操作窗口和画面反馈，不据此宣称流畅度、截图或方向验收通过。
 
-## Submit Timeout：让行没有返回错误，时钟存在倒退
+## 后续仍使用旧 addon 的记录
 
-16 ms 的 `coachzWaitForForeground()` 返回 void，到时只结束让行。它不直接把 Timeout 返回给 Submit。不能仅凭 18.2 ms 调用耗时把故障归因于这个门槛。
+后续约 270 s 的启动仍带旧 addon：状态表保留旧 `wait` 字段，没有新增的 plane/alloc/dim 或 FR 记录。因此这份数据不能验收上面的首次导入、布局与失败捕获修订。它最后记录 made 2、private 0、shown 0、seed 0、start 0、shape 1、plain 1130、plain writer 2314，mirror 仍为 0；主帧提升继续失败，不能把没有方向异常当作 private 路径通过。
 
-GPU 的 `ringNow()` 原先使用 `clock_get_system_microtime()`。当前 XNU ARM 实现有整数截断：
+这次实际 table mode 为 1，`vm-admit` 采样到 1024；内核和统一日志没有 panic、@crash、KMD fail 或 GPU DeviceLost，没有目标显示进程的退出记录。未出现 slumber/resume，故这次不能增加电源恢复覆盖。没有定义正常操作窗口，G 的累计均值 26713 us 包含开机，不能换算为帧率或跨启动归因。
 
-```c
-/* rtclock 初始化 */
-rtclock_sec_divisor = divisor;
-rtclock_usec_divisor = divisor / USEC_PER_SEC;
-/* absolutetime_to_microtime */
-*secs = t64 = abstime / rtclock_sec_divisor;
-abstime -= t64 * rtclock_sec_divisor;
-*microsecs = (uint32_t)(abstime / rtclock_usec_divisor);
+容量拒绝取得第二种行距的证据，两组均为 f44、1488×2266、why2、offset 0、alignment 64、type 0、bits3：
+
+| row | size | room | 组内次数 |
+|---|---:|---:|---:|
+| 5952 | 13,499,136 | 13,488,128 | 4 |
+| 6144 | 13,934,592 | 13,922,304 | 3 |
+
+两种 size 都恰好等于 row×2268，第二组 room 恰好等于 row×2266，进一步对应 FDL 末尾两行补齐。两组来自各自状态快照，不能把总 placement 130 次全部归给它们。host-first 最后为 4176 次、836,084,255 字节，其中 row5952 整帧组为 54 次、728,310,528 字节；这些累计量仍不等于稳定操作窗口的带宽。
+
+新增 `CZ alias f... 宽×高 row... n... pitch... size... room...`：仅在原有对齐、容量、类型检查通过并且 Vulkan 绑定成功后记录 host 图像。只收集至少 2 MP 的图像，最多保留 32 组，报告 size×次数最大的一组；n 为成功创建次数，pitch 为其中显式行距回退次数。它可以确认整帧真正绑定到原 pages，但不是拷贝流量、节省量或所有成功绑定的总计，未覆盖后续 rebind 和 dma-buf 路径。仅看拒绝次数下降不足以证明该路径成功。
+
+## GOP 等待字段修正
+
+既有 `gop waits ... done ... mean ...` 中的 done 标签错误：NativeGOPPresenter 的统计槽 1 是等待新 swap 的**超时次数**，槽 6 是这些超时等待的总时长；没有可交付的新 swap 时才进入该等待。本次 waits 1376、该槽 215、均值约 500820 us，表示约 500 ms 的空闲超时，不是每帧渲染阻塞 500 ms。
+
+GPU package 改为打印 `timeouts`、`timeout mean` 和请求的超时毫秒数，保留原始统计及其语义；不改 presenter、显示硬件或等待行为。后续启动已打印 `timeouts 158 ... timeout mean 500843 ... req 500 ms`，标签修订已实际进入。
+
+## private 主帧已实际显示
+
+两份后续启动的最后记录如下；每个字段取其最后打印，不构成同一时刻的原子快照，也没有可比较的固定操作窗口。
+
+| 字段 | 第一份 | 第二份 |
+|---|---:|---:|
+| made / private | 2 / 2 | 3 / 3 |
+| seed / fail | 2 / 0 | 3 / 0 |
+| shown / plain | 1908 / 944 | 767 / 314 |
+| private writer / plain writer | 4406 / 0 | 1521 / 0 |
+| straight / turned | 1908 / 0 | 767 / 0 |
+| orientation mismatch / conflict | 0 / 0 | 0 / 0 |
+| mirror 次数 / 字节 | 1970 / 26,569,847,040 | 782 / 10,547,015,424 |
+| host shadow / pitch 拒绝 / placement 拒绝 | 0 / 0 / 0 | 0 / 0 / 0 |
+| 翻转次数 / 超时 | 2401 / 0 | 601 / 0 |
+
+这使主帧从“仅分配 private”推进到实际写入、seed 和显示。两个方向计数目前都只覆盖 straight，不能据此验收 turned；mismatch/conflict 为零不能代替画面、截图和切换快照反馈。第二份已有新的 `reuse` 字段，其值为 0，因此提前复用分支仍未取得命中证据。
+
+第二份的 `CZ alias` 为 f44、2266×1488、row9216、n319、pitch0、size=room=13,713,408，证明该形状实际通过 Vulkan 绑定。两份所有 copy 行均没有 b3 host-first，也没有 shape 行；仅剩 b5 的 2～3 次操作，字节未知，不能当作零字节搬运。host shadow 已不再出现，但 mirror 仍搬运上述全帧数据，不能把系统称为零拷贝。
+
+此处 alias 高度 1488 本身已是 4 的倍数，pitch0 表示没有经过显式行距回退。因此不能单靠这些记录验收 2266 行的 unpadded-linear 分支，也不能将旧 row5952 大块流量消失全部归因于该修订。
+
+两次 `vm-admit` 的采样都达到 2048，没有 KMD fail、Submit failure/retry/return、CB lost、VK_ERROR 或 DeviceLost，所给完整内核日志也没有 panic、@crash 或目标显示进程退出。两次均有三次恢复，status、ring、ME_INIT、wait 为 0。这增加了实际压力和恢复覆盖，不是较早方法 5 Timeout 的根因闭环。第二份后两次恢复报告累计 7 次 core accesses dropped asleep，不能略去；它表示访问被现有门控跳过，尚未定位具体调用，不等于硬件 fault 或恢复失败。
+
+## rotation 3 的缺失 backing 已定位
+
+两份都捕获了一次相同的 `FR stage1 ... missing buffer or invalid descriptor`，对应 plane 和 shape 计数均为 1，而 seed fail 为 0。这条路径尚未提交 seed 命令。
+
+源码顺序可以直接解释：
+
+```objc
+// 导入成功后，先设置 surface，再调用 coachzTurnedFrame。
+texture.surface = (IOSurfaceRef)CFRetain(surface);
+
+// NBTexture 的公开 Metal getter：IOSurface 纹理没有公开 buffer。
+- (id<MTLBuffer>)buffer { return _surface ? nil : (id<MTLBuffer>)_buffer; }
+
+// 旧物理平面创建因而总是得到 nil，而非实际持有的 _buffer。
+textureOnBuffer(plain.buffer, physical, ...);
 ```
 
-实机 counter 是 19,200,000 Hz，所以微秒除数为 19；秒尾的余数最多换出 1,010,526 微秒，进入下一秒后反而变为 1,000,000。旧 ringNow 因而每秒可能倒退约 10.5 ms。实机 gate 的 max `4294957407` 以有符号差值解释为 -9,889 微秒，直接支持此处发生过下溢。
+修订增加内部 `coachzLinearBackingBuffer`，只返回已强持有的 `_buffer`；物理平面通过它取得原有导入。公开 `buffer` 仍对 IOSurface 返回 nil，没有扩大公开 API 或绕过 memory-room、对齐、类型检查。`textureOnBuffer` 的缺失 backing 与无效 descriptor 错误也拆开，后续 FR 不再混写这两种原因。
 
-修订后的 ringNow 使用 `absolutetime_to_nanoseconds(mach_absolute_time()) / 1000`。该纳秒实现按完整的每秒除数进行乘除，不使用取整后的“每微秒 tick 数”。只修 GPU 提交时钟，不修改全局 XNU 时钟实现。
+下一次应首先确认 stage 1 缺失 backing 消失，并取得 turned seed/shown 的实际覆盖。新路径若出现 stage 4/5，按已有独立错误记录继续定位；不能只凭 straight 的成功数量宣称两个方向都通过。
 
-当前正常的零 wait_fence Submit 路径中，Timeout 可从 mode 1 的 `useVm → waitAll → wait` 传回；时钟倒退使无符号 elapsed 突然变大，可以制造假超时。该次现场没有内核阶段和 table mode，故仍保留“具体返回分支待下一次现场确认”的边界。
+## 提升停滞：分配不等于有效
 
-另修正 mode 1 的提交契约：等待旧 VM 空闲超时发生在新任务 IB/WPTR 发布之前，先释放本次临时 job 引用，再返回 Busy，让既有 Turnip 环路重试。不会对可能已经发布的任务盲目重交；ring、映射及真实故障保留原来的错误路径。
+此前版本存在以下可达闭环，上一批已改为统一 seed；本轮失败发生在 seed 之前：
 
-新增故障阶段行：input-wait、retire、publish、vm、ring，以及最终 Submit 的完整 wait_fence/timeout_ns。`submit retry ... vm-idle` 保留原始 Timeout，重复重试按二次幂采样。修正时钟与安全的提交前重试是两个独立改动，不把重试当作时钟修复的替代。
+1. 表面先按 plain 路径完成写入，`coachzCompleteFrameWrites` 使 writeSerial 非零；还没有有效的 private，valid 保持 NO。
+2. 后续 rotation 3 导入分配 private，设置 turned=YES 并增加 private，但没有 seed。
+3. 返回条件 `frame.valid || !frame.writeSerial` 为假，刚分配的 private 不会返回给渲染方；它也就无法通过 private 写入变成有效。
+4. 横向 `coachzFrameBind` 又因已有 turned private 而退出，不进入 seed。presenter 继续退到 plain。
 
-## 选择器读回 panic：先取得硬件访问条件
+实机还有一条直接现场：`command buffer refused: frame writeback: texture copy`。这是本地编码拒绝，不是 DeviceLost。结合旋转 blit 的 reach 检查，旧写回路径本身也需要修订；不能把未 seed 的可达闭环说成全部实机失败的唯一原因。这个闭环与 private 已分配、seed/private writer/shown 全为零的记录一致。旧代码把 writeSerial 同时当作“是否有完成写入”和“能否首次返回 private”，使两个含义相互阻塞。
 
-SP selector 0 的 dword offset 为 0xae10，字节偏移为 0x2b840，与实机 FAR 一致。faulting load 来自新增 `profileSample::check`；publisher 锁和 gPmAsleep 不能证明 GX/SP 域仍可访问。这是新增读回造成的回归。
+修订统一两个方向的提升入口 `coachzFrameSeed`：
 
-主线的相关保证见 [a6xx_gmu.c](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/msm/adreno/a6xx_gmu.c)：
+- writeSerial 只用于完成顺序，不再作为首次导入的放行条件。
+- 新 private 在 seed 命令完成前不发布到 frame.texture；seed 成功后同时设置 texture、turned、valid 和完成序号，才返回 private 视图。
+- 已有但无效的同向 private 可以重新 seed。尺寸和方向必须相符，不能把另一种表示替换进已发布的记录。
+- 横向候选在严格匹配整屏尺寸、BGRA8、render-target 和物理表面后，首次导入就 seed。纹理可长期复用，不能依赖显示后再次导入才提升；本轮 wait 已累计到 16、start 仍为 0。方向和已发布记录仍不能跨方向替换。
+- 完成的 seed 不覆盖已经完成的更新写入；失败或竞争时保留共享路径，并输出拒绝阶段。
 
-- `a6xx_gmu_sysprof_setup` 先取得 active runtime PM 引用并持有 GMU 锁；profiling 使用 PERFCOUNTER OOB vote 阻止 IFPC。
-- legacy OOB 的 PERFCOUNTER request/ack/clear 位分别为 17/25/25。`a6xx_gmu_set_oob` 等待确认，而非只设置一个软件标志。
-- `a6xx_gmu_gx_is_on` 与 `a6xx_gmu_sptprac_is_on` 读取 CX/GMU 的 SPTPRAC_PWR_CLK_STATUS，检查实际电源和时钟。
+private 计数改为首次成功 seed 后发布的记录数；seed 是成功初始化次数，包含重新初始化。它们仍不等于实际 shown 或 UBWC 验收。
 
-修订对应这些条件：publisher 锁排除本驱动的显式 PM 转换；另外取得并持有 PERFCOUNTER OOB，收到 ack 后检查 CX 侧 0x14340 的 A6XX 状态位。GX power/clock off、SP power/clock off 或转换中都不进入 GX 访问，还要求 SP power-on 位有效。OOB 或状态检查失败只输出 power skip，不读选择器。vote 保持到显式休眠，在 slumber 前释放；没有让每次采样主动唤醒已休眠的设备。
+## 已有效主帧的重复导入
 
-A6XX 状态位来自 `a6xx_gmu.xml`：0/1 为 SP 电源转换，2 为 SP power off，3 为 SP power on，4 为 SP clock off，6/7 为 GX power/clock off。不能套用 A7XX 的位定义。所有新增 MMIO 仍为对齐 32 位。
+旧顺序是先导入 IOSurface 的共享纹理；rotation 3 随后再次创建规范物理平面，最后才在 seed 中发现 private 已有效并返回视图。因而有效缓存仍支付线性图像的创建和布局检查，两个方向的可复用路径也不同。
 
-setup 和 sample 都经过同一硬件条件。rateThread 的 governor 时间基准改读 CX 的 19.2 MHz GMU always-on counter；DCVS 时钟测量的 GX 读取也使用受保护快照，跨 epoch 不相减。DCVS 请求与显式 PM 转换串行。resume 失败保持 GX 软件访问阻断，不再清掉 asleep 后继续初始化。
+新增 `coachzFrameReuse()`，在映射和 plane 基础检查之后、创建 buffer/共享纹理之前查找已有效的 resident。只有普通单平面、2D、单 mip/layer/sample、整屏尺寸、相同方向，且线性 backing 仍存活、物理尺寸和行距匹配时，才直接创建 private 视图。请求的完整 import descriptor 也须与成功导入时相同，包括 usage、resource options 和 swizzle；配置变化仍走正常导入校验。复用不会再次 seed，不会切换已发布方向；表面 ID 仍经 tag 校验。rotation 3 保留 BGRA8 和 framebuffer-only 限制；普通方向保留 sRGB 视图。
 
-该 OOB/硬件条件修订尚未上机，不能宣称 panic 已修复。冻结固件中已撤下的旧 profile 代码不因本交付而恢复。后续需要观察 `gpu prof power: vote on status ...`；若握手失败，应只出现 OOB timeout/status skip，并且没有 GX 选择器读取。`selector mismatches 0` 只描述读回结果，不替代电源访问条件或实机稳定性。
+backing 继续由活跃视图强持有，frame 表中仍为弱引用，不因缓存而延长 IOSurface 生命周期。弱引用加载在锁内取得本地强引用；视图创建调用 runtime 时不持有 frame 锁。backing 已释放、提升中或缓存无效时走原导入；普通导入后的 existing-view 路径仍保留，避免 sRGB 读取退化。`frame.texture/backing` 的读取和发布统一放在 frame 锁内，视图继续持有 backing 和 IOSurface use-count。
 
-## host-pages 整帧拷贝
+`CZ seed` 的同一行增加 `reuse` 成功计数，不增加状态表行数。它证明跳过重复导入的分支实际返回了视图，不等于新 seed、shown 或节省字节；收益和像素一致性仍待实机。该修改不会让目前尚未 seed 的主帧凭空命中缓存。
 
-首要形状为 2266×1488、BGRA、row 9072，占所记录 host first payload 的约 97%。9064 像素字节向 16 字节取整为 9072；9072 除以 64 余 48。Mesa `buffer_texture::plane_copy_regions` 保留 BufferLayout 的 row_pitch，计数中的 row 来自该复制布局。
+## rotation 3 不能直接按普通 blit 处理
 
-A6xx `fd6_layout_image` 对 explicit linear pitch 进行硬件对齐检查：
+运行时的 `texture_descriptor.rs`、`texture/rotation.rs` 和 `rotated.rs` 明确区分：render load/store 使用旋转后的 frame image，CPU/blit 按纹理自身 extent 和原始行距访问平面。`check_rotated_reach` 会拒绝越过实际 buffer 的 blit。对于物理平面 2266×1488、行距 9216 的表面，不能把 1488×2266 的旋转视图直接当作同尺寸普通 blit 来源或目标。
 
-```c
-fdl_set_pitchalign(layout, layout->pitchalign + 6);
-if (explicit_layout) {
-    layout->pitch0 = explicit_layout->pitch;
-    if (align(layout->pitch0, 1 << layout->pitchalign) != layout->pitch0)
-        return false;
-}
+本批为 turned frame 建立 rotation 0 的物理横向视图，并使用显式 GPU render transfer：
+
+- seed 和 plain 写入后的同步：物理平面 → 竖向 private，采用 rotation 3 的逆变换。
+- private 完成后的写回：竖向 private → 物理平面，采用原来的 rotation 3 store 变换。
+- 普通横向 private 保留同尺寸 blit；不替换原有 presenter 的变换。
+
+设 private frame 为 W×H，物理平面为 H×W，运行时 `rotated::source_map(3, ...)` 的 store 关系为：
+
+```text
+plane(y, W - 1 - x) = private(x, y)
+private(x, y) = plane(y, W - 1 - x)
 ```
 
-不能通过放宽检查让 9072 直接绑定。对外的 `minimumLinearTextureAlignmentForPixelFormat:` 和 `requiredLinearTextureBytesPerRowForDescriptor:` 现在都至少按 64 字节计算，保留 runtime 原本更大的要求。新分配的同尺寸 BGRA 有机会得到 9088 行距，从源头避免创建不能直接别名的内存；已经分配的旧行距仍走原来的合法复制路径。是否调用这些查询并采用答案由框架决定，不能保证该形状下一轮消失。
+在 Metal viewport 坐标下，既有 store vertex 的 UV 为 `(fy, fx)`；新增 inverse vertex 为 `(1-fy, 1-fx)`，两者互逆。新传输 fragment 返回完整 RGBA，不使用 presenter 中强制 alpha=1 的 fragment；nearest sampler 按像素中心取样，避免引入缩放或过滤。
 
-配合前述“只同步最后写入，不为只读绑定回写”，这是本批实际减少复制的两处代码改动。既有 host explicit layout/placement 尝试和 `CZ copy/shape`、`L host` 统计继续保留。新行距也不保证消除 placement 拒绝，需看 import 剩余长度和实际 requirements。
+传输使用现有 NMB render API 和已有 AIR 构建入口，没有增加内核 ABI。命令缓冲继续持有两端资源，并按同一表面的最后写入决定同步方向。只读绑定不产生回写。显式旋转传输本身有成本，必须结合 mirror、GPU 耗时及像素一致性判断收益。
 
-## 编译与验收
+## 新增阶段记录
 
-整批需要重新编译 addon、生成相应信任缓存并编译内核。只取 GPU 时钟、Submit 和电源保护修订时只需编内核；方向缓存和行距能力报告都在 addon，不能靠只编内核获得。
+| 字段 | 含义 |
+|---|---|
+| `CZ promote start` | 已开始的 seed 尝试，两个方向都计入 |
+| `busy` | 同一记录正在提升，当前导入退到共享路径 |
+| `race` | seed 完成时已有更新写入，拒绝覆盖 |
+| `shape` | 物理视图创建失败或尺寸不符合对应方向 |
+| `plane / alloc / dim` | 规范物理平面创建、private 分配、两端尺寸不符的独立计数 |
+| `CZ seed / fail` | 成功 seed，以及编码或完成失败 |
+| `CZ frame writer private / plain` | 实际完成写入的来源，不再把“plain 写入后更新了 private”记作 private writer |
+| `viewRefused` | 已有 private 无法创建对应视图 |
+| `CZ orient straight / turned` | 实际返回给 presenter 的两种方向 |
+| `mismatch / conflict` | 无效尺寸组合，以及拒绝跨方向复用；后者不要求为零 |
 
-使用原来的 addon/内核构建入口和完整启动参数，不新增参数。补丁以四行上下文生成；上游 checkout 未修改。没有构建、测试套件、写盘或自动上机，也没有提交。
+创建失败新增独立的 `FR stage` Note 3 分段记录，不依赖前 48 行状态表：stage 1 为物理平面，2 为 private 分配，3 为尺寸，4 为 seed 命令分配或编码，5 为 seed 完成失败。编码和完成失败独立采样，分别保留各自首次错误；stage 5 从该命令缓冲的 error 获取原因。物理平面的错误在创建函数返回处捕获，避免后续调用覆盖；按首次和幂次采样。pipeline、encoder、编码或结束失败同时保留 `frame transfer ...` 问题记录。若仍 shown 为零，阶段计数能区分尚未开始 seed、seed 失败、竞争或视图失败，不再只看分配数量。
 
-后续采集一轮正常操作即可，不为凑计数反复启动：
+## Submit Timeout：证据与本次改动
 
-- 首先确认无 rateThread abort、无方向来回变化。保留整次内核日志及统一日志，含 power vote/config/skip、CZ orient、frame writer、made/private/shown/plain。
-- 若 Submit 仍失败，保留同 PID 最早的 `submit failure/return/retry`、KMD、VK、CB lost，以及 table mode/时钟相关记录。Busy 重试不应被转成 DeviceLost；其他原始错误不要丢弃。
-- 初始化后操作约五分钟并记大致起止时间，采集前后 `CZ copy/shape`、`L inp/host`、`CZ mirror`、G/H/J、频率及翻转统计，用累计差比较。
-- 检查 9072 的整帧流量是否减少、新行距及 inplace/pitched 是否变化，并反馈局部更新、残影、截图、切换快照及撕裂。约三分钟且含初始化的累计数据不与较长启动直接比较。
-- 正常熄屏/亮屏时若实际发生 slumber/resume，检查 vote 的释放/重新取得及新 epoch。没有发生休眠无需重复操作。
+- `coachzWaitForForeground()` 返回 void。达到 16 ms 门槛后继续提交，不产生 Submit Timeout。本轮最后 gate 记录有 219 次到期、最大等待 32910 us，同时没有 KMD fail 或 DeviceLost，不能再将该门槛直接当成较早故障的原因。
+- `metal ... selector 6 status 0xe00002d6` 是最后一次 WaitFence 调用结果，不是方法 5 的提交失败。不同时间的 selector 13 成功记录也不是它的原子现场。
+- Darwin 的 `darwin_submit_chunk()` 只重试 `kIOReturnBusy`；其他 Submit 失败会调用 `vk_device_set_lost`。因此能确认接口如何放大错误，但较早方法 5 的 Timeout 没有当时的内核失败阶段和 table mode，准确来源尚未证实。
+- 主线 Linux 的 `msm_ioctl_gem_submit()` 将任务交给 DRM scheduler 并返回 fence，A6xx 的 `a6xx_set_pagetable()` 将 `CP_SMMU_TABLE_UPDATE` 放进 ring。它们是硬件顺序与排队设计的依据，没有 XNU 的 `kIOReturnBusy` 接口，不能把本批策略写成照抄 Linux。
 
-原始日志和环境详情不进公开产物。
+本次在 `NativeAdrenoSubmit::submit()` 的 `retireCompleted()` 之后、临时资源持有和 cache publication 之前增加 mode 1 准入检查：不同 VM 且仍有未完成任务时返回 Busy。此时没有发布新任务的 IB/WPTR，fence 仍为 0；Darwin 释放内核调用后重试，保留资源与提交一次的语义。不在持有 publisher 锁时进入正常提交的两秒 `waitAll`。
+
+`useVm()` 还被故障恢复和 replay 调用，因此保留其等待逻辑以及已有的提交前 Timeout→Busy 修订；本次没有将它整体改成非阻塞，也没有将已经发布任务的 Timeout 统一改成可重试。mode 2 的 ring 内页表切换不改。启动打印 `COACHZ gpu submit policy: table mode ...`，实际发生准入压力时打印采样的 `stage vm-admit`。
+
+本轮已确认实际 mode 1、准入分支触发，并继续完成提交；它不再只是未触发的源码修订。但较早 DeviceLost 的准确来源仍未证实，不能把本轮未复现当作全部根因已消失。mode 2 的实现仍未改。再次出现方法 5 错误时，应一起保留第一条 `submit failure/return/retry`、KMD、VK、CB lost，不能拿正常 WaitFence 到期替代。
+
+## 减少影子拷贝：改动和尚缺的归因
+
+主帧提升后直接渲染到 private 图像；turned frame 的 seed 和外部同步改用规范物理平面上的显式 render transfer，避开旋转视图的普通 blit，以及原运行时通过暂存、旋转 kernel 和紧凑 buffer 搬运的路径。同一表面按最后写入方向同步，只读绑定不触发回写。显式 transfer 仍有真实 GPU 成本，并非零拷贝；还需核对 shown、mirror、host-first 字节和截图等外部读者的一致性。
+
+本轮 host-first 最后为 8659 次、1,392,385,243 字节；最大形状 1488×2266、row5952 为 86 次、1,159,901,952 字节。不同时间的最后行不能一一配对，更不能与此前不同负载启动直接比较收益。
+
+新 placement 记录的最大组为 f44、1488×2266、row5952、n4、why2，bind offset 0、alignment 64、size 13,499,136、room 13,488,128、type 0、type bits 3。这里是**容量**拒绝，差 11,008 字节；pitch 和 offset 对齐满足，memory type 也在允许集合。总 placement 为 354 次，而这组只有 4 次，不能把全部 354 次都归到该组。
+
+`Refusal::Placement` 仍包括 `texels.buffer.copied()`；其他拒绝按实际数值继续归因，不能取消 Vulkan 绑定范围或 CPU/GPU 一致性检查。
+
+本批在最终 placement 拒绝处加数值记录，并覆盖 copied-buffer 分支；显式 pitch 回退成功不算最终拒绝。最多保留 64 组，溢出计数单独保留。按“拒绝图像要求或行距×高度，再乘拒绝次数”的估算范围排序，界面报告最大一组的两行 `CZ place`，该排序不是实测传输字节。
+
+| 字段 | 含义 |
+|---|---|
+| `f / 宽×高 / row / off / n` | Vulkan 格式、尺寸、行距、平面相对 offset 和拒绝次数 |
+| `at / align / size / room / t / bits` | 绑定相对 offset、所需对齐、所需字节、可用字节、memory type 与允许位图 |
+| `why` | 位 1：offset 对齐；2：容量；4：memory type；8：buffer 已复制，未查询要求；16：默认放置失败后显式布局也被拒绝 |
+| `cls` | 0：pointer import；1：fresh pages；2：dma-buf |
+| `overflow` | 表满后未分组的拒绝次数 |
+
+`why 8` 时 align/size/bits 为 0，表示没有查询，不能解读为硬件要求为零。本批不猜测 97 次的具体归因，不取消 imported-memory、对齐或 CPU/GPU 一致性检查。剩余 host-first 路径根据下一次明确拒绝原因继续改。
+
+### 显式 host 图像的末尾两行
+
+FDL 的末级线性布局为 GMEM 16×4 block blit 向上补齐高度：`2266 → 2268`。本轮要求恰好为 `5952 × 2268 = 13,499,136`；实际 texels 为 `5952 × 2266 = 13,487,232`，import 的最后一页给出 13,488,128 字节，所以页尾的 896 字节余量放不下额外两行。再次按页取整实际像素长度不会解决。
+
+现有 `turnip-render-mode-for-attachment-memory.patch` 的 `tu_attachment_unpadded()` 已对外部 host/显式线性附件的非整块边缘改用 draw load 和 2D unaligned store，避免整块 GMEM event 越过 texels。跟进为 FDL 参数增加默认关闭的 `unpadded_linear`，仅 Darwin 的显式 host 导入、线性、2D、单 mip、单层、单采样图像设置；FDL 同时要求显式布局和线性 tile mode 才不追加末尾补齐行。普通布局和其他调用仍补齐，UBWC 布局不变。
+
+这是使图像实际布局匹配其按 texel 访问路径，不是把 runtime 的 `placed()` 检查改成忽略超界。默认线性图像仍可能先被拒绝；显式布局重试的要求应降到实际 2266 行后由原检查正常接受。新路径的边缘像素、截图、缓存一致性和计数下降仍待实机。
+
+## 电源与选择器读回的边界
+
+本轮恢复序号到 66，profile epoch 到 67；所见恢复成功且 core accesses dropped asleep 为 0，PERFCOUNTER OOB 为 vote on、状态 0x28。这覆盖了实际发生的恢复和重新配置；不证明从未触发过的寄存器访问安全。
+
+CPU 读取 0xae10 曾在 GMU vote 存在、检查状态正常时产生同步外部读错误。原因未查明，不能断言该寄存器在硬件上不可读，也不能再把 OOB 加状态检查当作已充分证明的安全条件。本批保持现有内核禁用该读回的状态，不恢复 SP/TP 等选择器读回。`selector mismatches 0` 也不能解释为这些选择器全都读回匹配。
+
+## 源码依据
+
+- [Linux msm_gem_submit.c](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/msm/msm_gem_submit.c)：`msm_ioctl_gem_submit`、`drm_sched_entity_push_job` 和返回 fence。此处用于区分排队和执行，不是 XNU 错误码的来源。
+- [Linux a6xx_gpu.c](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/msm/adreno/a6xx_gpu.c)：`a6xx_set_pagetable`、`CP_SMMU_TABLE_UPDATE`、`a6xx_submit`。本批不改该硬件包序列。
+- [UniXNU NativeAdrenoSubmit.cpp](https://github.com/UniXNU/Adreno740/blob/0afbfdc0f3a659cd30b203d460b101c7815cbb16/NativeAdrenoSubmit.cpp)：`submit`、`useVm`、`waitAll`、`recover`；本项目增量在 `platform/coachz-prelink/patches/gpu/Adreno740.patch`。
+- [metal2vulkan texture/rotation.rs](https://github.com/steelbrain/metal2vulkan/blob/624bab3918de5b978e1101517abca2b4fa426565/crates/metal2vulkan-runtime/src/texture/rotation.rs)、[rotated.rs](https://github.com/steelbrain/metal2vulkan/blob/624bab3918de5b978e1101517abca2b4fa426565/crates/metal2vulkan-runtime/src/rotated.rs)：`check_rotated_reach` 和 `source_map`，确定旋转传输语义。
+- [metal2vulkan texture.rs](https://github.com/steelbrain/metal2vulkan/blob/624bab3918de5b978e1101517abca2b4fa426565/crates/metal2vulkan-runtime/src/texture.rs)、[texture/in_place_image.rs](https://github.com/steelbrain/metal2vulkan/blob/624bab3918de5b978e1101517abca2b4fa426565/crates/metal2vulkan-runtime/src/texture/in_place_image.rs)：copied-buffer 提前拒绝及 `placed` 的 offset、容量、type 检查；本地运行时还叠加既有补丁。
+- Darwin 的 `darwin_submit_chunk` 和原始 KMD 错误记录见本项目 `unixnu-gpu-stack.patch` 对应的 Mesa overlay 及当前固定 Mesa 基础源码，不用 Linux 的 errno 代替其实际分支。
+
+## 集成和下一次数据
+
+**功能修订需要重编 addon 和配套信任缓存；可先沿用本轮内核。** 首次导入 seed、有效主帧复用、内部 backing 访问、FR 记录、显式 host FDL 布局和成功绑定记录都在 addon/其 Mesa 静态依赖内；只编内核或继续冻结 addon 都不会带入。GOP 诊断标签已在后续内核记录中出现，不是本次 addon 修订的前置条件。不要将新 addon 配上旧信任缓存。
+
+addon 跟进只改四行上下文的 `unixnu-gpu-plugin.patch` 和 `unixnu-gpu-stack.patch`；Mesa 修改仍在既有 diagnostics overlay 中，沿用原构建应用和撤回路径。本次不再改 `Adreno740.patch` 和板级 package；既有 `CoachzGpu.cpp` 增量只纠正 GOP 诊断标签。上游 checkout 和已有二进制不改，不自行编译、写盘或上机。运行时 warning 仍在前部；FR 失败通过独立 Note 3 保留，按字段前缀查找，不依赖固定 row 编号。
+
+下一次需要：
+
+1. `CZ promote start`、seed、reuse、实际 private writer、shown，以及方向、残影、截图、切换快照和撕裂；不能只看 private 分配或同尺寸 IMG。若仍 start 0，保留 plane/alloc/dim 和第一组完整 `FR stage`。
+2. `gpu submit policy` 的实际 mode、`vm-admit` 或首条 Submit/KMD/VK 错误。没有压力记录只表示没有触发；不能宣称准入分支通过。
+3. 两行 `CZ place` 和新增 `CZ alias`，连同 CZ copy/shape、L host、mirror。确认整帧 alias 的 size≤room，n/pitch 增加，再检查边缘像素、截图与缓存一致性。保留初始化结束后正常操作的大致起止时间及前后计数，避免跨启动负载比较总量。
+4. 显式 frame transfer 失败时保留第一条错误及整份内核、统一日志；归档留在本地，不将原始环境标识放入公开产物。
+
+本批只做源码阅读、补丁应用/撤回的字节核对、差异和隐私检查；这些不代替编译和实机验收。

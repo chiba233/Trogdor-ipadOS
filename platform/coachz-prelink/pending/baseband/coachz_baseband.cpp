@@ -293,6 +293,9 @@ static void bb_esim_step(void)
       else j->state = CBE_J_FREE;
     }
   }
+  if (bb_esim.session && bb_esim.active < 0 &&
+      cbq_client_find(&bb_qmux, bb_esim.session_channel, CBE_SVC_VINYL, bb_esim.session_cid) < 0)
+    cbe_session_release(&bb_esim, now, 2);
   cbe_tick(&bb_esim, now);
   if (bb_esim.req_len) {
     const uint32_t queued = bb_tx_count;

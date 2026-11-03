@@ -212,6 +212,16 @@
      const NativeAdrenoRingClock *clock,const NativeAdrenoTimer *timer,const NativeAdrenoAbiDeviceInfo *info,
      uint32_t input_bits,uint32_t output_bits)
  {
+@@ -1171,8 +1259,9 @@
+         if(checked && !submit->outstanding())(void)submit->setTableSwitching(1,
+             [](void *cookie,uint64_t ttbr0)->IOReturn {return static_cast<NativeAdrenoGpuContext *>(cookie)->writeTtbr0(ttbr0);},g.context);
+     }
+     native_adreno_cp_aperture[3]=submit->tableMode();
++    printf("COACHZ gpu submit policy: table mode %u, mode 1 defers before publish, mode 2 switches in ring\n",submit->tableMode());
+     g.service=service;g.published=true;
+     {
+         thread_t thread=nullptr;
+         if(kernel_thread_start(nativeAdrenoHangcheck,nullptr,&thread)==KERN_SUCCESS)thread_deallocate(thread);
 --- a/NativeAdrenoRing.cpp
 +++ b/NativeAdrenoRing.cpp
 @@ -17,10 +17,11 @@
@@ -493,18 +503,29 @@
      NativeAdrenoVm *const vm_=vm;   /* this submission's VM: every vm_ below is the job's own */
      if(!attached_ || poisoned_)return kIOReturnNotReady;
      /* msm_ioctl_gem_submit refuses a VM a hang made unusable. */
-@@ -400,9 +414,9 @@
+@@ -400,9 +414,20 @@
          for(size_t j=0;j<handle_count;++j)if(handles[j]==buffer.handle) {known=true;break;}
          if(!known)handles[handle_count++]=buffer.handle;
      }
      IOReturn swept=retireCompleted();
 -    if(swept)return swept;
 +    if(swept) {printf("COACHZ gpu submit failure: pid %d stage retire status 0x%x\n",proc_selfpid(),swept);return swept;}
++    // Mode 1 changes TTBR0 on the CPU, so a different VM cannot enter while
++    // earlier jobs are live. Return pressure before holds/cache publication,
++    // outside any hardware publication; Darwin retries Busy after releasing the
++    // publisher lock. Keep useVm's wait for recovery/replay callers unchanged.
++    if(table_mode_==1 && vm!=table_vm_ && outstanding()) {
++        if(!clock)return kIOReturnBadArgument;
++        static uint32_t deferred;
++        const uint32_t n=++deferred;
++        if(n<=4 || !(n&(n-1)))printf("COACHZ gpu submit backpressure: pid %d stage vm-admit mode 1 pending %lu n%u\n",proc_selfpid(),(unsigned long)outstanding(),n);
++        return kIOReturnBusy;
++    }
      Job *job=free();
      if(!job)return kIOReturnNoMemory;
      for(size_t i=0;i<handle_count;++i) {
          IOReturn status=vm_->holdJob(handles[i]);
-@@ -471,8 +485,9 @@
+@@ -471,8 +496,9 @@
      /* No TLB invalidation before a submission: a map fills only invalid leaves (no TLB holds an invalid descriptor), an unmap drops
       * its own pages before it returns, and the tables above the leaves never change. The TLBIALL here emptied the GPU's TLB on every
       * submission (10944 in i568), so each frame began with page walks. A stalled fence still invalidates (below). */
@@ -514,7 +535,7 @@
          return status;
      }
      /* The ring this job goes to (the first ring alone unless the board turned the switch on). */
-@@ -481,19 +496,22 @@
+@@ -481,19 +507,22 @@
       * rings once its outstanding prefix has completed. Queue IDs are globally scoped. */
      for(const auto &earlier:jobs_)
          if(earlier.active && earlier.queue==queue) {index=earlier.ring;break;}
@@ -541,7 +562,7 @@
          return status;
      }
      /* One numbering for both rings: a fence tells its own ring, and a switch's arrival retires the jobs queued behind it. */
-@@ -501,10 +519,12 @@
+@@ -501,10 +530,12 @@
       * every ring's newest, and above the last this object handed out. */
      uint32_t base=fence_issued_;
      for(unsigned i=0;i<ring_count_;++i)if((int32_t)(ring(i)->lastSubmitted()-base)>0)base=ring(i)->lastSubmitted();
@@ -554,7 +575,7 @@
          /* A poisoned ring may already have consumed the WPTR write, so the
           * referenced buffers cannot be retired here. */
          if(target->poisoned()) {
-@@ -515,8 +535,15 @@
+@@ -515,8 +546,15 @@
          }
          while(handle_count) {vm_->retireJobAfterCompletion(handles[--handle_count]);++stats_.references_retired;}
          /* No room in the ring yet: the caller waits for an earlier job and submits again. */

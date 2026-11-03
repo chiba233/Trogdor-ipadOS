@@ -2,7 +2,7 @@ diff --git a/drivers/AdrenoMetal/bridge/patches/0026-coachz-copy-profile.patch b
 new file mode 100644
 --- /dev/null
 +++ b/drivers/AdrenoMetal/bridge/patches/0026-coachz-copy-profile.patch
-@@ -0,0 +1,310 @@
+@@ -0,0 +1,422 @@
 +--- a/crates/metal2vulkan-runtime/src/device/adopt.rs
 ++++ b/crates/metal2vulkan-runtime/src/device/adopt.rs
 +@@ -272,8 +272,9 @@
@@ -159,7 +159,7 @@ new file mode 100644
 +     /// `ERROR_FEATURE_NOT_PRESENT` where the device imports no dma-bufs.
 +--- a/crates/metal2vulkan-runtime/src/lib.rs
 ++++ b/crates/metal2vulkan-runtime/src/lib.rs
-+@@ -355,4 +355,10 @@
++@@ -355,4 +355,16 @@
 + pub use visibility::{VisibilityProblem, VisibilityResultMode};
 + pub use work_counts::{CopySite, MemoryFrees, WorkCounts};
 + pub use wrapped_buffer::{VkBufferMemory, WrappedBufferProblem};
@@ -170,9 +170,15 @@ new file mode 100644
 ++
 ++/// Coachz payload by backing, cause and copy region layout, descending by bytes.
 ++pub fn coachz_copy_shapes() -> Vec<[u64; 10]> { shadow::coachz_copy_shapes() }
+++
+++/// Final host-image refusals, ordered by rejected extent, and ungrouped attempts.
+++pub fn coachz_placement_profile() -> (Vec<[u64; 14]>, u64) { shadow::coachz_placement_profile() }
+++
+++/// Most-used large host-image shape successfully bound in place, not copy traffic.
+++pub fn coachz_host_alias_profile() -> Option<[u64; 8]> { shadow::coachz_host_alias_profile() }
 +--- a/crates/metal2vulkan-runtime/src/shadow.rs
 ++++ b/crates/metal2vulkan-runtime/src/shadow.rs
-+@@ -3082,4 +3082,87 @@
++@@ -3082,4 +3082,135 @@
 +         }
 +         copies
 +     }
@@ -260,9 +266,57 @@ new file mode 100644
 ++    rows.sort_by_key(|r| std::cmp::Reverse(r[7].saturating_add(r[8])));
 ++    rows
 ++}
+++
+++// Final host-image placement refusals, not copies or measured traffic.
+++// f,w,h,pitch,layout offset,bind offset,alignment,size,room,type,type bits,why,n,class.
+++// why: 1 alignment, 2 extent, 4 type, 8 buffer already copied, 16 explicit fallback refused.
+++static COACHZ_PLACEMENT: std::sync::Mutex<(Vec<[u64; 14]>, u64)> =
+++    std::sync::Mutex::new((Vec::new(), 0));
+++pub(super) fn coachz_record_placement(mut row: [u64; 14], class: crate::in_place::PagesClass) {
+++    if !crate::stage_trace::diagnostics() { return; }
+++    row[12] = 1;
+++    row[13] = match class {
+++        crate::in_place::PagesClass::Pointer => 0,
+++        crate::in_place::PagesClass::Fresh => 1,
+++        crate::in_place::PagesClass::DmaBuf => 2,
+++    };
+++    let Ok(mut table) = COACHZ_PLACEMENT.lock() else { return; };
+++    if let Some(old) = table.0.iter_mut().find(|r| r[..12] == row[..12] && r[13] == row[13]) {
+++        old[12] = old[12].saturating_add(1);
+++    } else if table.0.len() < 64 {
+++        table.0.push(row);
+++    } else {
+++        table.1 = table.1.saturating_add(1);
+++    }
+++}
+++pub(super) fn coachz_placement_profile() -> (Vec<[u64; 14]>, u64) {
+++    let Ok(table) = COACHZ_PLACEMENT.lock() else { return (Vec::new(), 0); };
+++    let mut rows = table.0.clone();
+++    // Largest rejected extents first; this score is not copy payload.
+++    rows.sort_by_key(|r| std::cmp::Reverse(r[7].max(r[3].saturating_mul(r[2])).saturating_mul(r[12])));
+++    (rows, table.1)
+++}
+++
+++// Large host images successfully bound over the caller's pages. These are
+++// creation counts and memory extents, not measured DRAM bytes or copy savings.
+++// f,w,h,pitch,n,explicit-pitch n,size,room; retain at most 32 distinct shapes.
+++static COACHZ_HOST_ALIASES: std::sync::Mutex<Vec<[u64; 8]>> = std::sync::Mutex::new(Vec::new());
+++pub(super) fn coachz_count_host_alias(mut row: [u64; 8]) {
+++    if !crate::stage_trace::diagnostics() || row[1].saturating_mul(row[2]) < 2_000_000 { return; }
+++    let Ok(mut rows) = COACHZ_HOST_ALIASES.lock() else { return; };
+++    row[4] = 1;
+++    if let Some(old) = rows.iter_mut().find(|r| r[..4] == row[..4] && r[6..] == row[6..]) {
+++        old[4] = old[4].saturating_add(1);
+++        old[5] = old[5].saturating_add(row[5]);
+++    } else if rows.len() < 32 { rows.push(row); }
+++}
+++pub(super) fn coachz_host_alias_profile() -> Option<[u64; 8]> {
+++    let rows = COACHZ_HOST_ALIASES.lock().ok()?;
+++    rows.iter().max_by_key(|r| r[6].saturating_mul(r[4])).copied()
+++}
 +--- a/crates/metal2vulkan-runtime/src/texture/in_place_image.rs
 ++++ b/crates/metal2vulkan-runtime/src/texture/in_place_image.rs
-+@@ -133,19 +133,34 @@
++@@ -133,19 +133,39 @@
 +         let layout = texels.layout;
 +         let (memory, buffer_offset, type_index) = texels.buffer.memory();
 +         let at = buffer_offset + layout.offset;
@@ -281,6 +335,7 @@ new file mode 100644
 +-        }
 ++            unsafe { release::object(raw_device, made.raw) };
 ++            if pitched {
+++                coachz_placement(plan, layout.row_pitch, layout.offset, &made.requirements, at, room, type_index, class, 0);
 ++                return Ok(Err(refused));
 ++            }
 ++            // A matching default pitch can still have page-rounded trailing storage.
@@ -288,12 +343,16 @@ new file mode 100644
 ++            // never shrink its requirements or extend the imported memory ourselves.
 ++            made = match self.host_pitched_image(plan, &layout, facts)? {
 ++                Ok(made) => made,
-++                Err((kind, why)) => return Ok(Err((kind, format!("{}; explicit: {why}", refused.1)))),
+++                Err((kind, why)) => {
+++                    coachz_placement(plan, layout.row_pitch, layout.offset, &made.requirements, at, room, type_index, class, 16);
+++                    return Ok(Err((kind, format!("{}; explicit: {why}", refused.1))));
+++                },
 ++            };
 ++            pitched = true;
 ++            if let Err(refused) = placed(&made.requirements, at, room, type_index) {
 ++                // SAFETY: the replacement is also live, unbound and unused.
 ++                unsafe { release::object(raw_device, made.raw) };
+++                coachz_placement(plan, layout.row_pitch, layout.offset, &made.requirements, at, room, type_index, class, 0);
 ++                return Ok(Err(refused));
 ++            }
 ++        }
@@ -302,7 +361,20 @@ new file mode 100644
 +         // buffer's import of host pages (or its fresh pages'), which the image holds, in a type the
 +         // image takes, at an offset that meets its alignment, its size inside the memory
 +         // (`placed`).
-+@@ -405,9 +420,9 @@
++@@ -153,8 +173,12 @@
++             // SAFETY: the image is live and unbound, and no command uses it.
++             unsafe { release::object(raw_device, raw) };
++             return Err(vulkan(error));
++         }
+++        crate::shadow::coachz_count_host_alias([
+++            plan.format.as_raw() as u64, plan.extent[0] as u64, plan.extent[1] as u64,
+++            layout.row_pitch, 1, u64::from(pitched), made.requirements.size, room,
+++        ]);
++         let image = self.in_place_of(Raw::new(raw), plan.clone(), descriptor, texels);
++         // Over a no-copy buffer's pages, its move notes them (a rebind may swap the image out of
++         // them); fresh pages are the buffer's for good.
++         let pages = match class {
++@@ -405,9 +429,9 @@
 +         use crate::dma_buf::{memory_plane_0, ModifierMemory, DRM_FORMAT_MOD_LINEAR};
 +         let (row_pitch, slice_pitch) = (layout.row_pitch, layout.slice_pitch);
 +         let raw_device = self.shared().vk();
@@ -313,11 +385,85 @@ new file mode 100644
 +             return Ok(Err((
 +                 Refusal::Pitch,
 +                 "the device enables no VK_EXT_image_drm_format_modifier for an image at Metal's \
++@@ -685,4 +709,18 @@
++         requirements,
++         dedicated.requires_dedicated_allocation != vk::FALSE,
++     )
++ }
+++
+++fn coachz_placement(plan: &ImagePlan, pitch: u64, offset: u64,
+++    req: &vk::MemoryRequirements, at: u64, room: u64, type_index: u32,
+++    class: PagesClass, extra: u64) {
+++    let mut why = extra;
+++    if !at.is_multiple_of(req.alignment.max(1)) { why |= 1; }
+++    if req.size > room { why |= 2; }
+++    if req.memory_type_bits & 1u32.checked_shl(type_index).unwrap_or(0) == 0 { why |= 4; }
+++    crate::shadow::coachz_record_placement([
+++        plan.format.as_raw() as u64, plan.extent[0] as u64, plan.extent[1] as u64,
+++        pitch, offset, at, req.alignment, req.size, room, type_index as u64,
+++        req.memory_type_bits as u64, why, 0, 0,
+++    ], class);
+++}
++--- a/crates/metal2vulkan-runtime/src/texture.rs
+++++ b/crates/metal2vulkan-runtime/src/texture.rs
++@@ -2205,8 +2205,18 @@
++                          texture was made"
++                             .to_owned(),
++                     )
++                 } else if texels.buffer.copied() {
+++                    // This refuses before querying image requirements. Distinguish it
+++                    // from an actual Vulkan bind alignment/size/type refusal.
+++                    let layout = texels.layout;
+++                    let (_, buffer_offset, type_index) = texels.buffer.memory();
+++                    crate::shadow::coachz_record_placement([
+++                        plan.format.as_raw() as u64, plan.extent[0] as u64, plan.extent[1] as u64,
+++                        layout.row_pitch, layout.offset, buffer_offset + layout.offset,
+++                        0, 0, texels.buffer.memory_room().saturating_sub(layout.offset),
+++                        type_index as u64, 0, 8, 0, 0,
+++                    ], class);
++                     // A copied host buffer's bytes the GPU uses lie in memory of the device's
++                     // own, no import of the pages (`copied.rs`): the shadow copies them, its
++                     // copies the buffer's uses, which commits copy in and completions merge back.
++                     ShadowCause::Refused(
 diff --git a/patches/mesa/turnip-coachz-diagnostics.patch b/patches/mesa/turnip-coachz-diagnostics.patch
 new file mode 100644
 --- /dev/null
 +++ b/patches/mesa/turnip-coachz-diagnostics.patch
-@@ -0,0 +1,218 @@
+@@ -0,0 +1,275 @@
++diff --git a/src/freedreno/fdl/fd6_layout.c b/src/freedreno/fdl/fd6_layout.c
++--- a/src/freedreno/fdl/fd6_layout.c
+++++ b/src/freedreno/fdl/fd6_layout.c
++@@ -287,9 +287,10 @@
++        * bit the last level to ensure any over-fetch is harmless.
++        * The pitch is already sufficiently aligned, but height
++        * may not be. note this only matters if last level is linear
++        */
++-      if (level == params->mip_levels - 1)
+++      if (level == params->mip_levels - 1 &&
+++          !(params->unpadded_linear && explicit_layout && tile_mode == TILE6_LINEAR))
++          nblocksy = align(nblocksy, 4);
++
++       slice->offset = offset + layout->size;
++
++diff --git a/src/freedreno/fdl/freedreno_layout.h b/src/freedreno/fdl/freedreno_layout.h
++--- a/src/freedreno/fdl/freedreno_layout.h
+++++ b/src/freedreno/fdl/freedreno_layout.h
++@@ -110,8 +110,14 @@
++     */
++    bool sparse;
++
++    bool force_disable_linear_fallback;
+++
+++   /* Explicit linear imports with texel-bounded GMEM load/store paths. The
+++    * caller must never use block blits that access padding beyond the extent.
+++    * Default false preserves ordinary FDL and Gallium allocation contracts.
+++    */
+++   bool unpadded_linear;
++
++    uint32_t plane;
++ };
++
++diff --git a/src/freedreno/vulkan/tu_image.cc b/src/freedreno/vulkan/tu_image.cc
 +--- a/src/freedreno/vulkan/tu_image.cc
 ++++ b/src/freedreno/vulkan/tu_image.cc
 +@@ -509,8 +509,34 @@
@@ -355,7 +501,29 @@ new file mode 100644
 + template <chip CHIP>
 + VkResult
 + tu_image_init(struct tu_device *device, struct tu_image *image,
-+@@ -828,8 +854,11 @@
++@@ -759,8 +785,21 @@
++          .is_mutable = is_mutable,
++          .sparse = image->vk.create_flags &
++             VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT,
++          .force_disable_linear_fallback = force_disable_linear_fallback,
+++#ifdef TU_HAS_DARWIN
+++         /* This exact case is handled by tu_attachment_unpadded: draws/2D
+++          * blits, not whole GMEM-block events, access the imported image.
+++          * A 2266-row host allocation must not need two nonexistent rows.
+++          */
+++         .unpadded_linear = plane_layouts && tile_mode == TILE6_LINEAR &&
+++            image->vk.image_type == VK_IMAGE_TYPE_2D &&
+++            image->vk.mip_levels == 1 && image->vk.array_layers == 1 &&
+++            image->vk.samples == VK_SAMPLE_COUNT_1_BIT &&
+++            (image->vk.external_handle_types &
+++             (VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT |
+++              VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT)),
+++#endif
++          .plane = i,
++       };
++
++       if (!fdl6_layout_image(layout, &device->physical_device->dev_info,
++@@ -828,8 +867,11 @@
 +       image->total_size = image->subsampled_metadata_offset +
 +          image->vk.array_layers * sizeof(struct tu_subsampled_metadata);
 +    }
@@ -367,6 +535,7 @@ new file mode 100644
 + }
 + TU_GENX(tu_image_init);
 +
++diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
 +--- a/src/freedreno/vulkan/tu_knl_darwin.cc
 ++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
 +@@ -139,9 +139,9 @@

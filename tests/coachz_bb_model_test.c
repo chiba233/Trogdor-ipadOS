@@ -473,16 +473,21 @@ static void esim_reset(void)
     esim_slots(1, 0);
     CHECK(esim.slots.euicc == 2 && esim.slots.active == 1 && esim.slots.eid_len == 16);
 }
-static void esim_tape(const uint8_t *data, uint32_t n, uint32_t total, uint32_t index)
+static void esim_tape_command(uint8_t command, uint8_t cid, const uint8_t *data, uint32_t n, uint32_t total, uint32_t index, uint32_t now)
 {
     uint8_t s[1600] = { 0 }, out[128], header[6] = { 1, 0x12, 0x34, 0x56, 0x78, 2 }, payload[1505] = { 0 };
+    header[0] = command;
     cbd_wr16(payload + 1, total); cbd_wr16(payload + 3, index); memcpy(payload + 5, data, n);
     uint32_t w = cbd_tlv(s + 7, sizeof s - 7, 1, header, sizeof header);
     w += cbd_tlv(s + 7 + w, sizeof s - 7 - w, 0x10, payload, n + 5);
     cbd_request(s, 9 + index, 0x1002, w);
-    const uint32_t answer = cbe_host(&esim, 1, 9, s, 7 + w, out, sizeof out, 2);
+    const uint32_t answer = cbe_host(&esim, 1, cid, s, 7 + w, out, sizeof out, now);
     CHECK(answer && answer != CBE_DEFERRED && !cbd_error(out + 6, answer - 6));
-    CHECK(cbd_rd16(out + 7) == 9 + index && out[4] == 0xe5 && out[5] == 9);
+    CHECK(cbd_rd16(out + 7) == 9 + index && out[4] == 0xe5 && out[5] == cid);
+}
+static void esim_tape(const uint8_t *data, uint32_t n, uint32_t total, uint32_t index)
+{
+    esim_tape_command(1, 9, data, n, total, index, 2);
 }
 static void esim_open(void)
 {
@@ -553,6 +558,36 @@ static void test_esim(void)
     csn[10] = 2; /* unimplemented legacy operations keep the existing fallback */
     CHECK(cbe_host(&esim, 1, 9, csn, sizeof csn, out, sizeof out, 2) == 0);
 
+    /* Native EID/device-capability writers both use TLV 1. Capabilities leave slot zero. */
+    uint8_t query[32] = { 0 }, h[5] = { 0x12, 0x34, 0x56, 0x78, 0 };
+    uint32_t q = cbd_tlv(query + 7, sizeof query - 7, 1, h, sizeof h);
+    cbd_request(query, 0x4321, 0x1005, q);
+    n = cbe_host(&esim, 1, 9, query, 7 + q, out, sizeof out, 2);
+    CHECK(n && !cbd_error(out + 6, n - 6));
+    const uint8_t *value = cbd_find(out + 6, n - 6, 0x10, &len);
+    CHECK(value && len == 4 && cbd_rd32(value) == 0x78563412);
+    value = cbd_find(out + 6, n - 6, 0x11, &len);
+    CHECK(value && len == 6 && value[0] == 12);
+    h[4] = 2;
+    q = cbd_tlv(query + 7, sizeof query - 7, 1, h, sizeof h);
+    cbd_request(query, 0x4322, 0x1004, q);
+    n = cbe_host(&esim, 1, 9, query, 7 + q, out, sizeof out, 2);
+    value = cbd_find(out + 6, n - 6, 0x11, &len);
+    CHECK(n && !cbd_error(out + 6, n - 6) && value && len == 16 && !memcmp(value, esim.slots.eid, 16));
+
+    /* GetSessionData is header-only and has no ES10 APDU: the modem-local record set is empty. */
+    uint8_t header[6] = { 0x15, 0x12, 0x34, 0x56, 0x78, 2 };
+    q = cbd_tlv(query + 7, sizeof query - 7, 1, header, sizeof header);
+    cbd_request(query, 0x4323, 0x1002, q);
+    n = cbe_host(&esim, 1, 9, query, 7 + q, out, sizeof out, 2);
+    CHECK(n && !cbd_error(out + 6, n - 6));
+    cbe_tick(&esim, 3);
+    CHECK(esim.done_pending && esim.step == CBE_S_IDLE && !esim.req_len && !esim.switches);
+    n = cbe_output(&esim, &channel, out, sizeof out);
+    value = cbd_find(out + 6, n - 6, 1, &len);
+    CHECK(n && value && len == 11 && value[0] == 0x15 && !cbd_rd16(value + 1) && cbd_rd32(value + 5) == 0x78563412);
+    CHECK(!cbd_find(out + 6, n - 6, 0x10, &len));
+
     /* A two-part command does not run before its last segment. Short APDUs preserve its full DER. */
     uint8_t der[1505] = { 0xbf, 0x20, 0x82, 0x05, 0xdc };
     for (unsigned i = 5; i < sizeof der; i++) der[i] = (uint8_t)i;
@@ -588,7 +623,7 @@ static void test_esim(void)
         n = cbe_output(&esim, &channel, out, sizeof out);
         CHECK(n && channel == 1 && out[4] == 0xe5 && out[5] == 9 && out[6] == 4 && cbd_rd16(out + 9) == 0x1003);
         const uint8_t *info = cbd_find(out + 6, n - 6, 1, &len);
-        CHECK(info && len == 9 && !info[1] && cbd_rd32(info + 3) == 0x78563412 && !info[7] && !info[8]);
+        CHECK(info && len == 11 && !cbd_rd16(info + 1) && !cbd_rd16(info + 3) && cbd_rd32(info + 5) == 0x78563412 && !info[9] && !info[10]);
         const uint8_t *data = cbd_find(out + 6, n - 6, 0x10, &len);
         CHECK(data && len == 4 + (index ? 5 : 1500) && cbd_rd16(data) == 2 && cbd_rd16(data + 2) == index);
         CHECK(data && !memcmp(data + 4, der + index * 1500, index ? 5 : 1500));
@@ -601,6 +636,38 @@ static void test_esim(void)
     struct cbe_seg segments[8];
     CHECK(cbe_segments(bpp, sizeof bpp, segments, 8) == 7);
     for (unsigned i = 0; i < 7; i++) CHECK(segments[i].off == offsets[i] && segments[i].len == lengths[i]);
+
+    /* Challenge/authenticate reuse the same channel until LoadBoundProfilePackage completes. */
+    const uint8_t session_der[] = { 0xbf, 0x2e, 0 };
+    esim_reset(); esim_tape_command(CBE_TAPE_CHALLENGE, 9, session_der, sizeof session_der, 1, 0, 2);
+    esim_open();
+    esim_apdu_response(6007, session_der, sizeof session_der, 0x90, 0);
+    CHECK(esim.session && esim.channel_open && esim.freeze && esim.step == CBE_S_IDLE && esim.done_pending);
+    n = cbe_output(&esim, &channel, out, sizeof out);
+    CHECK(n && !esim.done_pending);
+    /* A different client's queued command cannot take the lease. */
+    esim_tape_command(1, 10, session_der, sizeof session_der, 1, 0, 6008);
+    cbe_tick(&esim, 6008); CHECK(esim.step == CBE_S_IDLE && esim.active < 0 && !esim.req_len);
+    esim_tape_command(CBE_TAPE_AUTHENTICATE, 9, session_der, sizeof session_der, 1, 0, 6009);
+    cbe_tick(&esim, 6009);
+    CHECK(esim.step == CBE_S_APDU && esim.wait_msg == CBE_UIM_SEND_APDU && esim.switches == 1 && esim.channel_id == 1);
+    esim_apdu_response(6010, session_der, sizeof session_der, 0x90, 0);
+    CHECK(esim.session && esim.step == CBE_S_IDLE);
+    n = cbe_output(&esim, &channel, out, sizeof out); CHECK(n);
+    esim_tape_command(CBE_TAPE_LOAD_BPP, 9, session_der, sizeof session_der, 1, 0, 6011);
+    cbe_tick(&esim, 6011); CHECK(esim.step == CBE_S_APDU && esim.switches == 1);
+    esim_apdu_response(6012, session_der, sizeof session_der, 0x90, 0);
+    CHECK(!esim.session && esim.step == CBE_S_CLOSE);
+    esim_restore(6013);
+    CHECK(esim.switches == 2 && !esim.channel_open && !esim.freeze);
+
+    /* A lease with no next command times out through close + restore, not a stuck UIM freeze. */
+    esim_reset(); esim_tape_command(CBE_TAPE_CHALLENGE, 9, session_der, sizeof session_der, 1, 0, 2);
+    esim_open(); esim_apdu_response(6007, session_der, sizeof session_der, 0x90, 0);
+    n = cbe_output(&esim, &channel, out, sizeof out); CHECK(n);
+    cbe_tick(&esim, 6007 + CBE_SESSION_IDLE_MS);
+    CHECK(!esim.session && esim.step == CBE_S_CLOSE);
+    esim_restore(6008 + CBE_SESSION_IDLE_MS);
 
     /* A timed-out APDU still closes and restores; its late response cannot complete the close. */
     const uint8_t small[] = { 0xbf, 0x20, 0 };

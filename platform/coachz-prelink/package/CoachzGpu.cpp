@@ -440,10 +440,10 @@ void stampReport() {
     }
     reported = done;
     if (!n) return;
-    printf("COACHZ gpu path: kernel submit mean %llu max %llu us over %llu; fence waits %llu mean %llu max %llu us; gop waits %llu done %llu mean %llu max %llu us\n",
+    printf("COACHZ gpu path: kernel submit mean %llu max %llu us over %llu; fence waits %llu mean %llu max %llu us; gop waits %llu timeouts %llu timeout mean %llu max %llu us req %llu ms\n",
         native_adreno_submit_cost[0] ? native_adreno_submit_cost[1] * 10 / 192 / native_adreno_submit_cost[0] : 0, native_adreno_submit_cost[2] * 10 / 192, native_adreno_submit_cost[0],
         native_adreno_wait_outer[0], native_adreno_wait_outer[0] ? native_adreno_wait_outer[1] / native_adreno_wait_outer[0] : 0, native_adreno_wait_outer[3],
-        native_gop_wait_stats[0], native_gop_wait_stats[1], native_gop_wait_stats[1] ? native_gop_wait_stats[6] / native_gop_wait_stats[1] / 1000 : 0, native_gop_wait_stats[5] / 1000);
+        native_gop_wait_stats[0], native_gop_wait_stats[1], native_gop_wait_stats[1] ? native_gop_wait_stats[6] / native_gop_wait_stats[1] / 1000 : 0, native_gop_wait_stats[5] / 1000, native_gop_wait_stats[2]);
     printf("COACHZ gpu stamps: %u submissions, queue mean %llu max %llu us, gpu mean %llu max %llu us, gpu <1 %u <2 %u <4 %u <8 %u <16 %u <32 %u more %u ms\n", n, queue / n, queueMax, gpu / n, gpuMax,
         bins[0], bins[1], bins[2], bins[3], bins[4], bins[5], bins[6]);
 }
