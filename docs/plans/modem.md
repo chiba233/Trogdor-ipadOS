@@ -152,7 +152,6 @@ b9 用 drivers/RamBlock/coachz_modem.c 按上面的顺序接入，在 Wi-Fi 线�
 - 失效的卡在任何网络上都只得到紧急服务，拒绝原因 15（EMM #15）；同一张卡在 Debian 下也注册不上。
 
 接下来的卡点：
-- **LTE 掉线**：k151 上 LTE 反复掉线再恢复。
 - **蜂窝数据**：数据口设置已被接受；要看 `BindMuxDataPort` 的应答，之后才是 `pdp_ip` 接 `rmnet_ipa0`。蜂窝数据和数据漫游默认关闭，开数据通路前先确认。
 - **eSIM**：在 UIM 0x2f 应答里补 TLV 0x21，VINYL 0xe5 的 Tape 请求转成 UIM 逻辑通道上对 ISD-R 的 APDU。
 - **EFS 持久化**：modem 的写入只留在内核内存里，重启后从 FSG 重建。
@@ -163,6 +162,14 @@ b9 用 drivers/RamBlock/coachz_modem.c 按上面的顺序接入，在 Wi-Fi 线�
 - 反汇编确认两条原因：匹配要用 IMSI，指示里只有 ICCID；`createActivationStringFromData` 把 ICCID 字节按十六进制原样转成字符串、去掉末尾的 F，要的是阅读顺序的 BCD，而 EF_ICCID 每两位是对调存的。
 - k151：ICCID 对调回阅读顺序；CommCenter 开机自己读 EF_IMSI（9 字节），桥接层把应答接下来，解出 15 位数字，按阅读顺序打成 8 字节、末尾补 F，作为 TLV 0x43 放进激活指示。两个值都取自卡本身，日志里不打印。
 - 上机：状态栏显示运营商名、信号格和 LTE 标志，控制中心的蜂窝数据开关打开。LTE 反复掉线，过一会儿又回到 LTE，原因在查。APN 设置和实际数据收发还没确认。
+
+### 第九次上机（运营商配置文件推送）
+
+- LTE 掉线来自一个循环：SIM 匹配到运营商包后，CommCenter（QMIBasebandSettingsDriver）把包里的 PRI（DER，9 段）和 GRI（XML，43 段）用 BSP 0xa000 推给基带，每段 1024 字节，TLV 0x01 是 {u16 文件类型，u16 段号，u16 总段数，数据}；再用 SetConfig 0xe00d 发 IMSI 切换和多 PDN 两项设置，然后重启基带让配置生效。桥接层回“不支持”，配置缓存不下来，每次上线都推送、重启，约 12 s 一轮。
+- 每段的应答要带 TLV 0x40 ExpectedSegmentInfo，即下一段段号，否则记 `Next segment numbers are not matching`；最后一段之后要由基带发 FileTransferStatus 指示 0xa001（TLV 0x01 {u8 文件类型，u8 结果，0 为成功}，TLV 0x10 订阅号 1），否则等 22 s 判失败。桥接层照此收下文件后丢弃，跟 sahara 推来的镜像一样。
+- 上机：推了两轮后 CommCenter 记 `Cached PRI file configuration is same as the one intended to be pushed, bailing out`，之后没有再重启，LTE 保持注册（只观察了约半分钟）。两轮的事务结果仍记 `kTransactionFailed`，原因没查。
+- 软重启前那 12 s 是 ABM 发 BSP 0xe001 后等复位检测，跟 ABP 的 `bootstage` 属性无关；`bootstage` 只有 `SafeResetModemLegacy` 读，读不到时走最快的路径，发布一个在线值反而会轮询 reset 和 wake。
+- 数据上下文仍然没有分配，CommCenter 记 `kDataNotSupported{context is not assigned}`。
 
 ### eSIM Tape 实现（待实机）
 

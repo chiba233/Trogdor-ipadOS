@@ -451,6 +451,30 @@ static int bb_private_answer(uint32_t channel, const struct cbq_result &r, const
     if (n != CBE_DEFERRED) bb_push(channel, bb_out, n);
     return 1;
   }
+  // Carrier bundle files (coachz_bb_data.h): accepted and dropped, each segment acknowledged with the next segment number.
+  if (r.service == CBD_SVC_BSP && message == CBD_BSP_SEND_FILE) {
+    struct cbd_file_segment f;
+    if (!cbd_bsp_file_segment(sdu, r.len, &f)) return 0;
+    uint8_t tlvs[8];
+    const uint32_t t = cbd_bsp_file_answer(&f, tlvs, sizeof tlvs);
+    const uint32_t n = cbq_private_answer(sdu, r.service, r.cid, 0, tlvs, t, bb_out, sizeof bb_out);
+    if (n) bb_push(channel, bb_out, n);
+    if (f.segment + 1u == f.count) {
+      // The file is complete: report it received as an Apple modem does (FileTransferStatus), or CommCenter times out after 22 s.
+      uint8_t done[12];
+      const uint32_t d = cbd_bsp_file_done(&f, done, sizeof done);
+      const uint32_t m = cbq_private_indication(CBD_BSP_FILE_TRANSFER_STATUS, r.service, r.cid, done, d, bb_out, sizeof bb_out);
+      if (m) bb_push(channel, bb_out, m);
+      printf("COACHZ baseband: carrier file type %u taken (%u segments, last %u bytes), dropped, transfer status sent\n", f.type, f.count, f.bytes);
+    }
+    return 1;
+  }
+  if (r.service == CBD_SVC_BSP && message == CBD_BSP_SET_CONFIG) {
+    const uint32_t n = cbq_private_answer(sdu, r.service, r.cid, 0, nullptr, 0, bb_out, sizeof bb_out);
+    if (n) bb_push(channel, bb_out, n);
+    printf("COACHZ baseband: baseband config (SetConfig) taken\n");
+    return 1;
+  }
   if (r.service == CBD_SVC_BSP && message == CBD_BSP_ACTIVATION_REGISTER) {
     const uint32_t n = cbq_private_answer(sdu, r.service, r.cid, 0, 0, 0, bb_out, sizeof bb_out);
     if (n) bb_push(channel, bb_out, n);

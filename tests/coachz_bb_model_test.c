@@ -453,6 +453,23 @@ static void test_data(void)
           tlvs[33] == 0x43 && tlvs[34] == 8 && !memcmp(tlvs + 36, imsi, 8));
     CHECK(cbd_activation_state(tlvs, sizeof tlvs, iccid, NULL) == CBD_ACTIVATION_TLVS + 13);
     CHECK(!cbd_activation_state(tlvs, CBD_ACTIVATION_SIM_TLVS - 1, iccid, imsi));
+    /* Carrier bundle file push (BSP 0xa000): segment 3 of 9 of file type 9 is answered with success and the next segment, 4. */
+    const uint8_t seg_req[] = { 0, 4, 0, 0x00, 0xa0, 13, 0, 1, 10, 0, 9, 0, 3, 0, 9, 0, 0xde, 0xad, 0xbe, 0xef };
+    struct cbd_file_segment fs;
+    CHECK(cbd_bsp_file_segment(seg_req, sizeof seg_req, &fs) && fs.type == 9 && fs.segment == 3 && fs.count == 9 && fs.bytes == 4);
+    uint8_t seg_tlv[8];
+    const uint32_t segt = cbd_bsp_file_answer(&fs, seg_tlv, sizeof seg_tlv);
+    n = cbq_private_answer(seg_req, CBD_SVC_BSP, 1, 0, seg_tlv, segt, out, sizeof out);
+    const uint8_t seg_ok[] = { 1, 24, 0, 0x80, 0xe2, 1, 2, 4, 0, 0x00, 0xa0, 12, 0, 2, 4, 0, 0, 0, 0, 0, 0x40, 2, 0, 4, 0 };
+    CHECK(n == sizeof seg_ok && !memcmp(out, seg_ok, sizeof seg_ok));
+    /* After the last segment: FileTransferStatus 0xa001 with {type 9, success} and subscription 1. */
+    uint8_t done_tlv[12];
+    const uint32_t dt = cbd_bsp_file_done(&fs, done_tlv, sizeof done_tlv);
+    n = cbq_private_indication(CBD_BSP_FILE_TRANSFER_STATUS, CBD_SVC_BSP, 1, done_tlv, dt, out, sizeof out);
+    const uint8_t done_ind[] = { 1, 21, 0, 0x80, 0xe2, 1, 4, 0, 0, 0x01, 0xa0, 9, 0, 1, 2, 0, 9, 0, 0x10, 1, 0, 1 };
+    CHECK(dt == 9 && n == sizeof done_ind && !memcmp(out, done_ind, sizeof done_ind));
+    uint8_t seg_bad[sizeof seg_req]; memcpy(seg_bad, seg_req, sizeof seg_req); seg_bad[12] = 9;   /* segment past the count */
+    CHECK(!cbd_bsp_file_segment(seg_bad, sizeof seg_bad, &fs));
     n = cbq_private_unsupported(act, 0xe5, 2, out, sizeof out);
     CHECK(n == 20 && out[4] == 0xe5 && cbq_rd16(out + 16) == 1 && cbq_rd16(out + 18) == CBQ_ERR_NOT_SUPPORTED);
     /* Two WDS clients on one mux: only modem success activates each family, and stopping IPv4 preserves IPv6. */
