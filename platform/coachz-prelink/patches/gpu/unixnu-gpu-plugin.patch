@@ -354,7 +354,7 @@
  // NMB_LOG_STDERR: also on stderr (a daemon's NSLog reaches only the unified log, which a bring-up board does not read).
  static bool logToStderr() {static bool on=getenv("NMB_LOG_STDERR")!=nullptr;return on;}
  // The GPU stack's log lines (log-gpu=1 on the boot line: the plugin sets SHENG_LOG_GPU): NSLog output, the pipeline journal. The problem notes that feed
-@@ -1020,15 +1040,31 @@
+@@ -1020,15 +1040,40 @@
  @property(nonatomic) uint32_t pvrtc;   // the PVRTC format the texture was asked for, decoded into its RGBA8 (0: none)
  - (void)replacePvrtcRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes length:(size_t)length;
  @property(nonatomic) NmbTextureDescriptor descriptor;
@@ -382,11 +382,20 @@
 +@property(nonatomic,weak) NBTexture *backing;
 +@end
 +@implementation CoachzFrame
++@end
++// One attachment/blit write. Only load-preserving private render targets can
++// narrow the mirror; every other writer keeps the full-surface contract.
++@interface CoachzFrameWrite : NSObject
++@property(nonatomic,strong) NBTexture *texture;
++@property(nonatomic) MTLScissorRect damage;
++@property(nonatomic) BOOL partial;
++@end
++@implementation CoachzFrameWrite
  @end
  // The render server counts the surfaces it textures in use while the textures live (countUse).
  static const bool gCountsSurfaceUse=!strcmp(getprogname(),"backboardd");
  // A no-copy import keeps its pages until the runtime frees it, which can be after the buffer object goes (a command buffer still using
-@@ -1281,8 +1317,9 @@
+@@ -1281,8 +1326,9 @@
  - (BOOL)isDrawable {return _descriptor.is_drawable!=0;}
  - (IOSurfaceRef)iosurface {return _surface;}
  - (NSUInteger)iosurfacePlane {return 0;}
@@ -396,7 +405,7 @@
  - (NSUInteger)bufferBytesPerRow {return _rowBytes;}
  - (id<MTLTexture>)parentTexture {return _parent;}
  - (NSUInteger)rotation {return _descriptor.rotation;}
-@@ -1295,8 +1332,9 @@
+@@ -1295,8 +1341,9 @@
  - (id<MTLTexture>)view:(NmbTexture *)handle {
   if(!handle){NBLOG(@"native-metal: texture view refused: %@",lastError());return nil;}
   NBTexture *view=[NBTexture new];view.handle=handle;NmbTextureDescriptor descriptor;nmb_texture_describe(handle,&descriptor);view.descriptor=descriptor;
@@ -406,7 +415,7 @@
   return (id<MTLTexture>)view;
  }
  - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format {
-@@ -1380,12 +1418,14 @@
+@@ -1380,12 +1427,14 @@
    sys_dcache_flush(reinterpret_cast<void *>(it->first),it->second);
    gSurfaceFlushBytes+=it->second;gTimeSurfaceFlush.add(began);
   }
@@ -424,12 +433,15 @@
   texture.buffer=buffer;texture.offset=offset;texture.rowBytes=row;return texture;
  }
  // myron: a two-plane extended-range surface ('b3a8', RGB10A8_2P_XR10) whose planes report no row bytes. IOSurfaceGetBytesPerRowOfPlane
-@@ -1454,8 +1494,12 @@
+@@ -1454,8 +1503,15 @@
   texture.buffer=self;texture.offset=offset;texture.rowBytes=row;return (id<MTLTexture>)texture;
  }
  @end
 
-+static bool coachzMirrorFrames(NmbCommandBuffer *commands,NSMutableArray *writes,NSMutableSet *owners);
++static bool coachzMirrorFrames(NmbCommandBuffer *commands,NSMutableArray *writes,NSMutableSet *owners,uint32_t guards);
++static CoachzFrameWrite *coachzTrackFramePass(NSMutableArray *,NBTexture *,MTLRenderPassAttachmentDescriptor *,bool);
++static void coachzFrameDraw(NSMutableArray *,const std::vector<MTLScissorRect> &);
++static bool coachzIsTrackedFrame(NBTexture *);
 +static void coachzTrackFrameWrite(NSMutableArray *writes,NBTexture *texture);
 +static void coachzCompleteFrameWrites(NSMutableArray *writes,bool completed,uint32_t serial);
 +static void coachzTelemetry(char *out,size_t size);
@@ -437,17 +449,135 @@
  @interface NBLibrary : NBObject
  @property(nonatomic) NmbLibrary *handle;
  @property(nonatomic,strong) id storage;          // what keeps the metallib's bytes mapped: its functions' bitcode, for stitching
-@@ -1930,8 +1974,9 @@
+@@ -1930,8 +1986,10 @@
  @property(nonatomic) uint64_t committedUs;
  @property(nonatomic) uint32_t commitIndex;
  @property(nonatomic,strong) NSMutableArray *scheduledHandlers,*completedHandlers;
  @property(nonatomic,strong) NSMutableSet *surfaces;
 +@property(nonatomic,strong) NSMutableArray *coachzFrameWrites;
++@property(nonatomic) uint32_t coachzMirrorGuards; // compute, shader-image or imported-buffer access
  // Runtime handles retain GPU storage, but only the Objective-C owner retains
  // a no-copy deallocator, its memory owner and texture/heap ancestry.
  @property(nonatomic,strong) NSMutableSet *resourceOwners;
  // The sampled sources watched for a rewrite while the GPU could read them (gWatchSources), kept alive until completion.
-@@ -2650,15 +2695,17 @@
+@@ -2301,8 +2359,9 @@
+ // Stage 0 compute, 1 vertex, 2 fragment (the bridge's numbering).
+ - (void)buffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {
+  if(buffer && ![(id)buffer isKindOfClass:[NBBuffer class]]){[_commandBuffer refuse:@"foreign buffer"];return;}
+  if(buffer)[_commandBuffer.resourceOwners addObject:buffer];
++ if(buffer && [(NBBuffer *)buffer importedSurface])_commandBuffer.coachzMirrorGuards|=4;
+  if(gDrawStats)[self noteState:kDSBuffer key:stage<<8|(uint32_t)index object:(__bridge const void *)buffer value:offset];
+  if(dumpMaybe(_commandBuffer))[self dumpBind:buffer?@[buffer,@(offset)]:nil index:index stage:stage];
+  ENCODE([self check:nmb_encoder_set_buffer(self->_handle,stage,buffer?[(NBBuffer *)buffer handle]:nullptr,offset,(uint32_t)index) what:"setBuffer"]);
+ }
+@@ -2317,8 +2376,9 @@
+            [NSString stringWithFormat:@"kernel %u texture %lu",_commandBuffer.dumpKernels,(unsigned long)index]);
+   if(_commandBuffer.dumpTargets.count>before)[_dumpEntries addObject:_commandBuffer.dumpTargets.lastObject];
+  }
+  if(texture)[_commandBuffer.resourceOwners addObject:texture];
++ if(texture && coachzIsTrackedFrame((NBTexture *)texture))_commandBuffer.coachzMirrorGuards|=2;
+  [self dumpBind:texture index:index stage:stage+4];
+  if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
+  if(texture && gWatchSources)[_commandBuffer watchTexture:(NBTexture *)texture];
+  ENCODE([self check:nmb_encoder_set_texture(self->_handle,stage,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index) what:"setTexture"]);
+@@ -2387,8 +2447,9 @@
+ - (void)setThreadgroupMemoryLength:(NSUInteger)n atIndex:(NSUInteger)i {
+  ENCODE([self check:nmb_compute_set_threadgroup_memory(self.handle,(uint32_t)n,(uint32_t)i) what:"setThreadgroupMemoryLength"]);
+ }
+ - (void)dispatch:(MTLSize)size group:(MTLSize)group threads:(bool)threads {
++ self.commandBuffer.coachzMirrorGuards|=1;
+  gDispatches++;self.commandBuffer->encodedWork.dispatches++;
+  const std::array<uint64_t,3> s={size.width,size.height,size.depth},g={group.width,group.height,group.depth};
+  ENCODE([self check:nmb_compute_dispatch(self.handle,s.data(),g.data(),threads) what:"dispatch"]);
+ }
+@@ -2396,8 +2457,9 @@
+ - (void)dispatchThreadgroups:(MTLSize)t threadsPerThreadgroup:(MTLSize)g {[self dispatch:t group:g threads:false];}
+ - (void)dispatchThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)buffer indirectBufferOffset:(NSUInteger)offset threadsPerThreadgroup:(MTLSize)group {
+  if(![(id)buffer isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign indirect buffer"];return;}
+  [self.commandBuffer.resourceOwners addObject:buffer];
++ self.commandBuffer.coachzMirrorGuards|=1;
+  gDispatches++;self.commandBuffer->encodedWork.dispatches++;
+  const std::array<uint64_t,3> g={group.width,group.height,group.depth};
+  ENCODE([self check:nmb_compute_dispatch_indirect(self.handle,[(NBBuffer *)buffer handle],offset,g.data()) what:"indirect dispatch"]);
+ }
+@@ -2406,10 +2468,14 @@
+ @end
+
+ @interface NBRenderEncoder : NBEncoder
+ @property(nonatomic) uint64_t passKey;   // colour 0 format | load << 16 | surface << 18 | big << 19
++@property(nonatomic,strong) NSMutableArray *coachzRenderWrites;
++@property(nonatomic) std::vector<MTLScissorRect> coachzScissors;
++- (void)coachzRecordDraw;
+ @end
+ @implementation NBRenderEncoder
++- (void)coachzRecordDraw {if(_coachzRenderWrites)coachzFrameDraw(_coachzRenderWrites,_coachzScissors);}
+ - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {
+  if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
+  if(dumpRange().first)self.dumpPipeline=state;
+  noteFormats(self.passKey|((uint64_t)((NBRenderPipeline *)state).stateFormat<<32));
+@@ -2469,13 +2535,15 @@
+  ENCODE([self check:nmb_render_set_viewports(self.handle,values.data(),count) what:"setViewports"]);
+ }
+ - (void)setScissorRects:(const MTLScissorRect *)r count:(NSUInteger)count {
+  if(!r || !count || count>16){[self.commandBuffer refuse:@"invalid scissor array"];return;}
++ if(_coachzRenderWrites)_coachzScissors.assign(r,r+count);
+  std::vector<uint64_t> values;values.reserve(count*4);
+  for(NSUInteger i=0;i<count;i++)values.insert(values.end(),{r[i].x,r[i].y,r[i].width,r[i].height});
+  ENCODE([self check:nmb_render_set_scissors(self.handle,values.data(),count) what:"setScissorRects"]);
+ }
+ - (void)setScissorRect:(MTLScissorRect)r {
++ if(_coachzRenderWrites)_coachzScissors={r};
+  const std::array<uint64_t,4> values={r.x,r.y,r.width,r.height};
+  if(dumpMaybe(self.commandBuffer) && dumpShown(self.dumpDraws+1))dumpLine(self.commandBuffer,[NSString stringWithFormat:@"pass %u scissor %lu,%lu %lux%lu",self.commandBuffer.dumpPasses,
+                                                  (unsigned long)r.x,(unsigned long)r.y,(unsigned long)r.width,(unsigned long)r.height]);
+  if(gDrawStats)[self noteState:kDSViewport key:1 object:nullptr value:hashBytes(values.data(),sizeof values)];
+@@ -2533,8 +2601,9 @@
+  return skip.pass && self.commandBuffer.dumpPasses==skip.pass && index>=skip.first && index<=skip.last;
+ }
+ - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b {
+  if([self skipDraw])return;
++ [self coachzRecordDraw];
+  gDraws++;self.commandBuffer->encodedWork.draws++;if(gDrawStats)[self noteDraw];
+  if(dumpMaybe(self.commandBuffer))[self dumpDraw:[NSString stringWithFormat:@"prim %lu start %lu count %lu instances %lu base %lu",(unsigned long)t,(unsigned long)s,(unsigned long)n,
+                  (unsigned long)i,(unsigned long)b]];
+  ENCODE([self check:nmb_render_draw(self.handle,t,(uint32_t)s,(uint32_t)n,(uint32_t)i,(uint32_t)b) what:"drawPrimitives"]);
+@@ -2549,8 +2618,9 @@
+                 instanceCount:(NSUInteger)i baseVertex:(NSInteger)v baseInstance:(NSUInteger)bi {
+  if(![(id)b isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign index buffer"];return;}
+  [self.commandBuffer.resourceOwners addObject:b];
+  if([self skipDraw])return;
++ [self coachzRecordDraw];
+  gDraws++;self.commandBuffer->encodedWork.draws++;if(gDrawStats)[self noteDraw];
+  if(dumpMaybe(self.commandBuffer) && dumpShown(self.dumpDraws+1)) {
+   const uint8_t *indices=(const uint8_t *)b.contents;const unsigned size=k==MTLIndexTypeUInt16?2:4;
+   NSMutableString *first=[NSMutableString string];
+@@ -2587,8 +2657,9 @@
+ - (void)patches:(NSUInteger)points start:(NSUInteger)start count:(NSUInteger)count patchIndex:(id<MTLBuffer>)pi offset:(NSUInteger)po
+           points:(id<MTLBuffer>)ci offset:(NSUInteger)co instances:(NSUInteger)instances base:(NSUInteger)base indirect:(id<MTLBuffer>)ib offset:(NSUInteger)io {
+  if(![self own:pi what:@"patch index buffer"] || ![self own:ci what:@"control point index buffer"] || ![self own:ib what:@"indirect buffer"])return;
+  if([self skipDraw])return;
++ [self coachzRecordDraw];
+  gDraws++;self.commandBuffer->encodedWork.draws++;if(gDrawStats)[self noteDraw];
+  if(dumpMaybe(self.commandBuffer))[self dumpDraw:[NSString stringWithFormat:@"patches %lu start %lu count %lu instances %lu base %lu%@",(unsigned long)points,(unsigned long)start,
+                  (unsigned long)count,(unsigned long)instances,(unsigned long)base,ib?@" indirect":@""]];
+  ENCODE([self check:nmb_render_draw_patches(self.handle,(uint32_t)points,(uint32_t)start,(uint32_t)count,pi?[(NBBuffer *)pi handle]:nullptr,po,
+@@ -2614,9 +2685,14 @@
+       indirectBufferOffset:(NSUInteger)io {
+  if(!ci || !ib){[self.commandBuffer refuse:@"nil control point index or indirect buffer"];return;}
+  [self patches:n start:0 count:0 patchIndex:pi offset:po points:ci offset:co instances:0 base:0 indirect:ib offset:io];
+ }
+-- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u stages:(MTLRenderStages)s {(void)r;(void)u;(void)s;}
++- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u stages:(MTLRenderStages)s {
++ (void)s;
++ if((u&MTLResourceUsageWrite) &&
++    (([(id)r isKindOfClass:[NBTexture class]] && coachzIsTrackedFrame((NBTexture *)r)) ||
++     ([(id)r isKindOfClass:[NBBuffer class]] && [(NBBuffer *)r importedSurface])))self.commandBuffer.coachzMirrorGuards|=8;
++}
+ - (void)updateFence:(id<MTLFence>)fence afterStages:(MTLRenderStages)stages {[self fence:fence stages:stages update:true];}
+ - (void)waitForFence:(id<MTLFence>)fence beforeStages:(MTLRenderStages)stages {[self fence:fence stages:stages update:false];}
+ @end
+
+@@ -2650,15 +2726,17 @@
  }
  - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
                toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dO {
@@ -465,7 +595,7 @@
   if(sl>s.mipmapLevelCount || nl>s.mipmapLevelCount-sl || dl>d.mipmapLevelCount || nl>d.mipmapLevelCount-dl ||
      ss>slices(s) || ns>slices(s)-ss || ds>slices(d) || ns>slices(d)-ds) {[self.commandBuffer refuse:@"texture copy range out of bounds"];return;}
   for(NSUInteger slice=0;slice<ns;slice++)for(NSUInteger level=0;level<nl;level++) {
-@@ -2669,8 +2716,9 @@
+@@ -2669,8 +2747,9 @@
   }
  }
  - (void)copyFromTexture:(id<MTLTexture>)s toTexture:(id<MTLTexture>)d {
@@ -475,7 +605,7 @@
   for(NSUInteger slice=0;slice<slices;slice++)for(NSUInteger level=0;level<levels;level++) {
    MTLSize size=MTLSizeMake(MAX(s.width>>level,(NSUInteger)1),MAX(s.height>>level,(NSUInteger)1),MAX(s.depth>>level,(NSUInteger)1));
    [self copyFromTexture:s sourceSlice:slice sourceLevel:level sourceOrigin:MTLOriginMake(0,0,0) sourceSize:size toTexture:d destinationSlice:slice
-@@ -2680,8 +2728,9 @@
+@@ -2680,8 +2759,9 @@
  - (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)o sourceBytesPerRow:(NSUInteger)row sourceBytesPerImage:(NSUInteger)image
              sourceSize:(MTLSize)z toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level
       destinationOrigin:(MTLOrigin)dO {
@@ -485,7 +615,7 @@
    const NmbTextureDescriptor t=[(NBTexture *)d descriptor];
    GLOG(@"native-metal: texture-log %llu bufferToTexture size %lux%lu origin %lu,%lu level %lu slice %lu | rows %lu image %lu offset %lu "
          @"buffer %lu%s | texture %llux%llu fmt %llu options %llx",(unsigned long long)gTexturesLogged.load(),(unsigned long)z.width,
-@@ -2894,9 +2943,9 @@
+@@ -2894,9 +2974,9 @@
  }
  // iPadOS 27: QuartzCore names the tasks a command buffer works for (GPU time attribution), on every buffer; there is no such accounting here.
  - (void)setResponsibleTaskIDs:(const void *)ids count:(NSUInteger)count {(void)ids;(void)count;}
@@ -496,7 +626,7 @@
   return self;
  }
  - (void)dealloc {nmb_command_buffer_release(_handle);}
-@@ -2983,9 +3032,22 @@
+@@ -2983,11 +3063,25 @@
   gBlits++;encodedWork.blits++;
   NmbCommandBuffer *handle=_handle;
   return [self encoder:[NBBlitEncoder new] make:^{return nmb_blit_encoder_new(handle);} what:@"blitCommandEncoder"];
@@ -517,14 +647,18 @@
 + coachzPassTally(d);
   NmbRenderPassDescriptor pass={};
   std::vector<SingleSampleCopy> resolveCopies;
++ NSMutableArray *frameRenderWrites=nil;
   _dumpPasses++;
   if(dumpMaybe(self)) {
-@@ -3027,14 +3089,16 @@
+   if(!_dumpTargets)_dumpTargets=[NSMutableArray array];
+   _dumpPending=[NSMutableArray array];
+@@ -3027,14 +3121,17 @@
   auto attachment=[&](MTLRenderPassAttachmentDescriptor *a,NmbPassAttachment &out)->bool {
    if(!a.texture)return true;
    if(![(id)a.texture isKindOfClass:[NBTexture class]])return false;
    NBTexture *texture=(NBTexture *)a.texture;if(texture.surface)[_surfaces addObject:texture];
-+  coachzTrackFrameWrite(_coachzFrameWrites,texture);
++  CoachzFrameWrite *write=coachzTrackFramePass(_coachzFrameWrites,texture,a,d.renderTargetArrayLength<=1);
++  if(write.partial){if(!frameRenderWrites)frameRenderWrites=[NSMutableArray array];[frameRenderWrites addObject:write];}
    [_resourceOwners addObject:texture];
    out.texture=texture.handle;out.level=a.level;out.slice=a.slice;out.depth_plane=a.depthPlane;out.load=a.loadAction;out.store=a.storeAction;
    if(a.resolveTexture) {
@@ -536,7 +670,18 @@
     if(singleSample()) {
      if(resolves) {
       if(a.loadAction!=MTLLoadActionLoad && a.storeAction==MTLStoreActionMultisampleResolve) {
-@@ -3119,8 +3183,10 @@
+@@ -3074,8 +3171,10 @@
+  NmbCommandBuffer *handle=_handle;
+  id<MTLRenderCommandEncoder> made=[self encoder:[NBRenderEncoder new] make:^{return nmb_render_encoder_new(handle,&pass);} what:@"renderCommandEncoder"];
+  if(made) {
+   ((NBRenderEncoder *)made).resolveCopies=std::move(resolveCopies);
++  ((NBRenderEncoder *)made).coachzRenderWrites=frameRenderWrites;
++  if(frameRenderWrites)((NBRenderEncoder *)made).coachzScissors={{0,0,SIZE_MAX,SIZE_MAX}};
+   id<MTLTexture> t0=d.colorAttachments[0].texture;
+   const uint64_t big=t0 && (uint64_t)t0.width*t0.height>=2000000;
+   ((NBRenderEncoder *)made).passKey=(t0?(uint64_t)t0.pixelFormat:0)|((uint64_t)d.colorAttachments[0].loadAction<<16)|
+    (uint64_t)([(id)t0 isKindOfClass:[NBTexture class]] && ((NBTexture *)t0).surface?1:0)<<18|big<<19;
+@@ -3119,8 +3218,10 @@
  }
  // After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
  - (void)finish {
@@ -547,7 +692,7 @@
   // release point. A retained completed command must not pin every old frame.
   [_surfaces removeAllObjects];[_resourceOwners removeAllObjects];
   @synchronized(gInFlight){[gInFlight removeObject:self];}
-@@ -3153,8 +3219,14 @@
+@@ -3153,8 +3254,14 @@
    watched.clear();[_sampled removeAllObjects];
   }
   // The runtime reports Vulkan's DeviceLost as Metal's code 11 (see -error).
@@ -562,18 +707,18 @@
    for(MTLCommandBufferHandler block in completedHandlers)block((id<MTLCommandBuffer>)self);
    dispatch_group_leave(self->_handlers);
    if(lost)endRenderServerAfterGpuLoss();
-@@ -3181,8 +3253,10 @@
+@@ -3181,8 +3288,10 @@
   encodeFlush();
  }
  // The runtime's half of a commit, on the encoding thread after the command buffer's encoders.
  - (void)submit {
-+ if(!self.encodeFailure && !coachzMirrorFrames(_handle,_coachzFrameWrites,_resourceOwners))
++ if(!self.encodeFailure && !coachzMirrorFrames(_handle,_coachzFrameWrites,_resourceOwners,self.coachzMirrorGuards))
 +  [self refuse:[@"frame writeback: " stringByAppendingString:lastError()]];
   if(!self.encodeFailure) {
    flushSurfaces(_surfaces);
    if(gLogTextures)dumpSurfacesOnce(_surfaces,_resourceOwners);
    for(WatchedSource &source:watched){source.hash=hashSource(source.bytes,source.length);gSourcesWatched[source.surface]++;}
-@@ -4146,10 +4220,431 @@
+@@ -4146,10 +4255,500 @@
   gNoCopyAll++;if(context)gNoCopyMade++;
   NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;buffer.wrapped=pointer;
   return (id<MTLBuffer>)buffer;
@@ -607,6 +752,9 @@
 +static std::atomic<uint64_t> gCoachzSeedStarted,gCoachzSeedBusy,gCoachzSeedRaced,gCoachzSeedShape,gCoachzViewRefused;
 +static std::atomic<uint64_t> gCoachzPlaneRefused,gCoachzPrivateRefused,gCoachzSeedMismatch,gCoachzReused;
 +static std::atomic<uint64_t> gCoachzSeedEncodeFailed,gCoachzSeedCompleteFailed;
++static std::atomic<uint64_t> gCoachzPartialMirrors,gCoachzEmptyMirrors,gCoachzMirrorSaved;
++static std::atomic<uint64_t> gCoachzDamageLoad,gCoachzDamageFull,gCoachzGuardedMirrors;
++static std::atomic<uint32_t> gCoachzMirrorGuardMask;
 +// Preserve the actual creation failure outside the 48-row telemetry table. The
 +// first plane failure used to be hidden behind later, unrelated warning rows.
 +static void coachzFrameFailure(unsigned stage,uint64_t count,NSString *why) {
@@ -691,7 +839,7 @@
 + return plane;
 +}
 +extern "C" id native_bridge_metal_library_with_air(const void *,size_t);
-+static bool coachzFrameTransfer(NmbCommandBuffer *commands,NBTexture *source,NBTexture *target,bool intoPrivate,NSMutableSet *owners) {
++static bool coachzFrameTransfer(NmbCommandBuffer *commands,NBTexture *source,NBTexture *target,bool intoPrivate,NSMutableSet *owners,const MTLScissorRect *written=nullptr) {
 + if(!commands || !source || !target || source.width!=target.height || source.height!=target.width)return false;
 + static std::mutex stateLock;
 + static NBRenderPipeline *pipelines[2];
@@ -723,11 +871,15 @@
 + [owners addObject:source];[owners addObject:target];
 + NmbRenderPassDescriptor pass={};
 + pass.width=target.width;pass.height=target.height;pass.array_length=1;pass.samples=1;
-+ pass.colors[0].texture=target.handle;pass.colors[0].load=MTLLoadActionDontCare;pass.colors[0].store=MTLStoreActionStore;
++ const bool clipped=written && (written->x || written->y || written->width!=target.width || written->height!=target.height);
++ pass.colors[0].texture=target.handle;
++ // A partial rotated mirror must preserve pixels outside its scissor too.
++ pass.colors[0].load=clipped?MTLLoadActionLoad:MTLLoadActionDontCare;pass.colors[0].store=MTLStoreActionStore;
 + NmbEncoder *encoder=nmb_render_encoder_new(commands,&pass);
 + if(!encoder){noteProblem([@"frame transfer encoder: " stringByAppendingString:lastError()]);return false;}
 + const double viewport[6]={0,0,(double)target.width,(double)target.height,0,1};
-+ const uint64_t scissor[4]={0,0,target.width,target.height};
++ const uint64_t scissor[4]={written?written->x:0,written?written->y:0,
++  written?written->width:target.width,written?written->height:target.height};
 + const bool ok=nmb_render_set_pipeline(encoder,pipeline.handle) &&
 +  nmb_render_set_viewport(encoder,viewport) && nmb_render_set_scissor(encoder,scissor) &&
 +  nmb_render_set_raster(encoder,MTLCullModeNone,MTLWindingClockwise,MTLTriangleFillModeFill) &&
@@ -907,7 +1059,10 @@
 + row("CZ orient straight%llu turned%llu mismatch%llu conflict%llu",(unsigned long long)gCoachzStraightShown.load(),
 +  (unsigned long long)gCoachzTurnedShown.load(),(unsigned long long)gCoachzFrameMismatch.load(),(unsigned long long)gCoachzViewConflict.load());
 + row("CZ frame writer private%llu plain%llu viewRefused%llu",(unsigned long long)gCoachzPrivateWrites.load(),(unsigned long long)gCoachzPlainWrites.load(),(unsigned long long)gCoachzViewRefused.load());
-+ row("CZ mirror n%llu bytes%llu",(unsigned long long)gCoachzMirrors.load(),(unsigned long long)gCoachzMirrorBytes.load());
++ row("CZ mirror n%llu bytes%llu part%llu skip%llu save%llu",(unsigned long long)gCoachzMirrors.load(),(unsigned long long)gCoachzMirrorBytes.load(),
++  (unsigned long long)gCoachzPartialMirrors.load(),(unsigned long long)gCoachzEmptyMirrors.load(),(unsigned long long)gCoachzMirrorSaved.load());
++ row("CZ damage load%llu full%llu guarded%llu mask%x",(unsigned long long)gCoachzDamageLoad.load(),
++  (unsigned long long)gCoachzDamageFull.load(),(unsigned long long)gCoachzGuardedMirrors.load(),gCoachzMirrorGuardMask.load());
 + row("CZ pass %llu MPix direct %llu private %llu surface %llu buffer %llu",(unsigned long long)gCoachzPasses.load(),
 +  (unsigned long long)(gCoachzDirectPixels.load()/1000000),(unsigned long long)(gCoachzPrivate.load()/1000000),
 +  (unsigned long long)(gCoachzSurface.load()/1000000),(unsigned long long)(gCoachzBuffer.load()/1000000));
@@ -950,15 +1105,48 @@
 + uint8_t *base=(uint8_t *)IOSurfaceGetBaseAddress(surface);
 + return base && at!=SIZE_MAX?coachzFrameOf(surface,(volatile uint64_t *)(base+at)):nil;
 +}
-+static void coachzTrackFrameWrite(NSMutableArray *writes,NBTexture *texture) {
++static bool coachzIsTrackedFrame(NBTexture *texture) {
 + NBTexture *root=nil;os_unfair_lock_lock(&gCoachzFrameLock);
 + const bool tracked=coachzFrameForWrite(texture,&root)!=nil;
++ os_unfair_lock_unlock(&gCoachzFrameLock);return tracked;
++}
++static CoachzFrameWrite *coachzAddFrameWrite(NSMutableArray *writes,NBTexture *texture) {
++ if(!coachzIsTrackedFrame(texture))return nil;
++ CoachzFrameWrite *write=[CoachzFrameWrite new];write.texture=texture;
++ [writes addObject:write];return write;
++}
++static void coachzTrackFrameWrite(NSMutableArray *writes,NBTexture *texture) {(void)coachzAddFrameWrite(writes,texture);}
++static CoachzFrameWrite *coachzTrackFramePass(NSMutableArray *writes,NBTexture *texture,MTLRenderPassAttachmentDescriptor *a,bool singleLayer) {
++ CoachzFrameWrite *write=coachzAddFrameWrite(writes,texture);if(!write)return nil;
++ NBTexture *root=nil;os_unfair_lock_lock(&gCoachzFrameLock);
++ CoachzFrame *frame=coachzFrameForWrite(texture,&root);
++ const bool resident=frame.valid && root==frame.texture && texture.coachzDirect;
 + os_unfair_lock_unlock(&gCoachzFrameLock);
-+ if(tracked)[writes addObject:texture];
++ write.partial=resident && singleLayer && a.loadAction==MTLLoadActionLoad && a.storeAction==MTLStoreActionStore && !a.resolveTexture &&
++  a.level==0 && a.slice==0 && a.depthPlane==0 && texture.width==root.width && texture.height==root.height &&
++  root.mipmapLevelCount==1 && root.arrayLength==1 && root.sampleCount==1;
++ (write.partial?gCoachzDamageLoad:gCoachzDamageFull)++;
++ return write;
++}
++// Clip first, so even an invalid caller rectangle cannot overflow an end coordinate.
++// The runtime still validates the actual scissor; a refused command never publishes pixels.
++static MTLScissorRect coachzClipDamage(MTLScissorRect r,NSUInteger width,NSUInteger height) {
++ if(r.x>=width || r.y>=height)return {0,0,0,0};
++ r.width=std::min(r.width,width-r.x);r.height=std::min(r.height,height-r.y);return r;
++}
++static MTLScissorRect coachzUnionDamage(MTLScissorRect a,MTLScissorRect b) {
++ if(!b.width || !b.height)return a;if(!a.width || !a.height)return b;
++ const NSUInteger x=std::min(a.x,b.x),y=std::min(a.y,b.y);
++ return {x,y,std::max(a.x+a.width,b.x+b.width)-x,std::max(a.y+a.height,b.y+b.height)-y};
++}
++static void coachzFrameDraw(NSMutableArray *writes,const std::vector<MTLScissorRect> &scissors) {
++ for(CoachzFrameWrite *write in writes)for(const MTLScissorRect &r:scissors)
++  write.damage=coachzUnionDamage(write.damage,coachzClipDamage(r,write.texture.width,write.texture.height));
 +}
 +static void coachzCompleteFrameWrites(NSMutableArray *writes,bool completed,uint32_t serial) {
 + os_unfair_lock_lock(&gCoachzFrameLock);
-+ for(NBTexture *view in writes) {
++ for(CoachzFrameWrite *write in writes) {
++  NBTexture *view=write.texture;
 +  NBTexture *root=nil;CoachzFrame *frame=coachzFrameForWrite(view,&root);
 +  if(!frame || (int32_t)(serial-frame.writeSerial)<0)continue;
 +  frame.writeSerial=serial;
@@ -968,32 +1156,58 @@
 + }
 + os_unfair_lock_unlock(&gCoachzFrameLock);
 +}
-+static bool coachzMirrorFrames(NmbCommandBuffer *commands,NSMutableArray *surfaces,NSMutableSet *owners) {
++static bool coachzMirrorFrames(NmbCommandBuffer *commands,NSMutableArray *surfaces,NSMutableSet *owners,uint32_t guards) {
 + NSMutableSet *seen=[NSMutableSet set];
 + NmbEncoder *blit=nullptr;bool ok=true;
 + // Only the last writer to a surface determines the direction of synchronization.
-+ for(NBTexture *view in surfaces.reverseObjectEnumerator) {
-+  NBTexture *root=nil,*resident=nil,*backing=nil;uint32_t surfaceID=0;bool turned=false;
++ for(CoachzFrameWrite *write in surfaces.reverseObjectEnumerator) {
++  NBTexture *view=write.texture;
++  NBTexture *root=nil,*resident=nil,*backing=nil;uint32_t surfaceID=0;bool turned=false,valid=false;
 +  os_unfair_lock_lock(&gCoachzFrameLock);
 +  CoachzFrame *frame=coachzFrameForWrite(view,&root);
-+  resident=frame.texture;backing=frame.backing;surfaceID=frame.surfaceID;turned=frame.turned;
++  resident=frame.texture;backing=frame.backing;surfaceID=frame.surfaceID;turned=frame.turned;valid=frame.valid;
 +  os_unfair_lock_unlock(&gCoachzFrameLock);
 +  if(!frame || !resident || !backing || [seen containsObject:@(surfaceID)])continue;
 +  [seen addObject:@(surfaceID)];
 +  NBTexture *source=(view.coachzDirect && root==resident)?resident:backing;
 +  NBTexture *target=source==resident?backing:resident;
++  const uint64_t fullBytes=(uint64_t)resident.width*resident.height*4;
++  MTLScissorRect damage={0,0,resident.width,resident.height};
++  bool partial=!guards && valid && source==resident;
++  if(guards){gCoachzGuardedMirrors++;gCoachzMirrorGuardMask.fetch_or(guards);}
++  if(partial) {
++   damage={0,0,0,0};
++   // A command may have several passes/writers. Union all, never just the last
++   // scissor. Any unbounded writer or other representation restores a full copy.
++   for(CoachzFrameWrite *other in surfaces) {
++    NBTexture *t=other.texture;
++    if(!t.surface || IOSurfaceGetID(t.surface)!=surfaceID)continue;
++    NBTexture *r=t;while(r.parent)r=(NBTexture *)r.parent;
++    if(!other.partial || !t.coachzDirect || r!=resident){partial=false;break;}
++    damage=coachzUnionDamage(damage,coachzClipDamage(other.damage,resident.width,resident.height));
++   }
++   if(!partial)damage={0,0,resident.width,resident.height};
++  }
++  if(!damage.width || !damage.height){gCoachzEmptyMirrors++;gCoachzMirrorSaved+=fullBytes;continue;}
++  const uint64_t bytes=(uint64_t)damage.width*damage.height*4;
 +  if(turned) {
 +   if(blit){ok=nmb_encoder_end(blit);blit=nullptr;if(!ok)break;}
-+   if(!coachzFrameTransfer(commands,source,target,target==resident,owners)){ok=false;break;}
++   // plane(y, W-1-x) = private(x,y): rotate only the target scissor,
++   // keeping the full viewport/UV transform and nearest sampling unchanged.
++   MTLScissorRect targetDamage=damage;
++   if(source==resident)targetDamage={damage.y,resident.width-damage.x-damage.width,damage.height,damage.width};
++   else targetDamage={0,0,target.width,target.height};
++   if(!coachzFrameTransfer(commands,source,target,target==resident,owners,&targetDamage)){ok=false;break;}
 +  } else {
 +   if(source.width!=target.width || source.height!=target.height){ok=false;break;}
 +   if(!blit)blit=nmb_blit_encoder_new(commands);
 +   if(!blit){ok=false;break;}
 +   [owners addObject:source];[owners addObject:target];
-+   const uint64_t origin[3]={0,0,0},size[3]={resident.width,resident.height,1};
++   const uint64_t origin[3]={damage.x,damage.y,0},size[3]={damage.width,damage.height,1};
 +   if(!nmb_blit_copy_texture(blit,source.handle,0,0,origin,size,target.handle,0,0,origin)){ok=false;break;}
 +  }
-+  gCoachzMirrors++;gCoachzMirrorBytes+=(uint64_t)resident.width*resident.height*4;
++  gCoachzMirrors++;gCoachzMirrorBytes+=bytes;
++  if(bytes<fullBytes){gCoachzPartialMirrors++;gCoachzMirrorSaved+=fullBytes-bytes;}
 + }
 + if(blit && !nmb_encoder_end(blit))ok=false;
 + return ok;
@@ -1005,7 +1219,7 @@
   if(gLogTextures && textureLogTurn())
    GLOG(@"native-metal: texture-log %llu texture %llux%llu fmt %llu type %llu levels %llu usage %llx options %llx %s",
          (unsigned long long)gTexturesLogged.load(),(unsigned long long)descriptor.width,(unsigned long long)descriptor.height,
-@@ -4162,8 +4657,9 @@
+@@ -4162,8 +4761,9 @@
  }
  // The surface's pages are the texels: its mapping in this process is imported without a copy (pinned by the kernel, mapped into the GPU's
  // 4 KiB context by Turnip), so every process that imports the surface renders and samples the same memory.
@@ -1015,7 +1229,7 @@
   // the plane's own address and rows. Only a plain surface has no planes, and then only plane 0 exists.
   const size_t planes=surface?IOSurfaceGetPlaneCount(surface):0;
   if(!surface || !d || (planes?plane>=planes:plane!=0)){refuseSurface(1,surface,d,plane,0,0);return nil;}
-@@ -4175,14 +4671,20 @@
+@@ -4175,14 +4775,20 @@
   size_t row=planes?IOSurfaceGetBytesPerRowOfPlane(surface,plane):IOSurfaceGetBytesPerRow(surface);
   size_t computed[4];   // myron: a 'b3a8' surface without plane rows
   if(!row && plane<2 && b3a8Planes(surface,allocation,computed)){start=(uintptr_t)base+computed[plane*2];row=computed[plane*2+1];}
@@ -1037,7 +1251,7 @@
  - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {
   const void *bytes=nullptr;size_t size=0;dispatch_data_t mapped=dispatch_data_create_map(data,&bytes,&size);
   const uint64_t libraryBegan=nowUs();
-@@ -4568,8 +5070,30 @@
+@@ -4568,8 +5174,30 @@
   return gDeviceObject;
  }
 
@@ -1068,7 +1282,7 @@
   NmbLibrary *handle=gDevice?nmb_library_new(gDevice,bytes,length,true):nullptr;if(!handle)return nil;
   NBLibrary *library=[NBLibrary new];library.handle=handle;return library;
  }
-@@ -4678,8 +5202,9 @@
+@@ -4678,8 +5306,9 @@
  }
  // The telemetry table the plugin streams to the kernel's log: newline-separated rows of at most 90 characters.
  extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
@@ -1078,7 +1292,7 @@
    char text[200];int n=snprintf(text,sizeof text,format,args...);if(n<=0)return;if(n>90)n=90;
    if(at+(size_t)n+2>=size)return;memcpy(out+at,text,(size_t)n);at+=(size_t)n;out[at++]='\n';out[at]=0;};
   auto ms=[](uint64_t us){return (unsigned long long)(us/1000);};
-@@ -4747,8 +5272,16 @@
+@@ -4747,8 +5376,16 @@
    uint64_t tc[8]={};
    if(nmb_device_texture_counts(gDevice,tc))
     row("L inp %llu/%llu rf %llu/%llu sh %llu cp %llu bk %llu rt %llu",(unsigned long long)tc[0],(unsigned long long)tc[1],(unsigned long long)tc[2],
@@ -1095,7 +1309,7 @@
    {
     std::lock_guard<std::mutex> lock(gUnalignedLock);
     if(gUnalignedCount)
-@@ -4823,10 +5356,8 @@
+@@ -4823,10 +5460,8 @@
       frames[3],frames[4]);
      row("MA%zub %s %s %s %s %s",i,frames[5],frames[6],frames[7],frames[8],frames[9]);
     }

@@ -429,7 +429,7 @@ diff --git a/patches/mesa/turnip-coachz-diagnostics.patch b/patches/mesa/turnip-
 new file mode 100644
 --- /dev/null
 +++ b/patches/mesa/turnip-coachz-diagnostics.patch
-@@ -0,0 +1,275 @@
+@@ -0,0 +1,358 @@
 +diff --git a/src/freedreno/fdl/fd6_layout.c b/src/freedreno/fdl/fd6_layout.c
 +--- a/src/freedreno/fdl/fd6_layout.c
 ++++ b/src/freedreno/fdl/fd6_layout.c
@@ -673,7 +673,90 @@ new file mode 100644
 +       }
 +       NativeAdrenoAbiBoCpuUnmap undo = {.handle = handle, .token = *token};
 +       kern_return_t kr = dw_call(NativeAdrenoMethodBoCpuUnmap, &undo, sizeof(undo), NULL, 0);
-+@@ -1516,8 +1610,17 @@
++@@ -1401,10 +1495,11 @@
++    }
++    return n;
++ }
++
++-/* One kernel submission of up to NativeAdrenoAbiMaxBuffers indirect buffers; while the kernel's ring has no room (kIOReturnBusy, as msm
++- * waits for ring space) it waits for this client's oldest job, or yields when none is in flight. */
+++/* A Busy reply publishes no job. Wait for this client's oldest fence and
+++ * remove its observed prefix. Pressure from another VM may leave no local fence
+++ * to wait on: pause without holding connection/retirement locks, then retry. */
++ static VkResult
++ darwin_submit_chunk(struct tu_queue *queue, const NativeAdrenoAbiSubmitBuffer *entries,
++                     unsigned count, uint32_t *fence, struct tu_darwin_submit_rec *rec)
++ {
++@@ -1414,15 +1509,27 @@
++    req.queue = 0;
++    for (unsigned i = 0; i < count; i++)
++       req.buffers[i] = entries[i];
++
+++   uint32_t reaped = 0, pauses = 0;
+++   uint64_t pause_ns = 0;
++    for (;;) {
++       NativeAdrenoAbiSubmitReply reply = {};
++       const uint64_t began = tu_trace_clock_ns();
++       kern_return_t kr = dw_call(NativeAdrenoMethodSubmit, &req, sizeof(req), &reply, sizeof(reply));
++       rec->call_us += (uint32_t)MIN2((tu_trace_clock_ns() - began) / 1000, 0xffffffffull - rec->call_us);
++       if (kr == KERN_SUCCESS) {
++          *fence = (uint32_t)reply.fence;
+++         if (reaped || pauses) {
+++            static uint32_t pressure_notes;
+++            const uint32_t n = p_atomic_inc_return(&pressure_notes);
+++            if (n <= 4 || !(n & (n - 1))) {
+++               char text[96];
+++               snprintf(text, sizeof(text), "KMD pressure n%u busy%u reaped%u pauses%u us%llu", n, rec->busy,
+++                        reaped, pauses, (unsigned long long)(pause_ns / 1000));
+++               dw_note_text(text);
+++            }
+++         }
++          return VK_SUCCESS;
++       }
++       if (kr != kIOReturnBusy)
++          return vk_device_set_lost(&dev->vk, "submit failed: 0x%x", kr);
++@@ -1431,13 +1538,35 @@
++       pthread_mutex_lock(&dw.lock);
++       uint32_t oldest = dw.inflight_count ? dw.inflight[0] : 0;
++       pthread_mutex_unlock(&dw.lock);
++       const uint64_t waited = tu_trace_clock_ns();
++-      if (!oldest)
++-         sched_yield();
++-      else if (dw_wait_fence_locked_free(dev, oldest, UINT64_MAX) != VK_SUCCESS)
++-         return vk_device_set_lost(&dev->vk, "submit: waiting for ring space failed");
++-      rec->space_wait_us += (uint32_t)((tu_trace_clock_ns() - waited) / 1000);
+++      if (!oldest) {
+++         /* sched_yield may immediately run this thread again. A short sleep
+++          * avoids hammering Submit while a different process owns the ring;
+++          * it is a retry interval, never a submission timeout. */
+++         usleep(100);
+++         pauses++;
+++         pause_ns += tu_trace_clock_ns() - waited;
+++      } else {
+++         if (dw_wait_fence_locked_free(dev, oldest, UINT64_MAX) != VK_SUCCESS)
+++            return vk_device_set_lost(&dev->vk, "submit: waiting for ring space failed");
+++         /* All this connection's queues use kernel queue 0; completion of
+++          * oldest therefore retires its prefix. Do not repeatedly wait a fence
+++          * that already completed. Lock only the small list, after the wait and
+++          * deferred-storage sweep have released their locks. */
+++         pthread_mutex_lock(&dw.lock);
+++         unsigned done = 0;
+++         while (done < dw.inflight_count && (int32_t)(oldest - dw.inflight[done]) >= 0)
+++            done++;
+++         if (done) {
+++            dw.inflight_count -= done;
+++            memmove(dw.inflight, dw.inflight + done, dw.inflight_count * sizeof(dw.inflight[0]));
+++            reaped += done;
+++         }
+++         pthread_mutex_unlock(&dw.lock);
+++      }
+++      rec->space_wait_us += (uint32_t)MIN2((tu_trace_clock_ns() - waited) / 1000,
+++                                        0xffffffffull - rec->space_wait_us);
++    }
++ }
++
++ static VkResult
++@@ -1516,8 +1645,17 @@
 +       VkResult result = dw_open_connection(dev->physical_device->instance);
 +       if (result != VK_SUCCESS)
 +          return result;
@@ -691,7 +774,7 @@ new file mode 100644
 +       vk_zalloc(&dev->vk.alloc, sizeof(*retire), 8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
 +    if (!retire) {
 +       dw_close_connection();
-+@@ -1591,10 +1694,12 @@
++@@ -1591,10 +1729,12 @@
 +       return VK_SUCCESS; /* counters not attached in this kernel */
 +    if (kr != KERN_SUCCESS)
 +       return vk_device_set_lost(&device->vk, "error getting GPU status: 0x%x", kr);

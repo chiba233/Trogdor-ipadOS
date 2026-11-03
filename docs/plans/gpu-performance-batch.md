@@ -2,7 +2,7 @@
 
 两次后续启动已实际显示 private 主帧，分别 shown 1908 和 767；两次主机纹理 shadow 和 placement/pitch 拒绝均为 0，后一次还取得 319 次同尺寸 host 图像成功绑定记录。提交前 Busy 准入在两次都触发，三次恢复均返回成功，所给内核日志没有 DeviceLost 或 panic。这些是路径执行证据，没有画面反馈或固定操作窗口，尚不代表方向、截图、流畅度和长期稳定性全部通过。
 
-本次继续修订 rotation 3 的独立物理平面：内部错误调用 Metal 的公开 `buffer` getter，它对 IOSurface 纹理刻意返回 nil，导致 stage 1 在进入 runtime 前失败。改为内部 backing 访问方法；公开 API 行为不变。**这次修订需重编 addon 与配套信任缓存，内核可沿用。** 未自行编译或实机验收，不提交调试迭代。
+本次继续推进局部镜像写回与 Busy 等待整理，均在 addon 及其 Mesa 依赖内。另修订 rotation 3 的独立物理平面：内部错误调用 Metal 的公开 `buffer` getter，它对 IOSurface 纹理刻意返回 nil，导致 stage 1 在进入 runtime 前失败。改为内部 backing 访问方法；公开 API 行为不变。**这次修订需重编 addon 与配套信任缓存，内核可沿用。** 未自行编译或实机验收，不提交调试迭代。
 
 ## 此前未 seed 阶段的记录
 
@@ -192,6 +192,37 @@ FDL 的末级线性布局为 GMEM 16×4 block blit 向上补齐高度：`2266 �
 
 这是使图像实际布局匹配其按 texel 访问路径，不是把 runtime 的 `placed()` 检查改成忽略超界。默认线性图像仍可能先被拒绝；显式布局重试的要求应降到实际 2266 行后由原检查正常接受。新路径的边缘像素、截图、缓存一致性和计数下降仍待实机。
 
+## 继续减少镜像写回
+
+private 路径走通后，两份记录仍分别编码 26.6 GB 和 10.5 GB 的全帧镜像。当前实现对每个完成写入的表面都取整个 resident extent，即便一个保留旧内容的 pass 只更新小区域。
+
+本批新增写入记录和保守的区域并集。只有已经有效、单 mip/layer/sample、root 尺寸不变的 private 主帧附件，在 Load + Store、无 resolve、level/slice/depth-plane 均为 0 时，才允许缩小镜像。记录独立于可选 draw statistics：三条实际 draw 入口（普通、indexed、patch/indirect patch）都会累积当时的单个或多个 scissor；未设置 scissor 按整附件处理。按各条 scissor 先裁剪再求所有 draw、所有 pass 的包围矩形，不能只取最后设置的矩形。
+
+普通方向用相同 origin/size 做局部 blit。rotation 3 仍用完整 viewport/UV 变换，只将目标 scissor 从 private 的 `(x,y,w,h)` 转成物理平面的 `(y,W-x-w,h,w)`；部分旋转写回的目标 load action 必须为 Load，以保留范围外像素。seed 和整帧传输仍沿用原来的完整路径。
+
+以下情况保持整帧同步：Clear/DontCare、resolve、其他 mip/layer、plain 写入、缓存无效、同一表面出现任一无界记录或其他表示的写入。命令内出现 compute、已标记主帧的 shader 纹理绑定、IOSurface buffer 绑定或显式主帧资源写入时，也不缩小范围；shader 对资源的任意写入不能用 raster scissor 作边界。只缩小现有写回，不延后到 CPU 读取时，也不删除截图/外部读取所依赖的共享像素同步。
+
+写入表、scissor 数组只为符合条件的主帧 pass 分配，普通 pass 不持有区域跟踪数组。纯 Load+Store 且没有 draw 的可界定记录可以跳过镜像；一旦同一命令里还有完整写入，仍恢复整帧。
+
+状态行扩展为：
+
+- `CZ mirror ... part ... skip ... save ...`：局部镜像次数、无更新跳过次数，以及相对原整帧策略少编码的像素字节估算。
+- `CZ damage load ... full ... guarded ... mask ...`：允许跟踪的附件、完整记录，以及因命令级保护而采用整帧的镜像次数；mask 位 1 为 compute，2 为主帧 shader texture，4 为 surface buffer，8 为显式资源写入，取累计 OR。
+
+这些是编码记录，不是实测 DRAM 流量或 GPU 时间；命令失败时也不能把尝试的字节当成完成量。增加一条前部状态行，固定 48 行上限会挤掉尾部可选摘要；按字段前缀读取，不依赖 row 编号。必须检查局部更新、移动窗口/滚动、截图、切换快照和两个方向的像素一致性；若 part/save 为零，结合 load/full/guarded/mask 区分实际没有可缩小范围与保护分支占满，不能宣称收益。
+
+依据：[Metal setScissorRect](https://developer.apple.com/documentation/metal/mtlrendercommandencoder/setscissorrect(_:)) 规定 raster fragments 位于 scissor 内；[MTLLoadAction.load](https://developer.apple.com/documentation/metal/mtlloadaction/load) 保留附件原有内容。这里修改 Metal/runtime 的传输边界，没有改硬件寄存器或 Linux 的启动时序。
+
+## Busy 压力下的等待整理
+
+Darwin 的 `darwin_note_fence()` 将提交加入固定长度 inflight 列表，但原实现没有在等待成功后移除已完成项。`darwin_submit_chunk()` 遇 Busy 会继续选列表首项，因而可能反复等待早已完成的历史 fence；没有本连接 fence 时，`sched_yield()` 也可能立即重新运行并再次调用 Submit。两份启动都有实际 vm-admit 压力，这说明该重试路径有现实入口；现有计数不能量化这两种空转各占多少。
+
+本批在该压力分支等待成功之后、所有等待和退役存储锁已释放时，单独锁住连接列表，按原有有符号 fence 序号比较移除已观察完成的前缀。本连接所有队列使用内核 queue 0，原接口已要求其完成前缀有序。只清理下次选择等待对象的列表；不释放 BO，不改变 last_fence，不提前 signal Vulkan sync，也不把未完成任务删除。
+
+列表为空时改为请求 100 us 休眠，然后继续重试；不是新的提交超时或 watchdog，实际调度间隔可能更长。仍只重试 Busy，其他原始提交错误和真实 fence 等待错误继续保留原来的 DeviceLost 处理。内核的准入、16 ms 前台 gate、恢复和已发布任务语义都不改。
+
+成功走出压力后，按首次/幂次保留独立 Note 3：`KMD pressure n... busy... reaped... pauses... us...`。reaped 为这次 chunk 从候选表移除的已完成 fence 数，pauses/us 为无本地 fence 时的休眠次数和实际累计时长，busy 沿用当前 queue-submit record 的累计值。它不是 KMD fail；需要和 vm-admit、Submit 原始错误及同窗口 CPU/提交耗时一起判断收益。较早 DeviceLost 的根因尚未因此闭环。
+
 ## 电源与选择器读回的边界
 
 本轮恢复序号到 66，profile epoch 到 67；所见恢复成功且 core accesses dropped asleep 为 0，PERFCOUNTER OOB 为 vote on、状态 0x28。这覆盖了实际发生的恢复和重新配置；不证明从未触发过的寄存器访问安全。
@@ -209,15 +240,15 @@ CPU 读取 0xae10 曾在 GMU vote 存在、检查状态正常时产生同步外�
 
 ## 集成和下一次数据
 
-**功能修订需要重编 addon 和配套信任缓存；可先沿用本轮内核。** 首次导入 seed、有效主帧复用、内部 backing 访问、FR 记录、显式 host FDL 布局和成功绑定记录都在 addon/其 Mesa 静态依赖内；只编内核或继续冻结 addon 都不会带入。GOP 诊断标签已在后续内核记录中出现，不是本次 addon 修订的前置条件。不要将新 addon 配上旧信任缓存。
+**功能修订需要重编 addon 和配套信任缓存；可先沿用本轮内核。** 首次导入 seed、有效主帧复用、内部 backing 访问、局部镜像、Busy 等待整理、FR 记录、显式 host FDL 布局和成功绑定记录都在 addon/其 Mesa 静态依赖内；只编内核或继续冻结 addon 都不会带入。GOP 诊断标签已在后续内核记录中出现，不是本次 addon 修订的前置条件。不要将新 addon 配上旧信任缓存。
 
 addon 跟进只改四行上下文的 `unixnu-gpu-plugin.patch` 和 `unixnu-gpu-stack.patch`；Mesa 修改仍在既有 diagnostics overlay 中，沿用原构建应用和撤回路径。本次不再改 `Adreno740.patch` 和板级 package；既有 `CoachzGpu.cpp` 增量只纠正 GOP 诊断标签。上游 checkout 和已有二进制不改，不自行编译、写盘或上机。运行时 warning 仍在前部；FR 失败通过独立 Note 3 保留，按字段前缀查找，不依赖固定 row 编号。
 
 下一次需要：
 
 1. `CZ promote start`、seed、reuse、实际 private writer、shown，以及方向、残影、截图、切换快照和撕裂；不能只看 private 分配或同尺寸 IMG。若仍 start 0，保留 plane/alloc/dim 和第一组完整 `FR stage`。
-2. `gpu submit policy` 的实际 mode、`vm-admit` 或首条 Submit/KMD/VK 错误。没有压力记录只表示没有触发；不能宣称准入分支通过。
-3. 两行 `CZ place` 和新增 `CZ alias`，连同 CZ copy/shape、L host、mirror。确认整帧 alias 的 size≤room，n/pitch 增加，再检查边缘像素、截图与缓存一致性。保留初始化结束后正常操作的大致起止时间及前后计数，避免跨启动负载比较总量。
+2. `gpu submit policy` 的实际 mode、`vm-admit`、`KMD pressure` 或首条 Submit/KMD/VK 错误。没有压力记录只表示没有触发；不能宣称准入分支通过。
+3. 两行 `CZ place` 和新增 `CZ alias`，连同 CZ copy/shape、L host、mirror 的 part/skip/save 和 `CZ damage`。确认整帧 alias 的 size≤room，n/pitch 增加，再检查边缘像素、截图与缓存一致性。保留初始化结束后正常操作的大致起止时间及前后计数，避免跨启动负载比较总量。
 4. 显式 frame transfer 失败时保留第一条错误及整份内核、统一日志；归档留在本地，不将原始环境标识放入公开产物。
 
 本批只做源码阅读、补丁应用/撤回的字节核对、差异和隐私检查；这些不代替编译和实机验收。
