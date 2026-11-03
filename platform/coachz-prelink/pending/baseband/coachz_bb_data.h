@@ -326,6 +326,17 @@ static inline uint32_t cbd_bsp_file_answer(const struct cbd_file_segment *f, uin
     return room >= 5u ? cbd_tlv(tlvs, room, 0x40, next, 2) : 0;
 }
 
+/* BSP 0xb001 (queryActivationStatus): TLV 0x01 ChipInformation {u32 chip id, u32 serial number}. CommCenter puts both in the activation
+ * postponement info (kCTPostponementInfoBasebandChipID, ...BasebandSerialNumber) and ABM publishes them; unanswered it logs "Unable to
+ * get chip id and serial number" on every query. The bridge answers the same two values BBUpdater already read over BHI and sahara. */
+#define CBD_BSP_CHIP_INFO 0xb001u
+static inline uint32_t cbd_bsp_chip_info(uint32_t chip, uint32_t serial, uint8_t *tlvs, uint32_t room)
+{
+    const uint8_t v[8] = { (uint8_t)chip, (uint8_t)(chip >> 8), (uint8_t)(chip >> 16), (uint8_t)(chip >> 24),
+                           (uint8_t)serial, (uint8_t)(serial >> 8), (uint8_t)(serial >> 16), (uint8_t)(serial >> 24) };
+    return room >= 11u ? cbd_tlv(tlvs, room, 0x01, v, 8) : 0;
+}
+
 /* CommCenter reads EF_ICCID and EF_IMSI itself: UIM Read Transparent (0x20), TLV 0x02 {u16 file id, u8 path length, path}. The answer
  * carries TLV 0x11 {u16 content length, content} (libqmi qmi-service-uim.json). Files are stored as on the card (TS 31.102). */
 #define CBD_SVC_UIM 0x0bu

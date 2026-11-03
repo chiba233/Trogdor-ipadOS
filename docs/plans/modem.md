@@ -169,6 +169,7 @@ b9 用 drivers/RamBlock/coachz_modem.c 按上面的顺序接入，在 Wi-Fi 线�
 - 每段的应答要带 TLV 0x40 ExpectedSegmentInfo，即下一段段号，否则记 `Next segment numbers are not matching`；最后一段之后要由基带发 FileTransferStatus 指示 0xa001（TLV 0x01 {u8 文件类型，u8 结果，0 为成功}，TLV 0x10 订阅号 1），否则等 22 s 判失败。桥接层照此收下文件后丢弃，跟 sahara 推来的镜像一样。
 - 上机：推了两轮后 CommCenter 记 `Cached PRI file configuration is same as the one intended to be pushed, bailing out`，之后没有再重启，LTE 保持注册（只观察了约半分钟）。两轮的事务结果仍记 `kTransactionFailed`，原因没查。
 - 软重启前那 12 s 是 ABM 发 BSP 0xe001 后等复位检测，跟 ABP 的 `bootstage` 属性无关；`bootstage` 只有 `SafeResetModemLegacy` 读，读不到时走最快的路径，发布一个在线值反而会轮询 reset 和 wake。
+- BSP 0xb001（`queryActivationStatus`）的应答是 TLV 0x01 ChipInformation {u32 芯片 ID，u32 序列号}，CommCenter 放进激活附带信息（`kCTPostponementInfoBasebandChipID`、`...BasebandSerialNumber`），ABM 也发布这两项。桥接层回 BHI 和 sahara 阶段报过的同一组值（固定序列号，不是真实的）；上机后 `Unable to get chip id and serial number` 不再出现。eSIM 的 `Could not get cellular plan device Info` 仍在，跟这两项无关。
 - 数据上下文仍然没有分配，CommCenter 记 `kDataNotSupported{context is not assigned}`。
 
 ### eSIM Tape 实现（待实机）

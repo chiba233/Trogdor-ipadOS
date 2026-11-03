@@ -469,6 +469,13 @@ static int bb_private_answer(uint32_t channel, const struct cbq_result &r, const
     }
     return 1;
   }
+  if (r.service == CBD_SVC_BSP && message == CBD_BSP_CHIP_INFO) {
+    uint8_t tlvs[12];
+    const uint32_t t = cbd_bsp_chip_info(CBS_CHIP_ID, CBS_SERIAL, tlvs, sizeof tlvs);
+    const uint32_t n = cbq_private_answer(sdu, r.service, r.cid, 0, tlvs, t, bb_out, sizeof bb_out);
+    if (n) bb_push(channel, bb_out, n);
+    return 1;
+  }
   if (r.service == CBD_SVC_BSP && message == CBD_BSP_SET_CONFIG) {
     const uint32_t n = cbq_private_answer(sdu, r.service, r.cid, 0, nullptr, 0, bb_out, sizeof bb_out);
     if (n) bb_push(channel, bb_out, n);

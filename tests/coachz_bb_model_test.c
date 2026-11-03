@@ -468,6 +468,10 @@ static void test_data(void)
     n = cbq_private_indication(CBD_BSP_FILE_TRANSFER_STATUS, CBD_SVC_BSP, 1, done_tlv, dt, out, sizeof out);
     const uint8_t done_ind[] = { 1, 21, 0, 0x80, 0xe2, 1, 4, 0, 0, 0x01, 0xa0, 9, 0, 1, 2, 0, 9, 0, 0x10, 1, 0, 1 };
     CHECK(dt == 9 && n == sizeof done_ind && !memcmp(out, done_ind, sizeof done_ind));
+    /* BSP 0xb001: chip id and serial, little endian, chip id first. */
+    uint8_t chip_tlv[12];
+    CHECK(cbd_bsp_chip_info(0x009540e1u, 0x0c0ac42bu, chip_tlv, sizeof chip_tlv) == 11 && chip_tlv[0] == 1 && chip_tlv[1] == 8 &&
+          chip_tlv[3] == 0xe1 && chip_tlv[5] == 0x95 && chip_tlv[7] == 0x2b && chip_tlv[10] == 0x0c);
     uint8_t seg_bad[sizeof seg_req]; memcpy(seg_bad, seg_req, sizeof seg_req); seg_bad[12] = 9;   /* segment past the count */
     CHECK(!cbd_bsp_file_segment(seg_bad, sizeof seg_bad, &fs));
     n = cbq_private_unsupported(act, 0xe5, 2, out, sizeof out);
