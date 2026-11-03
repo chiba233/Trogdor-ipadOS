@@ -144,8 +144,14 @@ b9 用 drivers/RamBlock/coachz_modem.c 按上面的顺序接入，在 Wi-Fi 线�
 - 有效 SIM：开机后插拔一次 SIM，再开关飞行模式，状态栏才出运营商名和信号格；0x56、0x57 加上以后仍要插拔一次。“关于本机”的运营商是未知，CommCenter 记 `Missing carrier preferences path`。
 - 开关飞行模式后 Wi-Fi 重新加入，驱动报的信号正常，SpringBoard 收到的却是 0 格，图标变空心。
 
+### 第七次上机（开机即显示）
+
+- 桥接层给每个通道最多排 64 帧等 ABM 读。开机时 53 个客户端的注册和指示一齐到达，每次开机都溢出，丢 5 到 22 帧。丢的是哪一帧决定症状：一次丢了 VOICE（服务 9）0x3 的两条应答，CommCenter 25 s 后记 `ATCS_TIMEOUT on message for svc=9` 并硬重启基带，这就是开机约 40 s 的那次重启；丢了 UIM 和 NAS 的帧，SIM 和注册状态停在旧值，插拔一次 SIM 才重新拉取。队列改为 1024 帧并记录每次丢帧后，开机没有丢帧、没有重启，状态栏直接显示运营商名和信号格。
+- 运营商设置包：CommCenter 只查国家包和服务网络的运营商包，从不为 SIM 查运营商包，日志是 `No PersonalityID while CB changed`；没有运营商包就没有 APN，数据上下文记 `kDataNotSupported{context is not assigned}`，一次 Start Network 也不发。
+- 激活指示每个卡槽的信息只在带了该槽的 ICCID、IMSI 一组 TLV（卡槽一从 0x42 起，卡槽二从 0x46 起）时才会填上；pp 判断有没有 SIM 看的就是这两项，现在一项都没有，所以每次都记 `BB activated, but there is no SIM`。
+- 失效的卡在任何网络上都只得到紧急服务，拒绝原因 15（EMM #15）；同一张卡在 Debian 下也注册不上。
+
 接下来的卡点：
-- **开机即显示**：查为什么要插拔一次 SIM 才显示注册状态。
 - **运营商设置包**：“关于本机”的运营商是未知。
 - **蜂窝数据**：数据口设置已被接受；要看 `BindMuxDataPort` 的应答，之后才是 `pdp_ip` 接 `rmnet_ipa0`。蜂窝数据和数据漫游默认关闭，开数据通路前先确认。
 - **eSIM**：在 UIM 0x2f 应答里补 TLV 0x21，VINYL 0xe5 的 Tape 请求转成 UIM 逻辑通道上对 ISD-R 的 APDU。

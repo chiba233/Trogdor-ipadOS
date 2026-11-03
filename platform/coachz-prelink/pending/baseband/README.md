@@ -42,7 +42,7 @@ Data 卷的统一日志里看 ABM 和 BBUpdater：
 
 ## 真机结果
 
-BBUpdater 接受 SBL（镜像号 0x15）后报告启动成功，ABM engage，53 个 QMI 客户端接到 modem，`pbl`、`sahara`、`qmux1`、`qmux2` 都走自己的通道。modem 的工厂数据（FSG）放进固件块后，“关于本机”显示 IMEI 和 ICCID，SIM 就绪。激活指示带上服务已开通和两个卡槽已接受后，有效 SIM 在 LTE 上注册（漫游）并完成 CS、PS 附着，状态栏显示运营商名和信号格（目前要开机后插拔一次 SIM）；DPM、WDA 设置和数据口绑定都成功。eSIM 在设置里出现了，页面显示还不对；蜂窝数据还没有通过，卡点见 [docs/plans/modem.md](../../../../docs/plans/modem.md)。
+BBUpdater 接受 SBL（镜像号 0x15）后报告启动成功，ABM engage，53 个 QMI 客户端接到 modem，`pbl`、`sahara`、`qmux1`、`qmux2` 都走自己的通道。modem 的工厂数据（FSG）放进固件块后，“关于本机”显示 IMEI 和 ICCID，SIM 就绪。激活指示带上服务已开通和两个卡槽已接受后，有效 SIM 在 LTE 上注册（漫游）并完成 CS、PS 附着，开机后状态栏直接显示运营商名和信号格（发给 ABM 的队列放 1024 帧：64 帧时开机必溢出，丢掉的应答会让 CommCenter 硬重启基带，或让 SIM 和注册状态停在旧值）；DPM、WDA 设置和数据口绑定都成功。eSIM 在设置里出现了，页面显示还不对；蜂窝数据还没有通过，卡点见 [docs/plans/modem.md](../../../../docs/plans/modem.md)。
 
 ## 没核实的
 

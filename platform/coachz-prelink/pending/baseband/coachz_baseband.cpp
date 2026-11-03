@@ -26,7 +26,10 @@
 #include "coachz_bb_esim.h"
 
 #define BB_FRAME_MAX (64u * 1024u)       // one read or write: a QMUX frame, a SAHARA packet or a READ_DATA answer
-#define BB_QUEUE 64u                     // frames waiting for ABM, per channel
+// Frames waiting for ABM, per channel. At boot the 53 clients' registrations and indications arrive faster than ABM reads; with 64 the
+// queue overflowed every boot (5 to 22 frames), a lost VOICE answer made CommCenter reset the baseband (ATCS_TIMEOUT) and lost UIM and
+// NAS frames left the SIM and registration state stale until the SIM was reinserted. A dropped frame is a lost answer: keep room.
+#define BB_QUEUE 1024u
 #define BB_READS 8u                      // asynchronous reads waiting for a frame, per channel
 #define BB_TX 64u                        // QMI messages waiting for the Wi-Fi thread
 #define BB_SYNC_READ_SECONDS 30u
@@ -139,6 +142,11 @@ static void bb_push(uint32_t channel, const uint8_t *data, uint32_t len)
   uint8_t *copy = len && len <= BB_FRAME_MAX ? static_cast<uint8_t *>(IOMallocData(len)) : nullptr;
   if (!copy || c->count == BB_QUEUE) {
     if (copy) IOFreeData(copy, len);
+    // Probe: which answer was lost (header fields only).
+    if (c->frames_dropped < 32u)
+      printf("COACHZ baseband: dropped frame for ABM on channel %u (%s, %u queued, %u bytes) svc 0x%x type %u msg 0x%x\n", channel,
+             copy ? "queue full" : "no memory", c->count, len, len > 4 ? data[4] : 0u, len > CBQ_HDR ? data[CBQ_HDR] : 0u,
+             len > CBQ_HDR + 4 ? (uint32_t)(data[CBQ_HDR + 3] | data[CBQ_HDR + 4] << 8) : 0u);
     c->frames_dropped++;
     return;
   }
