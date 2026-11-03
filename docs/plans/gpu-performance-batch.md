@@ -6,6 +6,8 @@
 
 k148 开机约 307 秒的最后记录：`CZ seed 16 fail 0`，`CZ frames made 16 private 16 shown 2640 plain 1008`，方向 `straight1328 turned1312 mismatch0 conflict1`；`CZ sync out1517 in1388 miss0 attach1`；`CZ miss tag1008 frame0 invalid0 shape0`，plain 全部是没有有效标记；镜像 2905 次共 39.2 GB，局部写回 4 次、省 3.5 MB；`KMD pressure n32 busy9 reaped8 pauses1`。同样到 307 秒，k147 是提交 3647 次、翻转 1801 次、镜像 627 次，k148 是 7735、3601、2905 次，每次翻转的整帧镜像从 0.35 次升到 0.81 次，原因还没查。
 
+提交数和翻转数同步翻倍（每次翻转约 2 次提交，两次一样），翻倍的是出帧数。多出来的是共享面拷回私有纹理（`in`），它以前总是整帧。k150 的计数显示 plain 写入全是直视图上的 Load pass（`pass L534 C0 D0 rot0 srgb0`），damage 可界定，但几乎每次拷回都因为同一命令把主帧绑成 shader 纹理而被 mask 2 拦成整帧（`guarded222`，`inpart0`）。之后的 addon 让 plain 写入也记录 damage，拷回只拷这块（旋转帧把平面矩形换算成私有坐标 `x = W-y-h, y = x`）；mask 2 只在 usage 带 ShaderWrite 或未知时才拦，只读绑定计入 `CZ damage … ro`。随 k151 上机，计数还没读。
+
 ## 最新启动记录
 
 每项取其最后打印；没有固定操作窗口或画面反馈，不能与其他启动的累计耗时直接比较：

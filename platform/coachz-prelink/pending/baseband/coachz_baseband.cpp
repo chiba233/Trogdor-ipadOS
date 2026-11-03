@@ -23,6 +23,7 @@
 #include "coachz_bb_control.h"
 #include "coachz_bb_channels.h"
 #include "coachz_bb_data.h"
+#include "coachz_bb_pdp.h"
 #include "coachz_bb_esim.h"
 
 #define BB_FRAME_MAX (64u * 1024u)       // one read or write: a QMUX frame, a SAHARA packet or a READ_DATA answer
@@ -65,6 +66,8 @@ static void (*bb_del_client)(uint32_t local_port);
 static int bb_published;
 static uint32_t bb_private_seen[64], bb_private_count, bb_ctl_logged;
 static uint8_t bb_out[BB_FRAME_MAX];     // answers built under the lock
+static struct cbp_client bb_pdp_clients[CBQ_MAX_CLIENTS];
+static uint32_t bb_pdp_owners[CBQ_MAX_CLIENTS];
 static struct cbd_setup bb_data;         // the data port setup ModemManager runs for IPA (coachz_bb_data.h)
 static int bb_data_slot[2] = { -1, -1 }; // the bridge's own DPM and WDA clients
 static uint32_t bb_endpoint_fixes, bb_activations;
@@ -132,12 +135,50 @@ static void bb_init(void)
   bb_esim_resp = static_cast<uint8_t *>(IOMallocData(BB_ESIM_BYTES));
   cbe_init(&bb_esim, bb_esim_in, bb_esim_in ? BB_ESIM_BYTES : 0,
            bb_esim_resp, bb_esim_resp ? BB_ESIM_BYTES : 0);
+  // Read-only eUICC answers (coachz_bb_esim.h): 16 KiB for each of the four entries.
+  uint8_t *cache = static_cast<uint8_t *>(IOMallocData(4u * 16384u));
+  cbe_set_cache(&bb_esim, cache, cache ? 4u * 16384u : 0);
   cbc_init(&bb_control);
   cbs_init(&bb_sahara, bb_sahara_images, sizeof bb_sahara_images / sizeof bb_sahara_images[0], 0x10000);
 }
 
+// Probe: QMI header fields of each message (service, type, message, transaction, length, QMI error), never TLV contents, so no APN,
+// ICCID, APDU or address reaches the log. UIM, VINYL and WDS print every message; other services the first 6 of a kind, then each
+// power of two. A budget keeps the log ring from filling; the periodic report says how many lines it held back.
+#define BB_TRACE_KINDS 512u
+#define BB_TRACE_BUDGET 6000u
+static uint64_t bb_trace_key[BB_TRACE_KINDS];
+static uint32_t bb_trace_count[BB_TRACE_KINDS], bb_trace_lines, bb_trace_held;
+static void bb_trace(const char *dir, uint32_t channel, uint32_t service, uint32_t cid, const uint8_t *sdu, uint32_t n)
+{
+  if (!service || n < 7u) return;   // CTL has its own SDU layout and its own lines
+  const uint32_t type = sdu[0], txn = cbd_rd16(sdu + 1), message = cbd_rd16(sdu + 3);
+  const uint32_t error = type == 2u ? (cbd_sdu_ok(sdu, n) ? cbd_error(sdu, n) : 0xfffeu) : 0u;
+  const uint64_t key = 1u + ((uint64_t)((uint32_t)dir[0] << 8 | (uint32_t)dir[4]) << 48 |(uint64_t)service << 40 | (uint64_t)type << 32 |
+    (uint64_t)message << 16 | error);
+  uint32_t count = 0;
+  for (uint32_t i = 0, at = (uint32_t)(key * 0x9e3779b97f4a7c15ull >> 55) % BB_TRACE_KINDS; i < BB_TRACE_KINDS; i++, at = (at + 1) % BB_TRACE_KINDS) {
+    if (bb_trace_key[at] != key && bb_trace_key[at]) continue;
+    bb_trace_key[at] = key;
+    count = ++bb_trace_count[at];
+    break;
+  }
+  const bool always = service == CBE_SVC_UIM || service == CBE_SVC_VINYL || service == CBD_SVC_WDS;
+  if (!always && count > 6u && (count & (count - 1u))) return;
+  if (bb_trace_lines >= BB_TRACE_BUDGET) { bb_trace_held++; return; }
+  bb_trace_lines++;
+  printf("COACHZ qmi: %s ch %u svc 0x%x cid %u type %u msg 0x%x txn %u len %u err 0x%x n %u t %u\n",
+         dir, channel, service, cid, type, message, txn, n, error, count, bb_now_ms());
+}
+// A QMUX frame (I/F type 1, length, flags, service, client id, then the SDU).
+static void bb_trace_frame(const char *dir, uint32_t channel, const uint8_t *frame, uint32_t len)
+{
+  if (len >= CBQ_HDR + 7u && frame[0] == 1u) bb_trace(dir, channel, frame[4], frame[5], frame + CBQ_HDR, len - CBQ_HDR);
+}
+
 static void bb_push(uint32_t channel, const uint8_t *data, uint32_t len)
 {
+  if (channel == CBH_QMUX1 || channel == CBH_QMUX2) bb_trace_frame("to-host", channel == CBH_QMUX1 ? 1u : 2u, data, len);
   bb_channel *c = &bb_ch[channel];
   uint8_t *copy = len && len <= BB_FRAME_MAX ? static_cast<uint8_t *>(IOMallocData(len)) : nullptr;
   if (!copy || c->count == BB_QUEUE) {
@@ -185,6 +226,9 @@ static void bb_queue_tx(uint32_t local_port, uint32_t node, uint32_t port, const
   }
   memcpy(copy, data, len);
   bb_txq[(bb_tx_head + bb_tx_count++) % BB_TX] = { local_port, node, port, len, copy };
+  const uint32_t slot = local_port - CBQ_PORT_BASE;
+  if (slot < CBQ_MAX_CLIENTS && bb_qmux.client[slot].used && bb_qmux.client[slot].channel == CBQ_INTERNAL)
+    bb_trace("int-tx", 0, bb_qmux.client[slot].service, bb_qmux.client[slot].cid, data, len);
 }
 
 // BBUEUR13Loader pushes the SBL with SendImage on pbl, frees that transport, opens sahara and waits 40 s for the loaded SBL's HELLO there. So the
@@ -241,9 +285,31 @@ static void bb_data_start(void)
   bb_data_step();
 }
 
+// WDS is still entirely owned by CommCenter. Observe only wire lifecycle facts, never credentials or addresses.
+static void bb_pdp_note(uint32_t local_port, uint32_t cid, uint32_t channel, const uint8_t *sdu, uint32_t n)
+{
+  const uint32_t slot = local_port - CBQ_PORT_BASE;
+  if (slot >= CBQ_MAX_CLIENTS || !cbd_sdu_ok(sdu, n)) return;
+  const uint32_t owner = 1u + cid + (channel << 8);
+  if (bb_pdp_owners[slot] != owner) {
+    bzero(&bb_pdp_clients[slot], sizeof bb_pdp_clients[slot]);
+    bb_pdp_clients[slot].family = 4; // WDS default family, overridden by Set IP Family or Start Network
+    bb_pdp_owners[slot] = owner;
+  }
+  cbp_client &c = bb_pdp_clients[slot];
+  if (cbp_observe(&c, sdu, n))
+    printf("COACHZ pdp: WDS type %u message 0x%x txn %u mux %u family %u active %u error %u address-fields %u\n",
+      sdu[0], cbd_rd16(sdu + 3), cbd_rd16(sdu + 1), c.mux, c.family, c.active,
+      sdu[0] == 2 ? cbd_error(sdu, n) : 0, c.settings);
+}
+
+static void bb_sim_request(const struct cbq_result &r, const uint8_t *sdu);
+
 // A request for the modem, with the data port named as this modem has it.
 static void bb_to_modem(const struct cbq_result &r, const uint8_t *sdu)
 {
+  if (r.service == CBD_SVC_WDS) bb_pdp_note(r.local_port, r.cid, r.channel, sdu, r.len);
+  bb_sim_request(r, sdu);
   if (r.service == CBE_SVC_UIM && bb_esim.route_failed) {
     const uint32_t n = cbq_private_answer(sdu, r.service, r.cid, CBE_ERR_INTERNAL, nullptr, 0, bb_out, sizeof bb_out);
     if (n) bb_push(r.channel ? CBH_QMUX2 : CBH_QMUX1, bb_out, n);
@@ -330,6 +396,49 @@ static void bb_esim_step(void)
     printf("COACHZ baseband: esim event %u a%u b%u c%u d%u e%u\n", event.kind, event.a, event.b, event.c, event.d, event.e);
 }
 
+// The activation indication (coachz_bb_data.h) to the BSP client that registered, with slot one's ICCID and IMSI once the card gave them.
+static uint8_t bb_iccid[CBD_ICCID_BYTES], bb_imsi[CBD_IMSI_BYTES], bb_iccid_known, bb_imsi_known, bb_act_known, bb_act_channel, bb_act_cid;
+static void bb_activation_indicate(void)
+{
+  if (!bb_act_known) return;
+  uint8_t tlvs[CBD_ACTIVATION_SIM_TLVS];
+  const uint32_t t = cbd_activation_state(tlvs, sizeof tlvs, bb_iccid_known ? bb_iccid : nullptr, bb_imsi_known ? bb_imsi : nullptr);
+  const uint32_t n = cbq_private_indication(CBD_BSP_ACTIVATION_REGISTER, CBD_SVC_BSP, bb_act_cid, tlvs, t, bb_out, sizeof bb_out);
+  if (n) bb_push(bb_act_channel, bb_out, n);
+}
+
+// CommCenter's own EF_ICCID and EF_IMSI reads: the request's client, transaction and file, so the answer can be recognized. Never logged.
+struct bb_sim_read { uint8_t used, channel, cid; uint16_t txn, file; };
+static bb_sim_read bb_sim_reads[8];
+static uint32_t bb_sim_next;
+static void bb_sim_request(const struct cbq_result &r, const uint8_t *sdu)
+{
+  if (r.service != CBD_SVC_UIM) return;
+  const uint32_t file = cbd_uim_read_file(sdu, r.len);
+  if (file != CBD_EF_ICCID && file != CBD_EF_IMSI) return;
+  bb_sim_reads[bb_sim_next++ % 8] = { 1, r.channel, r.cid, cbd_rd16(sdu + 1), (uint16_t)file };
+}
+static void bb_sim_answer(const struct cbq_result &r, const uint8_t *sdu, uint32_t n)
+{
+  if (r.service != CBD_SVC_UIM || n < 7u || sdu[0] != 2u || cbd_rd16(sdu + 3) != CBD_UIM_READ_TRANSPARENT) return;
+  for (auto &q : bb_sim_reads) {
+    if (!q.used || q.channel != r.channel || q.cid != r.cid || q.txn != cbd_rd16(sdu + 1)) continue;
+    q.used = 0;
+    uint8_t ef[16], value[CBD_ICCID_BYTES];
+    const uint32_t len = cbd_uim_read_content(sdu, n, ef, sizeof ef);
+    const bool iccid = q.file == CBD_EF_ICCID;
+    if (iccid ? !cbd_iccid_from_ef(ef, len, value) : !cbd_imsi_from_ef(ef, len, value)) return;
+    uint8_t *have = iccid ? bb_iccid : bb_imsi, *known = iccid ? &bb_iccid_known : &bb_imsi_known;
+    const uint32_t size = iccid ? CBD_ICCID_BYTES : CBD_IMSI_BYTES;
+    if (*known && !memcmp(value, have, size)) return;
+    memcpy(have, value, size); *known = 1;
+    printf("COACHZ baseband: slot one %s read from the card, activation indication %s\n", iccid ? "ICCID" : "IMSI",
+           bb_act_known ? "sent again with it" : "waits for registration");
+    bb_activation_indicate();
+    return;
+  }
+}
+
 // A private request the bridge answers itself: 1 when it did.
 static int bb_private_answer(uint32_t channel, const struct cbq_result &r, const uint8_t *sdu)
 {
@@ -343,13 +452,13 @@ static int bb_private_answer(uint32_t channel, const struct cbq_result &r, const
     return 1;
   }
   if (r.service == CBD_SVC_BSP && message == CBD_BSP_ACTIVATION_REGISTER) {
-    uint8_t tlvs[CBD_ACTIVATION_TLVS];
-    const uint32_t t = cbd_activation_state(tlvs, sizeof tlvs);
-    uint32_t n = cbq_private_answer(sdu, r.service, r.cid, 0, 0, 0, bb_out, sizeof bb_out);
+    const uint32_t n = cbq_private_answer(sdu, r.service, r.cid, 0, 0, 0, bb_out, sizeof bb_out);
     if (n) bb_push(channel, bb_out, n);
-    n = cbq_private_indication(message, r.service, r.cid, tlvs, t, bb_out, sizeof bb_out);
-    if (n) bb_push(channel, bb_out, n);
-    if (bb_activations++ < 4) printf("COACHZ baseband: activation register answered, state activated\n");
+    bb_act_known = 1; bb_act_channel = (uint8_t)channel; bb_act_cid = r.cid;
+    bb_activation_indicate();
+    if (bb_activations++ < 4)
+      printf("COACHZ baseband: activation register answered, state activated, slot one ICCID %s, IMSI %s\n", bb_iccid_known ? "included" : "not read yet",
+             bb_imsi_known ? "included" : "not read yet");
     return 1;
   }
   return 0;
@@ -381,6 +490,7 @@ static void bb_host_write(uint32_t channel, const uint8_t *data, uint32_t len)
   }
   if (channel != CBH_QMUX1 && channel != CBH_QMUX2) return;   // counted above, nothing behind it yet
   const uint32_t qmux = channel == CBH_QMUX1 ? 0 : 1;
+  bb_trace_frame("host", qmux + 1u, data, len);
   const struct cbq_result r = cbq_from_host(&bb_qmux, qmux, data, len, bb_out, sizeof bb_out);
   switch (r.kind) {
   case CBQ_TO_HOST:
@@ -893,6 +1003,8 @@ public:
 };
 OSDefineMetaClassAndStructors(AppleBaseband, IOService)
 
+#include "coachz_bb_pdp.cpp"
+
 // ------------------------------------------------------------------ the data plane's kernel services
 // ABM's data::TransportService calls ApplePDPHelperInterface::getInstance()->enableMetadataTrailer() without a null check, and getInstance
 // is null without an AppleIPAppender service to open. ApplePDPHelper picks its variant by which PDP manager is registered; this is the Mav
@@ -909,6 +1021,10 @@ public:
   IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *, OSObject *, void *) override
   {
     if (!args) return kIOReturnBadArgument;
+    if (selector == 16) {
+      if (args->scalarInputCount != 2) return kIOReturnBadArgument;
+      return bb_pdp_block(static_cast<uint32_t>(args->scalarInput[0]), static_cast<uint32_t>(args->scalarInput[1]));
+    }
     static uint32_t seen;
     if (selector < 32 && !(__atomic_fetch_or(&seen, 1u << selector, __ATOMIC_RELAXED) & (1u << selector)))
       printf("COACHZ baseband: AppleIPAppender selector %u answered with zeros\n", selector);
@@ -975,6 +1091,7 @@ extern "C" void coachz_baseband_configure(void (*send)(uint32_t, uint32_t, uint3
 {
   if (!coachz_baseband_enabled() || bb_published) return;
   bb_init();
+  bb_pdp_init();
   bb_send = send;
   bb_del_client = del_client;
   IOService *provider = IOService::getResourceService();
@@ -1002,6 +1119,7 @@ extern "C" void coachz_baseband_del_server(uint32_t service, uint32_t node, uint
   if (!bb_lock) return;
   IOLockLock(bb_lock);
   cbq_server_del(&bb_qmux, service, node, port);
+  if (service == CBD_SVC_WDS) bzero(bb_pdp_clients, sizeof bb_pdp_clients);
   IOLockUnlock(bb_lock);
 }
 
@@ -1013,10 +1131,12 @@ extern "C" int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32
   IOLockLock(bb_lock);
   const struct cbq_result r = cbq_from_modem(&bb_qmux, dst_port, src_node, static_cast<const uint8_t *>(body), size, bb_out, sizeof bb_out);
   if (r.kind == CBQ_TO_HOST && r.channel == CBQ_INTERNAL) {
+    bb_trace("int-rx", 0, r.service, r.cid, static_cast<const uint8_t *>(body), size);
     if (bb_esim_slot >= 0 && dst_port == CBQ_PORT_BASE + (uint32_t)bb_esim_slot) {
       cbe_answer(&bb_esim, static_cast<const uint8_t *>(body), size, bb_now_ms());
     } else if (cbd_answer(&bb_data, r.service, static_cast<const uint8_t *>(body), size)) bb_data_step();
   } else if (r.kind == CBQ_TO_HOST) {
+    if (r.service == CBD_SVC_WDS) bb_pdp_note(dst_port, r.cid, r.channel, static_cast<const uint8_t *>(body), size);
     // A temporary eUICC card-status indication is not the restored logical SIM.
     const uint8_t *sdu = static_cast<const uint8_t *>(body);
     if (bb_esim.freeze && r.service == CBE_SVC_UIM && size >= 7 &&
@@ -1031,6 +1151,7 @@ extern "C" int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32
       memcpy(bb_out + CBQ_HDR, bb_fix, fixed);
       bb_push(r.channel == 0 ? CBH_QMUX1 : CBH_QMUX2, bb_out, CBQ_HDR + fixed);
     } else bb_push(r.channel == 0 ? CBH_QMUX1 : CBH_QMUX2, bb_out, r.len);
+    bb_sim_answer(r, sdu, size);   // after the answer itself: bb_activation_indicate reuses bb_out
   }
   IOLockUnlock(bb_lock);
   return 1;
@@ -1057,11 +1178,13 @@ extern "C" void coachz_baseband_poll(void)
   }
   for (uint32_t i = 0; i < r; i++)
     if (bb_del_client) bb_del_client(released[i]);
+  bb_pdp_poll();
 }
 
 extern "C" void coachz_baseband_report(unsigned second)
 {
   if (!bb_lock || !bb_published) return;
+  bb_pdp_report(second);
   IOLockLock(bb_lock);
   uint32_t clients = 0, servers = 0;
   for (uint32_t i = 0; i < CBQ_MAX_CLIENTS; i++) clients += bb_qmux.client[i].used;
@@ -1069,6 +1192,7 @@ extern "C" void coachz_baseband_report(unsigned second)
   printf("COACHZ baseband: %u s: %u QMI services, %u clients, dropped %u/%u; sahara state %u, %u executes, %u requests; board calls %u (%u unsupported); data port step %u, %u endpoints named, %u activations\n",
          second, servers, clients, bb_qmux.dropped, bb_tx_dropped, bb_sahara.state, bb_sahara.executes, bb_sahara.requests, bb_control.calls, bb_control.unsupported,
          bb_data.step, bb_endpoint_fixes, bb_activations);
+  printf("COACHZ qmi: %u s: %u trace lines, %u held back by the budget\n", second, bb_trace_lines, bb_trace_held);
   for (uint32_t c = 0; c < CBH_PUBLISHED; c++) {
     const bb_channel *ch = &bb_ch[c];
     if (ch->opens)

@@ -335,9 +335,9 @@
 +	int error;
 +	/* ABM and BBUpdater say why a boot failed only in %s messages, and CommCenter's QMUX trace (com.apple.telephony.bb, category qmux) prints
 +	 * every QMI message as private bytes; both stay private unless logd is told otherwise for the subsystem. With this those logs can hold
-+	 * device identifiers: they stay on this machine. */
++	 * device identifiers: they stay on this machine. CommCenter's own subsystem too: its carrier bundle matching input is private. */
 +	static const char *const logging_paths[] = {"/private/var/preferences/Logging/Subsystems/com.apple.telephony.abm.plist",
-+	                                            "/private/var/preferences/Logging/Subsystems/com.apple.telephony.bb.plist"};
++	                                            "/private/var/preferences/Logging/Subsystems/com.apple.telephony.bb.plist", "/private/var/preferences/Logging/Subsystems/com.apple.CommCenter.plist"};
 +	static const char logging[] = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict><key>DEFAULT-OPTIONS</key><dict>"
 +	    "<key>Enable-Private-Data</key><true/><key>Privacy-Enable-Level</key><string>Private</string></dict></dict></plist>\n";
 +	int logging_error = 0;

@@ -152,10 +152,17 @@ b9 用 drivers/RamBlock/coachz_modem.c 按上面的顺序接入，在 Wi-Fi 线�
 - 失效的卡在任何网络上都只得到紧急服务，拒绝原因 15（EMM #15）；同一张卡在 Debian 下也注册不上。
 
 接下来的卡点：
-- **运营商设置包**：“关于本机”的运营商是未知。
+- **LTE 掉线**：k151 上 LTE 反复掉线再恢复。
 - **蜂窝数据**：数据口设置已被接受；要看 `BindMuxDataPort` 的应答，之后才是 `pdp_ip` 接 `rmnet_ipa0`。蜂窝数据和数据漫游默认关闭，开数据通路前先确认。
 - **eSIM**：在 UIM 0x2f 应答里补 TLV 0x21，VINYL 0xe5 的 Tape 请求转成 UIM 逻辑通道上对 ISD-R 的 APDU。
 - **EFS 持久化**：modem 的写入只留在内核内存里，重启后从 FSG 重建。
+
+### 第八次上机（ICCID、IMSI 和运营商设置包）
+
+- k150 的激活指示带上 ICCID 后，`BB activated, but there is no SIM` 只在读到 ICCID 之前出现，CommCenter 第一次为这张 SIM 查运营商包，也在 iPad 的运营商包里匹配到了对应的包；但匹配 SIM 信息时记 `There is no CarrierID or SIM Info present`，技术类型是 kUnknown，`Ignoring bundle setup for unknown technology type`。
+- 反汇编确认两条原因：匹配要用 IMSI，指示里只有 ICCID；`createActivationStringFromData` 把 ICCID 字节按十六进制原样转成字符串、去掉末尾的 F，要的是阅读顺序的 BCD，而 EF_ICCID 每两位是对调存的。
+- k151：ICCID 对调回阅读顺序；CommCenter 开机自己读 EF_IMSI（9 字节），桥接层把应答接下来，解出 15 位数字，按阅读顺序打成 8 字节、末尾补 F，作为 TLV 0x43 放进激活指示。两个值都取自卡本身，日志里不打印。
+- 上机：状态栏显示运营商名、信号格和 LTE 标志，控制中心的蜂窝数据开关打开。LTE 反复掉线，过一会儿又回到 LTE，原因在查。APN 设置和实际数据收发还没确认。
 
 ### eSIM Tape 实现（待实机）
 

@@ -2,8 +2,8 @@
 /*
  * Connects modem/ (mainline's ipa_config, ipa_setup and the IPA QMI handshake) to the modem start in bsd/dev/coachz_wifi.c, in
  * mainline's order: coachz_modem_configure before the modem boots, coachz_modem_starting as its start begins, coachz_modem_setup once
- * it raises ipa-setup-ready, then the handshake over QRTR and ipa_modem_start with rmnet_ipa0 open. No data call exists yet: that needs
- * QMI control (WDA data format, WDS bind mux and start network), so no packet is expected.
+ * it raises ipa-setup-ready, then the handshake over QRTR and ipa_modem_start with rmnet_ipa0 open. The baseband bridge owns the XNU pdp_ip interfaces and observes CommCenter WDS control;
+ * the data entry points below execute only on this owner thread.
  *
  * Polled from the Wi-Fi thread's millisecond loop instead of SPI 311 and 432. The WLAN firmware shares this modem, so every failure is
  * printed and turns the rest of this sequence off; nothing here stops the Wi-Fi sequence.
@@ -46,6 +46,22 @@ static struct coachz_ipa_cmd cm_cmd;
 static struct coachz_ipa_rx cm_lan, cm_modem_rx;
 static struct coachz_ipa_modem cm_modem;
 static int cm_modem_open;
+static void (*cm_data_rx)(uint32_t, const uint8_t *, uint32_t, uint32_t);
+void coachz_modem_data_receiver(void (*receiver)(uint32_t, const uint8_t *, uint32_t, uint32_t));
+int coachz_modem_data_send(uint32_t mux, const uint8_t *ip, uint32_t length);
+static void cm_data_deliver(void *context, uint32_t mux, const uint8_t *ip, uint32_t length, uint32_t ip_version)
+{
+    (void)context;
+    if (cm_data_rx) cm_data_rx(mux, ip, length, ip_version);
+}
+/* All three entry points run on the Wi-Fi/IPA owner thread, never an ifnet caller. */
+void coachz_modem_data_receiver(void (*receiver)(uint32_t, const uint8_t *, uint32_t, uint32_t)) { cm_data_rx = receiver; }
+int coachz_modem_data_send(uint32_t mux, const uint8_t *ip, uint32_t length)
+{
+    if (!cm_modem_open) return ENETDOWN;
+    const int result = coachz_ipa_modem_xmit(&cm_modem, mux, ip, length);
+    return result < 0 ? -result : result;
+}
 static struct ci_handshake cm_hs;
 static int cm_state;
 static int (*cm_send)(int client, uint32_t node, uint32_t port, const void *message, uint32_t length);
@@ -103,6 +119,9 @@ cm_modem_start(void)
         printf("COACHZ modem: data path failed (%d), the modem and Wi-Fi go on without it\n", err);
         return;
     }
+    /* Native data contexts bind mux 1..4. MAP framing and checksums stay in the rmnet backend. */
+    for (uint32_t mux = 1; mux <= 4; mux++) coachz_ipa_modem_mux_add(&cm_modem, mux);
+    cm_modem.mux_deliver = cm_data_deliver;
     cm_modem_open = 1;
     printf("COACHZ modem: channel states TX 0:%u RX 3:%u\n", cm_channel_state(0), cm_channel_state(3));
 }

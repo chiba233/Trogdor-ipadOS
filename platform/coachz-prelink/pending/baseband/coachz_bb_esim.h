@@ -84,6 +84,10 @@
 #define CBE_SESSION_IDLE_MS 180000u
 #define CBE_EVENTS 32u
 #define CBE_DEFERRED UINT32_MAX
+/* Answers to read-only ES10 queries, kept so a repeated query does not switch the physical slot away from the SIM in use:
+ * on hardware each switch dropped LTE about 2 s later, and the SIM state change it caused made CommCenter query again. */
+#define CBE_CACHE_ENTRIES 4u
+#define CBE_CACHE_REQ 64u
 
 static const uint8_t cbe_isdr_aid[16] = { 0xa0, 0x00, 0x00, 0x05, 0x59, 0x10, 0x10, 0xff, 0xff, 0xff, 0xff, 0x89, 0x00, 0x00, 0x01, 0x00 };
 static const uint8_t cbe_get_eid[] = { 0xbf, 0x3e, 0x03, 0x5c, 0x01, 0x5a };
@@ -206,6 +210,7 @@ enum cbe_event_kind {
     CBE_EV_CAPS,         /* a: slot one, b: slot two: the capability bytes changed */
     CBE_EV_LEGACY_CSN,   /* a: command, b: CommCenter slot, c: QMI result; no card identifier */
     CBE_EV_SESSION,      /* a: 1 held, 2 released; b: slot, c: trigger command, d: reason (0 explicit, 1 idle, 2 disconnect, 3 error) */
+    CBE_EV_CACHE,        /* a: command, b: 1 answered from the cache, 2 stored, 3 cleared; c: bytes (stored, answered) or entries (cleared) */
 };
 enum cbe_reason { CBE_R_NO_SLOTS = 1, CBE_R_NO_EUICC, CBE_R_SWITCH_LIMIT, CBE_R_QMI, CBE_R_SW, CBE_R_TIMEOUT, CBE_R_ROOM, CBE_R_INACTIVE, CBE_R_SEGMENTS };
 struct cbe_event { uint32_t kind, a, b, c, d, e; };
@@ -240,6 +245,10 @@ uint8_t done_pending, done_status, done_sw1, done_sw2;
 uint32_t done_chunk, done_len;
 struct cbe_event ev[CBE_EVENTS];
 uint32_t ev_count, ev_lost, card_status_fixed;
+/* read-only query answers; each entry's bytes at cache + index * (cache_cap / CBE_CACHE_ENTRIES) */
+uint8_t *cache;
+uint32_t cache_cap, cache_next;
+struct { uint8_t used, cmd, sw1, sw2; uint32_t req_len, resp_len; uint8_t req[CBE_CACHE_REQ]; } cached[CBE_CACHE_ENTRIES];
 };
 
 static inline void cbe_init(struct cbe *e, uint8_t *in, uint32_t in_cap, uint8_t *resp, uint32_t resp_cap)
@@ -410,12 +419,64 @@ static inline int cbe_session_terminal(uint32_t cmd)
     return cmd == CBE_TAPE_LOAD_BPP || cmd == CBE_TAPE_CANCEL || cmd == CBE_TAPE_CLEAR_SESSION ||
         cmd == CBE_TAPE_ENABLE || cmd == CBE_TAPE_DISABLE || cmd == CBE_TAPE_DELETE || cmd == CBE_TAPE_MEMORY_RESET;
 }
+/* ------------------------------------------------------------------ read-only query cache */
+static inline void cbe_set_cache(struct cbe *e, uint8_t *buf, uint32_t cap) { e->cache = buf; e->cache_cap = buf ? cap : 0; }
+/* SGP.22 queries whose answer only another ES10 command can change: GetEUICCInfo1 (BF20), GetEUICCInfo2 (BF22),
+ * GetProfilesInfo (BF2D), EuiccConfiguredAddresses (BF3C), GetEID (BF3E). Never the challenge (BF2E) or notifications. */
+static inline int cbe_cacheable(const uint8_t *req, uint32_t n)
+{
+    if (n < 2u || n > CBE_CACHE_REQ || req[0] != 0xbfu) return 0;
+    return req[1] == 0x20u || req[1] == 0x22u || req[1] == 0x2du || req[1] == 0x3cu || req[1] == 0x3eu;
+}
+static inline int cbe_cache_find(const struct cbe *e, uint32_t cmd, const uint8_t *req, uint32_t n)
+{
+    for (uint32_t i = 0; i < CBE_CACHE_ENTRIES; i++)
+        if (e->cached[i].used && e->cached[i].cmd == cmd && e->cached[i].req_len == n && !__builtin_memcmp(e->cached[i].req, req, n))
+            return (int)i;
+    return -1;
+}
+/* A hit fills the answer as the card gave it, with its status word. */
+static inline int cbe_cache_take(struct cbe *e, const struct cbe_job *j)
+{
+    const uint8_t *req = e->in + j->off;
+    if (!e->cache || e->switched || e->channel_open || !cbe_cacheable(req, j->len)) return 0;
+    const int i = cbe_cache_find(e, j->cmd, req, j->len);
+    if (i < 0 || e->cached[i].resp_len > e->resp_cap) return 0;
+    __builtin_memcpy(e->resp, e->cache + (uint32_t)i * (e->cache_cap / CBE_CACHE_ENTRIES), e->cached[i].resp_len);
+    e->resp_len = e->cached[i].resp_len; e->sw1 = e->cached[i].sw1; e->sw2 = e->cached[i].sw2; e->seg_count = 0;
+    cbe_event(e, CBE_EV_CACHE, j->cmd, 1, e->resp_len, 0, 0);
+    return 1;
+}
+/* After a command reached the card: keep a clean read-only answer; anything else may change the answers, so drop them all. */
+static inline void cbe_cache_note(struct cbe *e, const struct cbe_job *j, uint32_t status)
+{
+    if (!e->cache || j->cmd == CBE_TAPE_EID || j->cmd == CBE_TAPE_GET_SESSION || j->cmd == CBE_TAPE_CLEAR_SESSION) return;
+    const uint8_t *req = e->in + j->off;
+    if (!cbe_cacheable(req, j->len)) {
+        uint32_t had = 0;
+        for (uint32_t i = 0; i < CBE_CACHE_ENTRIES; i++) { had += e->cached[i].used; e->cached[i].used = 0; }
+        if (had) cbe_event(e, CBE_EV_CACHE, j->cmd, 3, had, 0, 0);
+        return;
+    }
+    const uint32_t room = e->cache_cap / CBE_CACHE_ENTRIES;
+    if (status || e->sw1 != 0x90u || e->sw2 || !e->resp_len || e->resp_len > room || cbe_cache_find(e, j->cmd, req, j->len) >= 0) return;
+    uint32_t i = 0;
+    while (i < CBE_CACHE_ENTRIES && e->cached[i].used) i++;
+    if (i == CBE_CACHE_ENTRIES) i = e->cache_next++ % CBE_CACHE_ENTRIES;
+    __builtin_memcpy(e->cache + i * room, e->resp, e->resp_len);
+    __builtin_memcpy(e->cached[i].req, req, j->len);
+    e->cached[i].used = 1; e->cached[i].cmd = j->cmd; e->cached[i].sw1 = e->sw1; e->cached[i].sw2 = e->sw2;
+    e->cached[i].req_len = j->len; e->cached[i].resp_len = e->resp_len;
+    cbe_event(e, CBE_EV_CACHE, j->cmd, 2, e->resp_len, 0, 0);
+}
+
 static inline void cbe_finish(struct cbe *e, uint32_t status, uint32_t reason, uint32_t detail, uint32_t now)
 {
     if (e->active >= 0) {
         e->done = e->job[e->active]; e->job[e->active].state = CBE_J_FREE;
         e->done_status = (uint8_t)status; e->done_sw1 = e->sw1; e->done_sw2 = e->sw2;
         e->done_pending = 1; e->done_chunk = 0; e->done_len = status ? 0 : e->resp_len;
+        cbe_cache_note(e, &e->done, status);
         if (status) cbe_event(e, CBE_EV_FAILED, e->done.cmd, e->step, detail, reason, 0);
         else cbe_event(e, CBE_EV_DONE, e->done.cmd, 0, (uint32_t)e->sw1 << 8 | e->sw2, e->resp_len, e->seg_count);
         e->active = -1;
@@ -456,6 +517,7 @@ static inline void cbe_begin(struct cbe *e, uint32_t now)
     if (j->cmd == CBE_TAPE_GET_SESSION || j->cmd == CBE_TAPE_CLEAR_SESSION) {
         cbe_finish(e, 0, 0, 0, now); return;
     }
+    if (cbe_cache_take(e, j)) { cbe_finish(e, 0, 0, 0, now); return; }
     if (j->cmd == CBE_TAPE_EID) {
         e->seg[0] = (struct cbe_seg){ 0, sizeof cbe_get_eid }; e->seg_count = 1;
     } else {

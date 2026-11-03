@@ -1687,3 +1687,11 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 - **流畅度**：明显更流畅。约 307 秒，没有 panic、`@crash`、DeviceLost，故障寄存器全 0，统一日志没有 command buffer 错误。
 - **计数**：同样到 307 秒，k147 提交 3647 次、翻转 1801 次、镜像 627 次，`frame-gpu` 超过 16 ms 占 19.6%；k148 是 7735、3601、2905 次，占 37.7%，commit-to-complete 平均 18.1 ms。为什么提交和翻转是两倍还没查。
 - **binary archive**：QuartzCore 和 CoreImage 自带的预编译库被拒（`InvalidFile`），k147 同样有。
+
+## LTE 标志出现（k151）
+
+内核在 k150 上只改了激活指示：ICCID 改成阅读顺序，再带上从卡上读到的 IMSI（TLV 0x43）。GPU 上层带 plain 写入后按区域拷回私有纹理、只读 shader 绑定不再强制整帧同步的修订。
+
+- **蜂窝**：有效 SIM 下状态栏显示运营商名、信号格和 LTE 标志，控制中心的蜂窝数据开关打开。LTE 反复掉线，过一会儿又回到 LTE。APN 和实际数据收发还没确认。
+- **第一次启动**：XNU 下 eMMC 没有上线，只有 microSD 卡发布成 disk0（k149 起这张卡一直插着），系统卷等不到，panic 在 `Failed to mount root device`；日志区写不进去，这次没有日志。Debian 下分区表完好。同一张镜像重启后正常。
+- **GPU**：这次的计数还没读。

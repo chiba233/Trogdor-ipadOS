@@ -7,6 +7,7 @@
 #include "coachz_bb_control.h"
 #include "coachz_bb_channels.h"
 #include "coachz_bb_data.h"
+#include "coachz_bb_pdp.h"
 #include "coachz_bb_esim.h"
 
 static int failures;
@@ -423,16 +424,67 @@ static void test_data(void)
     n = cbq_private_answer(act, CBD_SVC_BSP, 3, 0, 0, 0, out, sizeof out);
     const uint8_t act_ok[] = { 1, 19, 0, 0x80, 0xe2, 3, 2, 0x34, 0x12, 0x0c, 0xb0, 7, 0, 2, 4, 0, 0, 0, 0, 0 };
     CHECK(n == sizeof act_ok && !memcmp(out, act_ok, sizeof act_ok));
-    uint8_t tlvs[CBD_ACTIVATION_TLVS];
-    const uint32_t t = cbd_activation_state(tlvs, sizeof tlvs);
+    uint8_t tlvs[CBD_ACTIVATION_SIM_TLVS];
+    const uint32_t t = cbd_activation_state(tlvs, CBD_ACTIVATION_TLVS, NULL, NULL);
     n = cbq_private_indication(CBD_BSP_ACTIVATION_REGISTER, CBD_SVC_BSP, 3, tlvs, t, out, sizeof out);
     /* kActivated, service provisioned (0x4f = 2), slot one's card provisioned (0x50 = 2), both slots accepted (0x56, 0x57 = 1) */
     const uint8_t act_ind[] = { 1, 32, 0, 0x80, 0xe2, 3, 4, 0, 0, 0x0c, 0xb0, 20, 0, 1, 1, 0, 0, 0x4f, 1, 0, 2, 0x50, 1, 0, 2,
                                 0x56, 1, 0, 1, 0x57, 1, 0, 1 };
     CHECK(t == CBD_ACTIVATION_TLVS && n == sizeof act_ind && !memcmp(out, act_ind, sizeof act_ind));
-    CHECK(!cbd_activation_state(tlvs, CBD_ACTIVATION_TLVS - 1));   /* no room: nothing to send */
+    CHECK(!cbd_activation_state(tlvs, CBD_ACTIVATION_TLVS - 1, NULL, NULL));   /* no room: nothing to send */
+    /* CommCenter's EF_ICCID and EF_IMSI reads (synthetic values) are recognized, then go into the indication in reading order. */
+    const uint8_t iccid_req[] = { 0, 7, 0, 0x20, 0, 13, 0, 1, 2, 0, 0, 0, 2, 5, 0, 0xe2, 0x2f, 2, 0, 0x3f };
+    const uint8_t imsi_req[] = { 0, 8, 0, 0x20, 0, 13, 0, 1, 2, 0, 0, 0, 2, 5, 0, 0x07, 0x6f, 2, 0, 0x3f };
+    CHECK(cbd_uim_read_file(iccid_req, sizeof iccid_req) == CBD_EF_ICCID && cbd_uim_read_file(imsi_req, sizeof imsi_req) == CBD_EF_IMSI);
+    uint8_t iccid_ans[] = { 2, 7, 0, 0x20, 0, 22, 0, 2, 4, 0, 0, 0, 0, 0, 0x11, 12, 0, 10, 0,
+                            0x98, 0x10, 0x32, 0x54, 0x76, 0x98, 0x10, 0x32, 0x54, 0x76 };
+    uint8_t ef[16], iccid[CBD_ICCID_BYTES], imsi[CBD_IMSI_BYTES];
+    uint32_t eflen = cbd_uim_read_content(iccid_ans, sizeof iccid_ans, ef, sizeof ef);
+    CHECK(eflen == 10 && cbd_iccid_from_ef(ef, eflen, iccid) && iccid[0] == 0x89 && iccid[1] == 0x01 && iccid[9] == 0x67);
+    iccid_ans[17] = 9;   /* a content length that does not match its TLV is not a read */
+    CHECK(!cbd_uim_read_content(iccid_ans, sizeof iccid_ans, ef, sizeof ef));
+    /* IMSI 001010123456789: length 8, digit 1 above parity 9, then pairs low nibble first */
+    const uint8_t ef_imsi[9] = { 8, 0x09, 0x10, 0x10, 0x10, 0x32, 0x54, 0x76, 0x98 };
+    CHECK(cbd_imsi_from_ef(ef_imsi, sizeof ef_imsi, imsi));
+    const uint8_t imsi_bcd[8] = { 0x00, 0x10, 0x10, 0x12, 0x34, 0x56, 0x78, 0x9f };
+    CHECK(!memcmp(imsi, imsi_bcd, sizeof imsi_bcd));
+    const uint32_t ts = cbd_activation_state(tlvs, sizeof tlvs, iccid, imsi);
+    CHECK(ts == CBD_ACTIVATION_SIM_TLVS && tlvs[20] == 0x42 && tlvs[21] == 10 && !memcmp(tlvs + 23, iccid, 10) &&
+          tlvs[33] == 0x43 && tlvs[34] == 8 && !memcmp(tlvs + 36, imsi, 8));
+    CHECK(cbd_activation_state(tlvs, sizeof tlvs, iccid, NULL) == CBD_ACTIVATION_TLVS + 13);
+    CHECK(!cbd_activation_state(tlvs, CBD_ACTIVATION_SIM_TLVS - 1, iccid, imsi));
     n = cbq_private_unsupported(act, 0xe5, 2, out, sizeof out);
     CHECK(n == 20 && out[4] == 0xe5 && cbq_rd16(out + 16) == 1 && cbq_rd16(out + 18) == CBQ_ERR_NOT_SUPPORTED);
+    /* Two WDS clients on one mux: only modem success activates each family, and stopping IPv4 preserves IPv6. */
+    struct cbp_client calls[2] = { { 0 }, { 0 } };
+    uint8_t wire[64], reply[64], v;
+    for (uint32_t i = 0; i < 2; i++) {
+        v = 1;
+        uint32_t wn = cbd_request(wire, 1, CBD_WDS_BIND_MUX_DATA_PORT, cbd_tlv(wire + 7, 57, 0x11, &v, 1));
+        CHECK(cbp_observe(&calls[i], wire, wn) && !calls[i].mux);
+        uint32_t rn = cbq_private_answer(wire, 1, 1, 0, NULL, 0, reply, sizeof reply);
+        CHECK(cbp_observe(&calls[i], reply + CBQ_HDR, rn - CBQ_HDR) && calls[i].mux == 1);
+        v = i ? 6 : 4;
+        wn = cbd_request(wire, 2, CBP_FAMILY, cbd_tlv(wire + 7, 57, 1, &v, 1));
+        CHECK(cbp_observe(&calls[i], wire, wn));
+        rn = cbq_private_answer(wire, 1, 1, 0, NULL, 0, reply, sizeof reply);
+        CHECK(cbp_observe(&calls[i], reply + CBQ_HDR, rn - CBQ_HDR));
+        wn = cbd_request(wire, 3, CBP_START, 0);
+        CHECK(cbp_observe(&calls[i], wire, wn) && !calls[i].active);
+        uint8_t handle[7];
+        uint32_t extra = cbd_tlv_u32(handle, sizeof handle, 1, 0x1234 + i);
+        rn = cbq_private_answer(wire, 1, 1, 0, handle, extra, reply, sizeof reply);
+        CHECK(cbp_observe(&calls[i], reply + CBQ_HDR, rn - CBQ_HDR) && calls[i].active);
+    }
+    CHECK(cbp_active_families(calls, 2, 1) == 3 && !cbp_active_families(calls, 2, 2));
+    cbd_request(wire, 4, CBP_STOP, 0);
+    CHECK(cbp_observe(&calls[0], wire, 7));
+    uint32_t rn = cbq_private_answer(wire, 1, 1, 0, NULL, 0, reply, sizeof reply);
+    CHECK(cbp_observe(&calls[0], reply + CBQ_HDR, rn - CBQ_HDR));
+    CHECK(cbp_active_families(calls, 2, 1) == 2);
+    const uint8_t disconnected[] = { 4, 0, 0, CBP_STATUS, 0, 5, 0, 1, 2, 0, 1, 0 };
+    CHECK(cbp_observe(&calls[1], disconnected, sizeof disconnected));
+    CHECK(!cbp_active_families(calls, 2, 1));
     if (!failures) printf("PASS data port and activation\n");
 }
 
@@ -687,6 +739,38 @@ static void test_esim(void)
     if (!failures) printf("PASS esim tape transport and cleanup\n");
 }
 
+/* A repeated read-only query is answered from the cache without a slot switch; a command that changes the card clears it. */
+static uint8_t esim_cache[4 * 1024];
+static void esim_drain(void)
+{
+    uint8_t out[2048], channel = 0;
+    for (unsigned i = 0; i < 8 && cbe_output(&esim, &channel, out, sizeof out); i++) {}
+    CHECK(!esim.done_pending);
+}
+static void test_esim_cache(void)
+{
+    const uint8_t query[] = { 0xbf, 0x2d, 0 }, answer[] = { 0xbf, 0x2d, 2, 0xa0, 0 }, del[] = { 0xbf, 0x33, 0 };
+    const uint8_t challenge[] = { 0xbf, 0x2e, 0 };
+    CHECK(cbe_cacheable(query, sizeof query) && !cbe_cacheable(challenge, sizeof challenge) && !cbe_cacheable(del, sizeof del));
+    esim_reset(); cbe_set_cache(&esim, esim_cache, sizeof esim_cache);
+    esim_tape_command(13, 9, query, sizeof query, 1, 0, 2); esim_open();
+    esim_apdu_response(6007, answer, sizeof answer, 0x90, 0);
+    esim_restore(6008);
+    CHECK(esim.cached[0].used && esim.cached[0].resp_len == sizeof answer);
+    esim_drain();
+    const uint32_t switches = esim.switches;
+    esim_tape_command(13, 9, query, sizeof query, 1, 0, 20000);
+    cbe_tick(&esim, 20001);
+    CHECK(esim.step == CBE_S_IDLE && !esim.freeze && !esim.req_len && esim.switches == switches);
+    CHECK(esim.done_pending && esim.done_len == sizeof answer && esim.done_sw1 == 0x90 && !memcmp(esim.resp, answer, sizeof answer));
+    esim_drain();
+    esim_tape_command(CBE_TAPE_DELETE, 9, del, sizeof del, 1, 0, 20002); esim_open();
+    esim_apdu_response(6007, NULL, 0, 0x90, 0);
+    esim_restore(6008);
+    CHECK(!esim.cached[0].used);
+    if (!failures) printf("PASS esim read-only query cache\n");
+}
+
 int main(void)
 {
     test_qmux();
@@ -697,5 +781,6 @@ int main(void)
     test_channels();
     test_data();
     test_esim();
+    test_esim_cache();
     return failures ? 1 : 0;
 }

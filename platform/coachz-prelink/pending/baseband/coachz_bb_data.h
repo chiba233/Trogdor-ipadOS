@@ -253,23 +253,89 @@ static inline int cbd_answer(struct cbd_setup *s, uint32_t service, const uint8_
  * SIM lock. While slot one is not accepted CommCenter logs "Baseband activation result is unexpected!" and "BB activated, but there
  * is no SIM" on every activation query and sets the service provisioned state back to kUnknown. This modem has no SIM lock: both
  * slots are accepted.
+ *
+ * Whether a slot holds a SIM at all is the slot's own record in ActivationInfo (slot one at +0x60, its present flag at +0x110; slot
+ * two at +0x110, flag at +0x1c0). parseMutableTlvs fills slot one's record, and sets the flag, from TLV 0x42 (ActivationIccidSlot1,
+ * 10 bytes); 0x43 is its IMSI (8 bytes), 0x44 and 0x45 its GIDs, 0x46 to 0x49 the same for slot two. ActivationInfo +0x1c8 is the OR of
+ * the two flags, and pp reads it: without 0x42 every activation query ends in "BB activated, but there is no SIM". pp then hands the
+ * slot's ICCID and IMSI to carrier bundle matching (kCTPostponementInfoICCID, kCTPostponementInfoIMSI) through
+ * createActivationStringFromData, which prints the bytes as hex and drops a trailing F: both are BCD in reading order, padded with F.
+ * With the ICCID alone matching answers "There is no CarrierID or SIM Info present", the bundle technology stays kUnknown and the
+ * carrier bundle is never set up (no APN, no data context). So both, as read from the card, go into the indication once known.
  */
 #define CBD_SVC_BSP 0xe2u
 #define CBD_BSP_ACTIVATION_REGISTER 0xb00cu
 #define CBD_ACTIVATED 0u
 #define CBD_PROVISIONED 2u
 #define CBD_ACCEPTED 1u
+#define CBD_ICCID_BYTES 10u
+#define CBD_IMSI_BYTES 8u
 #define CBD_ACTIVATION_TLVS 20u
-static inline uint32_t cbd_activation_state(uint8_t *tlvs, uint32_t room)
+#define CBD_ACTIVATION_SIM_TLVS (CBD_ACTIVATION_TLVS + 3u + CBD_ICCID_BYTES + 3u + CBD_IMSI_BYTES)
+static inline uint32_t cbd_activation_state(uint8_t *tlvs, uint32_t room, const uint8_t *iccid, const uint8_t *imsi)
 {
     const uint8_t state = CBD_ACTIVATED, provisioned = CBD_PROVISIONED, accepted = CBD_ACCEPTED;
-    if (room < CBD_ACTIVATION_TLVS) return 0;
+    const uint32_t need = CBD_ACTIVATION_TLVS + (iccid ? 3u + CBD_ICCID_BYTES : 0u) + (iccid && imsi ? 3u + CBD_IMSI_BYTES : 0u);
+    if (room < need) return 0;
     uint32_t w = cbd_tlv(tlvs, room, 0x01, &state, 1);
     w += cbd_tlv(tlvs + w, room - w, 0x4f, &provisioned, 1);
     w += cbd_tlv(tlvs + w, room - w, 0x50, &provisioned, 1);
     w += cbd_tlv(tlvs + w, room - w, 0x56, &accepted, 1);
     w += cbd_tlv(tlvs + w, room - w, 0x57, &accepted, 1);
+    if (iccid) w += cbd_tlv(tlvs + w, room - w, 0x42, iccid, CBD_ICCID_BYTES);
+    if (iccid && imsi) w += cbd_tlv(tlvs + w, room - w, 0x43, imsi, CBD_IMSI_BYTES);
     return w;
+}
+
+/* CommCenter reads EF_ICCID and EF_IMSI itself: UIM Read Transparent (0x20), TLV 0x02 {u16 file id, u8 path length, path}. The answer
+ * carries TLV 0x11 {u16 content length, content} (libqmi qmi-service-uim.json). Files are stored as on the card (TS 31.102). */
+#define CBD_SVC_UIM 0x0bu
+#define CBD_UIM_READ_TRANSPARENT 0x0020u
+#define CBD_EF_ICCID 0x2fe2u
+#define CBD_EF_IMSI 0x6f07u
+static inline uint32_t cbd_uim_read_file(const uint8_t *sdu, uint32_t n)
+{
+    uint32_t len = 0;
+    if (!cbd_sdu_ok(sdu, n) || sdu[0] != 0u || cbd_rd16(sdu + 3) != CBD_UIM_READ_TRANSPARENT) return 0;
+    const uint8_t *file = cbd_find(sdu, n, 0x02, &len);
+    return file && len >= 3u ? cbd_rd16(file) : 0u;
+}
+/* The content of a successful read, at most room bytes: its length, or 0. */
+static inline uint32_t cbd_uim_read_content(const uint8_t *sdu, uint32_t n, uint8_t *out, uint32_t room)
+{
+    uint32_t len = 0;
+    if (!cbd_sdu_ok(sdu, n) || sdu[0] != 2u || cbd_rd16(sdu + 3) != CBD_UIM_READ_TRANSPARENT || cbd_error(sdu, n)) return 0;
+    const uint8_t *r = cbd_find(sdu, n, 0x11, &len);
+    if (!r || len < 2u || cbd_rd16(r) != len - 2u || len - 2u > room) return 0;
+    for (uint32_t i = 0; i < len - 2u; i++) out[i] = r[2 + i];
+    return len - 2u;
+}
+/* EF_ICCID keeps each digit pair low nibble first: swap into reading order. */
+static inline int cbd_iccid_from_ef(const uint8_t *ef, uint32_t n, uint8_t out[CBD_ICCID_BYTES])
+{
+    if (n != CBD_ICCID_BYTES) return 0;
+    for (uint32_t i = 0; i < CBD_ICCID_BYTES; i++) out[i] = (uint8_t)(ef[i] << 4 | ef[i] >> 4);
+    return 1;
+}
+/* EF_IMSI: a length byte (digit bytes that follow), then digit 1 in the high nibble of the first byte above the parity nibble, then
+ * pairs low nibble first, F filling. Repacked in reading order, padded with F. */
+static inline int cbd_imsi_from_ef(const uint8_t *ef, uint32_t n, uint8_t out[CBD_IMSI_BYTES])
+{
+    uint8_t digits[16];
+    uint32_t count = 0;
+    if (n < 2u || !ef[0] || ef[0] > 8u || n < 1u + ef[0]) return 0;
+    for (uint32_t i = 1; i <= ef[0]; i++) {
+        const uint8_t lo = ef[i] & 0xfu, hi = ef[i] >> 4;
+        if (i > 1u) { if (lo > 9u) break; digits[count++] = lo; }
+        if (hi > 9u) break;
+        digits[count++] = hi;
+    }
+    if (count < 6u || count > 15u) return 0;
+    for (uint32_t i = 0; i < CBD_IMSI_BYTES; i++) {
+        const uint8_t a = 2u * i < count ? digits[2u * i] : 0xfu, b = 2u * i + 1u < count ? digits[2u * i + 1u] : 0xfu;
+        out[i] = (uint8_t)(a << 4 | b);
+    }
+    return 1;
 }
 
 #endif /* COACHZ_BB_DATA_H */
