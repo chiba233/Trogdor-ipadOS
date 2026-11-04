@@ -1695,3 +1695,10 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 - **蜂窝**：有效 SIM 下状态栏显示运营商名、信号格和 LTE 标志，控制中心的蜂窝数据开关打开。LTE 反复掉线，过一会儿又回到 LTE。APN 和实际数据收发还没确认。
 - **第一次启动**：XNU 下 eMMC 没有上线，只有 microSD 卡发布成 disk0（k149 起这张卡一直插着），系统卷等不到，panic 在 `Failed to mount root device`；日志区写不进去，这次没有日志。Debian 下分区表完好。同一张镜像重启后正常。
 - **GPU**：这次的计数还没读。
+
+
+## k165 GPU 直接渲染与图层复制
+
+启动 45，日志覆盖 932 秒。首个 backboardd 尝试 13257 次、直接渲染 1073 次，八次像素对照全部零差异。后续 backboardd 中有两次对照差异，分别为七个像素、最大两个 8-bit 单位，以及两个像素、最大一个单位；最后一个进程没有直接渲染。程序和附件布局隔离状态继续生效。
+
+两次 backboardd 崩溃的 asi 为 `Failed to create IOSurfaceAccelerator`，栈为 `detach_layer` → `IOMFBDisplay::copy_surface` → `create_new_iosa_manager` → `abort`，相邻日志为匹配 AppleM2ScalerCSCDriver 失败。SpringBoard 和 chronod 随后 SIGABRT。整次没有 panic 或 DeviceLost。累计提交完成均值 73.6 ms 包含两次界面重启和初始化，缺少固定操作窗口。

@@ -1,3 +1,4 @@
+diff --git a/GpuScanoutClient.h b/GpuScanoutClient.h
 --- a/GpuScanoutClient.h
 +++ b/GpuScanoutClient.h
 @@ -34,8 +34,9 @@
@@ -78,6 +79,7 @@
      void note(uint32_t value) {if (transport_.mark) transport_.mark(transport_.context, value);}
      bool fail(int step, int error) {stats_->step = step; stats_->error = error; return false;}
      Transport transport_ = {};
+diff --git a/GpuScanoutPresenter.h b/GpuScanoutPresenter.h
 --- a/GpuScanoutPresenter.h
 +++ b/GpuScanoutPresenter.h
 @@ -18,8 +18,11 @@
@@ -300,6 +302,7 @@
      Source sources_[kSources] = {};
      uint64_t uses_ = 0;
  };
+diff --git a/NativeAdrenoMetalPlugin.mm b/NativeAdrenoMetalPlugin.mm
 --- a/NativeAdrenoMetalPlugin.mm
 +++ b/NativeAdrenoMetalPlugin.mm
 @@ -93,9 +93,10 @@
@@ -314,6 +317,7 @@
      uint32_t word = 0;
      if (!readTask(site, &word, sizeof word)) return 0x6E40;
      if (word == 0xd503201f) return 0x6E42;
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 --- a/NativeBridgeMetalFrontend.mm
 +++ b/NativeBridgeMetalFrontend.mm
 @@ -17,8 +17,10 @@
@@ -354,7 +358,7 @@
  // NMB_LOG_STDERR: also on stderr (a daemon's NSLog reaches only the unified log, which a bring-up board does not read).
  static bool logToStderr() {static bool on=getenv("NMB_LOG_STDERR")!=nullptr;return on;}
  // The GPU stack's log lines (log-gpu=1 on the boot line: the plugin sets SHENG_LOG_GPU): NSLog output, the pipeline journal. The problem notes that feed
-@@ -1020,15 +1040,40 @@
+@@ -1020,15 +1040,59 @@
  @property(nonatomic) uint32_t pvrtc;   // the PVRTC format the texture was asked for, decoded into its RGBA8 (0: none)
  - (void)replacePvrtcRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes length:(size_t)length;
  @property(nonatomic) NmbTextureDescriptor descriptor;
@@ -365,6 +369,9 @@
  @property(nonatomic) IOSurfaceRef surface;
 +@property(nonatomic,strong) NBTexture *coachzBacking; // canonical pixels held by private or plain fallback views
 +@property(nonatomic) BOOL coachzDirect;   // the display's frame in a private texture (coachzDisplayFrame), not the surface's pages
++// Plain import provenance, read from the root even when the pass uses a child view.
++@property(nonatomic) uint8_t coachzPlainImport; // 1 before resident, 2 straight ready, 3 turned resident, 4 not ready
++@property(nonatomic,strong) NBTexture *coachzResident; // GPU root when a private view keeps its original public parent
  @property(nonatomic) NSUInteger offset,rowBytes;
  @property(nonatomic,strong) id<MTLTexture> parent;
  @property(nonatomic,strong) id<MTLHeap> parentHeap;
@@ -373,7 +380,10 @@
  - (void)countUse;
 +@end
 +// Coachz: one display surface (coachzFrameOf below).
-+@interface CoachzFrame : NSObject
++@interface CoachzFrame : NSObject {
++@public
++ std::atomic<uint32_t> plainWriters; // leases held through completion, including uncommitted writes
++}
 +@property(nonatomic,strong) NBTexture *texture;
 +@property(nonatomic) uint32_t surfaceID;
 +@property(nonatomic) BOOL shown,turned,promoting,valid;
@@ -382,20 +392,48 @@
 +@property(nonatomic,weak) NBTexture *backing;
 +@end
 +@implementation CoachzFrame
++- (instancetype)init {
++ if((self=[super init]))plainWriters.store(0);
++ return self;
++}
 +@end
 +// One attachment/blit write. Only load-preserving private render targets can
 +// narrow the mirror; every other writer keeps the full-surface contract.
 +@interface CoachzFrameWrite : NSObject
 +@property(nonatomic,strong) NBTexture *texture;
 +@property(nonatomic) MTLScissorRect damage;
-+@property(nonatomic) BOOL partial,coherent;
++@property(nonatomic) BOOL partial,coherent,sealed,sealPlanned;
++@property(nonatomic) uintptr_t passCaller;
++@property(nonatomic) uint32_t passActions; // load in bits 0..3, store in bits 4..7
++@property(nonatomic,strong) CoachzFrame *plainLease;
++- (void)releasePlainLease;
 +@end
 +@implementation CoachzFrameWrite
++- (void)releasePlainLease {
++ CoachzFrame *frame=_plainLease;_plainLease=nil;
++ if(frame)frame->plainWriters.fetch_sub(1);
++}
++- (void)dealloc {[self releasePlainLease];}
  @end
  // The render server counts the surfaces it textures in use while the textures live (countUse).
  static const bool gCountsSurfaceUse=!strcmp(getprogname(),"backboardd");
  // A no-copy import keeps its pages until the runtime frees it, which can be after the buffer object goes (a command buffer still using
-@@ -1281,8 +1326,9 @@
+@@ -1254,8 +1318,14 @@
+   out->format=pvrtcCarrier(out->format);out->usage|=MTLTextureUsageShaderRead;
+  }
+  return true;
+ }
++static NBTexture *coachzReusePlainView(NBTexture *source,NBTexture *validated);
++static NBTexture *coachzGpuRoot(NBTexture *texture) {
++ if(texture.coachzDirect && texture.coachzResident)return texture.coachzResident;
++ while(texture.parent)texture=(NBTexture *)texture.parent;
++ return texture;
++}
+ @implementation NBTexture
+ - (NSUInteger)allocatedSize {return nmb_texture_allocated_size(_handle);}
+ - (BOOL)isAliasable {return nmb_texture_is_aliasable(_handle);}
+ - (void)makeAliasable {if(!nmb_texture_make_aliasable(_handle))NBLOG(@"native-metal: texture makeAliasable: %@",lastError());}
+@@ -1281,8 +1351,9 @@
  - (BOOL)isDrawable {return _descriptor.is_drawable!=0;}
  - (IOSurfaceRef)iosurface {return _surface;}
  - (NSUInteger)iosurfacePlane {return 0;}
@@ -405,17 +443,21 @@
  - (NSUInteger)bufferBytesPerRow {return _rowBytes;}
  - (id<MTLTexture>)parentTexture {return _parent;}
  - (NSUInteger)rotation {return _descriptor.rotation;}
-@@ -1295,8 +1341,9 @@
+@@ -1295,9 +1366,13 @@
  - (id<MTLTexture>)view:(NmbTexture *)handle {
   if(!handle){NBLOG(@"native-metal: texture view refused: %@",lastError());return nil;}
   NBTexture *view=[NBTexture new];view.handle=handle;NmbTextureDescriptor descriptor;nmb_texture_describe(handle,&descriptor);view.descriptor=descriptor;
   view.parent=(id<MTLTexture>)self;view.buffer=_buffer;view.offset=_offset;view.rowBytes=_rowBytes;
-+ view.coachzDirect=_coachzDirect;view.coachzBacking=_coachzBacking;
++ view.coachzDirect=_coachzDirect;view.coachzBacking=_coachzBacking;view.coachzResident=_coachzResident;
   if(_surface){view.surface=(IOSurfaceRef)CFRetain(_surface);[view countUse];}
++ // The original view has already passed the runtime's range/format/swizzle checks.
++ // Reuse the resident only for a new view, leaving existing handles immutable.
++ if(!_coachzDirect && _surface)if(NBTexture *direct=coachzReusePlainView(self,view))return (id<MTLTexture>)direct;
   return (id<MTLTexture>)view;
  }
  - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format {
-@@ -1380,12 +1427,14 @@
+  if(isPvrtc(format))format=(MTLPixelFormat)pvrtcCarrier(format);
+@@ -1380,12 +1455,14 @@
    sys_dcache_flush(reinterpret_cast<void *>(it->first),it->second);
    gSurfaceFlushBytes+=it->second;gTimeSurfaceFlush.add(began);
   }
@@ -433,7 +475,7 @@
   texture.buffer=buffer;texture.offset=offset;texture.rowBytes=row;return texture;
  }
  // myron: a two-plane extended-range surface ('b3a8', RGB10A8_2P_XR10) whose planes report no row bytes. IOSurfaceGetBytesPerRowOfPlane
-@@ -1454,8 +1503,16 @@
+@@ -1454,8 +1531,16 @@
   texture.buffer=self;texture.offset=offset;texture.rowBytes=row;return (id<MTLTexture>)texture;
  }
  @end
@@ -450,12 +492,68 @@
  @interface NBLibrary : NBObject
  @property(nonatomic) NmbLibrary *handle;
  @property(nonatomic,strong) id storage;          // what keeps the metallib's bytes mapped: its functions' bitcode, for stitching
-@@ -1930,8 +1987,12 @@
+@@ -1751,11 +1836,18 @@
+ - (void)dealloc {nmb_compute_pipeline_release(_handle);}
+ - (NSUInteger)maxTotalThreadsPerThreadgroup {return nmb_compute_pipeline_max_threads(_handle);}
+ - (NSUInteger)threadExecutionWidth {return nmb_compute_pipeline_execution_width(_handle);}
+ @end
+-@interface NBRenderPipeline : NBObject
++@interface NBRenderPipeline : NBObject {
++@public
++ BOOL coachzTurnChecked;
++ uint32_t coachzTurnMask,coachzColorMask,coachzColorWrites;
++ std::array<std::array<uint32_t,8>,8> coachzBlendState;
++ std::array<uint64_t,4> coachzTurnHashes;
++}
+ @property(nonatomic) NmbRenderPipeline *handle;
+ @property(nonatomic,copy) NSString *dumpInfo;   // NATIVE_METAL_DUMP_CB: its functions, formats and vertex layout
++@property(nonatomic,copy) NSString *coachzFragmentName;
+ @property(nonatomic) uint32_t stateFormat;   // its colour 0 pixel format (the DF rows)
+ @end
+ @implementation NBRenderPipeline
+ - (void)dealloc {nmb_render_pipeline_release(_handle);}
+@@ -1913,8 +2005,34 @@
+   fwrite(IOSurfaceGetBaseAddress(surface),1,alloc,out);fclose(out);
+  }
+  if(manifest)fclose(manifest);
+ }
++@interface CoachzTurnColor : NSObject
++@property(nonatomic,strong) NBTexture *source,*rotated;
++@property(nonatomic) uint32_t slot,load,store,bytesPerPixel;
++@end
++@implementation CoachzTurnColor
++@end
++struct CoachzTurnDraw {
++ NBRenderPipeline *pipeline=nil;
++ std::array<double,6> viewport={};
++ std::array<uint64_t,4> scissor={};
++ std::array<float,4> blend={};
++ uint32_t ordinal=0;
++};
++static void coachzReleaseTurnAudit(id);
++@interface CoachzTurnAudit : NSObject
++@property(nonatomic) BOOL finished;
++@property(nonatomic,strong) NBBuffer *report;
++@property(nonatomic,strong) NSArray<CoachzTurnColor *> *colors;
++@property(nonatomic) std::vector<CoachzTurnDraw> draws;
++@property(nonatomic) BOOL traceTruncated;
++@property(nonatomic) std::vector<std::array<uint64_t,4>> programs;
++@end
++@implementation CoachzTurnAudit
++- (void)dealloc {if(!_finished)coachzReleaseTurnAudit(self);}
++@end
++static void coachzFinishTurnAudits(id commandBuffer);
+ @interface NBCommandBuffer : NBObject {
+ @public
+  EncodedWork encodedWork;   // the command buffer's single encoder thread, not global counter deltas
+  uint64_t createdUs;
+@@ -1930,8 +2048,13 @@
  @property(nonatomic) uint64_t committedUs;
  @property(nonatomic) uint32_t commitIndex;
  @property(nonatomic,strong) NSMutableArray *scheduledHandlers,*completedHandlers;
  @property(nonatomic,strong) NSMutableSet *surfaces;
 +@property(nonatomic,strong) NSMutableArray *coachzFrameWrites;
++@property(nonatomic,strong) NSMutableArray *coachzTurnAudits;
 +@property(nonatomic) uint32_t coachzMirrorGuards; // unbounded compute writes affect the whole command
 +@property(nonatomic,strong) NSMutableDictionary<NSNumber *,NSNumber *> *coachzFrameGuards;
 +- (void)coachzGuardSurface:(IOSurfaceRef)surface reason:(uint32_t)reason;
@@ -463,27 +561,186 @@
  // a no-copy deallocator, its memory owner and texture/heap ancestry.
  @property(nonatomic,strong) NSMutableSet *resourceOwners;
  // The sampled sources watched for a rewrite while the GPU could read them (gWatchSources), kept alive until completion.
-@@ -2301,8 +2362,9 @@
+@@ -1952,9 +2075,34 @@
+  NmbTexture *source,*destination;
+  uint64_t sourceLevel,sourceSlice,destinationLevel,destinationSlice;
+  std::array<uint64_t,3> sourceOrigin,destinationOrigin,size;
+ };
+-@interface NBEncoder : NBObject
++@interface NBEncoder : NBObject {
++@public
++ BOOL coachzDeferred,coachzSelected,coachzAuditing;
++ uint32_t coachzTurnReject,coachzTurnDraws;
++ uint64_t coachzTurnBegan;
++ std::vector<std::function<void()>> coachzCalls;
++ size_t coachzHeldBytes;
++ std::shared_ptr<NmbRenderPassDescriptor> coachzPass;
++ NBTexture *coachzTarget,*coachzTurnView;
++ CoachzFrame *coachzTurnFrame;
++ CoachzFrameWrite *coachzTurnWrite;
++ NSMutableSet *coachzTurnPipelines;
++ NSArray *coachzTurnPrefix;
++ NSMutableArray<CoachzTurnColor *> *coachzTurnColors;
++ uint64_t coachzTurnLayout;
++ BOOL coachzCaptureTrace,coachzTraceTruncated;
++ CoachzTurnDraw coachzCurrentDraw;
++ std::vector<CoachzTurnDraw> coachzDrawTrace;
++ std::vector<std::array<uint64_t,4>> coachzTurnPrograms;
++ NBComputePipeline *coachzAuditPipeline;
++ CoachzTurnAudit *coachzAuditLease;
++}
++@property(nonatomic,copy) NmbEncoder *(^coachzFactory)(void);
++- (void)coachzResolveDeferred;
++- (void)coachzFlushDeferred;
++- (void)coachzWatchResource:(id)resource;
+ @property(nonatomic) NmbEncoder *handle;
+ @property(nonatomic,strong) NBCommandBuffer *commandBuffer;
+ @property(nonatomic) std::vector<SingleSampleCopy> resolveCopies;
+ @property(nonatomic,strong) NSMutableArray *dumpEntries;   // its NATIVE_METAL_DUMP_CB targets, given its label at endEncoding
+@@ -2144,9 +2292,36 @@
+  std::unique_lock<std::mutex> lock(t.lock);
+  const uint64_t target=t.queued;
+  t.idle.wait(lock,[&]{return t.done>=target;});
+ }
+-#define ENCODE(...) encodeLater([=]{__VA_ARGS__;})
++static inline bool deferEncode(NBCommandBuffer *) {return false;}
++static inline bool deferEncode(NBEncoder *encoder) {return encoder->coachzDeferred;}
++template<class F> static void recordEncode(NBCommandBuffer *,F &&work) {encodeLater(std::forward<F>(work));}
++template<class F> static void recordEncode(NBEncoder *encoder,F &&work) {
++ encoder->coachzCalls.emplace_back(std::forward<F>(work));
++ if(encoder->coachzCalls.size()>=4096) {
++  encoder->coachzTurnReject|=128;[encoder coachzResolveDeferred];
++ }
++}
++// Ordinary encoders keep the original allocation-free batching. Only a
++// candidate pass holds weak-self calls until its complete bindings are known.
++#define ENCODE(...) do { \
++ if(deferEncode(self)) { \
++  using EncodeOwner=__typeof(self); __weak EncodeOwner weakOwner=self; \
++  recordEncode(self,[=]{EncodeOwner self=weakOwner;if(self){__VA_ARGS__;}}); \
++ } else encodeLater([=]{__VA_ARGS__;}); \
++} while(0)
++@class NBRenderEncoder;
++static void coachzResolveQuarter(NBRenderEncoder *);
++static bool coachzSealQuarter(NBEncoder *);
++static bool coachzMakeAudit(NBEncoder *);
++static bool coachzSeedMrt(NBEncoder *);
++static bool coachzStoreMrt(NBEncoder *);
++static void coachzSelectMrt(NBEncoder *);
++static bool coachzSetupQuarter(NBRenderEncoder *,NBTexture *,MTLRenderPassDescriptor *,CoachzFrameWrite *);
++static bool coachzResourceAliases(id,NBTexture *);
++static std::array<double,6> coachzQuarterViewport(NBEncoder *,std::array<double,6>);
++static std::array<uint64_t,4> coachzQuarterScissor(NBEncoder *,std::array<uint64_t,4>);
+ // Held while a resource wait reads an in-flight command buffer's runtime handle and while a locally refused command buffer frees it.
+ static std::mutex gRuntimeHandleLock;
+ static void waitForResource(id resource) {
+  encodeDrain();   // every committed command buffer's uses recorded
+@@ -2224,9 +2399,44 @@
+ - (bool)check:(bool)ok what:(const char *)what {
+  if(!ok)[_commandBuffer refuse:[NSString stringWithFormat:@"%s: %@",what,lastError()]];
+  return ok;
+ }
++- (void)coachzResolveDeferred { [self coachzFlushDeferred]; }
++- (void)coachzFlushDeferred {
++ if(!coachzDeferred)return;
++ coachzDeferred=NO;
++ auto calls=std::make_shared<std::vector<std::function<void()>>>(std::move(coachzCalls));
++ auto factory=self.coachzFactory;self.coachzFactory=nil;
++ encodeLater([self,calls,factory]{
++  auto open=[&]{self.handle=factory();return [self check:self.handle!=nullptr what:"deferred render encoder"];};
++  if((self->coachzSelected || self->coachzAuditing) && !coachzSeedMrt(self)) {
++   [self check:false what:"quarter-turn MRT seed"];
++   return;
++  }
++  if(self->coachzAuditing) {
++   for(CoachzTurnColor *color in self->coachzTurnColors)if(color.load==MTLLoadActionDontCare) {
++    auto &attachment=self->coachzPass->colors[color.slot];
++    attachment.load=MTLLoadActionClear;
++    for(double &component:attachment.clear)component=0;
++   }
++   self->coachzSelected=NO;
++   if(!open())return;
++   for(auto &call:*calls)call();
++   NmbEncoder *reference=self.handle;self.handle=nullptr;
++   if(![self check:nmb_encoder_end(reference) what:"reference pass end"])return;
++   coachzSelectMrt(self);
++   self->coachzSelected=YES;
++  }
++  if(!open())return;
++  for(auto &call:*calls)call();
++ });
++}
++- (void)coachzWatchResource:(id)resource {
++ if(coachzDeferred)for(CoachzTurnColor *color in coachzTurnColors)
++  if(coachzResourceAliases(resource,color.source))coachzTurnReject|=2;
++}
+ - (void)endEncoding {
++ if(coachzDeferred)[self coachzResolveDeferred];
+  if(self.label.length)for(NSMutableDictionary *entry in _dumpEntries)entry[@"encoder"]=self.label;
+  if(_dumpDraws)dumpLine(_commandBuffer,[NSString stringWithFormat:@"pass %u: %u draws %@",_commandBuffer.dumpPasses,_dumpDraws,self.label?:@""]);
+  if(_dumpRuns.count>1 || _dumpDraws>6)for(NSArray *run in _dumpRuns)
+   dumpLine(_commandBuffer,[NSString stringWithFormat:@"pass %u run: draws %@..%lu | %@ | depth %@",_commandBuffer.dumpPasses,run[2],
+@@ -2241,8 +2451,13 @@
+           [self check:nmb_blit_copy_texture(blit,c.source,c.sourceSlice,c.sourceLevel,c.sourceOrigin.data(),c.size.data(),
+             c.destination,c.destinationSlice,c.destinationLevel,c.destinationOrigin.data()) what:"single-sample resolve"];
+          [self check:nmb_encoder_end(blit) what:"single-sample resolve end"];
+          self->_resolveCopies.clear();
++        }
++        if(self->coachzSelected) {
++         if(self->coachzAuditing && !coachzMakeAudit(self)){[self check:false what:"quarter-turn audit"];return;}
++         if(!coachzStoreMrt(self)){[self check:false what:"quarter-turn MRT store"];return;}
++         if(!coachzSealQuarter(self))[self check:false what:"quarter-turn surface synchronization"];
+         });
+  encodeFlush();
+ }
+ - (void)insertDebugSignpost:(NSString *)s {(void)s;}
+@@ -2300,9 +2515,11 @@
+ }
  // Stage 0 compute, 1 vertex, 2 fragment (the bridge's numbering).
  - (void)buffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {
   if(buffer && ![(id)buffer isKindOfClass:[NBBuffer class]]){[_commandBuffer refuse:@"foreign buffer"];return;}
++ if(coachzDeferred)[self coachzWatchResource:buffer];
   if(buffer)[_commandBuffer.resourceOwners addObject:buffer];
 + if(buffer && [(NBBuffer *)buffer importedSurface])[_commandBuffer coachzGuardSurface:[(NBBuffer *)buffer importedSurface] reason:4];
   if(gDrawStats)[self noteState:kDSBuffer key:stage<<8|(uint32_t)index object:(__bridge const void *)buffer value:offset];
   if(dumpMaybe(_commandBuffer))[self dumpBind:buffer?@[buffer,@(offset)]:nil index:index stage:stage];
   ENCODE([self check:nmb_encoder_set_buffer(self->_handle,stage,buffer?[(NBBuffer *)buffer handle]:nullptr,offset,(uint32_t)index) what:"setBuffer"]);
  }
-@@ -2317,8 +2379,9 @@
+@@ -2316,9 +2533,11 @@
+   dumpNote(_commandBuffer,_commandBuffer.dumpTargets,texture,0,0,
             [NSString stringWithFormat:@"kernel %u texture %lu",_commandBuffer.dumpKernels,(unsigned long)index]);
    if(_commandBuffer.dumpTargets.count>before)[_dumpEntries addObject:_commandBuffer.dumpTargets.lastObject];
   }
++ if(coachzDeferred)[self coachzWatchResource:texture];
   if(texture)[_commandBuffer.resourceOwners addObject:texture];
 + if(texture && coachzShaderMayWriteFrame((NBTexture *)texture))[_commandBuffer coachzGuardSurface:[(NBTexture *)texture surface] reason:2];
   [self dumpBind:texture index:index stage:stage+4];
   if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
   if(texture && gWatchSources)[_commandBuffer watchTexture:(NBTexture *)texture];
   ENCODE([self check:nmb_encoder_set_texture(self->_handle,stage,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index) what:"setTexture"]);
-@@ -2387,8 +2450,9 @@
+@@ -2335,15 +2554,20 @@
+  if(sampler && !clamped){[_commandBuffer refuse:@"sampler with LOD clamps refused"];return;}
+  [self sampler:(id<MTLSamplerState>)clamped index:index stage:stage];
+ }
+ - (void)bytes:(const void *)bytes length:(NSUInteger)length index:(NSUInteger)index stage:(uint32_t)stage {
++ if(coachzDeferred) {
++  if(length>(1u<<20)-coachzHeldBytes){coachzTurnReject|=128;[self coachzResolveDeferred];}
++  else coachzHeldBytes+=length;
++ }
+  if(dumpMaybe(_commandBuffer))[self dumpBind:[NSData dataWithBytes:bytes length:length] index:index stage:stage];
+  if(gDrawStats)[self noteState:kDSBytes key:stage<<8|(uint32_t)index object:nullptr value:hashBytes(bytes,length)];
+- if(!gEncodeThread){[self check:nmb_encoder_set_bytes(_handle,stage,bytes,length,(uint32_t)index) what:"setBytes"];return;}
++ if(!gEncodeThread && !coachzDeferred){[self check:nmb_encoder_set_bytes(_handle,stage,bytes,length,(uint32_t)index) what:"setBytes"];return;}
+  const std::vector<uint8_t> copy((const uint8_t *)bytes,(const uint8_t *)bytes+(bytes?length:0));   // the caller's bytes are its own again
+  ENCODE([self check:nmb_encoder_set_bytes(self->_handle,stage,copy.empty()?nullptr:copy.data(),length,(uint32_t)index) what:"setBytes"]);
+ }
+ - (void)fence:(id<MTLFence>)fence stages:(uint64_t)stages update:(bool)update {
++ if(coachzDeferred)coachzTurnReject|=16;
+  if(![(id)fence isKindOfClass:[NBFence class]]){[_commandBuffer refuse:@"foreign fence"];return;}
+  ENCODE(NmbFence *handle=[(NBFence *)fence handle];
+         [self check:update?nmb_encoder_update_fence(self->_handle,handle,stages):nmb_encoder_wait_fence(self->_handle,handle,stages)
+                what:update?"updateFence":"waitForFence"]);
+@@ -2387,8 +2611,9 @@
  - (void)setThreadgroupMemoryLength:(NSUInteger)n atIndex:(NSUInteger)i {
   ENCODE([self check:nmb_compute_set_threadgroup_memory(self.handle,(uint32_t)n,(uint32_t)i) what:"setThreadgroupMemoryLength"]);
  }
@@ -493,7 +750,7 @@
   const std::array<uint64_t,3> s={size.width,size.height,size.depth},g={group.width,group.height,group.depth};
   ENCODE([self check:nmb_compute_dispatch(self.handle,s.data(),g.data(),threads) what:"dispatch"]);
  }
-@@ -2396,8 +2460,9 @@
+@@ -2396,8 +2621,9 @@
  - (void)dispatchThreadgroups:(MTLSize)t threadsPerThreadgroup:(MTLSize)g {[self dispatch:t group:g threads:false];}
  - (void)dispatchThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)buffer indirectBufferOffset:(NSUInteger)offset threadsPerThreadgroup:(MTLSize)group {
   if(![(id)buffer isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign indirect buffer"];return;}
@@ -503,7 +760,7 @@
   const std::array<uint64_t,3> g={group.width,group.height,group.depth};
   ENCODE([self check:nmb_compute_dispatch_indirect(self.handle,[(NBBuffer *)buffer handle],offset,g.data()) what:"indirect dispatch"]);
  }
-@@ -2406,10 +2471,14 @@
+@@ -2406,13 +2632,30 @@
  @end
 
  @interface NBRenderEncoder : NBEncoder
@@ -513,64 +770,162 @@
 +- (void)coachzRecordDraw;
  @end
  @implementation NBRenderEncoder
-+- (void)coachzRecordDraw {if(_coachzRenderWrites)coachzFrameDraw(_coachzRenderWrites,_coachzScissors);}
++- (void)coachzResolveDeferred {coachzResolveQuarter(self);}
++- (void)coachzRecordDraw {
++ if(_coachzRenderWrites)coachzFrameDraw(_coachzRenderWrites,_coachzScissors);
++ if(coachzDeferred && coachzCaptureTrace) {
++  if(coachzDrawTrace.size()<32) {
++   coachzCurrentDraw.ordinal=coachzTurnDraws;
++   coachzDrawTrace.push_back(coachzCurrentDraw);
++  } else coachzTraceTruncated=YES;
++ }
++}
  - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {
   if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
   if(dumpRange().first)self.dumpPipeline=state;
++ if(coachzDeferred) {
++  [coachzTurnPipelines addObject:state];
++  coachzCurrentDraw.pipeline=(NBRenderPipeline *)state;
++ }
   noteFormats(self.passKey|((uint64_t)((NBRenderPipeline *)state).stateFormat<<32));
-@@ -2469,13 +2538,15 @@
-  ENCODE([self check:nmb_render_set_viewports(self.handle,values.data(),count) what:"setViewports"]);
+  if(gDrawStats)[self noteState:kDSPipeline key:0 object:(__bridge const void *)state value:0];
+  ENCODE([self check:nmb_render_set_pipeline(self.handle,[(NBRenderPipeline *)state handle]) what:"setRenderPipelineState"]);
+ }
+@@ -2450,37 +2693,56 @@
+  for(NSUInteger k=0;k<r.length;k++)[self sampler:s[k] lodMin:a[k] max:b[k] index:r.location+k stage:2];
+ }
+ - (void)setDepthStencilState:(id<MTLDepthStencilState>)state {
+  if(state && ![(id)state isKindOfClass:[NBDepthStencil class]]){[self.commandBuffer refuse:@"foreign depth/stencil state"];return;}
++ if(coachzDeferred && state)coachzTurnReject|=16;
+  if(dumpRange().first)self.dumpDepth=state;
+  if(gDrawStats)[self noteState:kDSDepth key:0 object:(__bridge const void *)state value:0];
+  ENCODE([self check:nmb_render_set_depth_stencil(self.handle,state?[(NBDepthStencil *)state handle]:nullptr) what:"setDepthStencilState"]);
+ }
+ - (void)setViewport:(MTLViewport)v {
+  const std::array<double,6> values={v.originX,v.originY,v.width,v.height,v.znear,v.zfar};
++ if(coachzDeferred)coachzCurrentDraw.viewport=values;
+  if(dumpMaybe(self.commandBuffer) && dumpShown(self.dumpDraws+1))dumpLine(self.commandBuffer,[NSString stringWithFormat:@"pass %u viewport %g,%g %gx%g depth %g..%g",self.commandBuffer.dumpPasses,
+                                                  v.originX,v.originY,v.width,v.height,v.znear,v.zfar]);
+  if(gDrawStats)[self noteState:kDSViewport key:0 object:nullptr value:hashBytes(values.data(),sizeof values)];
+- ENCODE([self check:nmb_render_set_viewport(self.handle,values.data()) what:"setViewport"]);
++ if(coachzDeferred && (!(v.width>0) || !(v.height>0) || v.znear!=0 || v.zfar!=1))coachzTurnReject|=16;
++ ENCODE(auto mapped=coachzQuarterViewport(self,values);[self check:nmb_render_set_viewport(self.handle,mapped.data()) what:"setViewport"]);
+ }
+ - (void)setViewports:(const MTLViewport *)v count:(NSUInteger)count {
+  if(!v || !count || count>16){[self.commandBuffer refuse:@"invalid viewport array"];return;}
+  std::vector<double> values;values.reserve(count*6);
+  for(NSUInteger i=0;i<count;i++)values.insert(values.end(),{v[i].originX,v[i].originY,v[i].width,v[i].height,v[i].znear,v[i].zfar});
+- ENCODE([self check:nmb_render_set_viewports(self.handle,values.data(),count) what:"setViewports"]);
++ if(coachzDeferred)coachzCurrentDraw.viewport={v[0].originX,v[0].originY,v[0].width,v[0].height,v[0].znear,v[0].zfar};
++ if(coachzDeferred && (count!=1 || !(v[0].width>0) || !(v[0].height>0) || v[0].znear!=0 || v[0].zfar!=1))coachzTurnReject|=16;
++ ENCODE(if(self->coachzSelected) {
++         auto mapped=values;std::array<double,6> one;std::copy_n(values.data(),6,one.data());
++         one=coachzQuarterViewport(self,one);std::copy_n(one.data(),6,mapped.data());
++         [self check:nmb_render_set_viewports(self.handle,mapped.data(),count) what:"setViewports"];
++        } else [self check:nmb_render_set_viewports(self.handle,values.data(),count) what:"setViewports"]);
  }
  - (void)setScissorRects:(const MTLScissorRect *)r count:(NSUInteger)count {
   if(!r || !count || count>16){[self.commandBuffer refuse:@"invalid scissor array"];return;}
 + if(_coachzRenderWrites)_coachzScissors.assign(r,r+count);
++ if(coachzDeferred)coachzCurrentDraw.scissor={r[0].x,r[0].y,r[0].width,r[0].height};
   std::vector<uint64_t> values;values.reserve(count*4);
   for(NSUInteger i=0;i<count;i++)values.insert(values.end(),{r[i].x,r[i].y,r[i].width,r[i].height});
-  ENCODE([self check:nmb_render_set_scissors(self.handle,values.data(),count) what:"setScissorRects"]);
+- ENCODE([self check:nmb_render_set_scissors(self.handle,values.data(),count) what:"setScissorRects"]);
++ ENCODE(if(self->coachzSelected) {
++         auto mapped=values;for(NSUInteger i=0;i<count;i++) {
++          std::array<uint64_t,4> one;std::copy_n(values.data()+4*i,4,one.data());
++          one=coachzQuarterScissor(self,one);std::copy_n(one.data(),4,mapped.data()+4*i);
++         }
++         [self check:nmb_render_set_scissors(self.handle,mapped.data(),count) what:"setScissorRects"];
++        } else [self check:nmb_render_set_scissors(self.handle,values.data(),count) what:"setScissorRects"]);
  }
  - (void)setScissorRect:(MTLScissorRect)r {
 + if(_coachzRenderWrites)_coachzScissors={r};
   const std::array<uint64_t,4> values={r.x,r.y,r.width,r.height};
++ if(coachzDeferred)coachzCurrentDraw.scissor=values;
   if(dumpMaybe(self.commandBuffer) && dumpShown(self.dumpDraws+1))dumpLine(self.commandBuffer,[NSString stringWithFormat:@"pass %u scissor %lu,%lu %lux%lu",self.commandBuffer.dumpPasses,
                                                   (unsigned long)r.x,(unsigned long)r.y,(unsigned long)r.width,(unsigned long)r.height]);
   if(gDrawStats)[self noteState:kDSViewport key:1 object:nullptr value:hashBytes(values.data(),sizeof values)];
-@@ -2533,8 +2604,9 @@
+- ENCODE([self check:nmb_render_set_scissor(self.handle,values.data()) what:"setScissorRect"]);
++ ENCODE(auto mapped=coachzQuarterScissor(self,values);[self check:nmb_render_set_scissor(self.handle,mapped.data()) what:"setScissorRect"]);
+ }
+ // The runtime takes cull mode, winding and fill mode together; this encoder keeps Metal's defaults until each is set.
+ - (void)raster {
+  NSNumber *cull=objc_getAssociatedObject(self,"cull"),*winding=objc_getAssociatedObject(self,"winding"),*fill=objc_getAssociatedObject(self,"fill");
+@@ -2491,16 +2753,19 @@
+ - (void)setCullMode:(MTLCullMode)m {objc_setAssociatedObject(self,"cull",@(m),OBJC_ASSOCIATION_RETAIN);[self raster];}
+ - (void)setFrontFacingWinding:(MTLWinding)w {objc_setAssociatedObject(self,"winding",@(w),OBJC_ASSOCIATION_RETAIN);[self raster];}
+ - (void)setTriangleFillMode:(MTLTriangleFillMode)f {objc_setAssociatedObject(self,"fill",@(f),OBJC_ASSOCIATION_RETAIN);[self raster];}
+ - (void)setDepthBias:(float)bias slopeScale:(float)slope clamp:(float)clamp {
++ if(coachzDeferred && (bias || slope || clamp))coachzTurnReject|=16;
+  if(gDrawStats)[self noteState:kDSOther key:UINT32_MAX object:nullptr value:0];ENCODE([self check:nmb_render_set_depth_bias(self.handle,bias,slope,clamp) what:"setDepthBias"]);
+ }
+ - (void)setLineWidth:(float)width {ENCODE([self check:nmb_render_set_line_width(self.handle,width) what:"setLineWidth"]);}
+ - (void)setDepthClipMode:(MTLDepthClipMode)mode {
++ if(coachzDeferred && mode!=MTLDepthClipModeClip)coachzTurnReject|=16;
+  static std::atomic<bool> told{false};
+  if(mode!=MTLDepthClipModeClip && !told.exchange(true))NBLOG(@"native-metal: depth clamp requested; drawn with depth clipping");
+ }
+ - (void)setVisibilityResultMode:(MTLVisibilityResultMode)mode offset:(NSUInteger)offset {
++ if(coachzDeferred && mode!=MTLVisibilityResultModeDisabled)coachzTurnReject|=16;
+  ENCODE([self check:nmb_render_set_visibility_mode(self.handle,mode,offset) what:"setVisibilityResultMode"]);
+ }
+ - (void)setFragmentTexture:(id<MTLTexture>)t atTextureIndex:(NSUInteger)ti samplerState:(id<MTLSamplerState>)s atSamplerIndex:(NSUInteger)si {
+  [self texture:t index:ti stage:2];[self sampler:s index:si stage:2];
+@@ -2517,9 +2782,11 @@
+ - (void)setStencilFrontReferenceValue:(uint32_t)f backReferenceValue:(uint32_t)b {
+  if(gDrawStats)[self noteState:kDSOther key:UINT32_MAX object:nullptr value:0];ENCODE([self check:nmb_render_set_stencil_reference(self.handle,f,b) what:"setStencilReferenceValues"]);
+ }
+ - (void)setBlendColorRed:(float)r green:(float)g blue:(float)b alpha:(float)a {
+- const std::array<float,4> c={r,g,b,a};if(gDrawStats)[self noteState:kDSOther key:UINT32_MAX object:nullptr value:0];ENCODE([self check:nmb_render_set_blend_color(self.handle,c.data()) what:"setBlendColor"]);
++ const std::array<float,4> c={r,g,b,a};
++ if(coachzDeferred)coachzCurrentDraw.blend=c;
++ if(gDrawStats)[self noteState:kDSOther key:UINT32_MAX object:nullptr value:0];ENCODE([self check:nmb_render_set_blend_color(self.handle,c.data()) what:"setBlendColor"]);
+ }
+ // NATIVE_METAL_SKIP_DRAWS=PASS:FIRST:LAST: every command buffer's render pass PASS (counted from 1) leaves out its draws FIRST..LAST
+ // (counted from 1), to find which draws make what a frame shows.
+ - (BOOL)skipDraw {
+@@ -2533,8 +2800,10 @@
   return skip.pass && self.commandBuffer.dumpPasses==skip.pass && index>=skip.first && index<=skip.last;
  }
  - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b {
   if([self skipDraw])return;
++ if(coachzDeferred){if(t!=MTLPrimitiveTypeTriangle && t!=MTLPrimitiveTypeTriangleStrip)coachzTurnReject|=32;if(n && i)coachzTurnDraws++;}
 + [self coachzRecordDraw];
   gDraws++;self.commandBuffer->encodedWork.draws++;if(gDrawStats)[self noteDraw];
   if(dumpMaybe(self.commandBuffer))[self dumpDraw:[NSString stringWithFormat:@"prim %lu start %lu count %lu instances %lu base %lu",(unsigned long)t,(unsigned long)s,(unsigned long)n,
                   (unsigned long)i,(unsigned long)b]];
   ENCODE([self check:nmb_render_draw(self.handle,t,(uint32_t)s,(uint32_t)n,(uint32_t)i,(uint32_t)b) what:"drawPrimitives"]);
-@@ -2549,8 +2621,9 @@
+@@ -2549,8 +2818,10 @@
                  instanceCount:(NSUInteger)i baseVertex:(NSInteger)v baseInstance:(NSUInteger)bi {
   if(![(id)b isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign index buffer"];return;}
   [self.commandBuffer.resourceOwners addObject:b];
   if([self skipDraw])return;
++ if(coachzDeferred){[self coachzWatchResource:b];if(t!=MTLPrimitiveTypeTriangle && t!=MTLPrimitiveTypeTriangleStrip)coachzTurnReject|=32;if(n && i)coachzTurnDraws++;}
 + [self coachzRecordDraw];
   gDraws++;self.commandBuffer->encodedWork.draws++;if(gDrawStats)[self noteDraw];
   if(dumpMaybe(self.commandBuffer) && dumpShown(self.dumpDraws+1)) {
    const uint8_t *indices=(const uint8_t *)b.contents;const unsigned size=k==MTLIndexTypeUInt16?2:4;
    NSMutableString *first=[NSMutableString string];
-@@ -2587,8 +2660,9 @@
+@@ -2587,8 +2858,10 @@
  - (void)patches:(NSUInteger)points start:(NSUInteger)start count:(NSUInteger)count patchIndex:(id<MTLBuffer>)pi offset:(NSUInteger)po
            points:(id<MTLBuffer>)ci offset:(NSUInteger)co instances:(NSUInteger)instances base:(NSUInteger)base indirect:(id<MTLBuffer>)ib offset:(NSUInteger)io {
   if(![self own:pi what:@"patch index buffer"] || ![self own:ci what:@"control point index buffer"] || ![self own:ib what:@"indirect buffer"])return;
   if([self skipDraw])return;
++ if(coachzDeferred)coachzTurnReject|=32;
 + [self coachzRecordDraw];
   gDraws++;self.commandBuffer->encodedWork.draws++;if(gDrawStats)[self noteDraw];
   if(dumpMaybe(self.commandBuffer))[self dumpDraw:[NSString stringWithFormat:@"patches %lu start %lu count %lu instances %lu base %lu%@",(unsigned long)points,(unsigned long)start,
                   (unsigned long)count,(unsigned long)instances,(unsigned long)base,ib?@" indirect":@""]];
   ENCODE([self check:nmb_render_draw_patches(self.handle,(uint32_t)points,(uint32_t)start,(uint32_t)count,pi?[(NBBuffer *)pi handle]:nullptr,po,
-@@ -2614,9 +2688,16 @@
+@@ -2614,9 +2887,17 @@
        indirectBufferOffset:(NSUInteger)io {
   if(!ci || !ib){[self.commandBuffer refuse:@"nil control point index or indirect buffer"];return;}
   [self patches:n start:0 count:0 patchIndex:pi offset:po points:ci offset:co instances:0 base:0 indirect:ib offset:io];
  }
 -- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u stages:(MTLRenderStages)s {(void)r;(void)u;(void)s;}
 +- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u stages:(MTLRenderStages)s {
++ if(coachzDeferred)[self coachzWatchResource:r];
 + (void)s;
 + if(!(u&MTLResourceUsageWrite))return;
 + if([(id)r isKindOfClass:[NBTexture class]] && coachzIsTrackedFrame((NBTexture *)r))
@@ -582,7 +937,7 @@
  - (void)waitForFence:(id<MTLFence>)fence beforeStages:(MTLRenderStages)stages {[self fence:fence stages:stages update:false];}
  @end
 
-@@ -2650,15 +2731,17 @@
+@@ -2650,15 +2931,17 @@
  }
  - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
                toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dO {
@@ -600,7 +955,7 @@
   if(sl>s.mipmapLevelCount || nl>s.mipmapLevelCount-sl || dl>d.mipmapLevelCount || nl>d.mipmapLevelCount-dl ||
      ss>slices(s) || ns>slices(s)-ss || ds>slices(d) || ns>slices(d)-ds) {[self.commandBuffer refuse:@"texture copy range out of bounds"];return;}
   for(NSUInteger slice=0;slice<ns;slice++)for(NSUInteger level=0;level<nl;level++) {
-@@ -2669,8 +2752,9 @@
+@@ -2669,8 +2952,9 @@
   }
  }
  - (void)copyFromTexture:(id<MTLTexture>)s toTexture:(id<MTLTexture>)d {
@@ -610,7 +965,7 @@
   for(NSUInteger slice=0;slice<slices;slice++)for(NSUInteger level=0;level<levels;level++) {
    MTLSize size=MTLSizeMake(MAX(s.width>>level,(NSUInteger)1),MAX(s.height>>level,(NSUInteger)1),MAX(s.depth>>level,(NSUInteger)1));
    [self copyFromTexture:s sourceSlice:slice sourceLevel:level sourceOrigin:MTLOriginMake(0,0,0) sourceSize:size toTexture:d destinationSlice:slice
-@@ -2680,8 +2764,9 @@
+@@ -2680,8 +2964,9 @@
  - (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)o sourceBytesPerRow:(NSUInteger)row sourceBytesPerImage:(NSUInteger)image
              sourceSize:(MTLSize)z toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level
       destinationOrigin:(MTLOrigin)dO {
@@ -620,7 +975,7 @@
    const NmbTextureDescriptor t=[(NBTexture *)d descriptor];
    GLOG(@"native-metal: texture-log %llu bufferToTexture size %lux%lu origin %lu,%lu level %lu slice %lu | rows %lu image %lu offset %lu "
          @"buffer %lu%s | texture %llux%llu fmt %llu options %llx",(unsigned long long)gTexturesLogged.load(),(unsigned long)z.width,
-@@ -2882,8 +2967,16 @@
+@@ -2882,8 +3167,16 @@
   [(id<MTLCommandBuffer>)readback commit];
  }
 
@@ -637,7 +992,7 @@
  static char kUserDictionaryKey;
  - (id)userDictionary {
   @synchronized(self) {
-@@ -2894,9 +2987,9 @@
+@@ -2894,9 +3187,9 @@
  }
  // iPadOS 27: QuartzCore names the tasks a command buffer works for (GPU time attribution), on every buffer; there is no such accounting here.
  - (void)setResponsibleTaskIDs:(const void *)ids count:(NSUInteger)count {(void)ids;(void)count;}
@@ -648,7 +1003,22 @@
   return self;
  }
  - (void)dealloc {nmb_command_buffer_release(_handle);}
-@@ -2983,11 +3076,25 @@
+@@ -2960,11 +3253,12 @@
+ - (id)encoder:(NBEncoder *)encoder make:(NmbEncoder *(^)(void))make what:(NSString *)what {
+  if(self.committed){[self refuse:[what stringByAppendingString:@" after commit"]];return nil;}
+  encoder.commandBuffer=self;
+  make=[make copy];   // the caller's block literal is on its stack; the encoding thread calls it later
+- ENCODE(NmbEncoder *handle=make();
++ if(encoder->coachzDeferred)encoder.coachzFactory=make;
++ else {ENCODE(NmbEncoder *handle=make();
+         if(!handle)[self refuse:[NSString stringWithFormat:@"%@: %@",what,lastError()]];
+-        encoder.handle=handle);
++        encoder.handle=handle);}
+  if([encoder isKindOfClass:[NBComputeEncoder class]])_dumpKernels++;
+  if(_dumpPending.count) {
+   if(!_dumpTargets)_dumpTargets=[NSMutableArray array];
+   [_dumpTargets addObjectsFromArray:_dumpPending];encoder.dumpEntries=_dumpPending;_dumpPending=nil;
+@@ -2983,11 +3277,27 @@
   gBlits++;encodedWork.blits++;
   NmbCommandBuffer *handle=_handle;
   return [self encoder:[NBBlitEncoder new] make:^{return nmb_blit_encoder_new(handle);} what:@"blitCommandEncoder"];
@@ -658,8 +1028,8 @@
 +static std::atomic<uint64_t> gCoachzPasses,gCoachzDirectPixels,gCoachzPrivate,gCoachzSurface,gCoachzBuffer;
 +static void coachzPassTally(MTLRenderPassDescriptor *d) {
 + id<MTLTexture> t=d.colorAttachments[0].texture;
-+ while([t isKindOfClass:[NBTexture class]] && ((NBTexture *)t).parent)t=((NBTexture *)t).parent;
 + if(![t isKindOfClass:[NBTexture class]])return;
++ t=(id<MTLTexture>)coachzGpuRoot((NBTexture *)t);
 + NBTexture *texture=(NBTexture *)t;
 + const uint64_t pixels=(uint64_t)texture.width*texture.height;
 + (texture.coachzDirect?gCoachzDirectPixels:texture.surface?gCoachzSurface:texture.buffer?gCoachzBuffer:gCoachzPrivate)+=pixels;
@@ -667,19 +1037,25 @@
 +}
  - (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {
 + coachzPassTally(d);
++ const uintptr_t framePassCaller=(uintptr_t)__builtin_return_address(0);
   NmbRenderPassDescriptor pass={};
   std::vector<SingleSampleCopy> resolveCopies;
 + NSMutableArray *frameRenderWrites=nil;
++ CoachzFrameWrite *firstFrameWrite=nil;
   _dumpPasses++;
   if(dumpMaybe(self)) {
    if(!_dumpTargets)_dumpTargets=[NSMutableArray array];
    _dumpPending=[NSMutableArray array];
-@@ -3027,14 +3134,17 @@
+@@ -3027,14 +3337,21 @@
   auto attachment=[&](MTLRenderPassAttachmentDescriptor *a,NmbPassAttachment &out)->bool {
    if(!a.texture)return true;
    if(![(id)a.texture isKindOfClass:[NBTexture class]])return false;
    NBTexture *texture=(NBTexture *)a.texture;if(texture.surface)[_surfaces addObject:texture];
 +  CoachzFrameWrite *write=coachzTrackFramePass(_coachzFrameWrites,texture,a,d.renderTargetArrayLength<=1);
++  if(&out==&pass.colors[0])firstFrameWrite=write;
++  if(write && !texture.coachzDirect) {
++   write.passCaller=framePassCaller;write.passActions=(uint32_t)a.loadAction|((uint32_t)a.storeAction<<4);
++  }
 +  if(write.partial){if(!frameRenderWrites)frameRenderWrites=[NSMutableArray array];[frameRenderWrites addObject:write];}
    [_resourceOwners addObject:texture];
    out.texture=texture.handle;out.level=a.level;out.slice=a.slice;out.depth_plane=a.depthPlane;out.load=a.loadAction;out.store=a.storeAction;
@@ -692,9 +1068,22 @@
     if(singleSample()) {
      if(resolves) {
       if(a.loadAction!=MTLLoadActionLoad && a.storeAction==MTLStoreActionMultisampleResolve) {
-@@ -3074,8 +3184,10 @@
+@@ -3071,11 +3388,22 @@
+   [_resourceOwners addObject:d.visibilityResultBuffer];
+   pass.visibility=[(NBBuffer *)d.visibilityResultBuffer handle];
+  }
   NmbCommandBuffer *handle=_handle;
-  id<MTLRenderCommandEncoder> made=[self encoder:[NBRenderEncoder new] make:^{return nmb_render_encoder_new(handle,&pass);} what:@"renderCommandEncoder"];
+- id<MTLRenderCommandEncoder> made=[self encoder:[NBRenderEncoder new] make:^{return nmb_render_encoder_new(handle,&pass);} what:@"renderCommandEncoder"];
++ NBRenderEncoder *render=[NBRenderEncoder new];
++ render.commandBuffer=self;
++ coachzSetupQuarter(render,firstFrameWrite.texture?:(NBTexture *)d.colorAttachments[0].texture,d,firstFrameWrite);
++ NmbEncoder *(^make)(void);
++ if(render->coachzDeferred) {
++  render->coachzPass=std::make_shared<NmbRenderPassDescriptor>(pass);
++  auto recordedPass=render->coachzPass;
++  make=^{return nmb_render_encoder_new(handle,recordedPass.get());};
++ } else make=^{return nmb_render_encoder_new(handle,&pass);};
++ id<MTLRenderCommandEncoder> made=[self encoder:render make:make what:@"renderCommandEncoder"];
   if(made) {
    ((NBRenderEncoder *)made).resolveCopies=std::move(resolveCopies);
 +  ((NBRenderEncoder *)made).coachzRenderWrites=frameRenderWrites;
@@ -703,18 +1092,20 @@
    const uint64_t big=t0 && (uint64_t)t0.width*t0.height>=2000000;
    ((NBRenderEncoder *)made).passKey=(t0?(uint64_t)t0.pixelFormat:0)|((uint64_t)d.colorAttachments[0].loadAction<<16)|
     (uint64_t)([(id)t0 isKindOfClass:[NBTexture class]] && ((NBTexture *)t0).surface?1:0)<<18|big<<19;
-@@ -3119,8 +3231,10 @@
+@@ -3119,8 +3447,12 @@
  }
  // After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
  - (void)finish {
   flushSurfaces(_surfaces);
++ coachzFinishTurnAudits(self);
 + coachzCompleteFrameWrites(_coachzFrameWrites,!self.failedLocally && nmb_command_buffer_metal_error_code(_handle)==0,self.commitIndex);
++ for(CoachzFrameWrite *write in _coachzFrameWrites)[write releasePlainLease];
 + [_coachzFrameWrites removeAllObjects];[_coachzFrameGuards removeAllObjects];
   // Actual GPU completion (or a local refusal that never submitted) is the
   // release point. A retained completed command must not pin every old frame.
   [_surfaces removeAllObjects];[_resourceOwners removeAllObjects];
   @synchronized(gInFlight){[gInFlight removeObject:self];}
-@@ -3153,8 +3267,14 @@
+@@ -3153,8 +3485,14 @@
    watched.clear();[_sampled removeAllObjects];
   }
   // The runtime reports Vulkan's DeviceLost as Metal's code 11 (see -error).
@@ -729,7 +1120,7 @@
    for(MTLCommandBufferHandler block in completedHandlers)block((id<MTLCommandBuffer>)self);
    dispatch_group_leave(self->_handlers);
    if(lost)endRenderServerAfterGpuLoss();
-@@ -3181,8 +3301,10 @@
+@@ -3181,8 +3519,10 @@
   encodeFlush();
  }
  // The runtime's half of a commit, on the encoding thread after the command buffer's encoders.
@@ -740,7 +1131,7 @@
    flushSurfaces(_surfaces);
    if(gLogTextures)dumpSurfacesOnce(_surfaces,_resourceOwners);
    for(WatchedSource &source:watched){source.hash=hashSource(source.bytes,source.length);gSourcesWatched[source.surface]++;}
-@@ -4146,10 +4268,586 @@
+@@ -4146,10 +4486,1209 @@
   gNoCopyAll++;if(context)gNoCopyMade++;
   NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;buffer.wrapped=pointer;
   return (id<MTLBuffer>)buffer;
@@ -777,10 +1168,42 @@
 +static std::atomic<uint64_t> gCoachzPartialMirrors,gCoachzEmptyMirrors,gCoachzMirrorSaved;
 +static std::atomic<uint64_t> gCoachzDamageLoad,gCoachzDamageFull,gCoachzGuardedMirrors;
 +static std::atomic<uint32_t> gCoachzMirrorGuardMask;
++// A full mirror may have several reasons. Keep the bits independent so a
++// mixed command that also has an unbounded record stays visible as mixed.
++enum CoachzMirrorFullReason : unsigned {
++ CoachzFullGuard, CoachzFullInvalid, CoachzFullUnbounded, CoachzFullMixed,
++ CoachzFullCoverage, CoachzFullReasonCount
++};
++static std::atomic<uint64_t> gCoachzFullReasons[2][CoachzFullReasonCount];
++static std::atomic<uint64_t> gCoachzFullMirrors[2];
++static std::atomic<uint64_t> gCoachzNoopTail,gCoachzNoopOpposite;
++static void coachzNoteFullMirror(bool out,uint32_t reasons,unsigned privateWrites,unsigned plainWrites,unsigned emptyWrites) {
++ const unsigned direction=out?1:0;
++ const uint64_t total=++gCoachzFullMirrors[direction];
++ bool sampled=false;
++ for(unsigned reason=0;reason<CoachzFullReasonCount;reason++) {
++  if(!(reasons&(1u<<reason)))continue;
++  const uint64_t count=++gCoachzFullReasons[direction][reason];
++  sampled|=count<=4 || !(count&(count-1));
++ }
++ if(!sampled)return;
++ char text[96]={};uint32_t words[24]={};
++ snprintf(text,sizeof text,"MF %s bits%x n%llu private%u plain%u empty%u",out?"out":"in",reasons,
++  (unsigned long long)total,privateWrites,plainWrites,emptyWrites);
++ memcpy(words,text,sizeof text);nbNote(3,words,24);
++}
 +static std::atomic<uint64_t> gCoachzSyncOut,gCoachzSyncIn,gCoachzSyncMissing,gCoachzBackingAttached;
 +static std::atomic<uint64_t> gCoachzMissTag,gCoachzMissFrame,gCoachzMissInvalid,gCoachzMissShape;
 +static std::atomic<uint64_t> gCoachzPlainLoad,gCoachzPlainClear,gCoachzPlainDontCare,gCoachzPlainRotated,gCoachzPlainSRGB,gCoachzPartialIn;
 +static std::atomic<uint64_t> gCoachzReadBindings;
++// Classify the last plain target of each coverage-only full incoming mirror.
++static std::atomic<uint64_t> gCoachzTargetKinds[3],gCoachzTargetWhole,gCoachzTargetUnion;
++static std::atomic<uint64_t> gCoachzReuseSubset,gCoachzReuseViews,gCoachzReuseBusy,gCoachzReuseCross;
++static std::atomic<uint64_t> gCoachzTurnCandidates,gCoachzTurnRuns,gCoachzTurnAuditCount,gCoachzTurnAuditGood,gCoachzTurnAuditBad;
++static std::atomic<uint64_t> gCoachzTurnRejected[10],gCoachzTurnPrepareUs,gCoachzTurnPixels,gCoachzTurnSeals;
++static std::atomic<uint64_t> gCoachzTurnEntryRejected[10];
++static std::atomic<uint64_t> gCoachzMrtSeeds,gCoachzMrtStores,gCoachzMrtInBytes,gCoachzMrtOutBytes;
++static std::atomic<uint64_t> gCoachzMrtRefused[8];
 +// Preserve the actual creation failure outside the 48-row telemetry table. The
 +// first plane failure used to be hidden behind later, unrelated warning rows.
 +static void coachzFrameFailure(unsigned stage,uint64_t count,NSString *why) {
@@ -836,7 +1259,7 @@
 + os_unfair_lock_lock(&gCoachzFrameLock);NBTexture *resident=frame.texture;os_unfair_lock_unlock(&gCoachzFrameLock);
 + NBTexture *view=(NBTexture *)[(id<MTLTexture>)resident newTextureViewWithPixelFormat:format];
 + if(!view){gCoachzViewRefused++;return nil;}
-+ view.coachzDirect=YES;
++ view.coachzDirect=YES;view.coachzResident=resident;
 + view.coachzBacking=backing;
 + os_unfair_lock_lock(&gCoachzFrameLock);frame.backing=backing;os_unfair_lock_unlock(&gCoachzFrameLock);
 + view.surface=(IOSurfaceRef)CFRetain(surface);
@@ -868,21 +1291,22 @@
 +static bool coachzFrameTransfer(NmbCommandBuffer *commands,NBTexture *source,NBTexture *target,bool intoPrivate,NSMutableSet *owners,const MTLScissorRect *written=nullptr) {
 + if(!commands || !source || !target || source.width!=target.height || source.height!=target.width)return false;
 + static std::mutex stateLock;
-+ static NBRenderPipeline *pipelines[2];
++ static std::map<std::pair<uint64_t,bool>,NBRenderPipeline *> pipelines;
 + static NBSampler *sampler;
 + NBRenderPipeline *pipeline=nil;
 + {
 +  std::lock_guard<std::mutex> lock(stateLock);
-+  if(!pipelines[intoPrivate?1:0]) {
++  auto &cached=pipelines[{(uint64_t)target.pixelFormat,intoPrivate}];
++  if(!cached) {
 +   size_t length=0;const void *air=nmb_scanout_convert_air(&length);
 +   id<MTLLibrary> library=air && length?native_bridge_metal_library_with_air(air,length):nil;
 +   MTLRenderPipelineDescriptor *d=[MTLRenderPipelineDescriptor new];
 +   d.vertexFunction=[library newFunctionWithName:(intoPrivate?@"scanout_unrotated_vs":@"scanout_rotated_vs")];
 +   d.fragmentFunction=[library newFunctionWithName:@"scanout_frame_fs"];
-+   d.colorAttachments[0].pixelFormat=MTLPixelFormatBGRA8Unorm;
++   d.colorAttachments[0].pixelFormat=target.pixelFormat;
 +   NSError *error=nil;
 +   if(d.vertexFunction && d.fragmentFunction)
-+    pipelines[intoPrivate?1:0]=(NBRenderPipeline *)[gDeviceObject newRenderPipelineStateWithDescriptor:d error:&error];
++    cached=(NBRenderPipeline *)[gDeviceObject newRenderPipelineStateWithDescriptor:d error:&error];
 +   if(error)noteProblem([@"frame transfer pipeline: " stringByAppendingString:error.localizedDescription?:@"unknown"]);
 +  }
 +  if(!sampler) {
@@ -891,7 +1315,7 @@
 +   d.sAddressMode=MTLSamplerAddressModeClampToEdge;d.tAddressMode=MTLSamplerAddressModeClampToEdge;
 +   sampler=(NBSampler *)[gDeviceObject newSamplerStateWithDescriptor:d];
 +  }
-+  pipeline=pipelines[intoPrivate?1:0];
++  pipeline=cached;
 + }
 + if(!pipeline || !sampler){noteProblem(@"frame transfer pipeline or sampler unavailable");return false;}
 + [owners addObject:source];[owners addObject:target];
@@ -928,6 +1352,9 @@
 + NBTexture *texture=frame.texture;
 + if(texture && (frame.turned!=turned || texture.width!=d.width || texture.height!=d.height)) {
 +  gCoachzViewConflict++;os_unfair_lock_unlock(&gCoachzFrameLock);return nil;
++ }
++ if(frame->plainWriters.load()) {
++  os_unfair_lock_unlock(&gCoachzFrameLock);gCoachzReuseBusy++;return nil;
 + }
 + if(texture && frame.valid) {
 +  os_unfair_lock_unlock(&gCoachzFrameLock);
@@ -1022,6 +1449,7 @@
 + volatile uint64_t *word=coachzSurfaceTag(surface);if(!word)return;
 + os_unfair_lock_lock(&gCoachzFrameLock);
 + CoachzFrame *frame=coachzFrameOf(surface,word);const bool resident=frame.texture!=nil;
++ plain.coachzPlainImport=!resident?1:frame.turned?3:(frame.valid && !frame.promoting)?2:4;
 + os_unfair_lock_unlock(&gCoachzFrameLock);
 + if(!resident)return;
 + NBTexture *linear=plain.coachzBacking;
@@ -1062,17 +1490,19 @@
 + CoachzFrame *frame=coachzFrameOf(surface,word);
 + if(!frame){os_unfair_lock_unlock(&gCoachzFrameLock);return nil;}
 + NBTexture *resident=frame.texture,*backing=frame.backing;
-+ // All members are uint64_t. A changed usage/options/swizzle must go through
-+ // normal import validation; a cached image is not proof that request is valid.
++ // A changed usage can reuse the resident when every requested capability is
++ // already present. Keep the original options, geometry and swizzle checks.
 + const NmbTextureDescriptor imported=frame.importDescriptor;
++ NmbTextureDescriptor compatible=requested;compatible.usage=imported.usage;
 + const bool sameDescriptor=memcmp(&requested,&imported,sizeof requested)==0;
-+ const bool ready=frame && sameDescriptor && frame.valid && !frame.promoting && frame.turned==turned && resident && backing &&
++ const bool subset=requested.usage && resident && !(requested.usage&~resident.usage) && memcmp(&compatible,&imported,sizeof imported)==0;
++ const bool ready=(sameDescriptor || subset) && frame.valid && !frame.promoting && !frame->plainWriters.load() && frame.turned==turned && resident && backing &&
 +  resident.width==d.width && resident.height==d.height && backing.width==width && backing.height==height &&
 +  backing.rowBytes==IOSurfaceGetBytesPerRow(surface);
 + os_unfair_lock_unlock(&gCoachzFrameLock);
 + if(!ready)return nil;
 + id<MTLTexture> view=coachzFrameView(frame,surface,backing,d.pixelFormat);
-+ if(view)gCoachzReused++;
++ if(view){gCoachzReused++;if(!sameDescriptor)gCoachzReuseSubset++;}
 + return view;
 +}
 +// A cache miss may just mean the previous view's weak backing expired. Keep
@@ -1083,9 +1513,45 @@
 + volatile uint64_t *word=coachzSurfaceTag(surface);if(!word)return nil;
 + os_unfair_lock_lock(&gCoachzFrameLock);
 + CoachzFrame *frame=coachzFrameOf(surface,word);NBTexture *resident=frame.texture;
-+ const bool ready=frame && frame.valid && !frame.promoting && !frame.turned && resident && d.width==resident.width && d.height==resident.height;
++ const bool ready=frame && frame.valid && !frame.promoting && !frame->plainWriters.load() && !frame.turned && resident && d.width==resident.width && d.height==resident.height;
 + os_unfair_lock_unlock(&gCoachzFrameLock);
 + return ready?coachzFrameView(frame,surface,plain,d.pixelFormat):nil;
++}
++// A retained plain import may predate promotion. Newly created whole views can
++// join the private path without mutating the old texture or recorded commands.
++static NBTexture *coachzReusePlainView(NBTexture *source,NBTexture *validated) {
++ NBTexture *root=coachzGpuRoot(source);IOSurfaceRef surface=source.surface;
++ const NmbTextureDescriptor d=validated.descriptor;
++ const uint64_t allowed=MTLTextureUsageShaderRead|MTLTextureUsageRenderTarget|MTLTextureUsagePixelFormatView;
++ if(!surface || IOSurfaceGetPlaneCount(surface) || source.coachzDirect || source.rotation || root.rotation || d.rotation ||
++    d.type!=MTLTextureType2D || d.levels!=1 || d.samples!=1 || d.array_length!=1 || d.depth!=1 ||
++    (d.format!=MTLPixelFormatBGRA8Unorm && d.format!=MTLPixelFormatBGRA8Unorm_sRGB) ||
++    !d.usage || (d.usage&~allowed) || d.swizzle!=packedSwizzle(MTLTextureSwizzleChannelsDefault) ||
++    root.width!=IOSurfaceGetWidth(surface) || root.height!=IOSurfaceGetHeight(surface) ||
++    d.width!=root.width || d.height!=root.height)return nil;
++ volatile uint64_t *word=coachzSurfaceTag(surface);if(!word)return nil;
++ os_unfair_lock_lock(&gCoachzFrameLock);
++ CoachzFrame *frame=coachzFrameOf(surface,word);NBTexture *resident=frame.texture;
++ const bool cross=frame && frame.turned;
++ const bool busy=frame && (frame.promoting || frame->plainWriters.load());
++ const bool ready=frame && frame.valid && !cross && !busy && resident &&
++  resident.width==d.width && resident.height==d.height && !(d.usage&~resident.usage);
++ const uint32_t serial=frame.writeSerial;
++ os_unfair_lock_unlock(&gCoachzFrameLock);
++ if(!ready){if(cross)gCoachzReuseCross++;if(busy)gCoachzReuseBusy++;return nil;}
++ NBTexture *backing=source.coachzBacking;
++ if(!backing)backing=root.pixelFormat==MTLPixelFormatBGRA8Unorm?root:coachzFramePlane(surface,root);
++ if(!backing)return nil;
++ NBTexture *direct=(NBTexture *)coachzFrameView(frame,surface,backing,(MTLPixelFormat)d.format);
++ if(!direct)return nil;
++ os_unfair_lock_lock(&gCoachzFrameLock);
++ const bool current=frame.valid && !frame.promoting && !frame->plainWriters.load() && frame.writeSerial==serial;
++ os_unfair_lock_unlock(&gCoachzFrameLock);
++ if(!current){gCoachzReuseBusy++;return nil;}
++ // Preserve the API parent while GPU write tracking follows coachzResident.
++ direct.parent=(id<MTLTexture>)source;
++ gCoachzReuseViews++;
++ return direct;
 +}
 +// Seed eligible whole-mode targets on their first import. Presentation does not
 +// imply a later reimport; all writers still mirror to the shared surface.
@@ -1119,9 +1585,28 @@
 +  (unsigned long long)gCoachzPlainSRGB.load());
 + row("CZ mirror n%llu bytes%llu part%llu skip%llu save%llu",(unsigned long long)gCoachzMirrors.load(),(unsigned long long)gCoachzMirrorBytes.load(),
 +  (unsigned long long)gCoachzPartialMirrors.load(),(unsigned long long)gCoachzEmptyMirrors.load(),(unsigned long long)gCoachzMirrorSaved.load());
-+ row("CZ damage load%llu full%llu guarded%llu mask%x ro%llu",(unsigned long long)gCoachzDamageLoad.load(),
++ row("CZ damage load%llu full%llu guarded%llu mask%x ro%llu noop%llu/%llu",(unsigned long long)gCoachzDamageLoad.load(),
 +  (unsigned long long)gCoachzDamageFull.load(),(unsigned long long)gCoachzGuardedMirrors.load(),gCoachzMirrorGuardMask.load(),
-+  (unsigned long long)gCoachzReadBindings.load());
++  (unsigned long long)gCoachzReadBindings.load(),(unsigned long long)gCoachzNoopTail.load(),(unsigned long long)gCoachzNoopOpposite.load());
++ row("CZ infull mix%llu bound%llu invalid%llu guard%llu wide%llu",
++  (unsigned long long)gCoachzFullReasons[0][CoachzFullMixed].load(),
++  (unsigned long long)gCoachzFullReasons[0][CoachzFullUnbounded].load(),
++  (unsigned long long)gCoachzFullReasons[0][CoachzFullInvalid].load(),
++  (unsigned long long)gCoachzFullReasons[0][CoachzFullGuard].load(),
++  (unsigned long long)gCoachzFullReasons[0][CoachzFullCoverage].load());
++ row("CZ reuse subset%llu views%llu busy%llu cross%llu",(unsigned long long)gCoachzReuseSubset.load(),
++  (unsigned long long)gCoachzReuseViews.load(),(unsigned long long)gCoachzReuseBusy.load(),(unsigned long long)gCoachzReuseCross.load());
++ row("CZ turn try%llu run%llu audit%llu/%llu/%llu seals%llu",(unsigned long long)gCoachzTurnCandidates.load(),
++  (unsigned long long)gCoachzTurnRuns.load(),(unsigned long long)gCoachzTurnAuditCount.load(),
++  (unsigned long long)gCoachzTurnAuditGood.load(),(unsigned long long)gCoachzTurnAuditBad.load(),(unsigned long long)gCoachzTurnSeals.load());
++ row("CZ turn refuse busy%llu alias%llu prog%llu probe%llu state%llu prim%llu wait%llu cap%llu",(unsigned long long)gCoachzTurnRejected[0].load(),
++  (unsigned long long)gCoachzTurnRejected[1].load(),(unsigned long long)gCoachzTurnRejected[2].load(),(unsigned long long)gCoachzTurnRejected[3].load(),
++  (unsigned long long)gCoachzTurnRejected[4].load(),(unsigned long long)gCoachzTurnRejected[5].load(),(unsigned long long)gCoachzTurnRejected[6].load(),(unsigned long long)gCoachzTurnRejected[7].load());
++ row("CZ turn work mpix%llu prep%lluus",(unsigned long long)(gCoachzTurnPixels.load()/1000000),
++  (unsigned long long)gCoachzTurnPrepareUs.load());
++ row("CZ target same%llu cross%llu other%llu whole%llu union%llu",
++  (unsigned long long)gCoachzTargetKinds[0].load(),(unsigned long long)gCoachzTargetKinds[1].load(),
++  (unsigned long long)gCoachzTargetKinds[2].load(),(unsigned long long)gCoachzTargetWhole.load(),(unsigned long long)gCoachzTargetUnion.load());
 + row("CZ sync out%llu in%llu inpart%llu miss%llu attach%llu",(unsigned long long)gCoachzSyncOut.load(),
 +  (unsigned long long)gCoachzSyncIn.load(),(unsigned long long)gCoachzPartialIn.load(),(unsigned long long)gCoachzSyncMissing.load(),
 +  (unsigned long long)gCoachzBackingAttached.load());
@@ -1162,8 +1647,7 @@
 +// Called under gCoachzFrameLock. The surface ID validates its in-band tag.
 +static CoachzFrame *coachzFrameForWrite(NBTexture *texture,NBTexture **root) {
 + IOSurfaceRef surface=texture.surface;
-+ NBTexture *held=texture;while(held.parent)held=(NBTexture *)held.parent;
-+ *root=held;
++ *root=coachzGpuRoot(texture);
 + if(!surface)return nil;
 + const size_t at=coachzTagOffset(IOSurfaceGetWidth(surface),IOSurfaceGetBytesPerRow(surface),IOSurfaceGetHeight(surface),IOSurfaceGetAllocSize(surface));
 + uint8_t *base=(uint8_t *)IOSurfaceGetBaseAddress(surface);
@@ -1190,8 +1674,14 @@
 + return false;
 +}
 +static CoachzFrameWrite *coachzAddFrameWrite(NSMutableArray *writes,NBTexture *texture) {
-+ if(!coachzIsTrackedFrame(texture))return nil;
++ NBTexture *root=nil;os_unfair_lock_lock(&gCoachzFrameLock);
++ CoachzFrame *frame=coachzFrameForWrite(texture,&root);
++ const bool plain=frame && !(texture.coachzDirect && root==frame.texture);
++ if(plain)frame->plainWriters.fetch_add(1);
++ os_unfair_lock_unlock(&gCoachzFrameLock);
++ if(!frame)return nil;
 + CoachzFrameWrite *write=[CoachzFrameWrite new];write.texture=texture;
++ if(plain)write.plainLease=frame;
 + [writes addObject:write];return write;
 +}
 +static void coachzTrackFrameWrite(NSMutableArray *writes,NBTexture *texture) {(void)coachzAddFrameWrite(writes,texture);}
@@ -1249,6 +1739,61 @@
 +static void coachzMarkFrameCoherent(NSMutableArray *writes,uint32_t surfaceID) {
 + for(CoachzFrameWrite *write in writes)if(write.texture.surface && IOSurfaceGetID(write.texture.surface)==surfaceID)write.coherent=YES;
 +}
++// Only load-preserving, bounded render records can prove that nothing wrote.
++// Blits, clears, resolves and unknown accesses remain possible pixel writers.
++static bool coachzFrameHasDamage(CoachzFrameWrite *write) {
++ return !write.partial || (write.damage.width && write.damage.height);
++}
++// A full damage union does not prove any one pass covered the whole surface.
++// Sample the actual records behind incoming wide mirrors, outside the row cap.
++// A same-size target is only a candidate: redirecting it also needs coherent
++// shader/blit/buffer aliases inside the command, not just a new attachment handle.
++static void coachzNotePlainTarget(NSMutableArray *writes,CoachzFrameWrite *last,NBTexture *resident,uint32_t surfaceID,bool turned) {
++ NBTexture *view=last.texture,*root=view;
++ while(root.parent)root=(NBTexture *)root.parent;
++ const bool wholeView=view.width==root.width && view.height==root.height;
++ const bool straight=!view.rotation && !root.rotation;
++ const unsigned kind=straight && wholeView && !turned && root.width==resident.width && root.height==resident.height?0:
++  straight && wholeView && turned && root.width==resident.height && root.height==resident.width?1:2;
++ const uint64_t n=++gCoachzTargetKinds[kind];
++ unsigned count=0,whole=0;
++ for(CoachzFrameWrite *write in writes) {
++  NBTexture *t=write.texture;
++  if(t.coachzDirect || !t.surface || IOSurfaceGetID(t.surface)!=surfaceID || !coachzFrameHasDamage(write))continue;
++  count++;
++  const MTLScissorRect r=write.damage;
++  if(write.partial && !r.x && !r.y && r.width==t.width && r.height==t.height)whole++;
++ }
++ (whole?gCoachzTargetWhole:gCoachzTargetUnion)++;
++ if(n>2 && (n&(n-1)))return;
++ auto note=[](const char *line){uint32_t words[24]={};memcpy(words,line,strnlen(line,95));nbNote(3,words,24);};
++ char line[96]={};
++ snprintf(line,sizeof line,"DP in kind%u n%llu writes%u whole%u private%lux%lu r%u",kind,(unsigned long long)n,count,whole,
++  (unsigned long)resident.width,(unsigned long)resident.height,turned?3u:0u);note(line);
++ // Keep at most the first two records and the last one; all records contribute
++ // to count/whole. No texture addresses or IOSurface identities are logged.
++ unsigned at=0;
++ for(CoachzFrameWrite *write in writes) {
++  NBTexture *t=write.texture;
++  if(t.coachzDirect || !t.surface || IOSurfaceGetID(t.surface)!=surfaceID || !coachzFrameHasDamage(write))continue;
++  const unsigned index=++at;
++  if(index>2 && write!=last)continue;
++  NBTexture *r=t;while(r.parent)r=(NBTexture *)r.parent;
++  snprintf(line,sizeof line,"DP target %u %lux%lu r%llu root%lux%lu r%llu f%lu u%llx birth%u",index,
++   (unsigned long)t.width,(unsigned long)t.height,(unsigned long long)t.rotation,
++   (unsigned long)r.width,(unsigned long)r.height,(unsigned long long)r.rotation,
++   (unsigned long)t.pixelFormat,(unsigned long long)t.usage,(unsigned)r.coachzPlainImport);note(line);
++  const MTLScissorRect d=write.damage;
++  snprintf(line,sizeof line,"DP pass %u load%u store%u partial%u rect%lu,%lu,%lu,%lu",index,
++   write.passActions&15,(write.passActions>>4)&15,write.partial?1u:0u,
++   (unsigned long)d.x,(unsigned long)d.y,(unsigned long)d.width,(unsigned long)d.height);note(line);
++  Dl_info info={};const bool found=write.passCaller && dladdr((const void *)write.passCaller,&info) && info.dli_fbase && info.dli_fname;
++  const char *name=found?strrchr(info.dli_fname,'/'):nullptr;
++  name=found?(name?name+1:info.dli_fname):"?";
++  snprintf(line,sizeof line,"DP site %u %.40s+%llx",index,name,
++   (unsigned long long)(found?write.passCaller-(uintptr_t)info.dli_fbase:0));note(line);
++ }
++}
 +static bool coachzMirrorFrames(NmbCommandBuffer *commands,NSMutableArray *surfaces,NSMutableSet *owners,uint32_t guards,NSDictionary *surfaceGuards) {
 + NSMutableSet *seen=[NSMutableSet set];
 + NmbEncoder *blit=nullptr;bool ok=true;
@@ -1265,33 +1810,74 @@
 +  if(!backing)backing=frame.backing;
 +  os_unfair_lock_unlock(&gCoachzFrameLock);
 +  if(!frame || !resident || [seen containsObject:@(surfaceID)])continue;
++  const uint32_t surfaceGuard=guards|[surfaceGuards[@(surfaceID)] unsignedIntValue];
++  const uint64_t fullBytes=(uint64_t)resident.width*resident.height*4;
++  if(write.sealed && write.coherent && !surfaceGuard) {
++   [seen addObject:@(surfaceID)];coachzMarkFrameCoherent(surfaces,surfaceID);continue;
++  }
++  if(!surfaceGuard && !coachzFrameHasDamage(write)) {
++   bool hasPixelWriter=false;
++   for(CoachzFrameWrite *earlier in surfaces) {
++    if(earlier.texture.surface && IOSurfaceGetID(earlier.texture.surface)==surfaceID && coachzFrameHasDamage(earlier)) {
++     hasPixelWriter=true;
++     break;
++    }
++   }
++   // Leave the surface unseen until the last possible pixel writer is reached.
++   if(hasPixelWriter) {
++    gCoachzNoopTail++;
++    continue;
++   }
++   if(valid) {
++    gCoachzNoopTail++;
++    [seen addObject:@(surfaceID)];
++    coachzMarkFrameCoherent(surfaces,surfaceID);
++    gCoachzEmptyMirrors++;
++    gCoachzMirrorSaved+=fullBytes;
++    continue;
++   }
++  }
 +  [seen addObject:@(surfaceID)];
 +  // A missing lease on the last writer must not select an older writer instead.
 +  if(!backing){gCoachzSyncMissing++;continue;}
 +  NBTexture *source=(view.coachzDirect && root==resident)?resident:backing;
 +  NBTexture *target=source==resident?backing:resident;
-+  const uint64_t fullBytes=(uint64_t)resident.width*resident.height*4;
 +  MTLScissorRect damage={0,0,resident.width,resident.height};
-+  const uint32_t surfaceGuard=guards|[surfaceGuards[@(surfaceID)] unsignedIntValue];
 +  const bool out=source==resident;
 +  // Out: damage in private coordinates. In: damage in the physical plane's, from straight plain writers.
 +  const NSUInteger damageWidth=out?resident.width:backing.width,damageHeight=out?resident.height:backing.height;
-+  bool partial=!surfaceGuard && valid;
-+  if(surfaceGuard){gCoachzGuardedMirrors++;gCoachzMirrorGuardMask.fetch_or(surfaceGuard);}
-+  if(partial) {
-+   damage={0,0,0,0};
-+   // A command may have several passes/writers. Union all, never just the last
-+   // scissor. Any unbounded writer or other representation restores a full copy.
-+   for(CoachzFrameWrite *other in surfaces) {
-+    NBTexture *t=other.texture;
-+    if(!t.surface || IOSurfaceGetID(t.surface)!=surfaceID)continue;
-+    NBTexture *r=t;while(r.parent)r=(NBTexture *)r.parent;
-+    const bool sameSide=out?(t.coachzDirect && r==resident):(!t.coachzDirect && r!=resident);
-+    if(!other.partial || !sameSide){partial=false;break;}
-+    damage=coachzUnionDamage(damage,coachzClipDamage(other.damage,damageWidth,damageHeight));
-+   }
-+   if(!partial)damage={0,0,resident.width,resident.height};
++  uint32_t fullReasons=0;
++  if(surfaceGuard) {
++   fullReasons|=1u<<CoachzFullGuard;
++   gCoachzGuardedMirrors++;
++   gCoachzMirrorGuardMask.fetch_or(surfaceGuard);
 +  }
++  if(!valid)fullReasons|=1u<<CoachzFullInvalid;
++  unsigned privateWrites=0,plainWrites=0,emptyWrites=0;
++  damage={0,0,0,0};
++  // Gather all causes and all same-side damage. A bounded no-op cannot make
++  // the command mixed or enlarge its dirty rectangle.
++  for(CoachzFrameWrite *other in surfaces) {
++   NBTexture *texture=other.texture;
++   if(!texture.surface || IOSurfaceGetID(texture.surface)!=surfaceID || other.sealed)continue;
++   NBTexture *otherRoot=coachzGpuRoot(texture);
++   const bool privateSide=texture.coachzDirect && otherRoot==resident;
++   const bool plainSide=!texture.coachzDirect && otherRoot!=resident;
++   const bool sameSide=out?privateSide:plainSide;
++   if(!coachzFrameHasDamage(other)) {
++    emptyWrites++;
++    if(valid && !surfaceGuard && !sameSide)gCoachzNoopOpposite++;
++    continue;
++   }
++   if(privateSide)privateWrites++;
++   if(plainSide)plainWrites++;
++   if(!other.partial || (!privateSide && !plainSide))fullReasons|=1u<<CoachzFullUnbounded;
++   if(!sameSide)fullReasons|=1u<<CoachzFullMixed;
++   if(other.partial && sameSide)
++    damage=coachzUnionDamage(damage,coachzClipDamage(other.damage,damageWidth,damageHeight));
++  }
++  const bool partial=fullReasons==0;
++  if(!partial)damage={0,0,resident.width,resident.height};
 +  if(!damage.width || !damage.height){coachzMarkFrameCoherent(surfaces,surfaceID);gCoachzEmptyMirrors++;gCoachzMirrorSaved+=fullBytes;continue;}
 +  const uint64_t bytes=(uint64_t)damage.width*damage.height*4;
 +  if(turned) {
@@ -1315,11 +1901,439 @@
 +  coachzMarkFrameCoherent(surfaces,surfaceID);
 +  (out?gCoachzSyncOut:gCoachzSyncIn)++;
 +  gCoachzMirrors++;gCoachzMirrorBytes+=bytes;
-+  if(bytes<fullBytes){gCoachzPartialMirrors++;gCoachzMirrorSaved+=fullBytes-bytes;if(!out)gCoachzPartialIn++;}
++  if(bytes==fullBytes) {
++   if(partial)fullReasons|=1u<<CoachzFullCoverage;
++   coachzNoteFullMirror(out,fullReasons,privateWrites,plainWrites,emptyWrites);
++   if(!out && fullReasons==(1u<<CoachzFullCoverage))coachzNotePlainTarget(surfaces,write,resident,surfaceID,turned);
++  } else if(bytes<fullBytes) {
++   gCoachzPartialMirrors++;
++   gCoachzMirrorSaved+=fullBytes-bytes;
++   if(!out)gCoachzPartialIn++;
++  }
 + }
 + if(blit && !nmb_encoder_end(blit))ok=false;
 + return ok;
 +}
++// Program identity includes both ordinary and quarter-turn stages. A successful
++// sampled comparison admits that program family for later passes in this boot.
++struct CoachzTurnProgram {unsigned state=0,seen=0;}; // new, pending, verified, rejected
++static std::mutex gCoachzTurnProgramsLock;
++static std::map<std::array<uint64_t,4>,CoachzTurnProgram> gCoachzTurnPrograms;
++static void coachzTurnNote(const char *text) {
++ uint32_t words[24]={};memcpy(words,text,strnlen(text,95));nbNote(3,words,24);
++}
++static bool coachzResourceAliases(id resource,NBTexture *target) {
++ if(!resource || !target)return false;
++ NBBuffer *buffer=nil;
++ if([resource isKindOfClass:[NBTexture class]]) {
++  NBTexture *texture=resource;
++  if(coachzGpuRoot(texture)==coachzGpuRoot(target))return true;
++  if(texture.surface && target.surface && IOSurfaceGetID(texture.surface)==IOSurfaceGetID(target.surface))return true;
++  buffer=[texture coachzLinearBackingBuffer];
++ } else if([resource isKindOfClass:[NBBuffer class]])buffer=resource;
++ if(!buffer)return false;
++ NBBuffer *targetBuffer=[target coachzLinearBackingBuffer];
++ if(targetBuffer && buffer.handle==targetBuffer.handle)return true;
++ if(buffer.importedSurface && target.surface && IOSurfaceGetID(buffer.importedSurface)==IOSurfaceGetID(target.surface))return true;
++ const uintptr_t a=(uintptr_t)buffer.wrapped,b=target.surface?(uintptr_t)IOSurfaceGetBaseAddress(target.surface):(uintptr_t)targetBuffer.wrapped;
++ if(!a || !b)return false;
++ const uint64_t n=buffer.length,m=target.surface?IOSurfaceGetAllocSize(target.surface):targetBuffer.length;
++ return a<=b?b-a<n:a-b<m;
++}
++static std::array<double,6> coachzQuarterViewport(NBEncoder *encoder,std::array<double,6> v) {
++ if(!encoder->coachzSelected)return v;
++ return {(double)encoder->coachzTarget.height-v[1]-v[3],v[0],v[3],v[2],v[4],v[5]};
++}
++static std::array<uint64_t,4> coachzQuarterScissor(NBEncoder *encoder,std::array<uint64_t,4> values) {
++ if(!encoder->coachzSelected)return values;
++ const MTLScissorRect r=coachzClipDamage({values[0],values[1],values[2],values[3]},encoder->coachzTarget.width,encoder->coachzTarget.height);
++ return {encoder->coachzTarget.height-r.y-r.height,r.x,r.height,r.width};
++}
++static NBComputePipeline *coachzTurnAuditPipeline() {
++ static std::mutex lock;static NBComputePipeline *pipeline;
++ std::lock_guard<std::mutex> guard(lock);
++ if(pipeline)return pipeline;
++ size_t length=0;const void *air=nmb_scanout_convert_air(&length);
++ id<MTLLibrary> library=air?native_bridge_metal_library_with_air(air,length):nil;
++ id<MTLFunction> function=[library newFunctionWithName:@"coachz_turn_audit"];
++ NSError *error=nil;
++ if(function)pipeline=(NBComputePipeline *)[gDeviceObject newComputePipelineStateWithFunction:function error:&error];
++ return pipeline;
++}
++// Float-sampled color transfers retain the attachment's own format. Integer,
++// compressed and depth/stencil targets need a separate transfer shader.
++static uint32_t coachzMrtPixelBytes(MTLPixelFormat format) {
++ switch(format) {
++ case MTLPixelFormatR8Unorm:return 1;
++ case MTLPixelFormatRG8Unorm:case MTLPixelFormatR16Unorm:case MTLPixelFormatR16Float:return 2;
++ case MTLPixelFormatBGRA8Unorm:case MTLPixelFormatBGRA8Unorm_sRGB:
++ case MTLPixelFormatRGBA8Unorm:case MTLPixelFormatRGBA8Unorm_sRGB:
++ case MTLPixelFormatRG16Unorm:case MTLPixelFormatRG16Float:case MTLPixelFormatR32Float:return 4;
++ case MTLPixelFormatRGBA16Unorm:case MTLPixelFormatRGBA16Float:case MTLPixelFormatRG32Float:return 8;
++ case MTLPixelFormatRGBA32Float:return 16;
++ default:return 0;
++ }
++}
++static bool coachzPrepareMrt(NBEncoder *encoder) {
++ for(CoachzTurnColor *color in encoder->coachzTurnColors) {
++  if(color.slot==0){color.rotated=encoder->coachzTurnView;continue;}
++  MTLTextureDescriptor *descriptor=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:color.source.pixelFormat
++   width:color.source.height height:color.source.width mipmapped:NO];
++  descriptor.storageMode=MTLStorageModePrivate;
++  descriptor.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;
++  color.rotated=(NBTexture *)[gDeviceObject newTextureWithDescriptor:descriptor];
++  if(!color.rotated) {
++   char note[96];snprintf(note,sizeof note,"TR mrt alloc slot%u f%u %.55s",color.slot,(unsigned)color.source.pixelFormat,lastError().UTF8String?:"unknown");
++   coachzTurnNote(note);
++   return false;
++  }
++  [encoder.commandBuffer.resourceOwners addObject:color.rotated];
++ }
++ return true;
++}
++static void coachzSelectMrt(NBEncoder *encoder) {
++ auto &pass=*encoder->coachzPass;
++ for(CoachzTurnColor *color in encoder->coachzTurnColors) {
++  auto &attachment=pass.colors[color.slot];
++  attachment.texture=color.rotated.handle;
++  if(color.load==MTLLoadActionDontCare) {
++   attachment.load=MTLLoadActionClear;
++   for(double &component:attachment.clear)component=0;
++  }
++ }
++ pass.width=encoder->coachzTurnView.width;
++ pass.height=encoder->coachzTurnView.height;
++ pass.coachz_quarter_turn=1;
++}
++static bool coachzSeedMrt(NBEncoder *encoder) {
++ for(CoachzTurnColor *color in encoder->coachzTurnColors)if(color.slot && color.load==MTLLoadActionLoad) {
++  if(!coachzFrameTransfer(encoder.commandBuffer.handle,color.source,color.rotated,true,encoder.commandBuffer.resourceOwners))return false;
++  gCoachzMrtSeeds++;
++  gCoachzMrtInBytes+=(uint64_t)color.source.width*color.source.height*color.bytesPerPixel;
++ }
++ return true;
++}
++static bool coachzStoreMrt(NBEncoder *encoder) {
++ if(encoder->coachzAuditing)return true;
++ for(CoachzTurnColor *color in encoder->coachzTurnColors)if(color.slot && color.store==MTLStoreActionStore) {
++  if(!coachzFrameTransfer(encoder.commandBuffer.handle,color.rotated,color.source,false,encoder.commandBuffer.resourceOwners))return false;
++  gCoachzMrtStores++;
++  gCoachzMrtOutBytes+=(uint64_t)color.source.width*color.source.height*color.bytesPerPixel;
++ }
++ return true;
++}
++static bool coachzSetupQuarter(NBRenderEncoder *encoder,NBTexture *texture,MTLRenderPassDescriptor *pass,CoachzFrameWrite *write) {
++ if(!texture || texture.coachzDirect || !texture.surface)return false;
++ const uint64_t attempt=++gCoachzTurnCandidates;
++ uint32_t reason=0;
++ if(!write)reason|=1;
++ if(!write.partial)reason|=2;
++ if(texture.pixelFormat!=MTLPixelFormatBGRA8Unorm)reason|=4;
++ if(pass.depthAttachment.texture || pass.stencilAttachment.texture || pass.visibilityResultBuffer)reason|=8;
++ const uint64_t width=texture.width,height=texture.height;
++ const uint64_t passWidth=pass.renderTargetWidth,passHeight=pass.renderTargetHeight;
++ if((passWidth && passWidth!=width) || (passHeight && passHeight!=height))reason|=16;
++ NSMutableArray<CoachzTurnColor *> *colors=[NSMutableArray array];
++ uint64_t layout=0xcbf29ce484222325ull;
++ uint32_t present=0;
++ for(unsigned slot=0;slot<8;slot++) {
++  MTLRenderPassColorAttachmentDescriptor *attachment=pass.colorAttachments[slot];
++  NBTexture *source=slot?(NBTexture *)attachment.texture:texture;
++  if(!source)continue;
++  present|=1u<<slot;
++  CoachzTurnColor *color=[CoachzTurnColor new];
++  color.source=source;color.slot=slot;color.load=(uint32_t)attachment.loadAction;color.store=(uint32_t)attachment.storeAction;
++  color.bytesPerPixel=coachzMrtPixelBytes(source.pixelFormat);
++  uint32_t bad=0;
++  if(slot) {
++   if(!color.bytesPerPixel)bad|=1;
++   if(source.width!=width || source.height!=height)bad|=2;
++   if(source.rotation || source.textureType!=MTLTextureType2D || source.sampleCount!=1)bad|=4;
++   if(attachment.level || attachment.slice || attachment.depthPlane || attachment.resolveTexture)bad|=8;
++   if(color.load>MTLLoadActionClear || color.store>MTLStoreActionStore)bad|=16;
++   for(CoachzTurnColor *other in colors)if(coachzResourceAliases(source,other.source) || coachzResourceAliases(other.source,source))bad|=32;
++   if(bad) {
++    reason|=32;
++    const uint64_t count=++gCoachzMrtRefused[slot];
++    if(count<=3 || !(count&(count-1))) {
++     char note[96];snprintf(note,sizeof note,"TR mrt slot%u bad%x f%u size%lux%lu rot%u actions%u/%u",slot,bad,(unsigned)source.pixelFormat,
++      (unsigned long)source.width,(unsigned long)source.height,(unsigned)source.rotation,color.load,color.store);
++     coachzTurnNote(note);
++    }
++   }
++  }
++  for(uint64_t value:{(uint64_t)slot,(uint64_t)source.pixelFormat,(uint64_t)source.width,(uint64_t)source.height,(uint64_t)color.load,(uint64_t)color.store})
++   layout=(layout^value)*0x100000001b3ull;
++  [colors addObject:color];
++ }
++ encoder->coachzTurnColors=colors;
++ encoder->coachzTurnLayout=layout;
++ NBTexture *root=nil;
++ os_unfair_lock_lock(&gCoachzFrameLock);
++ CoachzFrame *frame=coachzFrameForWrite(texture,&root);
++ NBTexture *resident=frame.texture;
++ const uint32_t flags=(frame.valid?1u:0u)|(frame.turned?2u:0u)|(frame.promoting?4u:0u);
++ const uint32_t rotation=texture.rotation,rootRotation=root.rotation;
++ const uint64_t residentWidth=resident.width,residentHeight=resident.height;
++ if(!frame)reason|=64;
++ if((flags&3)!=3 || (flags&4))reason|=128;
++ if(rotation || rootRotation)reason|=256;
++ if(!resident || residentWidth!=height || residentHeight!=width)reason|=512;
++ os_unfair_lock_unlock(&gCoachzFrameLock);
++ bool report=attempt<=3;
++ for(unsigned bit=0;bit<10;bit++)if(reason&(1u<<bit)) {
++  const uint64_t count=++gCoachzTurnEntryRejected[bit];
++  report|=count<=3 || !(count&(count-1));
++ }
++ if(report) {
++  char note[96];
++  snprintf(note,sizeof note,"TR entry n%llu mask%x partial%u actions%u/%u f%u",(unsigned long long)attempt,reason,
++   write.partial?1u:0u,(unsigned)pass.colorAttachments[0].loadAction,(unsigned)pass.colorAttachments[0].storeAction,(unsigned)texture.pixelFormat);
++  coachzTurnNote(note);
++  snprintf(note,sizeof note,"TR extent n%llu tex%llux%llu pass%llux%llu",(unsigned long long)attempt,
++   (unsigned long long)width,(unsigned long long)height,(unsigned long long)passWidth,(unsigned long long)passHeight);
++  coachzTurnNote(note);
++  snprintf(note,sizeof note,"TR resident n%llu flags%x rot%u/%u tex%llux%llu",(unsigned long long)attempt,flags,rotation,rootRotation,
++   (unsigned long long)residentWidth,(unsigned long long)residentHeight);
++  coachzTurnNote(note);
++  snprintf(note,sizeof note,"TR mrt layout n%llu present%x key%llx",(unsigned long long)attempt,present,(unsigned long long)layout);
++  coachzTurnNote(note);
++  for(CoachzTurnColor *color in colors) {
++   snprintf(note,sizeof note,"TR mrt color n%llu slot%u f%u size%lux%lu u%lx actions%u/%u",(unsigned long long)attempt,color.slot,
++    (unsigned)color.source.pixelFormat,(unsigned long)color.source.width,(unsigned long)color.source.height,
++    (unsigned long)color.source.usage,color.load,color.store);
++   coachzTurnNote(note);
++  }
++ }
++ if(reason)return false;
++ encoder->coachzTarget=texture;encoder->coachzTurnFrame=frame;encoder->coachzTurnWrite=write;
++ encoder->coachzTurnPipelines=[NSMutableSet set];encoder->coachzTurnBegan=nowUs();encoder->coachzDeferred=YES;
++ encoder->coachzCaptureTrace=gCoachzTurnAuditCount.load()<8;
++ encoder->coachzCurrentDraw.viewport={0,0,(double)width,(double)height,0,1};
++ encoder->coachzCurrentDraw.scissor={0,0,width,height};
++ return true;
++}
++static void coachzResolveQuarter(NBRenderEncoder *encoder) {
++ if(!encoder->coachzDeferred)return;
++ const uint64_t prepareBegan=nowUs();
++ uint32_t reason=encoder->coachzTurnReject;
++ if(!encoder->coachzTurnDraws)reason|=256;
++ NBCommandBuffer *commands=encoder.commandBuffer;
++ CoachzFrame *frame=encoder->coachzTurnFrame;
++ const uint32_t surfaceID=IOSurfaceGetID(encoder->coachzTarget.surface);
++ NSMutableArray *prefix=[NSMutableArray array];
++ for(CoachzFrameWrite *write in commands.coachzFrameWrites)if(write.texture.surface && IOSurfaceGetID(write.texture.surface)==surfaceID) {
++  [prefix addObject:write];
++  if(write!=encoder->coachzTurnWrite && !write.sealPlanned)reason|=1;
++ }
++ encoder->coachzTurnPrefix=prefix;
++ if(commands.coachzMirrorGuards || [commands.coachzFrameGuards[@(surfaceID)] unsignedIntValue] || commands.encodeFailure)reason|=1;
++ os_unfair_lock_lock(&gCoachzFrameLock);
++ if(!frame.valid || frame.promoting || frame->plainWriters.load()!=1)reason|=1;
++ os_unfair_lock_unlock(&gCoachzFrameLock);
++ std::vector<std::array<uint64_t,4>> programs;
++ if(!reason)for(NBRenderPipeline *pipeline in encoder->coachzTurnPipelines) {
++  @synchronized(pipeline) {
++   if(!pipeline->coachzTurnChecked) {
++    pipeline->coachzTurnHashes={};
++    pipeline->coachzTurnMask=nmb_render_pipeline_quarter_turn(pipeline.handle,pipeline->coachzTurnHashes.data());
++    pipeline->coachzTurnChecked=YES;
++    char note[96];snprintf(note,sizeof note,"TR program mask%x vs%llx fs%llx newvs%llx",pipeline->coachzTurnMask,
++     (unsigned long long)pipeline->coachzTurnHashes[0],(unsigned long long)pipeline->coachzTurnHashes[1],(unsigned long long)pipeline->coachzTurnHashes[2]);coachzTurnNote(note);
++    snprintf(note,sizeof note,"TR pipeline colors%x writes%x",pipeline->coachzColorMask,pipeline->coachzColorWrites);coachzTurnNote(note);
++    if(pipeline->coachzTurnMask==0x80000000) {
++     snprintf(note,sizeof note,"TR compile %.80s",lastError().UTF8String?:"unknown");coachzTurnNote(note);
++    }
++   }
++   if(pipeline->coachzTurnMask)reason|=4;
++   auto key=pipeline->coachzTurnHashes;
++   key[2]^=encoder->coachzTurnLayout;
++   key[3]^=(encoder->coachzTurnLayout<<1)|(encoder->coachzTurnLayout>>63);
++   programs.push_back(key);
++  }
++ }
++ bool audit=false;
++ if(!reason) {
++  std::sort(programs.begin(),programs.end());programs.erase(std::unique(programs.begin(),programs.end()),programs.end());
++  if(programs.empty())reason|=4;
++  else {
++   std::lock_guard<std::mutex> guard(gCoachzTurnProgramsLock);
++   for(const auto &key:programs) {
++    auto &program=gCoachzTurnPrograms[key];program.seen++;
++    if(program.state==3)reason|=4;
++    else if(program.state==1)reason|=64;
++    else if(program.state==0){audit=true;if(program.seen<3)reason|=64;}
++   }
++   if(audit && gCoachzTurnAuditCount.load()>=8)reason|=64;
++  }
++ }
++ if(!reason && audit) {
++  encoder->coachzAuditPipeline=coachzTurnAuditPipeline();
++  if(!encoder->coachzAuditPipeline)reason|=8;
++ }
++ if(!reason) {
++  encoder->coachzTurnView=(NBTexture *)coachzFrameView(frame,encoder->coachzTarget.surface,
++   encoder->coachzTarget.coachzBacking?:coachzGpuRoot(encoder->coachzTarget),MTLPixelFormatBGRA8Unorm);
++  if(!encoder->coachzTurnView)reason|=1;
++ }
++ if(!reason && !coachzPrepareMrt(encoder))reason|=8;
++ if(!reason && audit) {
++  std::lock_guard<std::mutex> guard(gCoachzTurnProgramsLock);
++  for(const auto &key:programs)if(gCoachzTurnPrograms[key].state==1)reason|=64;
++  if(!reason){for(const auto &key:programs)if(gCoachzTurnPrograms[key].state==0)gCoachzTurnPrograms[key].state=1;gCoachzTurnAuditCount++;}
++ }
++ encoder->coachzTurnPrograms=programs;
++ if(!reason) {
++  encoder->coachzAuditing=audit;encoder->coachzSelected=!audit;
++  if(audit) {
++   CoachzTurnAudit *lease=[CoachzTurnAudit new];lease.programs=programs;lease.colors=encoder->coachzTurnColors;
++   lease.draws=encoder->coachzDrawTrace;lease.traceTruncated=encoder->coachzTraceTruncated;
++   encoder->coachzAuditLease=lease;
++   if(!commands.coachzTurnAudits)commands.coachzTurnAudits=[NSMutableArray array];
++   [commands.coachzTurnAudits addObject:lease];
++  }
++  encoder->coachzTurnWrite.sealPlanned=YES;
++  if(!audit) {
++   coachzSelectMrt(encoder);
++   CoachzFrameWrite *write=encoder->coachzTurnWrite;
++   const MTLScissorRect d=coachzClipDamage(write.damage,encoder->coachzTarget.width,encoder->coachzTarget.height);
++   write.damage={encoder->coachzTurnView.width-d.y-d.height,d.x,d.height,d.width};
++   write.texture=encoder->coachzTurnView;[write releasePlainLease];
++   [commands.resourceOwners addObject:encoder->coachzTurnView];
++   const uint64_t pixels=(uint64_t)encoder->coachzTarget.width*encoder->coachzTarget.height;
++   gCoachzTurnRuns++;gCoachzTurnPixels+=pixels;gCoachzSurface-=pixels;gCoachzDirectPixels+=pixels;
++  }
++ } else for(unsigned bit=0;bit<10;bit++)if(reason&(1u<<bit))gCoachzTurnRejected[bit]++;
++ const uint64_t took=nowUs()-prepareBegan;gCoachzTurnPrepareUs+=took;
++ const uint64_t n=!reason?(audit?gCoachzTurnAuditCount.load():gCoachzTurnRuns.load()):gCoachzTurnCandidates.load();
++ if(n<=4 || !(n&(n-1))) {
++  char note[96];snprintf(note,sizeof note,"TR pass mode%u reason%x n%llu draws%u calls%zu prep%lluus",reason?0u:audit?1u:2u,reason,
++   (unsigned long long)n,encoder->coachzTurnDraws,encoder->coachzCalls.size(),(unsigned long long)took);coachzTurnNote(note);
++  snprintf(note,sizeof note,"TR mrt traffic seed%llu in%llu store%llu out%llu",(unsigned long long)gCoachzMrtSeeds.load(),
++   (unsigned long long)gCoachzMrtInBytes.load(),(unsigned long long)gCoachzMrtStores.load(),(unsigned long long)gCoachzMrtOutBytes.load());coachzTurnNote(note);
++  snprintf(note,sizeof note,"TR span n%llu wall%lluus held%zu",(unsigned long long)n,
++   (unsigned long long)(nowUs()-encoder->coachzTurnBegan),encoder->coachzHeldBytes);coachzTurnNote(note);
++ }
++ [encoder coachzFlushDeferred];
++}
++static bool coachzMakeAudit(NBEncoder *encoder) {
++ NBCommandBuffer *commands=encoder.commandBuffer;
++ CoachzTurnAudit *audit=encoder->coachzAuditLease;
++ const size_t bytes=audit.colors.count*256;
++ std::vector<uint32_t> initial(bytes/sizeof(uint32_t),0);
++ for(size_t i=0;i<audit.colors.count;i++)initial[i*64+2]=UINT32_MAX;
++ NBBuffer *report=[NBBuffer new];
++ report.handle=nmb_buffer_new(gDevice,bytes,MTLResourceStorageModeShared,initial.data());
++ report.options=MTLResourceStorageModeShared;
++ if(!report.handle)return false;
++ audit.report=report;
++ [commands.resourceOwners addObject:report];
++ [commands.resourceOwners addObject:encoder->coachzAuditPipeline];
++ [commands.resourceOwners addObject:encoder->coachzTurnView];
++ const uint64_t threads[3]={128,128,1},group[3]={16,8,1};
++ NmbEncoder *compute=nmb_compute_encoder_new(commands.handle);
++ if(!compute)return false;
++ bool ok=nmb_compute_set_pipeline(compute,encoder->coachzAuditPipeline.handle);
++ for(NSUInteger i=0;ok && i<audit.colors.count;i++) {
++  CoachzTurnColor *color=audit.colors[i];
++  if(color.store!=MTLStoreActionStore)continue;
++  const uint32_t dimensions[4]={(uint32_t)color.source.width,(uint32_t)color.source.height,0,0};
++  ok=nmb_encoder_set_texture(compute,0,color.source.handle,0) && nmb_encoder_set_texture(compute,0,color.rotated.handle,1) &&
++   nmb_encoder_set_buffer(compute,0,report.handle,i*256,0) && nmb_encoder_set_bytes(compute,0,dimensions,sizeof dimensions,1) &&
++   nmb_compute_dispatch(compute,threads,group,true);
++ }
++ if(!ok){nmb_encoder_discard(compute);return false;}
++ return nmb_encoder_end(compute);
++}
++static bool coachzSealQuarter(NBEncoder *encoder) {
++ // At endEncoding the prefix is immutable. Later encoders may already have
++ // recorded their writes on the calling thread, so never inspect the live list.
++ const bool ok=coachzMirrorFrames(encoder.commandBuffer.handle,(NSMutableArray *)encoder->coachzTurnPrefix,
++  encoder.commandBuffer.resourceOwners,0,nil);
++ if(ok) {for(CoachzFrameWrite *write in encoder->coachzTurnPrefix)write.sealed=YES;gCoachzTurnSeals++;}
++ return ok;
++}
++static void coachzReleaseTurnAudit(id object) {
++ CoachzTurnAudit *audit=object;
++ std::lock_guard<std::mutex> guard(gCoachzTurnProgramsLock);
++ for(const auto &key:audit.programs)if(gCoachzTurnPrograms[key].state==1)gCoachzTurnPrograms[key].state=0;
++}
++static void coachzFinishTurnAudits(id object) {
++ NBCommandBuffer *commands=object;
++ const bool complete=!commands.failedLocally && nmb_command_buffer_metal_error_code(commands.handle)==0;
++ for(CoachzTurnAudit *audit in commands.coachzTurnAudits) {
++  void *bytes=audit.report.contents;
++  if(!complete || !bytes) {
++   char note[96];
++   snprintf(note,sizeof note,"TR outcome local%u metal%u report%u",commands.failedLocally?1u:0u,
++    (unsigned)nmb_command_buffer_metal_error_code(commands.handle),bytes?1u:0u);
++   coachzTurnNote(note);
++   char error[384]={};
++   if(commands.failedLocally)snprintf(error,sizeof error,"%s",commands.encodeFailure.UTF8String?:"local refusal");
++   else if(!complete)nmb_command_buffer_error(commands.handle,error,sizeof error);
++   for(size_t at=0;at<strlen(error);at+=72) {
++    snprintf(note,sizeof note,"TR error part%u %.72s",(unsigned)(at/72),error+at);
++    coachzTurnNote(note);
++   }
++  }
++  if(bytes)sys_dcache_flush(bytes,audit.colors.count*256);
++  bool valid=complete && bytes,good=true;
++  std::vector<std::array<uint32_t,3>> badPixels; // slot, x, y
++  for(NSUInteger i=0;i<audit.colors.count;i++) {
++   CoachzTurnColor *color=audit.colors[i];
++   if(color.store!=MTLStoreActionStore)continue;
++   uint32_t data[4]={};
++   if(bytes)memcpy(data,(uint8_t *)bytes+i*256,sizeof data);
++   valid&=data[0]==128;
++   good&=data[1]==0;
++   if(complete && bytes && data[0]==128)for(uint32_t k=0;k<std::min(data[1],4u);k++) {
++    uint32_t pixel[10];
++    memcpy(pixel,(uint8_t *)bytes+i*256+16+k*sizeof pixel,sizeof pixel);
++    badPixels.push_back({color.slot,pixel[0],pixel[1]});
++    char note[96];
++    snprintf(note,sizeof note,"TR pixel slot%u xy%u,%u ref%08x/%08x/%08x/%08x",color.slot,pixel[0],pixel[1],pixel[2],pixel[3],pixel[4],pixel[5]);
++    coachzTurnNote(note);
++    snprintf(note,sizeof note,"TR pixel slot%u xy%u,%u turn%08x/%08x/%08x/%08x",color.slot,pixel[0],pixel[1],pixel[6],pixel[7],pixel[8],pixel[9]);
++    coachzTurnNote(note);
++   }
++   char note[96];snprintf(note,sizeof note,"TR audit slot%u rows%u diff%u first%u,%u delta%u",color.slot,data[0],data[1],
++    data[2]&65535,data[2]>>16,data[3]);coachzTurnNote(note);
++  }
++  good&=valid;
++  if(valid && !good) {
++   for(const CoachzTurnDraw &draw:audit.draws) {
++    if(!draw.pipeline)continue;
++    const auto &scissor=draw.scissor;
++    for(const auto &pixel:badPixels) {
++     const uint32_t slot=pixel[0],x=pixel[1],y=pixel[2];
++     if(x<scissor[0] || y<scissor[1] || x-scissor[0]>=scissor[2] || y-scissor[1]>=scissor[3])continue;
++     char note[96];
++     snprintf(note,sizeof note,"TR draw n%u slot%u xy%u,%u vs%llx fs%llx",draw.ordinal,slot,x,y,
++      (unsigned long long)draw.pipeline->coachzTurnHashes[0],(unsigned long long)draw.pipeline->coachzTurnHashes[1]);coachzTurnNote(note);
++     snprintf(note,sizeof note,"TR draw n%u scissor%llu,%llu,%llu,%llu",draw.ordinal,(unsigned long long)scissor[0],
++      (unsigned long long)scissor[1],(unsigned long long)scissor[2],(unsigned long long)scissor[3]);coachzTurnNote(note);
++     snprintf(note,sizeof note,"TR draw n%u viewport%.8g,%.8g,%.8g,%.8g",draw.ordinal,draw.viewport[0],draw.viewport[1],draw.viewport[2],draw.viewport[3]);coachzTurnNote(note);
++     const auto &blend=draw.pipeline->coachzBlendState[slot];
++     snprintf(note,sizeof note,"TR blend n%u slot%u mask%x on%u op%u/%u src%u/%u dst%u/%u",draw.ordinal,slot,
++      blend[0],blend[1],blend[2],blend[3],blend[4],blend[6],blend[5],blend[7]);coachzTurnNote(note);
++     snprintf(note,sizeof note,"TR blend n%u constant%.8g/%.8g/%.8g/%.8g",draw.ordinal,draw.blend[0],draw.blend[1],draw.blend[2],draw.blend[3]);coachzTurnNote(note);
++     snprintf(note,sizeof note,"TR shader n%u %.72s",draw.ordinal,draw.pipeline.coachzFragmentName.UTF8String?:"none");coachzTurnNote(note);
++    }
++   }
++   if(audit.traceTruncated)coachzTurnNote("TR draw trace truncated after 32 draws");
++  }
++  {
++   std::lock_guard<std::mutex> guard(gCoachzTurnProgramsLock);
++   for(const auto &key:audit.programs)if(gCoachzTurnPrograms[key].state==1)gCoachzTurnPrograms[key].state=good?2:valid?3:0;
++  }
++  audit.finished=YES;
++  if(good)gCoachzTurnAuditGood++;else if(valid)gCoachzTurnAuditBad++;
++  char note[96];snprintf(note,sizeof note,"TR audit valid%u good%u colors%lu fs%llx",valid?1u:0u,good?1u:0u,(unsigned long)audit.colors.count,
++   (unsigned long long)(audit.programs.empty()?0:audit.programs[0][1]));coachzTurnNote(note);
++ }
++ [commands.coachzTurnAudits removeAllObjects];
++}
++
  - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
   NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
 + coachzTextureKind('p',d);
@@ -1327,7 +2341,7 @@
   if(gLogTextures && textureLogTurn())
    GLOG(@"native-metal: texture-log %llu texture %llux%llu fmt %llu type %llu levels %llu usage %llx options %llx %s",
          (unsigned long long)gTexturesLogged.load(),(unsigned long long)descriptor.width,(unsigned long long)descriptor.height,
-@@ -4162,8 +4860,9 @@
+@@ -4162,8 +5701,9 @@
  }
  // The surface's pages are the texels: its mapping in this process is imported without a copy (pinned by the kernel, mapped into the GPU's
  // 4 KiB context by Turnip), so every process that imports the surface renders and samples the same memory.
@@ -1337,7 +2351,7 @@
   // the plane's own address and rows. Only a plain surface has no planes, and then only plane 0 exists.
   const size_t planes=surface?IOSurfaceGetPlaneCount(surface):0;
   if(!surface || !d || (planes?plane>=planes:plane!=0)){refuseSurface(1,surface,d,plane,0,0);return nil;}
-@@ -4175,14 +4874,21 @@
+@@ -4175,14 +5715,21 @@
   size_t row=planes?IOSurfaceGetBytesPerRowOfPlane(surface,plane):IOSurfaceGetBytesPerRow(surface);
   size_t computed[4];   // myron: a 'b3a8' surface without plane rows
   if(!row && plane<2 && b3a8Planes(surface,allocation,computed)){start=(uintptr_t)base+computed[plane*2];row=computed[plane*2+1];}
@@ -1360,7 +2374,28 @@
  - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {
   const void *bytes=nullptr;size_t size=0;dispatch_data_t mapped=dispatch_data_create_map(data,&bytes,&size);
   const uint64_t libraryBegan=nowUs();
-@@ -4568,8 +5274,34 @@
+@@ -4398,8 +5945,20 @@
+   if(error)*error=nbError([@"render pipeline: " stringByAppendingString:why]);
+   return nil;
+  }
+  NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;state.stateFormat=(uint32_t)d.colorAttachments[0].pixelFormat;gPipelines++;if(error)*error=nil;
++ for(unsigned slot=0;slot<8;slot++) {
++  MTLRenderPipelineColorAttachmentDescriptor *color=d.colorAttachments[slot];
++  if(color.pixelFormat!=MTLPixelFormatInvalid) {
++   state->coachzColorMask|=1u<<slot;
++   if(color.writeMask)state->coachzColorWrites|=1u<<slot;
++   state->coachzBlendState[slot]={(uint32_t)color.writeMask,(uint32_t)color.blendingEnabled,
++    (uint32_t)color.rgbBlendOperation,(uint32_t)color.alphaBlendOperation,
++    (uint32_t)color.sourceRGBBlendFactor,(uint32_t)color.destinationRGBBlendFactor,
++    (uint32_t)color.sourceAlphaBlendFactor,(uint32_t)color.destinationAlphaBlendFactor};
++  }
++ }
++ state.coachzFragmentName=d.fragmentFunction.name;
+  if(dumpRange().first)state.dumpInfo=renderDumpInfo(d);
+  return (id<MTLRenderPipelineState>)state;
+ }
+ // The asynchronous forms make the pipeline on the caller's thread and call the handler before returning, as the library's
+@@ -4568,8 +6127,34 @@
   return gDeviceObject;
  }
 
@@ -1395,7 +2430,7 @@
   NmbLibrary *handle=gDevice?nmb_library_new(gDevice,bytes,length,true):nullptr;if(!handle)return nil;
   NBLibrary *library=[NBLibrary new];library.handle=handle;return library;
  }
-@@ -4678,8 +5410,9 @@
+@@ -4678,12 +6263,42 @@
  }
  // The telemetry table the plugin streams to the kernel's log: newline-separated rows of at most 90 characters.
  extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
@@ -1405,7 +2440,40 @@
    char text[200];int n=snprintf(text,sizeof text,format,args...);if(n<=0)return;if(n>90)n=90;
    if(at+(size_t)n+2>=size)return;memcpy(out+at,text,(size_t)n);at+=(size_t)n;out[at++]='\n';out[at]=0;};
   auto ms=[](uint64_t us){return (unsigned long long)(us/1000);};
-@@ -4747,8 +5480,16 @@
++ // Keep RM/GM/GMb ahead of variable benchmark, format, cache and allocation rows.
++ if(gDevice) {
++  // How Turnip rendered the passes (tu_render_mode_stats): GMEM passes and their Mpx, SYSMEM passes the autotuner chose and theirs,
++  // SYSMEM passes for another reason and theirs, then GMEM passes with an attachment loaded or stored over its texels alone.
++  {
++   uint64_t rm[8]={};
++   static void *turnip=gLoaderPath.empty()?nullptr:dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD);
++   static void (*modeStats)(uint64_t *)=turnip?(void (*)(uint64_t *))dlsym(turnip,"tu_render_mode_stats"):nullptr;
++   if(modeStats) {
++    modeStats(rm);
++    row("RM gmem %llu %lluM | sys auto %llu %lluM other %llu %lluM | exact %llu",(unsigned long long)rm[0],(unsigned long long)(rm[1]/1000),
++     (unsigned long long)rm[2],(unsigned long long)(rm[3]/1000),(unsigned long long)rm[4],(unsigned long long)(rm[5]/1000),(unsigned long long)rm[6]);
++   }
++  }
++  // The tile-memory side of GMEM loads and stores (tu_gmem_side_stats), per site: 3D store source, 3D load source, 2D store source, input attachment; each
++  // transfers / of them with a swap other than WZYX / with MUTABLEEN / of a linear image. The second number must stay 0 for linear images.
++  {
++   uint64_t gm[16]={};
++   static void *turnip=gLoaderPath.empty()?nullptr:dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD);
++   static void (*sideStats)(uint64_t *)=turnip?(void (*)(uint64_t *))dlsym(turnip,"tu_gmem_side_stats"):nullptr;
++   if(sideStats) {
++    sideStats(gm);
++    row("GM s3d %llu/%llu/%llu/%llu l3d %llu/%llu/%llu/%llu",(unsigned long long)gm[0],(unsigned long long)gm[1],(unsigned long long)gm[2],(unsigned long long)gm[3],
++     (unsigned long long)gm[4],(unsigned long long)gm[5],(unsigned long long)gm[6],(unsigned long long)gm[7]);
++    row("GMb s2d %llu/%llu/%llu/%llu in %llu/%llu/%llu/%llu",(unsigned long long)gm[8],(unsigned long long)gm[9],(unsigned long long)gm[10],(unsigned long long)gm[11],
++     (unsigned long long)gm[12],(unsigned long long)gm[13],(unsigned long long)gm[14],(unsigned long long)gm[15]);
++   }
++  }
++ }
+  {std::lock_guard<std::mutex> lock(gBenchLock);for(unsigned r=0;r<4;r++)if(gBench[r][0])row("%.90s",gBench[r]);}
+  row("S c%llu/%llu d%llu p%llu x%llu R%llu D%llu F%llu M%lluk C%llu B%llu",(unsigned long long)gCommits.load(),(unsigned long long)gCommitFailures.load(),
+   (unsigned long long)gCompleted.load(),(unsigned long long)gPipelines.load(),(unsigned long long)gProblems.load(),(unsigned long long)gPasses.load(),
+   (unsigned long long)gDraws.load(),(unsigned long long)gFullScreenPasses.load(),(unsigned long long)(gBiggestPass.load()>>10),
+@@ -4747,8 +6362,16 @@
    uint64_t tc[8]={};
    if(nmb_device_texture_counts(gDevice,tc))
     row("L inp %llu/%llu rf %llu/%llu sh %llu cp %llu bk %llu rt %llu",(unsigned long long)tc[0],(unsigned long long)tc[1],(unsigned long long)tc[2],
@@ -1422,7 +2490,42 @@
    {
     std::lock_guard<std::mutex> lock(gUnalignedLock);
     if(gUnalignedCount)
-@@ -4823,10 +5564,8 @@
+@@ -4776,34 +6399,8 @@
+     (unsigned long long)(mc[4]>>20),(unsigned long long)(mc[5]>>20),(unsigned long long)mc[6],(unsigned long long)mc[7],
+     (unsigned long long)mc[8],(unsigned long long)mc[9],(unsigned long long)(bc[5]>>20),(unsigned long long)(bc[6]>>20),
+     (unsigned long long)bc[2],(unsigned long long)bc[3]);
+   }
+-  // How Turnip rendered the passes (tu_render_mode_stats): GMEM passes and their Mpx, SYSMEM passes the autotuner chose and theirs,
+-  // SYSMEM passes for another reason and theirs, then GMEM passes with an attachment loaded or stored over its texels alone.
+-  {
+-   uint64_t rm[8]={};
+-   static void *turnip=gLoaderPath.empty()?nullptr:dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD);
+-   static void (*modeStats)(uint64_t *)=turnip?(void (*)(uint64_t *))dlsym(turnip,"tu_render_mode_stats"):nullptr;
+-   if(modeStats) {
+-    modeStats(rm);
+-    row("RM gmem %llu %lluM | sys auto %llu %lluM other %llu %lluM | exact %llu",(unsigned long long)rm[0],(unsigned long long)(rm[1]/1000),
+-     (unsigned long long)rm[2],(unsigned long long)(rm[3]/1000),(unsigned long long)rm[4],(unsigned long long)(rm[5]/1000),(unsigned long long)rm[6]);
+-   }
+-  }
+-  // The tile-memory side of GMEM loads and stores (tu_gmem_side_stats), per site: 3D store source, 3D load source, 2D store source, input attachment; each
+-  // transfers / of them with a swap other than WZYX / with MUTABLEEN / of a linear image. The second number must stay 0 for linear images.
+-  {
+-   uint64_t gm[16]={};
+-   static void *turnip=gLoaderPath.empty()?nullptr:dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD);
+-   static void (*sideStats)(uint64_t *)=turnip?(void (*)(uint64_t *))dlsym(turnip,"tu_gmem_side_stats"):nullptr;
+-   if(sideStats) {
+-    sideStats(gm);
+-    row("GM s3d %llu/%llu/%llu/%llu l3d %llu/%llu/%llu/%llu",(unsigned long long)gm[0],(unsigned long long)gm[1],(unsigned long long)gm[2],(unsigned long long)gm[3],
+-     (unsigned long long)gm[4],(unsigned long long)gm[5],(unsigned long long)gm[6],(unsigned long long)gm[7]);
+-    row("GMb s2d %llu/%llu/%llu/%llu in %llu/%llu/%llu/%llu",(unsigned long long)gm[8],(unsigned long long)gm[9],(unsigned long long)gm[10],(unsigned long long)gm[11],
+-     (unsigned long long)gm[12],(unsigned long long)gm[13],(unsigned long long)gm[14],(unsigned long long)gm[15]);
+-   }
+-  }
+   // Who allocated the device memory (4 MiB or more at once): the three call stacks with the most bytes, as MiB, allocations and return
+   // addresses relative to their image (+offset in the plugin, whose link map NativeAdrenoMetal.map names them; *offset in another).
+   {
+    uint64_t sites[3*12]={};
+@@ -4823,10 +6420,8 @@
       frames[3],frames[4]);
      row("MA%zub %s %s %s %s %s",i,frames[5],frames[6],frames[7],frames[8],frames[9]);
     }
@@ -1433,6 +2536,7 @@
   {
    std::lock_guard<std::mutex> lock(gProblemLock);
    char formats[160];native_bridge_metal_formats_locked(formats,sizeof formats);row("F %.86s",formats);
+diff --git a/NativeMetalBridgePhase.h b/NativeMetalBridgePhase.h
 --- a/NativeMetalBridgePhase.h
 +++ b/NativeMetalBridgePhase.h
 @@ -128,11 +128,11 @@
@@ -1449,9 +2553,23 @@
                  }
              }
              snprintf(line, sizeof line, "PX %llu/%llu r%d e%x", (unsigned long long)st.frames, (unsigned long long)st.failures, st.lastResult,
+diff --git a/bridge/NativeMetalObjects.h b/bridge/NativeMetalObjects.h
 --- a/bridge/NativeMetalObjects.h
 +++ b/bridge/NativeMetalObjects.h
-@@ -346,8 +346,18 @@
+@@ -294,10 +294,12 @@
+ struct NmbRenderPassDescriptor {
+     struct NmbPassAttachment colors[8], depth, stencil;
+     uint64_t width, height, array_length, samples;
+     NmbBuffer *visibility; /* the pass's visibility result buffer, or null */
++    uint64_t coachz_quarter_turn; /* physical-plane render coordinates to private rotation 3 */
+ };
+ NmbEncoder *nmb_render_encoder_new(NmbCommandBuffer *, const struct NmbRenderPassDescriptor *);
++uint32_t nmb_render_pipeline_quarter_turn(const NmbRenderPipeline *, uint64_t hashes[4]);
+ bool nmb_encoder_end(NmbEncoder *);
+ void nmb_encoder_discard(NmbEncoder *);
+
+ /* stage: 0 compute, 1 vertex, 2 fragment */
+@@ -346,8 +348,18 @@
  bool nmb_blit_texture_to_buffer(NmbEncoder *, NmbTexture *source, uint64_t slice, uint64_t level, const uint64_t origin[3],
                                  const uint64_t size[3], NmbBuffer *destination, uint64_t offset, uint64_t bytes_per_row,
                                  uint64_t bytes_per_image);
@@ -1470,6 +2588,7 @@
  }
  #endif
  #endif
+diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
 --- a/bridge/NativeMetalObjects.rs
 +++ b/bridge/NativeMetalObjects.rs
 @@ -250,9 +250,18 @@
@@ -1513,7 +2632,49 @@
          // Flags bit 0x400: a format of blocks, which the alignment query has refused already.
          if info.flags & 0x400 != 0 || info.words[0] == 0 {
              return Err(format!("pixel format {format} has no texel size"));
-@@ -3041,4 +3050,64 @@
+@@ -1687,8 +1696,21 @@
+         Ok(boxed(NmbRenderPipeline(state)))
+     })
+ }
+
++/// # Safety
++/// `hashes` names four writable words; the pipeline remains live during the call.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn nmb_render_pipeline_quarter_turn(pipeline: *const NmbRenderPipeline, hashes: *mut u64) -> u32 {
++    guard(0x80000000, || {
++        if hashes.is_null() { return Err("null quarter-turn hashes".into()); }
++        let mut values = [0; 4];
++        let result = get(pipeline)?.0.coachz_quarter_turn(&mut values).map_err(e("quarter-turn pipeline"))?;
++        unsafe { std::ptr::copy_nonoverlapping(values.as_ptr(), hashes, 4); }
++        Ok(result)
++    })
++}
++
+ fn render_descriptor(descriptor: *const NmbRenderPipelineDescriptor) -> Result<RenderPipelineDescriptor, String> {
+         let d = get(descriptor)?;
+         // Each stage's linked functions ride on its function descriptor, as the compute pipeline's do (compute_descriptor).
+         let stage_linked = |functions, count, private, private_count| -> Result<LinkedFunctions, String> {
+@@ -2426,8 +2448,9 @@
+     pub height: u64,
+     pub array_length: u64,
+     pub samples: u64,
+     pub visibility: *const NmbBuffer,
++    pub coachz_quarter_turn: u64,
+ }
+
+ fn texture_of(a: &NmbPassAttachment) -> Result<Option<Texture>, String> {
+     if a.texture.is_null() { Ok(None) } else { Ok(Some(get(a.texture)?.0.clone())) }
+@@ -2438,8 +2461,9 @@
+                                          -> *mut NmbEncoder {
+     guard(std::ptr::null_mut(), || {
+         let d = get(descriptor)?;
+         let mut pass = RenderPassDescriptor::new();
++        pass.coachz_quarter_turn = d.coachz_quarter_turn != 0;
+         for (slot, a) in pass.color_attachments.iter_mut().zip(d.colors.iter()) {
+             slot.texture = texture_of(a)?;
+             slot.resolve_texture = optional(a.resolve_texture)?.map(|t| t.0.clone());
+             slot.resolve_level = a.resolve_level;
+@@ -3041,4 +3065,64 @@
          let queue = get(device)?.0.new_command_queue_with_max_command_buffer_count(count).map_err(e("command queue"))?;
          Ok(Box::into_raw(Box::new(NmbQueue(queue))))
      })
@@ -1578,9 +2739,10 @@
 +    unsafe { std::ptr::copy_nonoverlapping(row.as_ptr(), out, 8); }
 +    true
 +}
+diff --git a/shaders/scanout_convert.ll b/shaders/scanout_convert.ll
 --- a/shaders/scanout_convert.ll
 +++ b/shaders/scanout_convert.ll
-@@ -105,12 +105,138 @@
+@@ -105,12 +105,236 @@
  done:
    ret void
  }
@@ -1713,14 +2875,112 @@
 +declare float @air.convert.f.f32.u.i32(i32)
 +declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
 +
++; Coachz: sparse GPU self-comparison of the ordinary and quarter-turn pass.
++; 128x128 deterministic samples include the edges. report = rows, unequal,
++; first (y<<16|x), maximum channel difference in 8-bit codes. This is sampled
++; evidence, not a full-frame equality claim. Only x==0 increments the row count.
++; First four mismatches use ten words each after the four summary words,
++; holding x, y, then exact RGBA float bits from both images (176 bytes total).
++define void @coachz_turn_audit(ptr addrspace(1) %reference, ptr addrspace(1) %turned, ptr addrspace(1) %report, ptr addrspace(2) %dims, <2 x i32> %gid) {
++entry:
++  %gx = extractelement <2 x i32> %gid, i32 0
++  %gy = extractelement <2 x i32> %gid, i32 1
++  %okx = icmp ult i32 %gx, 128
++  %oky = icmp ult i32 %gy, 128
++  %ok = and i1 %okx, %oky
++  br i1 %ok, label %sample, label %done
++sample:
++  %w = load i32, ptr addrspace(2) %dims, align 16
++  %hp = getelementptr i32, ptr addrspace(2) %dims, i64 1
++  %h = load i32, ptr addrspace(2) %hp, align 4
++  %wm = sub i32 %w, 1
++  %hm = sub i32 %h, 1
++  %xm = mul i32 %gx, %wm
++  %ym = mul i32 %gy, %hm
++  %x = udiv i32 %xm, 127
++  %y = udiv i32 %ym, 127
++  %xy0 = insertelement <2 x i32> poison, i32 %x, i32 0
++  %xy = insertelement <2 x i32> %xy0, i32 %y, i32 1
++  %rx = sub i32 %hm, %y
++  %rxy0 = insertelement <2 x i32> poison, i32 %rx, i32 0
++  %rxy = insertelement <2 x i32> %rxy0, i32 %x, i32 1
++  %a0 = call { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1) %reference, <2 x i32> %xy, i32 0, i32 0)
++  %b0 = call { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1) %turned, <2 x i32> %rxy, i32 0, i32 0)
++  %a = extractvalue { <4 x float>, i8 } %a0, 0
++  %b = extractvalue { <4 x float>, i8 } %b0, 0
++  %row = icmp eq i32 %gx, 0
++  br i1 %row, label %countrow, label %compare
++countrow:
++  %rows = atomicrmw add ptr addrspace(1) %report, i32 1 monotonic, align 4
++  br label %compare
++compare:
++  %ne = fcmp une <4 x float> %a, %b
++  %n0 = extractelement <4 x i1> %ne, i32 0
++  %n1 = extractelement <4 x i1> %ne, i32 1
++  %n2 = extractelement <4 x i1> %ne, i32 2
++  %n3 = extractelement <4 x i1> %ne, i32 3
++  %n01 = or i1 %n0, %n1
++  %n23 = or i1 %n2, %n3
++  %different = or i1 %n01, %n23
++  br i1 %different, label %bad, label %done
++bad:
++  %badp = getelementptr i32, ptr addrspace(1) %report, i64 1
++  %badn = atomicrmw add ptr addrspace(1) %badp, i32 1 monotonic, align 4
++  %ys = shl i32 %y, 16
++  %packed = or i32 %ys, %x
++  %firstp = getelementptr i32, ptr addrspace(1) %report, i64 2
++  %first = atomicrmw umin ptr addrspace(1) %firstp, i32 %packed monotonic, align 4
++  %diff = fsub <4 x float> %a, %b
++  %neg = fneg <4 x float> %diff
++  %less = fcmp olt <4 x float> %diff, zeroinitializer
++  %abs = select <4 x i1> %less, <4 x float> %neg, <4 x float> %diff
++  %scaled = fmul <4 x float> %abs, <float 2.550000e+02, float 2.550000e+02, float 2.550000e+02, float 2.550000e+02>
++  %rounded = fadd <4 x float> %scaled, <float 5.000000e-01, float 5.000000e-01, float 5.000000e-01, float 5.000000e-01>
++  %codes = fptoui <4 x float> %rounded to <4 x i32>
++  %c0 = extractelement <4 x i32> %codes, i32 0
++  %c1 = extractelement <4 x i32> %codes, i32 1
++  %c2 = extractelement <4 x i32> %codes, i32 2
++  %c3 = extractelement <4 x i32> %codes, i32 3
++  %g01 = icmp ugt i32 %c0, %c1
++  %g23 = icmp ugt i32 %c2, %c3
++  %c01 = select i1 %g01, i32 %c0, i32 %c1
++  %c23 = select i1 %g23, i32 %c2, i32 %c3
++  %g = icmp ugt i32 %c01, %c23
++  %maximum = select i1 %g, i32 %c01, i32 %c23
++  %maxp = getelementptr i32, ptr addrspace(1) %report, i64 3
++  %max = atomicrmw umax ptr addrspace(1) %maxp, i32 %maximum monotonic, align 4
++  %keep = icmp ult i32 %badn, 4
++  br i1 %keep, label %record, label %done
++record:
++  %recordoffset = mul i32 %badn, 10
++  %recordbase = add i32 %recordoffset, 4
++  %recordx = getelementptr i32, ptr addrspace(1) %report, i32 %recordbase
++  store i32 %x, ptr addrspace(1) %recordx, align 4
++  %recordyi = add i32 %recordbase, 1
++  %recordy = getelementptr i32, ptr addrspace(1) %report, i32 %recordyi
++  store i32 %y, ptr addrspace(1) %recordy, align 4
++  %recordai = add i32 %recordbase, 2
++  %recorda = getelementptr i32, ptr addrspace(1) %report, i32 %recordai
++  %abits = bitcast <4 x float> %a to <4 x i32>
++  store <4 x i32> %abits, ptr addrspace(1) %recorda, align 4
++  %recordbi = add i32 %recordbase, 6
++  %recordb = getelementptr i32, ptr addrspace(1) %report, i32 %recordbi
++  %bbits = bitcast <4 x float> %b to <4 x i32>
++  store <4 x i32> %bbits, ptr addrspace(1) %recordb, align 4
++  br label %done
++done:
++  ret void
++}
++declare { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, i32, i32)
++
  !llvm.module.flags = !{!0, !1, !2, !3, !4, !5, !6, !7, !8}
 -!air.kernel = !{!9, !22}
-+!air.kernel = !{!9, !22, !26}
++!air.kernel = !{!9, !22, !26, !46}
  !air.compile_options = !{!17, !18}
  !llvm.ident = !{!19}
  !air.version = !{!20}
  !air.language_version = !{!21}
-@@ -140,4 +266,26 @@
+@@ -140,4 +364,33 @@
  !22 = !{ptr @scanout_opaque, !10, !23}
  !23 = !{!12, !13, !25, !24}
  !24 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"gid"}
@@ -1747,3 +3007,10 @@
 +!43 = !{ptr @scanout_plain_vs, !32, !35}
 +!44 = !{ptr @scanout_unrotated_vs, !32, !35}
 +!45 = !{ptr @scanout_frame_fs, !37, !39}
++
++!46 = !{ptr @coachz_turn_audit, !10, !47}
++!47 = !{!48, !49, !50, !51, !16}
++!48 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"texture2d<float, read>", !"air.arg_name", !"reference"}
++!49 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.read", !"air.arg_type_name", !"texture2d<float, read>", !"air.arg_name", !"turned"}
++!50 = !{i32 2, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"report"}
++!51 = !{i32 3, !"air.buffer", !"air.buffer_size", i32 16, !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"uint4", !"air.arg_name", !"dims"}

@@ -2,7 +2,326 @@ diff --git a/drivers/AdrenoMetal/bridge/patches/0026-coachz-copy-profile.patch b
 new file mode 100644
 --- /dev/null
 +++ b/drivers/AdrenoMetal/bridge/patches/0026-coachz-copy-profile.patch
-@@ -0,0 +1,422 @@
+@@ -0,0 +1,948 @@
++diff --git a/crates/metal2vulkan/src/bind/graphics.rs b/crates/metal2vulkan/src/bind/graphics.rs
++--- a/crates/metal2vulkan/src/bind/graphics.rs
+++++ b/crates/metal2vulkan/src/bind/graphics.rs
++@@ -1197,8 +1197,9 @@
++         vertex_layer.is_some() && !mesh && shape.render_target_array_length <= 1;
++     // A viewport Vulkan's cannot be: the vertex function compensates its position, and the
++     // pipeline compiled under another compensation (or none) is the other variant.
++     let viewport_compensation = shape.viewport_compensation;
+++    let quarter_turn = p.dependencies.iter().any(|d| matches!(d.fact, RuntimeFact::ViewportQuarterTurn));
++     let compiled_compensation = p.dependencies.iter().find_map(|d| match d.fact {
++         RuntimeFact::ViewportCompensation {
++             depth,
++             point_guard,
++@@ -1207,9 +1208,10 @@
++         } => Some(
++             ViewportCompensation::new(depth)
++                 .with_point_guard(point_guard)
++                 .with_mirrors(mirrors)
++-                .with_vertex_clamp(vertex_clamp),
+++                .with_vertex_clamp(vertex_clamp)
+++                .with_quarter_turn(quarter_turn),
++         ),
++         _ => None,
++     });
++     let profile = device.profile();
++@@ -1718,10 +1720,12 @@
++                 PushField::DispatchRegion if matches!(stage, Stage::Object | Stage::Mesh) => {}
++                 // A folded object function's region record (`bind::mesh_arguments`): the
++                 // consumer's hole.
++                 PushField::ReplayRegionAddress if stage == Stage::Object => {}
++-                // The draw's viewport compensation, which instantiation reads from the state.
++-                PushField::ViewportCompensation if stage == Stage::Vertex => {}
+++                // The draw's viewport compensation comes from the same state in both
+++                // stages. A quarter-turn fragment reads its physical-plane height.
+++                PushField::ViewportCompensation
+++                    if stage == Stage::Vertex || (stage == Stage::Fragment && quarter_turn) => {}
++                 // The draw's point guard band, which instantiation reads from the state.
++                 PushField::PointGuard if stage == Stage::Vertex => {}
++                 // The draw's mirrored viewports, which instantiation reads from the state.
++                 PushField::ViewportMirrors if stage == Stage::Vertex => {}
++diff --git a/crates/metal2vulkan/src/cache/codec.rs b/crates/metal2vulkan/src/cache/codec.rs
++--- a/crates/metal2vulkan/src/cache/codec.rs
+++++ b/crates/metal2vulkan/src/cache/codec.rs
++@@ -1264,8 +1264,9 @@
++         MergedDraws,
++         QuadPrimitiveIds,
++         PrivateList,
++         YCbCrInPlace { slot, samplers, device },
+++        ViewportQuarterTurn,
++     }
++     UniformViewChoice { Viewed, Spare, Kept }
++     Mechanism {
++         Specialization, Variant, PushConstant, DynamicState, DynamicStateOrPushConstant,
++diff --git a/crates/metal2vulkan/src/cache/mod.rs b/crates/metal2vulkan/src/cache/mod.rs
++--- a/crates/metal2vulkan/src/cache/mod.rs
+++++ b/crates/metal2vulkan/src/cache/mod.rs
++@@ -616,9 +616,10 @@
++             .amplification_draws
++             .filter(|_| stage != crate::pipeline::sym::Stage::Kernel);
++         out.viewport_compensation = self
++             .viewport_compensation
++-            .filter(|_| stage == crate::pipeline::sym::Stage::Vertex);
+++            .filter(|c| stage == crate::pipeline::sym::Stage::Vertex
+++                || (stage == crate::pipeline::sym::Stage::Fragment && c.quarter_turn));
++         out.storage_view_slots = self
++             .storage_view_slots
++             .iter()
++             .filter(|s| s.stage == stage)
++diff --git a/crates/metal2vulkan/src/device/mechanism.rs b/crates/metal2vulkan/src/device/mechanism.rs
++--- a/crates/metal2vulkan/src/device/mechanism.rs
+++++ b/crates/metal2vulkan/src/device/mechanism.rs
++@@ -170,9 +170,9 @@
++         // asks for; the binder writes each amplification's words before its draw.
++         RuntimeFact::AmplificationDraws { .. } => Mechanism::Variant,
++         // A separate compile of the pipeline, which a viewport Vulkan's cannot be asks for; the
++         // binder writes the draw's compensation.
++-        RuntimeFact::ViewportCompensation { .. } => Mechanism::Variant,
+++        RuntimeFact::ViewportCompensation { .. } | RuntimeFact::ViewportQuarterTurn => Mechanism::Variant,
++         // A pipeline compiled under the folded-groups variant; its plans state it.
++         RuntimeFact::FoldedGroups => Mechanism::Variant,
++         // A render pipeline compiled under the replay-bindings variant; its plans state it.
++         RuntimeFact::ReplayBindings => Mechanism::Variant,
++diff --git a/crates/metal2vulkan/src/lower/stage_io/mod.rs b/crates/metal2vulkan/src/lower/stage_io/mod.rs
++--- a/crates/metal2vulkan/src/lower/stage_io/mod.rs
+++++ b/crates/metal2vulkan/src/lower/stage_io/mod.rs
++@@ -422,8 +422,10 @@
++     /// stores (`word_color::encode`), with each word's layout.
++     pub words_written: BTreeMap<u32, crate::metal::format::WordAttachment>,
++     /// A vertex function's viewport compensation (`LoweringInputs::viewport_compensation`).
++     pub compensation: Option<Compensation>,
+++    /// Fragment position uses the original physical plane under the quarter turn.
+++    pub quarter_turn: bool,
++     /// A fragment function's depth output, which each return gives Metal's answer
++     /// (`clamp_depth`).
++     pub depth_clamp: Option<DepthClamp>,
++     /// The render pipeline's private masks a fragment function applies itself
++@@ -621,8 +623,9 @@
++ /// (`PushField::ViewportMirrors`). Under `vertex_clamp`, which only a compensated depth takes, it
++ /// clamps that depth by `PushField::VertexDepthClamp`.
++ #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
++ pub struct Compensation {
+++    pub quarter_turn: bool,
++     pub position: usize,
++     pub clip: Option<(usize, u32)>,
++     pub guard: Option<(usize, u32)>,
++     pub mirrors: bool,
++@@ -989,13 +992,29 @@
++ /// `x`, a value loaded through `link`, as the lowered representation of its form: a narrow
++ /// integer masked to its width, a narrow float rounded to its format, a `bool` carried as `uint`
++ /// compared with 0, the weights of a [`Place::Weights`] read.
++ fn to_lowered(
++-    cx: &EmitCx<'_>,
+++    cx: &mut EmitCx<'_>,
++     fb: &mut FunctionBuilder<'_>,
++     link: &Link,
++     x: SValue,
++ ) -> BResult<SValue> {
+++    let x = if cx.plan.families.stage_io.quarter_turn
+++        && matches!(cx.plan.families.stage_io.objects.get(link.object),
+++            Some(IoObject::Builtin { builtin: crate::spv::BuiltIn::FragCoord, .. }))
+++    {
+++        let field = cx.push_field(fb, PushField::ViewportCompensation)?;
+++        let bits = fb.composite_extract(field, &[0, 1])?;
+++        let float = fb.module().ty(SType::Float { width: 32 })?;
+++        let height = fb.convert(ConvOp::Bitcast, bits, float)?;
+++        let px = fb.composite_extract(x, &[0])?;
+++        let py = fb.composite_extract(x, &[1])?;
+++        let pz = fb.composite_extract(x, &[2])?;
+++        let pw = fb.composite_extract(x, &[3])?;
+++        let y = fb.binary(BinOp::FSub, height, px)?;
+++        let vector = fb.module().ty(SType::Vector { elem: float, len: 4 })?;
+++        fb.composite_construct(vector, &[py, y, pz, pw])?
+++    } else { x };
++     let form = link.form;
++     let x = placed(fb, link, x)?;
++     if bool_as_uint(cx, link) {
++         let zero = ops::splat(fb, uint_lanes(form), 0)?;
++@@ -2262,9 +2281,12 @@
++             }
++         }
++     };
++     let vec4 = fb.module().ty(SType::Vector { elem: f32_, len: 4 })?;
++-    fb.composite_construct(vec4, &[sxx, y_out, depth, w])
+++    let (x_out, y_out) = if c.quarter_turn {
+++        (y_out, fb.unary(UnOp::FNegate, sxx)?)
+++    } else { (sxx, y_out) };
+++    fb.composite_construct(vec4, &[x_out, y_out, depth, w])
++ }
++
++ /// How a return drops a positive NaN depth, which fails Metal's depth test (`clamp_depth`).
++ #[derive(Clone, Copy, Debug)]
++diff --git a/crates/metal2vulkan/src/lower/stage_io/plan.rs b/crates/metal2vulkan/src/lower/stage_io/plan.rs
++--- a/crates/metal2vulkan/src/lower/stage_io/plan.rs
+++++ b/crates/metal2vulkan/src/lower/stage_io/plan.rs
++@@ -1989,8 +1989,15 @@
++ /// Plan the entry's outputs and execution modes (vertex and fragment). A post-tessellation
++ /// vertex function's outputs are a vertex function's; its inputs and patch domain are
++ /// `lower::tessellation`'s.
++ pub fn entry(cx: &mut SelectCx<'_>) -> Result<(), Error> {
+++    if cx.inputs.viewport_compensation.is_some_and(|c| c.quarter_turn) {
+++        cx.facts.insert(RuntimeFact::ViewportQuarterTurn);
+++        if cx.stage == Stage::Fragment {
+++            cx.families.stage_io.quarter_turn = true;
+++            cx.push.insert(PushField::ViewportCompensation);
+++        }
+++    }
++     if cx.inputs.merged_draws && cx.stage == Stage::Vertex {
++         merged(cx)?;
++     }
++     let (returned, tys) = output_types(cx)?;
++@@ -2780,8 +2787,9 @@
++     let guard = clips
++         .filter(|_| c.point_guard)
++         .map(|(object, first)| (object, first + 2 * u32::from(c.depth)));
++     cx.families.stage_io.compensation = Some(Compensation {
+++        quarter_turn: c.quarter_turn,
++         position,
++         clip,
++         guard,
++         mirrors: c.mirrors,
++@@ -3333,9 +3341,9 @@
++ fn compensation_stores(c: Option<Compensation>) -> u64 {
++     let Some(c) = c else { return 0 };
++     let depth = if c.clip.is_some() { 9 } else { 0 };
++     let guard = if c.guard.is_some() { 13 } else { 0 };
++-    3 + depth + guard
+++    3 + depth + guard + u64::from(c.quarter_turn)
++ }
++
++ /// Whether a fragment function's depth output is clamped to `[0, 1]` as Metal stores it
++ /// (`DepthClamp::clamps`; five stores' words with a positive NaN's kill, two for the kill
++@@ -3376,8 +3384,11 @@
++             Source::Uniform(_) => loaded.push((p.param, USE_WORDS + UNIFORM_WORDS)),
++             Source::Pulled(r) => fetch_words = fetch_words.saturating_add(u64::from(r.words())),
++         }
++     }
+++    if cx.families.stage_io.quarter_turn {
+++        for (_, words) in &mut loaded { *words += 48; }
+++    }
++     let mut use_words = 0u64;
++     for inst in cx.body.insts.values() {
++         inst.kind.for_each_value(|v| {
++             if let Value::Arg(a) = v {
++diff --git a/crates/metal2vulkan/src/lower/sync/barrier.rs b/crates/metal2vulkan/src/lower/sync/barrier.rs
++--- a/crates/metal2vulkan/src/lower/sync/barrier.rs
+++++ b/crates/metal2vulkan/src/lower/sync/barrier.rs
++@@ -155,8 +155,9 @@
++ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
++ pub struct Deriv {
++     pub op: DerivOp,
++     pub value: ValueId,
+++    pub negate: bool,
++ }
++
++ /// The sync::barrier strategies.
++ #[non_exhaustive]
++@@ -198,9 +199,9 @@
++             // one's status word address and atomic.
++             BarrierStrategy::Barrier(b) => 16 + SEQ_CST_WORDS * u32::from(b.seq_cst),
++             BarrierStrategy::Fence(f) => 12 + SEQ_CST_WORDS * u32::from(f.seq_cst),
++             BarrierStrategy::NoFence => 0,
++-            BarrierStrategy::Derivative(_) => 4,
+++            BarrierStrategy::Derivative(d) => 4 + 4 * u32::from(d.negate),
++         }
++     }
++ }
++
++@@ -521,10 +522,18 @@
++         (DerivativeOp::Dfdx, false) => DerivOp::DPdx,
++         (DerivativeOp::Dfdy, false) => DerivOp::DPdy,
++         (DerivativeOp::Fwidth, false) => DerivOp::Fwidth,
++     };
+++    let quarter = fine && cx.inputs.viewport_compensation.is_some_and(|c| c.quarter_turn);
+++    let (op, negate) = if quarter {
+++        match op {
+++            DerivOp::DPdxFine => (DerivOp::DPdyFine, false),
+++            DerivOp::DPdyFine => (DerivOp::DPdxFine, true),
+++            other => (other, false),
+++        }
+++    } else { (op, false) };
++     cx.tangled.insert(id);
++-    Ok(BarrierStrategy::Derivative(Deriv { op, value }))
+++    Ok(BarrierStrategy::Derivative(Deriv { op, value, negate }))
++ }
++
++ /// The scope a barrier or fence of Metal scope `scope` is emitted at: a simdgroup scope is
++ /// `Workgroup` in a kernel whose simdgroups may span subgroups (every tier but `Direct` and
++@@ -583,8 +592,9 @@
++         BarrierStrategy::NoFence => Ok(()),
++         BarrierStrategy::Derivative(d) => {
++             let a = cx.operand(fb, d.value)?;
++             let x = fb.derivative(d.op, a)?;
+++            let x = if d.negate { fb.unary(crate::spirv::ir::UnOp::FNegate, x)? } else { x };
++             match cx.plan.values.inst(at) {
++                 Some(v) => {
++                     cx.define(v, x);
++                     Ok(())
++diff --git a/crates/metal2vulkan/src/pipeline/facts.rs b/crates/metal2vulkan/src/pipeline/facts.rs
++--- a/crates/metal2vulkan/src/pipeline/facts.rs
+++++ b/crates/metal2vulkan/src/pipeline/facts.rs
++@@ -738,8 +738,10 @@
++         slot: SlotRef,
++         samplers: u32,
++         device: bool,
++     },
+++    /// Position, fragment coordinates and explicit derivatives use the Coachz quarter turn.
+++    ViewportQuarterTurn,
++ }
++
++ /// What one compile made of a slot of a `RuntimeFact::UniformViewRange`.
++ #[non_exhaustive]
++diff --git a/crates/metal2vulkan/src/pipeline/lower_inputs.rs b/crates/metal2vulkan/src/pipeline/lower_inputs.rs
++--- a/crates/metal2vulkan/src/pipeline/lower_inputs.rs
+++++ b/crates/metal2vulkan/src/pipeline/lower_inputs.rs
++@@ -1053,8 +1053,11 @@
++ #[non_exhaustive]
++ #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
++ #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
++ pub struct ViewportCompensation {
+++    /// Coachz rotation 3: position (x,y) becomes (y,-x); fragment coordinates are inverse-mapped.
+++    #[cfg_attr(feature = "serde", serde(default))]
+++    pub quarter_turn: bool,
++     /// The depth too: the function rewrites `z` and writes the two clip distances, for a depth
++     /// range past `[0, 1]` the Vulkan viewport cannot hold. Without it only `x` is negated (a
++     /// negative width), and the function declares no clip distance of its own.
++     pub depth: bool,
++@@ -1080,12 +1083,18 @@
++     /// The compensation of the position's `x`, and of its depth where `depth`.
++     pub fn new(depth: bool) -> ViewportCompensation {
++         ViewportCompensation {
++             depth,
+++            quarter_turn: false,
++             point_guard: false,
++             mirrors: false,
++             vertex_clamp: false,
++         }
+++    }
+++
+++    /// Apply the clockwise physical-plane to private-frame quarter turn.
+++    pub fn with_quarter_turn(self, quarter_turn: bool) -> ViewportCompensation {
+++        ViewportCompensation { quarter_turn, ..self }
++     }
++
++     /// This compensation, with Metal's guard band for points where `point_guard`.
++     pub fn with_point_guard(self, point_guard: bool) -> ViewportCompensation {
++diff --git a/crates/metal2vulkan/src/tests/bind_shape_of.rs b/crates/metal2vulkan/src/tests/bind_shape_of.rs
++--- a/crates/metal2vulkan/src/tests/bind_shape_of.rs
+++++ b/crates/metal2vulkan/src/tests/bind_shape_of.rs
++@@ -228,8 +228,9 @@
++         }),
++         with(|s| {
++             s.viewport_compensation = Some(CompensatedViewport {
++                 compensation: ViewportCompensation {
+++                    quarter_turn: false,
++                     depth: true,
++                     ..ViewportCompensation::default()
++                 },
++                 ..CompensatedViewport::default()
++diff --git a/crates/metal2vulkan-runtime/src/device/adopt.rs b/crates/metal2vulkan-runtime/src/device/adopt.rs
 +--- a/crates/metal2vulkan-runtime/src/device/adopt.rs
 ++++ b/crates/metal2vulkan-runtime/src/device/adopt.rs
 +@@ -272,8 +272,9 @@
@@ -15,6 +334,7 @@ new file mode 100644
 +             gpu_times_from_host: raw.gpu_times_from_host,
 +             // An adopted device keeps no execution record: validation makes its own devices.
 +             record_executions: false,
++diff --git a/crates/metal2vulkan-runtime/src/device/create.rs b/crates/metal2vulkan-runtime/src/device/create.rs
 +--- a/crates/metal2vulkan-runtime/src/device/create.rs
 ++++ b/crates/metal2vulkan-runtime/src/device/create.rs
 +@@ -1288,16 +1288,25 @@
@@ -53,6 +373,7 @@ new file mode 100644
 +         memory_reads,
 +         owned: true,
 +         cache: cache.clone(),
++diff --git a/crates/metal2vulkan-runtime/src/device/mod.rs b/crates/metal2vulkan-runtime/src/device/mod.rs
 +--- a/crates/metal2vulkan-runtime/src/device/mod.rs
 ++++ b/crates/metal2vulkan-runtime/src/device/mod.rs
 +@@ -1212,8 +1212,10 @@
@@ -86,6 +407,7 @@ new file mode 100644
 +         };
 +         // The host image copy functions, where the device enabled `hostImageCopy` and copies to
 +         // and from `GENERAL` on the host: by their core names from Vulkan 1.4, else by the
++diff --git a/crates/metal2vulkan-runtime/src/encoder.rs b/crates/metal2vulkan-runtime/src/encoder.rs
 +--- a/crates/metal2vulkan-runtime/src/encoder.rs
 ++++ b/crates/metal2vulkan-runtime/src/encoder.rs
 +@@ -1498,8 +1498,9 @@
@@ -98,6 +420,7 @@ new file mode 100644
 +         }
 +         let bounded = (copies.iter())
 +             .filter(|copy| copy.cause == Some(CopyCause::Bounded))
++diff --git a/crates/metal2vulkan-runtime/src/host_memory.rs b/crates/metal2vulkan-runtime/src/host_memory.rs
 +--- a/crates/metal2vulkan-runtime/src/host_memory.rs
 ++++ b/crates/metal2vulkan-runtime/src/host_memory.rs
 +@@ -775,8 +775,10 @@
@@ -157,6 +480,7 @@ new file mode 100644
 +
 +     /// The memory types the dma-buf `fd` can be imported into (`vkGetMemoryFdPropertiesKHR`);
 +     /// `ERROR_FEATURE_NOT_PRESENT` where the device imports no dma-bufs.
++diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
 +--- a/crates/metal2vulkan-runtime/src/lib.rs
 ++++ b/crates/metal2vulkan-runtime/src/lib.rs
 +@@ -355,4 +355,16 @@
@@ -176,6 +500,206 @@ new file mode 100644
 ++
 ++/// Most-used large host-image shape successfully bound in place, not copy traffic.
 ++pub fn coachz_host_alias_profile() -> Option<[u64; 8]> { shadow::coachz_host_alias_profile() }
++diff --git a/crates/metal2vulkan-runtime/src/pipeline/render.rs b/crates/metal2vulkan-runtime/src/pipeline/render.rs
++--- a/crates/metal2vulkan-runtime/src/pipeline/render.rs
+++++ b/crates/metal2vulkan-runtime/src/pipeline/render.rs
++@@ -677,8 +677,77 @@
++     }
++ }
++
++ impl RenderPipelineState {
+++    /// Coachz's single-sample quarter turn. Check features whose lane/sample or
+++    /// indirect-resource semantics are not covered, then compile the real variant
+++    /// before any command switches its target. A refusal leaves the original state usable.
+++    pub fn coachz_quarter_turn(&self, hashes: &mut [u64; 4]) -> Result<u32, Error> {
+++        let Kind::Graphics(state) = &self.0 else { return Ok(1) };
+++        let base = state.base();
+++        let mut mask = 0u32;
+++        if base.graphics.rasterization_samples.as_raw() != 1 || base.graphics.tessellation.is_some()
+++            || base.graphics.writes_viewport_index || base.graphics.rasterizer_discard
+++            || base.graphics.depth_format.is_some() || base.graphics.stencil_format.is_some()
+++            || base.graphics.alpha_to_coverage {
+++            mask |= 1;
+++        }
+++        if base.interface.needs_handle_translation || base.interface.reaches_command_buffers
+++            || !base.interface.texture_writing_stages.is_empty() || base.graphics.vertex_writes_memory
+++            || base.interface.slots.values().any(|slot| matches!(slot,
+++                metal2vulkan::pipeline::SlotInterface::Buffer(buffer) if buffer.access.write)) {
+++            mask |= 2;
+++        }
+++        fn hash(words: &[u32]) -> u64 {
+++            words.iter().fold(0xcbf29ce484222325u64, |h,w| (h ^ u64::from(*w)).wrapping_mul(0x100000001b3))
+++        }
+++        for module in &base.stages {
+++            let stage = module.stage.as_raw();
+++            let at = match stage { 1 => 0, 16 => 1, _ => { mask |= 1; continue } };
+++            hashes[at] = hash(&module.spirv);
+++            let words = &module.spirv;
+++            let mut zero = std::collections::BTreeSet::new();
+++            let mut at = 5usize;
+++            while at < words.len() {
+++                let count = (words[at] >> 16) as usize;
+++                let op = words[at] & 0xffff;
+++                if count == 0 || count > words.len()-at { mask |= 32; break; }
+++                let args = &words[at+1..at+count];
+++                match op {
+++                    // Constant, constant null and constant composite, for the
+++                    // pixel-center InterpolateAtOffset(vec2(0)) used by the translator.
+++                    43 if args.len() >= 3 && args[2..].iter().all(|v| *v == 0) => { zero.insert(args[1]); }
+++                    46 if args.len() == 2 => { zero.insert(args[1]); }
+++                    44 if args.len() >= 3 && args[2..].iter().all(|v| zero.contains(v)) => { zero.insert(args[1]); }
+++                    // BuiltIn SampleId, SamplePosition, SampleMask, PointCoord.
+++                    71 if args.len() >= 3 && args[1] == 11 && matches!(args[2], 16|18|19|20) => mask |= 4,
+++                    72 if args.len() >= 4 && args[2] == 11 && matches!(args[3], 16|18|19|20) => mask |= 4,
+++                    // Explicit quad lanes need their own rotation rule.
+++                    365|366 => mask |= 8,
+++                    // Framebuffer-local input attachments use the invocation's
+++                    // current pixel. Every color attachment now turns together,
+++                    // so their subpass loads retain that local correspondence.
+++                    // Nonzero/sample interpolation still needs its own mapping.
+++                    12 if args.len() >= 5 && (args[3] == 77 || (args[3] == 78 && !zero.contains(args.last().unwrap()))) => mask |= 16,
+++                    _ => {}
+++                }
+++                at += count;
+++            }
+++        }
+++        if mask != 0 { return Ok(mask); }
+++        let mut key = state.0.base.key.clone();
+++        key.viewport_compensation = Some(metal2vulkan::pipeline::ViewportCompensation::new(false).with_quarter_turn(true));
+++        let variant = state.variant(&key)?;
+++        for module in &variant.pipeline().stages {
+++            match module.stage.as_raw() {
+++                1 => hashes[2] = hash(&module.spirv),
+++                16 => hashes[3] = hash(&module.spirv),
+++                _ => {}
+++            }
+++        }
+++        Ok(0)
+++    }
+++
++     /// The state of a tile pipeline (`tile.rs`).
++     pub(super) fn of_tile(state: TileState) -> RenderPipelineState {
++         RenderPipelineState(Kind::Tile(state))
++     }
++diff --git a/crates/metal2vulkan-runtime/src/render/draw_shape.rs b/crates/metal2vulkan-runtime/src/render/draw_shape.rs
++--- a/crates/metal2vulkan-runtime/src/render/draw_shape.rs
+++++ b/crates/metal2vulkan-runtime/src/render/draw_shape.rs
++@@ -417,8 +417,9 @@
++             .map_err(|_| internal("a draw of a state its pass refuses"))?;
++         let routed_colors = self.routed_colors(pipeline, &routing);
++         // A compensated depth, which a vertex clamp takes natively too, replaces the native
++         // range (`clamp_draw_depth`).
+++        let compensation = self.state.quarter_turn_compensation(compensation);
++         let compensated = compensation.is_some_and(|c| c.depth.is_some());
++         let native = native && !compensated;
++         let provoking_last = provoking::natively_last(device, self.state, (pipeline, assembly));
++         Ok(DrawSettings {
++diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
++--- a/crates/metal2vulkan-runtime/src/render.rs
+++++ b/crates/metal2vulkan-runtime/src/render.rs
++@@ -1866,8 +1866,9 @@
++ /// rasterization-rate map, its extended-range shadows and the extended-range colors whose clear
++ /// Metal's tile memory holds off its codes, whether its first instance records inline (and its
++ /// instances after a split with it), its residency, its log and its color group.
++ struct Opening {
+++    coachz_quarter_turn: bool,
++     layout: PassLayout,
++     /// The descriptor's `renderTargetArrayLength`, as the encoder keeps it.
++     render_target_array_length: u32,
++     shape: PassShape,
++@@ -1896,8 +1897,9 @@
++         log: Option<RenderLog>,
++         grouped: Option<Box<color_groups::Grouped>>,
++     ) -> Opening {
++         Opening {
+++            coachz_quarter_turn: descriptor.coachz_quarter_turn,
++             // A length of 1 or more is the layout's layers, a `u32`.
++             render_target_array_length: match descriptor.render_target_array_length {
++                 0 => 0,
++                 _ => layout.layers,
++@@ -1920,8 +1922,9 @@
++     /// An encoder over `core` of the pass `opening` describes, its first instance's draws
++     /// recording into `draws` (null where it records inline), made in its box.
++     fn assemble(core: EncoderCore, draws: vk::CommandBuffer, opening: Opening) -> Box<Self> {
++         let Opening {
+++            coachz_quarter_turn,
++             layout,
++             render_target_array_length,
++             shape,
++             compatible,
++@@ -1973,9 +1976,9 @@
++             state: Versioned::new(EncoderState::metal_defaults(
++                 rate_map
++                     .as_ref()
++                     .map_or(layout.extent, RateMappedPass::area),
++-            )),
+++            ).with_quarter_turn(coachz_quarter_turn)),
++             render_target_array_length,
++             visibility: Visibility::new(layout.visibility.clone()),
++             layout: Versioned::new(layout),
++             passes: vec![(shape, compatible)],
++diff --git a/crates/metal2vulkan-runtime/src/render_pass.rs b/crates/metal2vulkan-runtime/src/render_pass.rs
++--- a/crates/metal2vulkan-runtime/src/render_pass.rs
+++++ b/crates/metal2vulkan-runtime/src/render_pass.rs
++@@ -319,8 +319,10 @@
++ /// `MTLRenderPassDescriptor`: a value the caller fills, as Metal's mutable descriptor is.
++ #[non_exhaustive]
++ #[derive(Clone, Debug, Default)]
++ pub struct RenderPassDescriptor {
+++    /// Coachz-only physical-plane to private-frame transform, default false.
+++    pub coachz_quarter_turn: bool,
++     /// `colorAttachments`: the color attachments, by index.
++     pub color_attachments: [RenderPassColorAttachmentDescriptor; MAX_COLOR_ATTACHMENTS],
++     /// `depthAttachment`.
++     pub depth_attachment: RenderPassDepthAttachmentDescriptor,
++diff --git a/crates/metal2vulkan-runtime/src/render_state.rs b/crates/metal2vulkan-runtime/src/render_state.rs
++--- a/crates/metal2vulkan-runtime/src/render_state.rs
+++++ b/crates/metal2vulkan-runtime/src/render_state.rs
++@@ -186,8 +186,9 @@
++
++ /// The render encoder's state, in Metal's terms.
++ #[derive(Clone)]
++ pub(super) struct EncoderState {
+++    coachz_quarter_turn: bool,
++     /// The render area's width and height.
++     extent: [u32; 2],
++     viewports: ViewportList<Viewport>,
++     scissors: ViewportList<ScissorRect>,
++@@ -216,8 +217,9 @@
++     /// Metal's defaults over a render area of `extent`.
++     pub(super) fn metal_defaults(extent: [u32; 2]) -> EncoderState {
++         let [width, height] = extent;
++         EncoderState {
+++            coachz_quarter_turn: false,
++             extent,
++             viewports: ViewportList::One(Viewport::new(
++                 0.0,
++                 0.0,
++@@ -247,8 +249,23 @@
++             clip_mode: DepthClipMode::Clip,
++             provoking_last: false,
++             provoking_third: false,
++         }
+++    }
+++
+++    pub(super) fn with_quarter_turn(mut self, enabled: bool) -> Self {
+++        self.coachz_quarter_turn = enabled;
+++        self
+++    }
+++
+++    pub(super) fn quarter_turn_compensation(&self, value: Option<Compensation>) -> Option<Compensation> {
+++        if !self.coachz_quarter_turn { return value; }
+++        let mut value = value.unwrap_or_else(Compensation::identity);
+++        value.viewport.compensation = value.viewport.compensation.with_quarter_turn(true);
+++        // No compensated depth is admitted by the frontend. Lane a is unused by
+++        // the vertex path and carries the physical plane's height for FragCoord.
+++        value.viewport.values[1] = self.extent[0] as f32;
+++        Some(value)
++     }
++
++     /// `setViewports:count:` (one viewport for `setViewport:`), checked as the module says: a
++     /// depth range past `[0, 1]` refused as `refused` says (`depth_ranges_refused`), `None` on a
++diff --git a/crates/metal2vulkan-runtime/src/shadow.rs b/crates/metal2vulkan-runtime/src/shadow.rs
 +--- a/crates/metal2vulkan-runtime/src/shadow.rs
 ++++ b/crates/metal2vulkan-runtime/src/shadow.rs
 +@@ -3082,4 +3082,135 @@
@@ -314,6 +838,7 @@ new file mode 100644
 ++    let rows = COACHZ_HOST_ALIASES.lock().ok()?;
 ++    rows.iter().max_by_key(|r| r[6].saturating_mul(r[4])).copied()
 ++}
++diff --git a/crates/metal2vulkan-runtime/src/texture/in_place_image.rs b/crates/metal2vulkan-runtime/src/texture/in_place_image.rs
 +--- a/crates/metal2vulkan-runtime/src/texture/in_place_image.rs
 ++++ b/crates/metal2vulkan-runtime/src/texture/in_place_image.rs
 +@@ -133,19 +133,39 @@
@@ -404,6 +929,7 @@ new file mode 100644
 ++        req.memory_type_bits as u64, why, 0, 0,
 ++    ], class);
 ++}
++diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
 +--- a/crates/metal2vulkan-runtime/src/texture.rs
 ++++ b/crates/metal2vulkan-runtime/src/texture.rs
 +@@ -2205,8 +2205,18 @@
@@ -425,144 +951,6 @@ new file mode 100644
 +                     // own, no import of the pages (`copied.rs`): the shadow copies them, its
 +                     // copies the buffer's uses, which commits copy in and completions merge back.
 +                     ShadowCause::Refused(
-diff --git a/patches/mesa/turnip-transient-attachments-in-gmem.patch b/patches/mesa/turnip-transient-attachments-in-gmem.patch
-new file mode 100644
---- /dev/null
-+++ b/patches/mesa/turnip-transient-attachments-in-gmem.patch
-@@ -0,0 +1,60 @@
-+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
-+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
-++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
-+@@ -1388,10 +1388,10 @@ use_sysmem_rendering(struct tu_cmd_buffer *cmd,
-+                      tu_autotune::rp_ctx_t *rp_ctx,
-+                      tu_autotune::rp_key_opt rp_key)
-+ {
-+-   if (TU_DEBUG(SYSMEM)) {
-+-      cmd->state.rp.gmem_disable_reason = "TU_DEBUG(SYSMEM)";
-+-      return true;
-+-   }
-++   /* TU_DEBUG(SYSMEM) still lets a pass with a transient attachment (below) render in GMEM: in system memory such a pass wrote and
-++    * read every transient attachment in DRAM (a 3048x2032 pass with RGBA16F and R32F transients took 9-12 ms of GPU time) and
-++    * backed it for good. */
-++   const bool forced_sysmem = TU_DEBUG(SYSMEM);
-+ 
-+    /* can't fit attachments into gmem */
-+    if (!cmd->state.tiling->possible) {
-+@@ -1444,7 +1444,7 @@ use_sysmem_rendering(struct tu_cmd_buffer *cmd,
-+       return true;
-+    }
-+ 
-+-   if (TU_DEBUG(GMEM)) {
-++   if (TU_DEBUG(GMEM) && !forced_sysmem) {
-+       cmd->state.rp.gmem_disable_reason = "TU_DEBUG(GMEM)";
-+       return false;
-+    }
-+@@ -1466,6 +1466,11 @@ use_sysmem_rendering(struct tu_cmd_buffer *cmd,
-+          return false;
-+    }
-+ 
-++   if (forced_sysmem) {
-++      cmd->state.rp.gmem_disable_reason = "TU_DEBUG(SYSMEM)";
-++      return true;
-++   }
-++
-+    tu_autotune::render_mode optimal_mode =
-+       cmd->device->autotune->get_optimal_mode(cmd, rp_ctx, rp_key);
-+    bool use_sysmem = optimal_mode == tu_autotune::render_mode::SYSMEM;
-+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
-+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
-++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
-+@@ -1725,11 +1725,12 @@ tu_knl_darwin_load(struct tu_instance *instance)
-+    device->has_set_iova = !!(info->flags & NativeAdrenoDeviceClientIova);
-+    device->va_start = info->va_start;
-+    device->va_size = info->va_size;
-+-   /* Lazily allocated memory only where passes may keep attachments in tile memory (darwin_sparse_vma_init). With every pass in system
-+-    * memory (TU_DEBUG=sysmem) a lazy BO is backed in full at the first pass, on the render thread: 40-112 MiB wired inside
-+-    * vkCmdEndRenderPass, up to 340 ms each (untagged-3f2bd680), and freed again with the memory. Without the type a memoryless
-+-    * attachment is ordinary device memory, which the runtime places and keeps spare for the next one. */
-+-   device->has_lazy_bos = !TU_DEBUG(SYSMEM);
-++   /* Lazily allocated memory (darwin_sparse_vma_init) with TU_DEBUG=sysmem too: a pass with a transient attachment that has no memory
-++    * yet renders in GMEM (use_sysmem_rendering), so Metal's memoryless textures take none. As ordinary device memory they were new
-++    * 32-112 MiB image allocations whenever the render server held more of them than before, wired page by page (up to 309 ms in
-++    * untagged-7718d8c9). A pass that cannot render in GMEM still backs its attachment in full at the pass
-++    * (tu_allocate_transient_attachments). */
-++   device->has_lazy_bos = true;
-+    device->has_sparse = false;
-+    device->has_sparse_prr = false;
-+    device->has_raytracing = false;
-diff --git a/patches/mesa/turnip-gmem-memory-side-swap.patch b/patches/mesa/turnip-gmem-memory-side-swap.patch
-new file mode 100644
---- /dev/null
-+++ b/patches/mesa/turnip-gmem-memory-side-swap.patch
-@@ -0,0 +1,68 @@
-+UniXNU 93ad2ce, with r3d_src_gmem_load's tu_note_gmem_side line as the pinned turnip-gmem-mutable-swap.patch leaves it
-+(turnip-gmem-swap-trace.patch is not applied here).
-+diff --git a/src/freedreno/vulkan/tu_clear_blit.cc b/src/freedreno/vulkan/tu_clear_blit.cc
-+--- a/src/freedreno/vulkan/tu_clear_blit.cc
-++++ b/src/freedreno/vulkan/tu_clear_blit.cc
-+@@ -628,6 +628,17 @@ tu_gmem_transfer_swap_fixup(uint32_t info, uint32_t swap_mask, uint32_t identity
-+    return mutable_view ? info : ((info & ~swap_mask) | identity);
-+ }
-+ 
-++/* The memory side of a transfer between tile memory and a linear image keeps the image's own swap. Measured on the device (the plugin's
-++ * NativeTurnipSwapTest.h, swaptest4, device and imported host memory alike): a draw leaves its colour in tile memory in shader order (it
-++ * reads back right through an input attachment), so with the identity swap on the memory side a GMEM pass stored drawn BGRA8 colour with
-++ * red and blue exchanged (cc6633 for 3366cc) and loaded memory into tile memory in memory order (an input attachment read the loaded
-++ * blue as red). The tile side stays the identity (tu_gmem_transfer_swap_fixup in r3d_dst_gmem). */
-++static inline uint32_t
-++tu_gmem_memory_side_info(uint32_t info)
-++{
-++   return info;
-++}
-++
-+ template <chip CHIP>
-+ static void
-+ r2d_dst_impl(struct tu_cs *cs, const struct fdl6_view *iview, uint32_t layer,
-+@@ -635,8 +646,7 @@ r2d_dst_impl(struct tu_cs *cs, const struct fdl6_view *iview, uint32_t layer,
-+ {
-+    uint32_t dst_info = iview->RB_A2D_DEST_BUFFER_INFO;
-+    if (gmem_transfer)
-+-      dst_info = tu_gmem_transfer_swap_fixup(dst_info, A6XX_RB_A2D_DEST_BUFFER_INFO_COLOR_SWAP__MASK,
-+-                                             A6XX_RB_A2D_DEST_BUFFER_INFO_COLOR_SWAP(WZYX), iview->is_mutable);
-++      dst_info = tu_gmem_memory_side_info(dst_info);
-+    enum a6xx_format fmt = (enum a6xx_format) pkt_field_get(
-+       A6XX_RB_A2D_DEST_BUFFER_INFO_COLOR_FORMAT, dst_info);
-+    enum pipe_format dst_format = iview->format;
-+@@ -1691,7 +1701,8 @@ r3d_src_gmem_load(struct tu_cmd_buffer *cmd,
-+                   uint32_t layer)
-+ {
-+    tu_note_gmem_side(1, iview->image->layout[0].tile_mode == TILE6_LINEAR, false, WZYX);
-+-   r3d_src_load<CHIP>(cmd, cs, iview, layer, VK_FILTER_NEAREST, true);
-++   /* The memory side keeps the image's own swap (tu_gmem_memory_side_info); a mutable view's stays as upstream. */
-++   r3d_src_load<CHIP>(cmd, cs, iview, layer, VK_FILTER_NEAREST, iview->view.is_mutable);
-+ }
-+ 
-+ template <chip CHIP>
-+@@ -1776,8 +1787,7 @@ r3d_dst_impl(struct tu_cs *cs, const struct fdl6_view *iview, uint32_t layer,
-+ {
-+    uint32_t mrt_buf_info = iview->RB_MRT_BUF_INFO;
-+    if (gmem_transfer)
-+-      mrt_buf_info = tu_gmem_transfer_swap_fixup(mrt_buf_info, A6XX_RB_MRT_BUF_INFO_COLOR_SWAP__MASK,
-+-                                                 A6XX_RB_MRT_BUF_INFO_COLOR_SWAP(WZYX), iview->is_mutable);
-++      mrt_buf_info = tu_gmem_memory_side_info(mrt_buf_info);
-+ 
-+    enum a6xx_format fmt = (enum a6xx_format) pkt_field_get(
-+       A6XX_RB_MRT_BUF_INFO_COLOR_FORMAT, mrt_buf_info);
-+@@ -2470,12 +2480,8 @@ event_blit_run(struct tu_cmd_buffer *cmd,
-+          tu_cs_emit(cs, A6XX_RB_RESOLVE_SYSTEM_BUFFER_PITCH(blt_view->stencil_pitch).value);
-+       }
-+    } else {
-+-      tu_cs_emit(cs, gmem_transfer ?
-+-                        tu_gmem_transfer_swap_fixup(blt_view->view->RB_RESOLVE_SYSTEM_BUFFER_INFO,
-+-                                                    A6XX_RB_RESOLVE_SYSTEM_BUFFER_INFO_COLOR_SWAP__MASK,
-+-                                                    A6XX_RB_RESOLVE_SYSTEM_BUFFER_INFO_COLOR_SWAP(WZYX),
-+-                                                    blt_view->view->is_mutable) :
-+-                        blt_view->view->RB_RESOLVE_SYSTEM_BUFFER_INFO);
-++      tu_cs_emit(cs, gmem_transfer ? tu_gmem_memory_side_info(blt_view->view->RB_RESOLVE_SYSTEM_BUFFER_INFO) :
-++                                     blt_view->view->RB_RESOLVE_SYSTEM_BUFFER_INFO);
-+       tu_cs_image_ref_2d<CHIP>(cs, blt_view->view, blt_view->layer, false);
-+ 
-+       tu_cs_emit_pkt4(cs, REG_A6XX_RB_RESOLVE_SYSTEM_FLAG_BUFFER_BASE, 3);
 diff --git a/patches/mesa/turnip-coachz-diagnostics.patch b/patches/mesa/turnip-coachz-diagnostics.patch
 new file mode 100644
 --- /dev/null
@@ -926,22 +1314,163 @@ new file mode 100644
 +    return VK_SUCCESS;
 + }
 +
+diff --git a/patches/mesa/turnip-gmem-memory-side-swap.patch b/patches/mesa/turnip-gmem-memory-side-swap.patch
+new file mode 100644
+--- /dev/null
++++ b/patches/mesa/turnip-gmem-memory-side-swap.patch
+@@ -0,0 +1,68 @@
++UniXNU 93ad2ce, with r3d_src_gmem_load's tu_note_gmem_side line as the pinned turnip-gmem-mutable-swap.patch leaves it
++(turnip-gmem-swap-trace.patch is not applied here).
++diff --git a/src/freedreno/vulkan/tu_clear_blit.cc b/src/freedreno/vulkan/tu_clear_blit.cc
++--- a/src/freedreno/vulkan/tu_clear_blit.cc
+++++ b/src/freedreno/vulkan/tu_clear_blit.cc
++@@ -628,6 +628,17 @@ tu_gmem_transfer_swap_fixup(uint32_t info, uint32_t swap_mask, uint32_t identity
++    return mutable_view ? info : ((info & ~swap_mask) | identity);
++ }
++
+++/* The memory side of a transfer between tile memory and a linear image keeps the image's own swap. Measured on the device (the plugin's
+++ * NativeTurnipSwapTest.h, swaptest4, device and imported host memory alike): a draw leaves its colour in tile memory in shader order (it
+++ * reads back right through an input attachment), so with the identity swap on the memory side a GMEM pass stored drawn BGRA8 colour with
+++ * red and blue exchanged (cc6633 for 3366cc) and loaded memory into tile memory in memory order (an input attachment read the loaded
+++ * blue as red). The tile side stays the identity (tu_gmem_transfer_swap_fixup in r3d_dst_gmem). */
+++static inline uint32_t
+++tu_gmem_memory_side_info(uint32_t info)
+++{
+++   return info;
+++}
+++
++ template <chip CHIP>
++ static void
++ r2d_dst_impl(struct tu_cs *cs, const struct fdl6_view *iview, uint32_t layer,
++@@ -635,8 +646,7 @@ r2d_dst_impl(struct tu_cs *cs, const struct fdl6_view *iview, uint32_t layer,
++ {
++    uint32_t dst_info = iview->RB_A2D_DEST_BUFFER_INFO;
++    if (gmem_transfer)
++-      dst_info = tu_gmem_transfer_swap_fixup(dst_info, A6XX_RB_A2D_DEST_BUFFER_INFO_COLOR_SWAP__MASK,
++-                                             A6XX_RB_A2D_DEST_BUFFER_INFO_COLOR_SWAP(WZYX), iview->is_mutable);
+++      dst_info = tu_gmem_memory_side_info(dst_info);
++    enum a6xx_format fmt = (enum a6xx_format) pkt_field_get(
++       A6XX_RB_A2D_DEST_BUFFER_INFO_COLOR_FORMAT, dst_info);
++    enum pipe_format dst_format = iview->format;
++@@ -1691,7 +1701,8 @@ r3d_src_gmem_load(struct tu_cmd_buffer *cmd,
++                   uint32_t layer)
++ {
++    tu_note_gmem_side(1, iview->image->layout[0].tile_mode == TILE6_LINEAR, false, WZYX);
++-   r3d_src_load<CHIP>(cmd, cs, iview, layer, VK_FILTER_NEAREST, true);
+++   /* The memory side keeps the image's own swap (tu_gmem_memory_side_info); a mutable view's stays as upstream. */
+++   r3d_src_load<CHIP>(cmd, cs, iview, layer, VK_FILTER_NEAREST, iview->view.is_mutable);
++ }
++
++ template <chip CHIP>
++@@ -1776,8 +1787,7 @@ r3d_dst_impl(struct tu_cs *cs, const struct fdl6_view *iview, uint32_t layer,
++ {
++    uint32_t mrt_buf_info = iview->RB_MRT_BUF_INFO;
++    if (gmem_transfer)
++-      mrt_buf_info = tu_gmem_transfer_swap_fixup(mrt_buf_info, A6XX_RB_MRT_BUF_INFO_COLOR_SWAP__MASK,
++-                                                 A6XX_RB_MRT_BUF_INFO_COLOR_SWAP(WZYX), iview->is_mutable);
+++      mrt_buf_info = tu_gmem_memory_side_info(mrt_buf_info);
++
++    enum a6xx_format fmt = (enum a6xx_format) pkt_field_get(
++       A6XX_RB_MRT_BUF_INFO_COLOR_FORMAT, mrt_buf_info);
++@@ -2470,12 +2480,8 @@ event_blit_run(struct tu_cmd_buffer *cmd,
++          tu_cs_emit(cs, A6XX_RB_RESOLVE_SYSTEM_BUFFER_PITCH(blt_view->stencil_pitch).value);
++       }
++    } else {
++-      tu_cs_emit(cs, gmem_transfer ?
++-                        tu_gmem_transfer_swap_fixup(blt_view->view->RB_RESOLVE_SYSTEM_BUFFER_INFO,
++-                                                    A6XX_RB_RESOLVE_SYSTEM_BUFFER_INFO_COLOR_SWAP__MASK,
++-                                                    A6XX_RB_RESOLVE_SYSTEM_BUFFER_INFO_COLOR_SWAP(WZYX),
++-                                                    blt_view->view->is_mutable) :
++-                        blt_view->view->RB_RESOLVE_SYSTEM_BUFFER_INFO);
+++      tu_cs_emit(cs, gmem_transfer ? tu_gmem_memory_side_info(blt_view->view->RB_RESOLVE_SYSTEM_BUFFER_INFO) :
+++                                     blt_view->view->RB_RESOLVE_SYSTEM_BUFFER_INFO);
++       tu_cs_image_ref_2d<CHIP>(cs, blt_view->view, blt_view->layer, false);
++
++       tu_cs_emit_pkt4(cs, REG_A6XX_RB_RESOLVE_SYSTEM_FLAG_BUFFER_BASE, 3);
+diff --git a/patches/mesa/turnip-transient-attachments-in-gmem.patch b/patches/mesa/turnip-transient-attachments-in-gmem.patch
+new file mode 100644
+--- /dev/null
++++ b/patches/mesa/turnip-transient-attachments-in-gmem.patch
+@@ -0,0 +1,60 @@
++diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
++--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
+++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
++@@ -1388,10 +1388,10 @@ use_sysmem_rendering(struct tu_cmd_buffer *cmd,
++                      tu_autotune::rp_ctx_t *rp_ctx,
++                      tu_autotune::rp_key_opt rp_key)
++ {
++-   if (TU_DEBUG(SYSMEM)) {
++-      cmd->state.rp.gmem_disable_reason = "TU_DEBUG(SYSMEM)";
++-      return true;
++-   }
+++   /* TU_DEBUG(SYSMEM) still lets a pass with a transient attachment (below) render in GMEM: in system memory such a pass wrote and
+++    * read every transient attachment in DRAM (a 3048x2032 pass with RGBA16F and R32F transients took 9-12 ms of GPU time) and
+++    * backed it for good. */
+++   const bool forced_sysmem = TU_DEBUG(SYSMEM);
++
++    /* can't fit attachments into gmem */
++    if (!cmd->state.tiling->possible) {
++@@ -1444,7 +1444,7 @@ use_sysmem_rendering(struct tu_cmd_buffer *cmd,
++       return true;
++    }
++
++-   if (TU_DEBUG(GMEM)) {
+++   if (TU_DEBUG(GMEM) && !forced_sysmem) {
++       cmd->state.rp.gmem_disable_reason = "TU_DEBUG(GMEM)";
++       return false;
++    }
++@@ -1466,6 +1466,11 @@ use_sysmem_rendering(struct tu_cmd_buffer *cmd,
++          return false;
++    }
++
+++   if (forced_sysmem) {
+++      cmd->state.rp.gmem_disable_reason = "TU_DEBUG(SYSMEM)";
+++      return true;
+++   }
+++
++    tu_autotune::render_mode optimal_mode =
++       cmd->device->autotune->get_optimal_mode(cmd, rp_ctx, rp_key);
++    bool use_sysmem = optimal_mode == tu_autotune::render_mode::SYSMEM;
++diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
++--- a/src/freedreno/vulkan/tu_knl_darwin.cc
+++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
++@@ -1725,11 +1725,12 @@ tu_knl_darwin_load(struct tu_instance *instance)
++    device->has_set_iova = !!(info->flags & NativeAdrenoDeviceClientIova);
++    device->va_start = info->va_start;
++    device->va_size = info->va_size;
++-   /* Lazily allocated memory only where passes may keep attachments in tile memory (darwin_sparse_vma_init). With every pass in system
++-    * memory (TU_DEBUG=sysmem) a lazy BO is backed in full at the first pass, on the render thread: 40-112 MiB wired inside
++-    * vkCmdEndRenderPass, up to 340 ms each (untagged-3f2bd680), and freed again with the memory. Without the type a memoryless
++-    * attachment is ordinary device memory, which the runtime places and keeps spare for the next one. */
++-   device->has_lazy_bos = !TU_DEBUG(SYSMEM);
+++   /* Lazily allocated memory (darwin_sparse_vma_init) with TU_DEBUG=sysmem too: a pass with a transient attachment that has no memory
+++    * yet renders in GMEM (use_sysmem_rendering), so Metal's memoryless textures take none. As ordinary device memory they were new
+++    * 32-112 MiB image allocations whenever the render server held more of them than before, wired page by page (up to 309 ms in
+++    * untagged-7718d8c9). A pass that cannot render in GMEM still backs its attachment in full at the pass
+++    * (tu_allocate_transient_attachments). */
+++   device->has_lazy_bos = true;
++    device->has_sparse = false;
++    device->has_sparse_prr = false;
++    device->has_raytracing = false;
 diff --git a/scripts/build-adreno-metal-bridge.py b/scripts/build-adreno-metal-bridge.py
 --- a/scripts/build-adreno-metal-bridge.py
 +++ b/scripts/build-adreno-metal-bridge.py
-@@ -67,7 +67,7 @@
+@@ -66,9 +66,9 @@
+     # The host's diagnostics switch (SHENG_DIAG, from the boot argument sheng-diag=1): without it the stage ring and the allocation sites
      # keep nothing. The stage ring also marks the steps inside a batch's submission (SubmitStep: placed, gathered, vkQueueSubmit, changes).
      '0024-diagnostics-switch-and-submit-steps.patch',
      # Preserve specialized link names and source definitions; share large indexed constants and expose Vulkan allocation sizes.
 -    '0025-specialized-links-shared-constants-and-allocation-size.patch']]
 +    '0025-specialized-links-shared-constants-and-allocation-size.patch', '0026-coachz-copy-profile.patch']]
- 
- 
+
+
  def git_tree(*steps):
+     # The source tree a scratch index holds after HEAD and the given commands, without touching the source's own index.
 diff --git a/scripts/data/adreno-compiler-inputs.json b/scripts/data/adreno-compiler-inputs.json
 --- a/scripts/data/adreno-compiler-inputs.json
 +++ b/scripts/data/adreno-compiler-inputs.json
-@@ -56,7 +56,10 @@
+@@ -55,9 +55,12 @@
+     "patches/mesa/turnip-builtin-shader-pack.patch",
      "patches/mesa/turnip-host-import-images.patch",
      "patches/mesa/turnip-render-mode-for-attachment-memory.patch",
      "patches/mesa/turnip-gmem-mutable-swap.patch",
@@ -953,3 +1482,4 @@ diff --git a/scripts/data/adreno-compiler-inputs.json b/scripts/data/adreno-comp
    ],
    "integer_fma_reference": {
      "repository": "https://github.com/ucb-bar/berkeley-softfloat-3",
+     "commit": "a0c6494cdc11865811dec815d5c0049fba9d82a8",

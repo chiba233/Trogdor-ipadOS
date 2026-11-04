@@ -6,9 +6,56 @@
 
 k148 开机约 307 秒的最后记录：`CZ seed 16 fail 0`，`CZ frames made 16 private 16 shown 2640 plain 1008`，方向 `straight1328 turned1312 mismatch0 conflict1`；`CZ sync out1517 in1388 miss0 attach1`；`CZ miss tag1008 frame0 invalid0 shape0`，plain 全部是没有有效标记；镜像 2905 次共 39.2 GB，局部写回 4 次、省 3.5 MB；`KMD pressure n32 busy9 reaped8 pauses1`。同样到 307 秒，k147 是提交 3647 次、翻转 1801 次、镜像 627 次，k148 是 7735、3601、2905 次，每次翻转的整帧镜像从 0.35 次升到 0.81 次，原因还没查。
 
-提交数和翻转数同步翻倍（每次翻转约 2 次提交，两次一样），翻倍的是出帧数。多出来的是共享面拷回私有纹理（`in`），它以前总是整帧。k150 的计数显示 plain 写入全是直视图上的 Load pass（`pass L534 C0 D0 rot0 srgb0`），damage 可界定，但几乎每次拷回都因为同一命令把主帧绑成 shader 纹理而被 mask 2 拦成整帧（`guarded222`，`inpart0`）。之后的 addon 让 plain 写入也记录 damage，拷回只拷这块（旋转帧把平面矩形换算成私有坐标 `x = W-y-h, y = x`）；mask 2 只在 usage 带 ShaderWrite 或未知时才拦，只读绑定计入 `CZ damage … ro`。随 k151 上机，计数还没读。
+提交数和翻转数同步翻倍（每次翻转约 2 次提交，两次一样），翻倍的是出帧数。多出来的是共享面拷回私有纹理（`in`），它以前总是整帧。k150 的计数显示 plain 写入全是直视图上的 Load pass（`pass L534 C0 D0 rot0 srgb0`），damage 可界定，但几乎每次拷回都因为同一命令把主帧绑成 shader 纹理而被 mask 2 拦成整帧（`guarded222`，`inpart0`）。之后的 addon 让 plain 写入也记录 damage，拷回只拷这块（旋转帧把平面矩形换算成私有坐标 `x = W-y-h, y = x`）；mask 2 只在 usage 带 ShaderWrite 或未知时才拦，只读绑定计入 `CZ damage … ro`。k151 的完整内核日志最后记录 guarded0、mask0、ro2631，sync out1307、in1226、inpart0，damage load4829、full24，mirror 2533 次共 34,162,787,032 字节。commit-to-complete 均值 13662 us，frame-gpu 超过 16 ms 的约占 24%，包含初始化且操作窗口不同。所给结果没有 panic、@crash、DeviceLost 或 KMD fail。
 
-## 最新启动记录
+## 整帧回退分类与空记录修订
+
+k151 已经覆盖只读放行和 plain 区域跟踪，1226 次拷回依然全部整帧。现有字段还无法区分混合表示、无界记录、无效起始状态和区域并集覆盖整屏。混合写入目前是待计数确认的原因。
+
+源码中存在一个可达的方向选择问题。Load＋Store 的记录在没有 draw 或 scissor 为空时，damage 为零，但它仍可能作为最后写入选定镜像方向，另一表示上的空记录也会触发整帧混合回退。本批让这类已界定空记录退出方向选择和区域合并。末尾空记录前还有可能写入的记录时，继续回溯到后者。整个表面只有空记录且起始内容有效时，可以完成一次无更新同步。起始状态无效时仍进行完整同步。compute 和未知写入保护继续参与判断。
+
+新增 `CZ infull mix/bound/invalid/guard/wide`，在成功编码的共享→private 整帧镜像上统计原因。
+
+| 字段 | 原因 |
+|---|---|
+| mix | 同一表面存在另一表示的非空或无界候选写入 |
+| bound | 存在无法界定区域的写入记录，包括不满足区域跟踪条件的 pass 或 blit |
+| invalid | 起始 private 内容未确认有效 |
+| guard | 该表面或命令的未知写入保护触发 |
+| wide | 局部同步条件已满足，但 scissor 并集覆盖了整帧 |
+
+原因按独立位统计，可以同时出现，合计无需等于整帧次数。`wide` 只在局部同步条件满足时记录。`CZ damage` 增加 `noop A/B`，分别统计末尾空候选的跳过次数，以及合并区域时另一表示空记录的跳过次数，两者可重叠。
+
+两种方向的整帧同步还会通过独立 Note 3 采样 `MF in/out bits... n... private... plain... empty...`。bits 的 1、2、4、8、16 分别对应 guard、invalid、bound、mix、wide。private/plain 是该表面的候选写入记录数，empty 是已界定空记录数。首次和幂次按各原因分别采样，能保留稀有原因的首次现场。该记录独立于 48 行状态表。
+
+本批只排除了已确认无更新的记录。两种表示都存在可能写入时继续完整同步，后续依据 mix 的实际分布处理按写入顺序的表示切换。下一次需要 `CZ infull`、`noop`、首批 `MF in`、`inpart` 和同窗口镜像字节。像素一致性仍需覆盖局部更新、截图、切换快照和转屏。
+
+此次增量位于 addon 的 frontend，配套信任缓存随 addon 更新。代码检查覆盖补丁应用与撤回的文件字节一致性，编译和实机验证由下一轮构建完成。
+
+## 整帧 plain 绘制的接入跟进
+
+k152 最后记录为 `CZ infull mix0 bound0 invalid0 guard0 wide716`，`CZ sync out782 in716 inpart0 miss0 attach1`，plain pass 为 `L1474 C0 D0 rot0 srgb0`。本次运行没有报告 panic 或 DeviceLost。整帧拷回的原因已收敛到 scissor 并集覆盖整帧，优化方向进入 plain 绘制的 private 接入。
+
+本批包含两处实际路径修订。
+
+- 缓存的 plain 纹理创建 whole view 时，在原 runtime 的范围、格式和 swizzle 验证成功后，可以复用已有效的同方向 private。旧 plain handle 仍供已经记录的命令使用，新 view 的渲染和同步跟踪接入 private。API 的 parent 继续指向原纹理，内部 GPU root 由独立的 resident 引用表示，防止错误地按 plain 计数和回写。该入口覆盖提升前创建、之后持续派生 view 的纹理。
+- 重复 IOSurface 导入的 usage 是已有 private 能力的显式子集，且其余完整 descriptor 相同时，可以直接复用 private 和仍存活的 backing。这样省掉先重建共享图像再走 existing-private 的中间步骤。未知 usage、额外能力和其他 descriptor 变化继续走正常导入检查。
+
+新增 plain 写入租约覆盖已编码、尚未提交和正在执行的已跟踪写入。命令完成时释放租约，放弃的写入记录析构时也释放。存在此类写入期间，新 view、重复导入和 seed 复用走 plain 回退，避免拿尚未同步的 private 当作最新像素。持有已完成 encoder 的时间不会延长该租约。
+
+新 view 接入目前覆盖同方向、完整单 mip／单层／单采样、默认 swizzle 的 BGRA／sRGB view，且明确 usage 已被 resident 支持。跨方向接入仍需处理 render 坐标和别名的一致性，本批没有将其算作已完成。`CZ reuse subset/views/busy/cross` 分别记录兼容导入、新 view 命中、未完成写入或提升保护、方向不匹配。view 创建成功后，还需结合实际 private writer、in 和镜像字节判断渲染收益。
+
+### 整帧现场与诊断窗口
+
+`wide` 是命令内 scissor 包围矩形覆盖整帧，不能据此把 Load 改成 DontCare，或假定每个 fragment 都覆盖旧内容。新增 `CZ target same/cross/other/whole/union` 对 coverage-only 的整帧拷回分类。same／cross／other 取最后 plain writer 与 resident 的方向和尺寸关系。whole 表示至少一个 pass 的 scissor 并集已覆盖其整附件，union 表示只有跨 pass 合并后才覆盖；二者都统计编码边界。
+
+独立 Note 3 的 `DP in/target/pass/site` 按各类首次和幂次采样，每次最多保留前两个和最后一个有效 plain 写入记录。记录包含尺寸、rotation、format、usage、load／store、scissor、原导入状态，以及调用模块名和模块内偏移。birth 的 1、2、3、4 分别表示导入时尚无 resident、straight resident 已就绪、已有 turned resident、已有 resident 尚未就绪；0 表示该来源未经过此记录入口。该记录用于直接决定下一处接入分支。
+
+RM、GM、GMb 已整体移到可变 benchmark、DF、cache 和 allocation 行之前，位于前部 CZ 组之后。按当前 CZ 各分组的上限，三行可以完整进入 48 行窗口。取数符号和字段保持原语义。
+
+本批已通过现有工具入口构建 GPU addon 和匹配的信任缓存，产物位于惯例的 `build/coachz-gpu-userland`。编译、4 KiB 签名、信任缓存记录和 addon 中的新功能标记核对通过，既有壁纸资源和 shader 预热列表已一起打包。源码校验覆盖四行上下文补丁的正反应用及文件字节一致性。plain 绘制是否命中 private、像素与转屏一致性、截图／切换快照，以及同窗口的镜像字节和耗时仍需实机验收。
+
+## 此前启动记录
 
 每项取其最后打印；没有固定操作窗口或画面反馈，不能与其他启动的累计耗时直接比较：
 
@@ -288,7 +335,7 @@ CPU 读取 0xae10 曾在 GMU vote 存在、检查状态正常时产生同步外�
 
 **功能修订需要重编 addon 和配套信任缓存；可先沿用本轮内核。** 首次导入 seed、有效主帧复用、内部 backing 访问、plain 回退租约、完成回执、按表面保护、局部镜像、Busy 等待整理、FR 记录、显式 host FDL 布局和成功绑定记录都在 addon/其 Mesa 静态依赖内；只编内核或继续冻结 addon 都不会带入。GOP 诊断标签已在后续内核记录中出现，不是本次 addon 修订的前置条件。不要将新 addon 配上旧信任缓存。
 
-addon 跟进只改四行上下文的 `unixnu-gpu-plugin.patch` 和 `unixnu-gpu-stack.patch`；Mesa 修改仍在既有 diagnostics overlay 中，沿用原构建应用和撤回路径。本次不再改 `Adreno740.patch` 和板级 package；既有 `CoachzGpu.cpp` 增量只纠正 GOP 诊断标签。上游 checkout 和已有二进制不改，不自行编译、写盘或上机。运行时 warning 仍在前部；FR 失败通过独立 Note 3 保留，按字段前缀查找，不依赖固定 row 编号。
+addon 跟进只改四行上下文的 `unixnu-gpu-plugin.patch` 和 `unixnu-gpu-stack.patch`；Mesa 修改仍在既有 diagnostics overlay 中，沿用原构建应用和撤回路径。本次不再改 `Adreno740.patch` 和板级 package；既有 `CoachzGpu.cpp` 增量只纠正 GOP 诊断标签。GPU 构建沿用 `tools/xnu_gpu_userland.py` 与 `build/coachz-gpu-userland`，同次生成 addon 和配套信任缓存。运行时 warning 仍在前部；FR 失败通过独立 Note 3 保留，按字段前缀查找，不依赖固定 row 编号。
 
 下一次需要：
 
@@ -297,4 +344,102 @@ addon 跟进只改四行上下文的 `unixnu-gpu-plugin.patch` 和 `unixnu-gpu-s
 3. 两行 `CZ place` 和新增 `CZ alias`，连同 CZ copy/shape、L host、mirror 的 part/skip/save 和 `CZ damage`。确认整帧 alias 的 size≤room，n/pitch 增加，再检查边缘像素、截图与缓存一致性。保留初始化结束后正常操作的大致起止时间及前后计数，避免跨启动负载比较总量。
 4. 显式 frame transfer 失败时保留第一条错误及整份内核、统一日志；归档留在本地，不将原始环境标识放入公开产物。
 
-本批只做源码阅读、补丁应用/撤回的字节核对、差异和隐私检查；这些不代替编译和实机验收。
+补丁应用/撤回的字节核对、差异检查、GPU 构建和实机验收分别记录。
+
+
+## 跨方向直接渲染与采样对照
+
+本轮启动记录中，`CZ target cross347 whole347`，`same0`；`CZ infull wide347`，对应的 plain pass 本身覆盖整帧。`private writer799`、`shown614` 已实际发生，继续缩小拷入区域不能消除这组全帧传输。`G mean21906us` 是包含启动的累计值，缺少固定操作窗口，不能据此宣称性能回退或收益。
+
+### 实际优化
+
+- 对已有有效 turned private 主帧的单颜色、单采样 BGRA8 Load/Store pass，延迟选定目标，在完整绑定和程序信息就绪后直接画入 private。限定记录容量为 4096 条调用和 1 MiB inline bytes，超限走现有目标。
+- quarter-turn 变体将 clip position `(x,y)` 变为 `(y,-x)`，同步变换 viewport/scissor；片元物理坐标逆变换为 `(y,H-x)`，显式导数对应 `dfdx=dpdy`、`dfdy=-dpdx`。程序变体及缓存依赖显式包含 quarter-turn 标记。
+- 检查资源别名、写副作用、状态、sample/quad 和插值语义。选中 pass 结束后通过固定的写入前缀同步共享平面，并封存该前缀，避免后续镜像重复处理。外部读取依然有同步成本，收益需要分别观察拷入、拷出和 GPU 时间。
+
+### 同次启动的 GPU 数值对照
+
+原始与变换后的 VS/FS SPIR-V 哈希共同标识程序族。新程序族至少遇到三次才安排对照，每次启动最多八次。对照执行原 pass 和 quarter-turn pass，以 GPU compute 读取包含边缘的 128×128 网格，共 16384 个像素。正式输出使用原路径结果，对照后从原共享平面恢复 private。
+
+GPU 完成后要求处理行数为 128、差异数为零，才允许同次启动后续匹配程序族走直接渲染。有效差异会关闭本次启动的新直接渲染准入。未完成或局部失败的对照不授予准入。这是抽样一致性证据，不能当成逐像素证明。
+
+| 记录 | 后续可回答的问题 |
+|---|---|
+| `CZ turn try/run/audit/seals` | 候选、实际直接渲染、对照及同步各走了多少 |
+| `CZ turn refuse` | 别名、程序、状态、primitive、等待或容量限制各拒绝多少 |
+| `TR program mask/vs/fs/newvs` | 哪个程序及能力限制阻止了准入 |
+| `TR pass mode/reason/draws/calls/prep` | 原路径、对照、直接渲染的选择及准备耗时 |
+| `TR span wall/held` | 记录 pass 的跨度和 inline bytes，区分准备开销与 GPU 时间 |
+| `TR audit valid/rows/diff/first/delta/fs` | 对照是否完整、差异数量、首次坐标、最大 8-bit 通道差及程序 |
+
+下轮同时保留上述记录和 `CZ mirror`、`CZ sync`、`CZ frames`、`G/H/J`。对照是否完成、准入是否命中、拷入是否减少、拷出是否增加、截图/切换快照/方向是否一致，应分别判断。尽量记录初始化结束后的操作起止时间，用同窗口增量比较。
+
+此批需要新 addon 与配套信任缓存，可沿用现有内核。GPU 构建采用惯例入口和输出目录，壁纸与 prime list 在同次打包中携带。
+
+GPU 构建已完成，addon 为 14,332,184 字节、20 项文件，包含 prime list 和两套壁纸；配套信任缓存包含三个签名哈希。前端/AIR 语法与惯例 GPU 完整构建已通过，真机路径命中、像素抽样及性能结果待后续启动记录。
+
+
+### 入口未命中的跟进
+
+本轮实机中 `CZ turn try0 run0 audit0/0/0`，同时 `CZ target cross400 whole400`、`CZ infull wide400`，新路径未进入。具体入口拒绝原因缺失，尚未确定根因。
+
+颜色零槽的写入记录改为根据输出 attachment 槽位确定，去掉对重复取得的描述符对象地址的依赖。`try` 在 plain IOSurface 进入筛选时计数。新增 `TR entry`、`TR extent`、`TR resident`，按各拒绝原因的首次和幂次采样，包含 pass/纹理尺寸、帧状态、旋转、Load/Store 和格式。
+
+`TR entry mask` 位值依次为 1 缺写入记录、2 不满足 partial、4 格式、8 深度/模板/visibility、16 显式 pass 尺寸、32 多颜色附件、64 缺帧记录、128 帧未有效/未转向/提升中、256 视图旋转、512 private 尺寸。mask 0 表示通过入口，后续继续看 `TR pass` 和 GPU 对照。构建后需要更新 addon 与配套信任缓存。
+
+入口跟进已通过惯例 GPU 构建，addon 为 14,332,720 字节，配套信任缓存含三个签名哈希，壁纸与 prime list 同次携带。入口拒绝原因和直接渲染命中待下一次实机日志确认。
+
+
+### 多颜色附件的共同 quarter-turn
+
+实机入口记录为 `mask20 partial1 actions1/1 f80`，`tex2266x1488 pass2266x1488`、`flags3 rot0/0 tex1488x2266`。主帧条件满足，阻断来自原先对所有附加颜色附件的统一拒绝。
+
+现在对同尺寸、单采样 2D 的浮点或 UNORM 颜色目标建立同格式的旋转 private 附件，所有颜色槽共同使用 quarter-turn 几何与片元坐标规则。Load 附件在原路径执行前 seed，Clear 保留清除值，附加目标的 DontCare 选择清零。直接路径的 Store 附件在 pass 结束后同步回原目标，DontCare store 不回写。格式或布局不支持时保留原路径并记录具体槽位。
+
+显式 framebuffer-local input attachment 随全部颜色附件共同旋转，保留 subpass load 对当前像素的对应关系；非零偏移/采样插值仍拒绝。GPU 对照对每个 Store 颜色附件各检查 128×128 个样本，独立记录差异，全部完整且零差异才准入。DontCare store 不参与内容验收。程序准入键包含颜色槽位、格式、尺寸和 Load/Store 布局，避免不同 MRT 布局共用一次验收。
+
+- `TR mrt layout` 记录实际附件位图和布局键，`TR mrt color` 记录各槽的格式、尺寸、usage 和 actions。
+- `TR pipeline colors/writes` 是管线描述符声明的颜色槽和非零 write mask，不等同于实测像素写入量。
+- `TR mrt slot/bad` 的 bad 位值为 1 格式、2 尺寸、4 旋转/类型/采样、8 mip/slice/resolve、16 actions、32 附件别名。入口 mask 的 32 现在表示具体 MRT 布局拒绝。
+- `TR audit slot` 按槽记录处理行数、差异、首次坐标和最大通道差；汇总的 valid/good 决定本次启动后续准入。仍是抽样证据。
+- `TR mrt traffic seed/in/store/out` 记录附加附件的传输次数及按尺寸和格式估算的逻辑字节，和原有主帧 mirror/sync 分开观察。附加纹理的分配及 seed/store 都有成本，需要结合 G/H/J 的同窗口数据评估。
+
+需要新 addon 与配套信任缓存，可沿用现有内核。真机附件布局、新路径命中和收益待下一次日志确认。
+
+多颜色附件跟进已完成惯例 GPU 编译、签名和打包。addon 为 14,339,768 字节、20 项文件，配套信任缓存含三个签名哈希，prime list 与两套壁纸同次携带。实机准入、各槽像素抽样和传输成本待后续日志。
+
+
+### 片元补偿参数的绑定接入
+
+实机已进入多附件对照，`audit8/0/0 seals8 run0`，报告 rows 为 0。独立 ST 分段还原出 `a Fragment push field ViewportCompensation in a render pipeline` 的绑定器 invariant。quarter-turn 编译变体请求片元 ViewportCompensation，但 bind plan 的字段准入仍仅接受 Vertex，绘制在提交前遭到拒绝。
+
+绑定器现在对 quarter-turn 变体接受 Fragment 的该字段。实例化仍使用现有的统一字段写入分支，从 draw state 携带与顶点阶段一致的补偿值，片元读取其中的物理平面高度。
+
+无效对照新增 `TR outcome local/metal/report`，区分 EL0 拒绝、运行时错误码和报告映射；原始拒绝原因通过 `TR error part` 分段保留。这样 rows0 时能直接定位提交前拒绝或 GPU 执行/报告问题。
+
+需要更新 addon 与配套信任缓存，可沿用现有内核。后续以有效的逐槽 rows、diff、valid/good，以及 run 和主帧同步量确认路径与收益。
+
+片元绑定接入修订已完成惯例 GPU 编译、签名与打包。addon 为 14,340,992 字节、20 项文件，配套信任缓存含三个签名哈希。真机有效对照与直接渲染命中待后续日志确认。
+
+
+### 按程序与附件布局隔离回退
+
+实机第一组 `rows128 diff0 valid1 good1` 后已有一次直接渲染。第二组 16384 个采样点中有 3 个差异，最大 8-bit 通道差为 1，首次坐标为 659,503；原全局停用使后续直接渲染停止，最终 `run1 audit2/1/1`。
+
+移除全局停用，继续使用既有程序/附件布局状态表隔离失败项。失败对照中尚待准入的程序键标记 rejected；已通过的程序键保持可用。零差异准入条件继续生效，微小差异的原因由原始数值确认。
+
+- 每个 Store 附件在既有 256-byte 报告内保留前四个异常样本。摘要仍占四个 uint，随后每条占十个 uint，内容为 x、y、参考 RGBA 和 quarter-turn RGBA 的精确 float32 位模式，总占用 176 字节。记录由原差异计数的原子返回值分配，样本顺序按 GPU 到达次序。
+- `TR pixel slot/xy/ref/turn` 输出这些位模式，保留细微舍入差，原 rows/diff/first/delta 摘要继续打印。
+- 启动内对照预算仍为八次。在预算尚未用满的候选 pass 中，最多保留前 32 个 draw 的管线、viewport、scissor 和混合常量；出现有效差异后，仅输出 scissor 覆盖异常样本的 draw。该范围不能证明三角形实际覆盖了该点，截断通过独立记录标明。
+- `TR draw` 关联 draw 序号、异常点和 VS/FS 哈希，`TR blend` 记录各颜色槽的 write mask、混合启用、操作、源/目标因子及常量，`TR shader` 记录片元函数名。绘制记录在失败时格式化输出。
+
+需要更新 addon 与配套信任缓存，可沿用现有内核。下一次同时看 run 是否持续增加、audit 成败数、异常 RGBA 与绘制状态，以及同窗口 mirror/sync/G/H/J。
+
+按程序隔离回退和异常像素现场已通过前端/AIR 语法与惯例 GPU 完整构建。addon 为 14,342,472 字节、20 项文件，配套信任缓存含三个签名哈希。持续直接渲染和异常样本现场待实机日志确认。
+
+
+### k165 实机记录
+
+启动 45，保留日志覆盖 932 秒。首个 backboardd 的 `try13257 run1073`，八次对照均零差异。随后进程中两次对照分别有七个和两个异常像素，最大通道差为两个和一个 8-bit 单位；异常现场已包含原始像素与绘制、混合状态，最后一个进程 run 为零。
+
+backboardd 两次 SIGABRT 的 asi 为 `Failed to create IOSurfaceAccelerator`，调用栈经 `detach_layer`、`IOMFBDisplay::copy_surface` 和 `create_new_iosa_manager`。前一条匹配失败为 AppleM2ScalerCSCDriver；SpringBoard 和 chronod 随后退出。整次启动没有 panic 或 DeviceLost。提交到完成的累计均值为 73.6 ms，包含界面重启及重新初始化，没有固定操作窗口，不能直接和此前累计均值比较。
