@@ -1702,3 +1702,12 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 启动 45，日志覆盖 932 秒。首个 backboardd 尝试 13257 次、直接渲染 1073 次，八次像素对照全部零差异。后续 backboardd 中有两次对照差异，分别为七个像素、最大两个 8-bit 单位，以及两个像素、最大一个单位；最后一个进程没有直接渲染。程序和附件布局隔离状态继续生效。
 
 两次 backboardd 崩溃的 asi 为 `Failed to create IOSurfaceAccelerator`，栈为 `detach_layer` → `IOMFBDisplay::copy_surface` → `create_new_iosa_manager` → `abort`，相邻日志为匹配 AppleM2ScalerCSCDriver 失败。SpringBoard 和 chronod 随后 SIGABRT。整次没有 panic 或 DeviceLost。累计提交完成均值 73.6 ms 包含两次界面重启和初始化，缺少固定操作窗口。
+
+
+## k168–k170 Wi-Fi 建在原版 IONetworkingFamily 上
+
+内核 prelink 原版 IONetworkingFamily，`IOKitBSDInit()` 在 IOBSD 之前去掉它的 `IONetworkStack` personality，Wi-Fi 的接口和网络栈改为继承原版类。
+
+- **k168**：`COACHZ net: ... removed 1`，但用户客户端用了自己的类名，`IOUC CoachzNetworkStackUserClient failed MACF in process pid 37, configd`，InterfaceNamer 没有完成，wifid 停在 `WiFiManagerCreate`，Wi-Fi 开关灰掉。
+- **k169、k170**：用户客户端改成原版 `IONetworkStackUserClient` 实例换 vtable。没有 `failed MACF`；开机后自动加入已保存网络，认证、关联、四次握手完成，DHCP 发布 IPv4 和路由，IPv6 也拿到，DNS 可达。`the network stack was opened` 没有出现。
+- 之后一次开机始终没有加入：上一次开机时控制中心发起了断开（wifid 记 `user-initiated disconnect ... reason=Control Center`），iPadOS 把自动加入关到第二天早上，这是系统行为，不是驱动问题。

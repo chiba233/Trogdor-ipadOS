@@ -21,5 +21,6 @@ archives = ["build-corecrypto-14.py", "build-corecrypto-14.py --namespace", "com
   "component:RamBlock", "../drivers/RamBlock/build-usb-stack.py", "build-coachz-display.py", "component:AppleKeyStoreState", "component:ShengHidInput", "build-coachz-backlight.py", "build-coachz-audio.py", "build-coachz-gpu.py", "build-coachz-wifi-net.py"]
 
 [kernel.prelink]
-# The restore RAM disk mounts tmpfs: the OS profile's list does not include it.
-extra_args = ["--root", "com.apple.filesystems.tmpfs"]
+# The restore RAM disk mounts tmpfs: the OS profile's list does not include it. The Wi-Fi registry derives from the original
+# IONetworkingFamily (tools/record_network_bindings.py), which the Apple USB host stack and every USB network driver also need.
+extra_args = ["--root", "com.apple.filesystems.tmpfs", "--root", "com.apple.iokit.IONetworkingFamily"]

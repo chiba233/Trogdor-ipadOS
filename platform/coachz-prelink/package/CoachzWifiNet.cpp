@@ -35,7 +35,9 @@ extern "C" {
 #include <sys/systm.h>
 #include <stdarg.h>
 #include <mach/kmod.h>
+#include <libkern/OSKextLib.h>
 #include "coachz_wifi_net.h"
+#include "OriginalIONetworkingABI.h"
 
 extern "C" kmod_info_t g_kernel_kmod_info;
 extern "C" void coachz_wifi_net_static_init(void) __asm__("__GLOBAL__sub_I_CoachzWifiNet.cpp");
@@ -483,24 +485,48 @@ errno_t if_ioctl(ifnet_t, unsigned long cmd, void *data) {
 
 class IO80211Controller : public IOService { OSDeclareDefaultStructors(IO80211Controller); };
 OSDefineMetaClassAndStructors(IO80211Controller, IOService);
-class IONetworkInterface : public IOService { OSDeclareDefaultStructors(IONetworkInterface); };
-OSDefineMetaClassAndStructors(IONetworkInterface, IOService);
-// The system's network configuration and wireless daemon tell a wireless interface by its class name.
+
+// The system's network configuration and wireless daemon tell a wireless interface by its class name, IO80211Interface, and find it as
+// an IONetworkInterface. That class is the original IONetworkingFamily's (OriginalIONetworkingABI.h, from tools/record_network_bindings.py):
+// the Apple USB host stack and every USB network driver load the original family, so its names are not ours to define. The interface is
+// not made by the family and its ifnet is this file's own, so every IOService slot the original class overrides is replaced here by the
+// IOService one and no original IONetworkInterface method runs on this object; build-coachz-wifi-net.py checks that in the compiled table.
 class IO80211Interface : public IONetworkInterface {
   OSDeclareDefaultStructors(IO80211Interface);
  public:
-  IOReturn newUserClient(task_t, void *, UInt32 type, OSDictionary *, IOUserClient **) APPLE_KEXT_OVERRIDE {
+  void free() APPLE_KEXT_OVERRIDE { IOService::free(); }
+  bool serializeProperties(OSSerialize *s) const APPLE_KEXT_OVERRIDE { return IOService::serializeProperties(s); }
+  bool requestTerminate(IOService *provider, IOOptionBits options) APPLE_KEXT_OVERRIDE { return IOService::requestTerminate(provider, options); }
+  bool willTerminate(IOService *provider, IOOptionBits options) APPLE_KEXT_OVERRIDE { return IOService::willTerminate(provider, options); }
+  bool handleOpen(IOService *client, IOOptionBits options, void *arg) APPLE_KEXT_OVERRIDE { return IOService::handleOpen(client, options, arg); }
+  void handleClose(IOService *client, IOOptionBits options) APPLE_KEXT_OVERRIDE { IOService::handleClose(client, options); }
+  bool handleIsOpen(const IOService *client) const APPLE_KEXT_OVERRIDE { return IOService::handleIsOpen(client); }
+  IOReturn message(UInt32 type, IOService *provider, void *argument) APPLE_KEXT_OVERRIDE { return IOService::message(type, provider, argument); }
+  IOReturn newUserClient(task_t, void *, UInt32 type, IOUserClient **) APPLE_KEXT_OVERRIDE { return refuse(type); }
+  IOReturn newUserClient(task_t, void *, UInt32 type, OSDictionary *, IOUserClient **) APPLE_KEXT_OVERRIDE { return refuse(type); }
+  IOReturn powerStateWillChangeTo(IOPMPowerFlags flags, unsigned long state, IOService *device) APPLE_KEXT_OVERRIDE {
+    return IOService::powerStateWillChangeTo(flags, state, device);
+  }
+  IOReturn powerStateDidChangeTo(IOPMPowerFlags flags, unsigned long state, IOService *device) APPLE_KEXT_OVERRIDE {
+    return IOService::powerStateDidChangeTo(flags, state, device);
+  }
+  // Pure in the original; only the family's own code would call it, and none of it holds this object.
+  void original178() APPLE_KEXT_OVERRIDE { log(3, "wifi-net: an original IONetworkInterface method was called on the Wi-Fi interface"); }
+ private:
+  static IOReturn refuse(UInt32 type) {
     static unsigned said; if (said++ < 4) log(6, "wifi-net: a user client of type %u was asked for: none offered (ioctl path)", static_cast<unsigned>(type));
     return kIOReturnUnsupported;
   }
 };
 OSDefineMetaClassAndStructors(IO80211Interface, IONetworkInterface);
 
-// The network configuration's interface namer waits for a service of this class, opens it and only then publishes that IOKit is quiet;
+// The network configuration's interface namer waits for an IONetworkStack, opens it and only then publishes that IOKit is quiet;
 // everything that lists interfaces (the wireless daemon among them) waits for that. Interfaces here are named when they are made, so the
-// commands it sends (as properties of its connection) are only logged.
-class IONetworkStackUserClient : public IOUserClient {
-  OSDeclareDefaultStructors(IONetworkStackUserClient);
+// commands it sends (as properties of its connection) are only logged. The stack class is the original family's; its own personality is
+// removed before IOBSD (coachz-prelink-network-family.patch), and every IOService slot the original overrides is replaced here. This
+// class supplies the user client's methods; the client itself is an original IONetworkStackUserClient (coachz_stack_client below).
+class CoachzNetworkStackUserClient : public IOUserClient {
+  OSDeclareDefaultStructors(CoachzNetworkStackUserClient);
  public:
   IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE {
     static unsigned said;
@@ -513,12 +539,55 @@ class IONetworkStackUserClient : public IOUserClient {
   }
   IOReturn clientClose() APPLE_KEXT_OVERRIDE { terminate(); return kIOReturnSuccess; }
 };
-OSDefineMetaClassAndStructors(IONetworkStackUserClient, IOUserClient);
-class IONetworkStack : public IOService {
-  OSDeclareDefaultStructors(IONetworkStack);
+OSDefineMetaClassAndStructors(CoachzNetworkStackUserClient, IOUserClient);
+
+// The configuration daemon's sandbox lets it open a user client of the class IONetworkStackUserClient only (on hardware a client of
+// another name failed MACF in configd, the interface namer never finished and the wireless daemon waited for it). That class is the
+// original family's, so the client is an original instance allocated by name, whose table is a copy of its own with the IOUserClient
+// slots the original overrides (OriginalIONetworkingABI.h) taken from CoachzNetworkStackUserClient's: setProperties and clientClose are
+// this file's, start, initWithTask and clientDied the native IOUserClient ones. Its destructors and getMetaClass stay the original's.
+// Every other slot must already be the same in both tables, or no client is made.
+extern "C" void *coachz_stack_client_table[] __asm__("__ZTV28CoachzNetworkStackUserClient");
+static IOUserClient *coachz_stack_client() {
+  static void **table;
+  static bool refused;
+  OSObject *object = refused ? nullptr : OSMetaClass::allocClassWithName("IONetworkStackUserClient");
+  IOUserClient *client = OSDynamicCast(IOUserClient, object);
+  if (!client) { OSSafeReleaseNULL(object); return nullptr; }
+  void **original = *reinterpret_cast<void ***>(client);
+  if (!table) {
+    void **ours = coachz_stack_client_table + 2;
+    bool replaced[kIONetworkStackUserClientSlots] = {};
+    for (unsigned slot : kIONetworkStackUserClientReplaced) replaced[slot] = true;
+    for (unsigned slot = 0; slot < kIONetworkStackUserClientSlots; ++slot) {
+      if (slot == 0 || slot == 1 || slot == 7 || replaced[slot] || original[slot] == ours[slot]) continue;
+      log(3, "wifi-net: the original stack client's slot %u differs from IOUserClient; no client is made", slot);
+      refused = true; client->release(); return nullptr;
+    }
+    void **copy = static_cast<void **>(IOMalloc(kIONetworkStackUserClientSlots * sizeof(void *)));
+    if (!copy) { client->release(); return nullptr; }
+    memcpy(copy, original, kIONetworkStackUserClientSlots * sizeof(void *));
+    for (unsigned slot : kIONetworkStackUserClientReplaced) copy[slot] = ours[slot];
+    table = copy;
+  }
+  *reinterpret_cast<void ***>(client) = table;
+  return client;
+}
+
+class CoachzNetworkStack : public IONetworkStack {
+  OSDeclareDefaultStructors(CoachzNetworkStack);
  public:
+  void free() APPLE_KEXT_OVERRIDE { IOService::free(); }
+  IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE { return IOService::setProperties(properties); }
+  bool didTerminate(IOService *provider, IOOptionBits options, bool *defer) APPLE_KEXT_OVERRIDE { return IOService::didTerminate(provider, options, defer); }
+  bool start(IOService *provider) APPLE_KEXT_OVERRIDE { return IOService::start(provider); }
+  void stop(IOService *provider) APPLE_KEXT_OVERRIDE { IOService::stop(provider); }
+  bool finalize(IOOptionBits options) APPLE_KEXT_OVERRIDE { return IOService::finalize(options); }
+  IOReturn newUserClient(task_t task, void *security, UInt32 type, IOUserClient **handler) APPLE_KEXT_OVERRIDE {
+    return newUserClient(task, security, type, nullptr, handler);
+  }
   IOReturn newUserClient(task_t task, void *security, UInt32 type, OSDictionary *, IOUserClient **handler) APPLE_KEXT_OVERRIDE {
-    IONetworkStackUserClient *client = OSTypeAlloc(IONetworkStackUserClient);
+    IOUserClient *client = coachz_stack_client();
     if (!client || !client->initWithTask(task, security, type)) { OSSafeReleaseNULL(client); return kIOReturnNoMemory; }
     if (!client->attach(this)) { client->release(); return kIOReturnError; }
     if (!client->start(this)) { client->detach(this); client->release(); return kIOReturnError; }
@@ -526,7 +595,7 @@ class IONetworkStack : public IOService {
     *handler = client; return kIOReturnSuccess;
   }
 };
-OSDefineMetaClassAndStructors(IONetworkStack, IOService);
+OSDefineMetaClassAndStructors(CoachzNetworkStack, IONetworkStack);
 
 namespace {
 
@@ -539,7 +608,7 @@ IOService *publish(IOService *service, IOService *provider, const char *name) {
 }
 void publish_registry(const char *ifname) {
   IOService *platform = IOService::getPlatform();
-  if (IONetworkStack *stack = OSTypeAlloc(IONetworkStack)) {
+  if (CoachzNetworkStack *stack = OSTypeAlloc(CoachzNetworkStack)) {
     if (!stack->init() || !publish(stack, platform, "IONetworkStack")) log(3, "wifi-net: the network stack service did not start"); else stack->release(); }
   IO80211Controller *controller = OSTypeAlloc(IO80211Controller);
   IO80211Interface *wlan = OSTypeAlloc(IO80211Interface);
@@ -562,6 +631,12 @@ void publish_registry(const char *ifname) {
 // for that, whether or not the radio has started yet.
 extern "C" void coachz_wifi_net_start(const uint8_t mac[6]) {
   if (gIf) return;
+  // The registry classes derive from the original family's; its metaclasses exist once the family is loaded. Nothing else loads it
+  // at this point: its own IONetworkStack personality is removed before IOBSD.
+  const OSReturn family = OSKextLoadKextWithIdentifier("com.apple.iokit.IONetworkingFamily");
+  if (family != kOSReturnSuccess) {
+    log(3, "wifi-net: the original IONetworkingFamily did not load: 0x%x", static_cast<unsigned>(family)); return;
+  }
   void *handle = OSMetaClass::preModLoad(g_kernel_kmod_info.name);
   if (!handle) { log(3, "wifi-net: network classes: no module handle"); return; }
   coachz_wifi_net_static_init();

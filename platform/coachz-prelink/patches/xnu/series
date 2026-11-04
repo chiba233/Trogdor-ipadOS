@@ -129,5 +129,8 @@ coachz-prelink-rotation.patch
 coachz-prelink-cluster-mhz.patch
 coachz-prelink-smart-cover.patch
 
+# The Wi-Fi registry derives from the original IONetworkingFamily: its own IONetworkStack personality is removed before IOBSD.
+coachz-prelink-network-family.patch
+
 # /chosen/coachz-baseband: the cellular bridge (pending/baseband): QRTR hooks in the Wi-Fi thread, its firmware on the Data volume, CommCenter running.
 coachz-prelink-baseband.patch

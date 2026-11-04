@@ -1,0 +1,68 @@
+{
+  "kernelcache_sha256": "f18b4df865405f2a287b84977d7aca745e056d656d9fc9df1662970ce2969de7",
+  "family": "com.apple.iokit.IONetworkingFamily",
+  "family_text_sha256": "84482be879cb943c843b7525520a85ce9e58527033fb3b869cbe96a7186fa76d",
+  "slide": -16777216,
+  "classes": {
+    "IONetworkInterface": {
+      "base": "IOService",
+      "size": 272,
+      "slots": 221,
+      "pure": [
+        178
+      ],
+      "overrides": [
+        0,
+        1,
+        7,
+        14,
+        43,
+        75,
+        76,
+        91,
+        92,
+        93,
+        132,
+        141,
+        159,
+        160
+      ],
+      "bound": true
+    },
+    "IONetworkStack": {
+      "base": "IOService",
+      "size": 208,
+      "slots": 168,
+      "pure": [],
+      "overrides": [
+        0,
+        1,
+        7,
+        14,
+        44,
+        77,
+        86,
+        87,
+        95
+      ],
+      "bound": true
+    },
+    "IONetworkStackUserClient": {
+      "base": "IOUserClient",
+      "size": 224,
+      "slots": 186,
+      "pure": [],
+      "overrides": [
+        0,
+        1,
+        7,
+        44,
+        86,
+        170,
+        172,
+        173
+      ],
+      "bound": false
+    }
+  }
+}

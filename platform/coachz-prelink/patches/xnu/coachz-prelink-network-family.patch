@@ -1,0 +1,32 @@
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -110,6 +110,28 @@
+ kern_return_t
+ IOKitBSDInit( void )
+ {
++	/*
++	 * Coachz: the Wi-Fi registry (CoachzWifiNet.cpp) subclasses the original IONetworkingFamily's IONetworkStack and IONetworkInterface
++	 * for an interface whose ifnet the family did not make. The family's own IONetworkStack personality matches IOResources once IOBSD
++	 * is published and would drive every published IONetworkInterface, that one included, so it is removed before; the family itself
++	 * stays loadable by identifier and for its dependents.
++	 */
++	if (gIOCatalogue) {
++		OSDictionary * match = OSDictionary::withCapacity(1);
++		OSString * name = OSString::withCString("IONetworkStack");
++		if (match && name) {
++			match->setObject(gIOClassKey, name);
++			SInt32 generation = 0;
++			OSOrderedSet * found = gIOCatalogue->findDrivers(match, &generation);
++			const unsigned int count = found ? found->getCount() : 0;
++			OSSafeReleaseNULL(found);
++			const bool removed = count && gIOCatalogue->removeDrivers(match, false);
++			IOLog("COACHZ net: original IONetworkStack personalities %u, removed %d\n", count, removed);
++		}
++		OSSafeReleaseNULL(match);
++		OSSafeReleaseNULL(name);
++	}
++
+ 	IOService::publishResource("IOBSD");
+ 
+ #if IOPOLLED_COREFILE

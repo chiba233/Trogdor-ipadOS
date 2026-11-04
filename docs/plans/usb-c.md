@@ -24,4 +24,4 @@
 
 ## 下一阶段
 
-xHCI 以上用哪套栈：kernelcache 里 Apple 原版的 `AppleUSBXHCI`/IOUSBHostFamily 接到这颗 DWC3 上，还是别的 xHCI 驱动；然后是两个口的热插拔、EC 的 Type-C 状态和 PD、唤醒中断、带宽投票。
+xHCI 以上改用 kernelcache 里 Apple 原版的 `AppleUSBXHCI`/IOUSBHostFamily，设计见 [USB 主机](usb-host.md)；然后是两个口的热插拔、EC 的 Type-C 状态和 PD、唤醒中断、带宽投票。设备模式在这块板上做不到：唯一的 DWC3 直连板载 RTS5411，两个口都在集线器下行口上。
