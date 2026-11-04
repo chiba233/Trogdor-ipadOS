@@ -225,7 +225,7 @@ def smp_tree(root, count):
 
 
 def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=True, root_uuid=None, cpus=1,
-                 full_screen=False, gmu_firmware_size=0, sqe_firmware_size=0, gpu_addon_size=0, motion_probe=False, wifi_mac=None, gestalt_cache=None, baseband=False, baseband_compat_hash=None):
+                 full_screen=False, gmu_firmware_size=0, sqe_firmware_size=0, gpu_addon_size=0, motion_probe=False, wifi_mac=None, gestalt_cache=None, baseband=False, baseband_compat_hash=None, apps=False):
     root = read_tree(adt)
     if cpus > 1:
         smp_tree(root, cpus)
@@ -242,6 +242,8 @@ def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=T
     if gestalt_cache:
         # MobileGestalt's cached answers: the kernel writes them before launchd (coachz-prelink-smart-cover.patch).
         root.child('chosen').set('coachz-mgcache', gestalt_cache)
+    if apps:
+        root.child('chosen').set('coachz-owner-apps', struct.pack('<I', 1))
     if baseband:
         # Starts the cellular bridge (pending/baseband). A /chosen property, because the boot command line has no room left.
         root.child('chosen').set('coachz-baseband', struct.pack('<I', 1))
@@ -306,7 +308,9 @@ def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=T
 
 def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=False, root_cache=None, root_device=None,
          root_uuid=None, data_seed=None, data_uuid=None, display=False, cpus=1, gpu=0, gmu_firmware=None, sqe_firmware=None, gpu_addon=None,
-         diagnostics=False, wifi_mac=None, root_emmc=False, gestalt_cache=None, baseband=False, baseband_commcenter=None):
+         diagnostics=False, wifi_mac=None, root_emmc=False, gestalt_cache=None, baseband=False, baseband_commcenter=None, usb_host=False, apps=False):
+    if apps and (not prelinked or not root_emmc or gpu != 9 or gpu_addon is None):
+        raise ValueError('the app environment requires the prelinked eMMC root and its GPU addon')
     if baseband and not prelinked:
         raise ValueError('the cellular bridge needs the prelinked kernel')
     if window & 0x1fffff or memory & 0x1fffff:
@@ -374,6 +378,13 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
             command_line += ' coachz-wifi-mac=' + wifi_mac
         if root_emmc:
             command_line += ' coachz-root-emmc=1'
+        if usb_host:
+            # Apple's USB host stack on usb_1 (CoachzUsbHost.cpp, docs/plans/usb-host.md). The controller then belongs to it and the
+            # libpayload stack stays off; coachz-usb-keyboard=1 still routes the base into the keyboard device, through the HID bridge
+            # above IOUSBHostHIDDevice instead of libpayload's interrupt queues (coachz_zed_input.c decodes both).
+            if not root_emmc:
+                raise ValueError('the Apple USB host stack needs the eMMC root: the USB disk route reads its root through libpayload')
+            command_line += ' coachz-usb-host=1'
     if gpu:
         # Adreno 618 bring-up stages (docs/plans/gpu.md): 1 inventory, 2 CX + GMU clock window, 3 also the GMU firmware into TCM,
         # 4 the window with a read-only GPU SMMU inventory.
@@ -414,6 +425,10 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         command_line = command_line.replace(' cpus=1 ', ' cpus=%d ' % cpus)
         # coachz-max-freq=1: ArmCpu raises the A55, A76 and L3 domains to their top non-boost states.
         command_line += ' sheng-smp=1 armcpu-self-ipi=1 armcpu-el2-entry=1 coachz-max-freq=1'
+        if usb_host:
+            # The accepted IPI self-probe is diagnostic only. Its 18 bytes make room
+            # for the host-stack switch in the 1023-byte boot-argument field.
+            command_line = command_line.replace(' armcpu-self-ipi=1', '')
     if data_uuid:
         if not root_uuid or data_seed is not None or not re.fullmatch(r'[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}', data_uuid):
             raise ValueError('an external Data UUID needs the main OS root and no memory Data seed')
@@ -440,7 +455,7 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         # The restore volume, from memory or from disk, runs as the restore OS environment; the main OS does not.
         environment = 'restore' if root_cache and not root_uuid else None
         adt = prelink_tree(adt, window, tree, ramdisk, cache, environment, wifi_mac=wifi_mac, gestalt_cache=gestalt_cache, baseband=baseband,
-                           baseband_compat_hash=hashlib.sha256(baseband_commcenter).digest() if baseband_commcenter is not None else None,
+                           baseband_compat_hash=hashlib.sha256(baseband_commcenter).digest() if baseband_commcenter is not None else None, apps=apps,
                            ram_root=not disk_root or bool(data_seed),
                            root_uuid=root_uuid, cpus=cpus, full_screen=display,
                            gmu_firmware_size=len(gmu_firmware) if gmu_firmware else 0, sqe_firmware_size=len(sqe_firmware) if sqe_firmware else 0, gpu_addon_size=len(gpu_addon) if gpu_addon else 0, motion_probe=diagnostics)
@@ -490,6 +505,8 @@ def main():
     p.add_argument('--smp', type=int, default=1, help='main OS: start CPU0..N-1 (up to 8) through PSCI')
     p.add_argument('--gpu', type=int, default=0, help='prelinked: Adreno 618 bring-up stage 1 to 8, or 9 for the driver (docs/plans/gpu.md)')
     p.add_argument('--root-emmc', action='store_true', help='the system, Data and the log ring on the eMMC partitions')
+    p.add_argument('--apps', action='store_true', help='enable the locally staged rootless app installer and root trust-cache endpoint')
+    p.add_argument('--usb-host', action='store_true', help='with --root-emmc: Apple\'s USB host stack on usb_1 (coachz-usb-host=1) instead of the libpayload keyboard stack')
     p.add_argument('--baseband', action='store_true', help='prelinked: start the cellular bridge (pending/baseband): /chosen/coachz-baseband and the J121AP baseband nodes; its firmware comes with tools/linux_log.py --baseband')
     p.add_argument('--baseband-commcenter', type=Path, help='with --baseband: signed copy from tools/coachz_cellular_compat.py, also passed to tools/linux_log.py')
     p.add_argument('--gestalt-cache', type=Path, help='a MobileGestalt cache plist the kernel writes before launchd; device data, keep it out of the repository')
@@ -515,7 +532,7 @@ def main():
                    gpu=a.gpu, gmu_firmware=a.gmu_firmware.read_bytes() if a.gmu_firmware else None,
                    sqe_firmware=a.sqe_firmware.read_bytes() if a.sqe_firmware else None,
                    gpu_addon=a.gpu_addon.read_bytes() if a.gpu_addon else None, diagnostics=a.diagnostics,
-                   wifi_mac=a.wifi_mac.read_text().strip() if a.wifi_mac else None, root_emmc=a.root_emmc,
+                   wifi_mac=a.wifi_mac.read_text().strip() if a.wifi_mac else None, root_emmc=a.root_emmc, usb_host=a.usb_host, apps=a.apps,
                    gestalt_cache=a.gestalt_cache.read_bytes() if a.gestalt_cache else None, baseband=a.baseband,
                    baseband_commcenter=a.baseband_commcenter.read_bytes() if a.baseband_commcenter else None)
     a.output.parent.mkdir(parents=True, exist_ok=True)

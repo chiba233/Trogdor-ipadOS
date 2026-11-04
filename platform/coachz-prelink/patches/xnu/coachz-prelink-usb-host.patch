@@ -1,0 +1,51 @@
+diff --git a/iokit/Kernel/IOCatalogue.cpp b/iokit/Kernel/IOCatalogue.cpp
+--- a/iokit/Kernel/IOCatalogue.cpp
++++ b/iokit/Kernel/IOCatalogue.cpp
+@@ -61,6 +61,7 @@
+ #include <IOKit/IOLib.h>
+ #include <IOKit/assert.h>
+ #include <IOKit/IOKitKeysPrivate.h>
++#include <pexpert/pexpert.h>
+ 
+ #if PRAGMA_MARK
+ #pragma mark Internal Declarations
+@@ -407,6 +408,26 @@
+ * xxx - during safe boot. That would be better implemented here.
+ *********************************************************************/
+ 
++/*
++ * Coachz: the Apple USB host stack is prelinked for coachz-usb-host=1 (CoachzUsbHost.cpp). Without that boot argument its controller is
++ * never made, and IOUSBHostFamily's resource services, whose personalities match IOResources as soon as IOKit is published, are left
++ * out so that such a boot starts the same services as before the stack was prelinked.
++ */
++static bool
++coachz_usb_host_personality_unused(OSDictionary * personality)
++{
++	static int enabled = -1;
++	if (enabled < 0) {
++		unsigned int value = 0;
++		enabled = PE_parse_boot_argn("coachz-usb-host", &value, sizeof(value)) && value == 1;
++	}
++	if (enabled) {
++		return false;
++	}
++	OSString * name = OSDynamicCast(OSString, personality->getObject(gIOClassKey.get()));
++	return name && (name->isEqualTo("AppleUSBHostResources") || name->isEqualTo("AppleUSBHostResourcesTypeC"));
++}
++
+ bool
+ IOCatalogue::addDrivers(
+ 	OSArray * drivers,
+@@ -454,6 +475,12 @@
+ 
+ 		OSKext::uniquePersonalityProperties(personality);
+ 
++		if (coachz_usb_host_personality_unused(personality)) {
++			IOLog("COACHZ usb-host: %s left out (coachz-usb-host is off)\n",
++			    OSDynamicCast(OSString, personality->getObject(gIOClassKey.get()))->getCStringNoCopy());
++			continue;
++		}
++
+ 		// Add driver personality to catalogue.
+ 
+ 		OSArray * array = arrayForPersonality(personality);

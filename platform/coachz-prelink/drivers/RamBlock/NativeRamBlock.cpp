@@ -23,6 +23,8 @@
 extern "C" {
 int coachz_usb_open(uint64_t *blocks);
 int coachz_usb_open_keyboard(void);
+int coachz_usb_host_enabled(void);   // CoachzUsbHost.cpp
+void coachz_usb_host_start(void);
 int coachz_emmc_root(void);
 int coachz_sdcc_window(const char *name, uint64_t *first, uint64_t *blocks);
 int coachz_mmc_log_write(uint64_t block, uint32_t count, const void *data);
@@ -266,8 +268,14 @@ bool NativeRamBlock::start(IOService *provider)
   // The system on the eMMC: this driver publishes no disk (CoachzMmcBlock does) and keeps the keyboard and the log ring.
   if (coachz_emmc_root()) {
     if (!(gate = IOLockAlloc())) return false;
-    const int keyboard = coachz_usb_open_keyboard();
-    kprintf("COACHZ USB: keyboard stack %d, no disk published here\n", keyboard);
+    // coachz-usb-host=1: Apple's host stack takes usb_1 (CoachzUsbHost.cpp); the libpayload stack must not touch the controller then.
+    if (coachz_usb_host_enabled()) {
+      coachz_usb_host_start();
+      kprintf("COACHZ USB: the Apple host stack takes the controller, no libpayload stack\n");
+    } else {
+      const int keyboard = coachz_usb_open_keyboard();
+      kprintf("COACHZ USB: keyboard stack %d, no disk published here\n", keyboard);
+    }
     if (!PE_parse_boot_argn("coachz-data-uuid", data_uuid, sizeof(data_uuid)) || strlen(data_uuid) != 36) panic("Coachz eMMC root without a Data volume");
     persistent_data = true;
     log_on_emmc = true;

@@ -1,0 +1,66 @@
+{
+  "kernelcache_sha256": "f18b4df865405f2a287b84977d7aca745e056d656d9fc9df1662970ce2969de7",
+  "slide": -16777216,
+  "text_sha256": {
+    "com.apple.driver.usb.AppleUSBHostT8011": "c10cf8bef38c65924c602e6b0dc6a18395090a1b9e046f5f5b1f58daf4c3ef80",
+    "com.apple.driver.usb.AppleUSBXHCI": "239a5e24fe0aa1654a0a8bb63b81c7cb8eda0366f02c858c24f758e5e982cb94",
+    "com.apple.iokit.IOHIDFamily": "7e4c5104814f2e773d5be13d092dec53ee44ba5a61a81264b229780406e86b72",
+    "com.apple.iokit.IOUSBHostFamily": "97fcd110966f958e0b7d2646679acc9bdd56c0459824369417837d86d4b90ecc"
+  },
+  "classes": {
+    "AppleUSBXHCI": {
+      "kext": "com.apple.driver.usb.AppleUSBXHCI",
+      "superclass": "AppleUSBHostController",
+      "size": 3656,
+      "slots": 299
+    },
+    "AppleNubT8011USBXHCI": {
+      "kext": "com.apple.driver.usb.AppleUSBHostT8011",
+      "superclass": "AppleUSBXHCI",
+      "size": 3688,
+      "slots": 301
+    }
+  },
+  "nub_overrides": [
+    0,
+    1,
+    7,
+    14,
+    86,
+    132,
+    177,
+    180,
+    182,
+    183,
+    193,
+    240,
+    273,
+    289,
+    290,
+    291,
+    292,
+    293,
+    294,
+    295,
+    296,
+    297
+  ],
+  "kept": [
+    289,
+    290,
+    291,
+    292,
+    293,
+    294,
+    295,
+    296,
+    297
+  ],
+  "start_slot": 86,
+  "cache_options_offset": 1172,
+  "provider_slots": {
+    "121": "__ZN9IOService24getDeviceMemoryWithIndexEj",
+    "127": "__ZN9IOService16getInterruptTypeEiPi"
+  },
+  "hid_interface_open_slot": 168
+}

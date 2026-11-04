@@ -1,0 +1,150 @@
+--- a/bsd/kern/kern_trustcache.c
++++ b/bsd/kern/kern_trustcache.c
+@@ -42,8 +42,28 @@
+ #include <IOKit/IOBSD.h>
+ #include <img4/firmware.h>
+ #include <TrustCache/API.h>
+ 
++#include <sys/sysctl.h>
++#include <sys/kauth.h>
++#include <sys/errno.h>
++
++/* Explicit image opt-in, independent of machine identity and ordinary boot arguments. */
++static bool
++coachz_apps_enabled(void)
++{
++	DTEntry chosen;
++	void *value = NULL;
++	unsigned size = 0;
++	uint32_t enabled = 0;
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
++	    SecureDTGetProperty(chosen, "coachz-owner-apps", &value, &size) != kSuccess || size != sizeof(enabled)) {
++		return false;
++	}
++	memcpy(&enabled, value, sizeof(enabled));
++	return enabled == 1;
++}
++
+ static bool boot_os_tc_loaded = false;
+ static bool boot_app_tc_loaded = false;
+ 
+ #if CONFIG_SPTM
+@@ -452,9 +472,9 @@
+ trust_cache_runtime_init(void)
+ {
+ 	bool allow_second_static_cache = false;
+ 	bool allow_engineering_caches = false;
+-	bool allow_legacy_caches = false;
++	bool allow_legacy_caches = coachz_apps_enabled();
+ 
+ #if CONFIG_SECOND_STATIC_TRUST_CACHE
+ 	allow_second_static_cache = true;
+ #endif
+@@ -559,9 +579,12 @@
+ static kern_return_t
+ xnu_load_legacy_trust_cache(
+ 	__unused const uint8_t *module_data, __unused const size_t module_size)
+ {
+-#if XNU_HAS_LEGACY_TRUST_CACHE_LOADING
++#if XNU_HAS_LEGACY_TRUST_CACHE_LOADING || defined(BCM2837)
++	if (!XNU_HAS_LEGACY_TRUST_CACHE_LOADING && !coachz_apps_enabled()) {
++		return KERN_DENIED;
++	}
+ 	kern_return_t ret = KERN_DENIED;
+ 
+ 	/* Allocate the trust cache data structure -- Z_WAITOK_ZERO means this can't fail */
+ 	TrustCache_t *trust_cache = kalloc_type(TrustCache_t, Z_WAITOK_ZERO);
+@@ -1172,4 +1195,40 @@
+ #endif
+ 
+ 	return KERN_SUCCESS;
+ }
++
++/* The locally provisioned root installer supplies legacy v1 modules. Ordinary EL0 cannot load one. */
++static int
++coachz_apps_trustcache SYSCTL_HANDLER_ARGS
++{
++	(void)oidp; (void)arg1; (void)arg2;
++	if (!coachz_apps_enabled() || kauth_cred_getuid(kauth_cred_get()) != 0) {
++		return EPERM;
++	}
++	if (req->oldptr || !req->newptr || req->newlen < 24 || req->newlen > 24 + 22 * 32768) {
++		return EINVAL;
++	}
++	const size_t size = req->newlen;
++	uint8_t *module = kalloc_data(size, Z_WAITOK);
++	if (!module) { return ENOMEM; }
++	int error = SYSCTL_IN(req, module, size);
++	uint32_t version = 0, count = 0;
++	if (!error) {
++		memcpy(&version, module, 4);
++		memcpy(&count, module + 20, 4);
++		if (version != 1 || !count || count > 32768 || size != 24 + (size_t)count * 22) { error = EINVAL; }
++	}
++	for (uint32_t i = 0; !error && i < count; i++) {
++		const uint8_t *entry = module + 24 + i * 22;
++		if (entry[20] < 1 || entry[20] > 4 || entry[21] || (i && memcmp(entry - 22, entry, 20) > 0)) { error = EINVAL; }
++	}
++	if (!error) {
++		kern_return_t kr = load_legacy_trust_cache(module, size);
++		if (kr != KERN_SUCCESS && kr != KERN_ALREADY_IN_SET) { error = EACCES; }
++	}
++	kfree_data(module, size);
++	printf("COACHZ apps: cache entries %u status %d\n", count, error);
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, coachz_trustcache, CTLTYPE_OPAQUE | CTLFLAG_WR | CTLFLAG_LOCKED,
++    0, 0, coachz_apps_trustcache, "S", "Opt-in root application trust cache");
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8868,8 +8868,40 @@
+  * no accelerator, so the plug-in is simply never loaded.
+  */
+ extern volatile int coachz_gpu_ready;
+ static void
++coachz_apps_prepare(proc_t p, user_addr_t scratch)
++{
++	DTEntry chosen;
++	void *value = NULL;
++	unsigned size = 0;
++	uint32_t enabled = 0;
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
++	    SecureDTGetProperty(chosen, "coachz-owner-apps", &value, &size) != kSuccess || size != sizeof(enabled)) { return; }
++	memcpy(&enabled, value, sizeof(enabled));
++	if (enabled != 1) { return; }
++	/* Restore both original executables; launchd starts the installer directly. */
++	static const char source[] = "/private/var/ngpu/owner-apps/boot", point[] = "/usr/libexec";
++	static volatile int stage, status;
++	native_gpu_addon_mount(p, scratch, 0x400, source, sizeof(source), point, sizeof(point),
++	    "/usr/libexec/xpcproxy", "/usr/libexec/mtmergeprops", &stage, &status);
++	printf("COACHZ apps: original programs union stage %d status %d\n", stage, status);
++	if (stage != 5 || status) { return; }
++	static const char jobs[] = "/private/var/ngpu/owner-apps/LaunchDaemons";
++	static const char job_point[] = "/System/Library/LaunchDaemons";
++	native_gpu_addon_mount(p, scratch, 0x600, jobs, sizeof(jobs), job_point, sizeof(job_point),
++	    "/System/Library/LaunchDaemons/com.apple.mtmergeprops.plist",
++	    "/System/Library/LaunchDaemons/com.coachz.apps.plist", &stage, &status);
++	printf("COACHZ apps: direct job union stage %d status %d\n", stage, status);
++	if (stage != 5 || status) { return; }
++	/* launchd reads this complete boot manifest itself after its first exec. */
++	static const char xpc[] = "/private/var/ngpu/owner-apps/xpc", xpc_point[] = "/System/Library/xpc";
++	native_gpu_addon_mount(p, scratch, 0x800, xpc, sizeof(xpc), xpc_point, sizeof(xpc_point),
++	    "/System/Library/xpc/launchd.plist", "/System/Library/xpc/coachz-apps-manifest", &stage, &status);
++	printf("COACHZ apps: launchd manifest union stage %d status %d\n", stage, status);
++}
++
++static void
+ coachz_gpu_prepare(proc_t p, user_addr_t scratch)
+ {
+ 	unsigned mode = 0;
+ 	if (!PE_parse_boot_argn("coachz-gpu", &mode, sizeof(mode)) || mode != 9) {
+@@ -8879,8 +8897,9 @@
+ 		delay(50000);
+ 	}
+ 	printf("COACHZ gpu: driver ready %d when launchd starts\n", coachz_gpu_ready);
+ 	native_gpu_addon_install(p, scratch);
++	coachz_apps_prepare(p, scratch);
+ 	static const char source[] = "/private/var/ngpu/addons", point[] = "/System/Library/Extensions";
+ 	native_gpu_addon_mount(p, scratch, 0x400, source, sizeof(source), point, sizeof(point), "/System/Library/Extensions/AGXMetalA10.bundle",
+ 	    "/System/Library/Extensions/NativeAdrenoMetal.bundle/Info.plist", &native_gpu_addon_stage, &native_gpu_addon_status);
+ 	printf("COACHZ gpu: plug-in files %d written %d same %d failed %d error %d, mount stage %d status %d\n", native_gpu_addon_files, native_gpu_addon_written,

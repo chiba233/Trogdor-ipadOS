@@ -14,7 +14,7 @@ stack = HERE / 'usb'
 mmc = HERE / 'mmc'
 usbsoc = HERE / 'usbsoc'
 modem = HERE / 'modem'
-for source in sorted(stack.glob('*.c')) + [HERE / 'coachz_usb.c', HERE / 'coachz_usb_hid.c', mmc / 'coachz_sdcc.c', usbsoc / 'coachz_usb_soc.c', modem / 'coachz_ipa_config.c', modem / 'coachz_gsi.c', HERE / 'coachz_modem.c']:
+for source in sorted(stack.glob('*.c')) + [HERE / 'coachz_usb.c', HERE / 'coachz_usb_hid.c', HERE / 'coachz_zed_input.c', mmc / 'coachz_sdcc.c', usbsoc / 'coachz_usb_soc.c', modem / 'coachz_ipa_config.c', modem / 'coachz_gsi.c', HERE / 'coachz_modem.c']:
     destination = out / (source.stem + '.o')
     command, index, arguments = [], 0, record['arguments']
     while index < len(arguments):
@@ -29,7 +29,7 @@ for source in sorted(stack.glob('*.c')) + [HERE / 'coachz_usb.c', HERE / 'coachz
         elif value not in ('-MD', '-MP') and not value.startswith('-DMOCKFS') and value != '-Werror':
             command.append(value)
         index += 1
-    own = source.name == 'coachz_modem.c' or source.parent in (mmc, usbsoc, modem)
+    own = source.name in ('coachz_modem.c', 'coachz_zed_input.c') or source.parent in (mmc, usbsoc, modem)
     if own:
         # Our own code: warnings stay on (but do not fail the archive), and no USB compatibility headers.
         command[1:1] = ['-I', str(modem if source.name == 'coachz_modem.c' else source.parent)]

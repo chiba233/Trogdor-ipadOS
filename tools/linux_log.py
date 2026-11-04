@@ -276,7 +276,16 @@ def main():
     kernel, memory = linux_image(kernel_node.props["data"], cstring(kernel_node.props["compression"]))
     wrapper, layout = compile_wrapper(out, kernel, memory,
         a.xnu_checkpoint.read_bytes() if a.xnu_checkpoint else None, discovery=a.display_discovery, pattern=a.pattern, backlight=a.display_backlight, screen=a.screen, usb_read=a.usb_read)
-    kernel_node.props["data"], kernel_node.props["compression"] = wrapper, string("none")
+    # Depthcharge's FIT loader supports LZMA (fit.c: fit_decompress/ulzman).
+    # A main-OS payload with local packages must remain below the modem archive.
+    if a.screen:
+        compressed = bytearray(lzma.compress(wrapper, format=lzma.FORMAT_ALONE, preset=1))
+        compressed[5:13] = len(wrapper).to_bytes(8, "little")
+        if lzma.decompress(compressed, format=lzma.FORMAT_ALONE) != wrapper:
+            raise ValueError("screen wrapper LZMA round-trip differs")
+        kernel_node.props["data"], kernel_node.props["compression"] = bytes(compressed), string("lzma")
+    else:
+        kernel_node.props["data"], kernel_node.props["compression"] = wrapper, string("none")
     hashes(kernel_node, True)
     count = 0
     for node in images.children:

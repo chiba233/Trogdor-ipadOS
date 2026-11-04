@@ -448,3 +448,33 @@
    return result == 0 ? KERN_SUCCESS : KERN_FAILURE;
  }
  
+@@ -780,6 +972,9 @@
+   return cpuName;
+ }
+ 
++static IOReturn armcpu_spi_attach_locked (uint32_t intid, bool edge, void (*handler) (void *), void *context,
++                                          uint32_t *readback, uint64_t *router);
++
+ // Readback after configuration: bit 0 group 1, bit 1 enabled, bit 2 edge, bits 8..15 priority; IROUTER separately.
+ extern "C" IOReturn armcpu_spi_attach (uint32_t intid, bool edge, void (*handler) (void *), void *context,
+                                        uint32_t *readback, uint64_t *router)
+@@ -787,6 +982,19 @@
+   if (gDist == 0 || armcpu_gic_ready == 0 || handler == nullptr) { return kIOReturnNotReady; }
+   const unsigned interrupts = ((read32 (gDist, 4) & 31) + 1) * 32;
+   if (intid < 32 || intid >= 1020 || intid >= interrupts) { return kIOReturnBadArgument; }
++  // Coachz: drivers attach from their own threads at the same time (both SDHCI slots, the USB host, GPU, Wi-Fi). Unserialized, two
++  // callers read the same gSpiUsed, fill the same slot and one handler is lost: its SPI then fires into "no handler" and is
++  // disabled, and the driver waits for it forever. The slot choice, the GICD read-modify-writes and the publication are one step.
++  static volatile uint32_t attachBusy = 0;
++  while (!__sync_bool_compare_and_swap (&attachBusy, 0U, 1U)) { __asm__ volatile ("yield"); }
++  const IOReturn status = armcpu_spi_attach_locked (intid, edge, handler, context, readback, router);
++  __atomic_store_n (&attachBusy, 0U, __ATOMIC_RELEASE);
++  return status;
++}
++
++static IOReturn armcpu_spi_attach_locked (uint32_t intid, bool edge, void (*handler) (void *), void *context,
++                                          uint32_t *readback, uint64_t *router)
++{
+   const uint32_t used = __atomic_load_n (&gSpiUsed, __ATOMIC_ACQUIRE);
+   for (uint32_t slot = 0; slot < used; slot++) {
+     if (gSpi[slot].id == intid) { return kIOReturnExclusiveAccess; }

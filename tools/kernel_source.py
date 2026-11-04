@@ -102,7 +102,7 @@ def patched_feeds(base, platform, out):
         shutil.rmtree(patched, ignore_errors=True)
         shutil.copytree(reference, patched, ignore=shutil.ignore_patterns('.git'))
         subprocess.run(['patch', '--batch', '--silent', '-p1', '-d', str(patched), '-i', str(patch)], check=True)
-        options += ['--local-module', 'driver:' + patch.stem + '=' + str(patched)]
+        options += ['--local-module', entry['kind'] + ':' + patch.stem + '=' + str(patched)]
     return options
 
 
@@ -229,6 +229,9 @@ def main():
                 os.environ['XNU_EXTRA_LD_ARCHIVES'] += ' -Wl,-force_load,' + str(ctx.tree / 'build/coachz-gpu/libCoachzGpu.a')
             if (ROOT / 'platform' / a.platform / 'scripts/build-coachz-wifi-net.py').is_file():
                 os.environ['XNU_EXTRA_LD_ARCHIVES'] += ' -Wl,-force_load,' + str(ctx.tree / 'build/coachz-wifi-net/libCoachzWifiNet.a')
+            if (ROOT / 'platform' / a.platform / 'scripts/build-coachz-usb-host.py').is_file():
+                # The Apple USB host stack's platform side; it calls the SMMU kit that libCoachzGpu.a carries.
+                os.environ['XNU_EXTRA_LD_ARCHIVES'] += ' -Wl,-force_load,' + str(ctx.tree / 'build/coachz-usb-host/libCoachzUsbHost.a')
         kernel.build(ctx, modules)
         candidate = ctx.tree / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf'
         if not candidate.is_file():

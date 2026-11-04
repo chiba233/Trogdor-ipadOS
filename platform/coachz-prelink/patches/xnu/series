@@ -132,5 +132,15 @@ coachz-prelink-smart-cover.patch
 # The Wi-Fi registry derives from the original IONetworkingFamily: its own IONetworkStack personality is removed before IOBSD.
 coachz-prelink-network-family.patch
 
+# The Apple USB host stack is prelinked for coachz-usb-host=1 (CoachzUsbHost.cpp); without it IOUSBHostFamily's resource services stay out.
+coachz-prelink-usb-host.patch
+
+# Explicit local app installation and the rootless package environment.
+coachz-prelink-apps.patch
+
+# Probes of finished work removed on the final sources: touch (K42/K43/K45/K47), usermanagerd and SpringBoard exit capture, the
+# LaunchServices/lsd/kill traces (LS, LSD, K39) and the memcpy line. Everything above stays as it was accepted.
+coachz-prelink-probe-cleanup.patch
+
 # /chosen/coachz-baseband: the cellular bridge (pending/baseband): QRTR hooks in the Wi-Fi thread, its firmware on the Data volume, CommCenter running.
 coachz-prelink-baseband.patch

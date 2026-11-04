@@ -54,9 +54,6 @@ extern "C" void coachz_gpu_pm_arm(void);
 extern "C" struct NativeAdrenoClientRecord {char name[20]; uint32_t opens, refused, closes, slot, peak_mib, last_refusal;} native_adreno_client_log[8];
 extern "C" volatile uint32_t native_adreno_mount_fail[4];
 extern "C" volatile uint64_t native_gop_gpu_offers, native_gop_gpu_completions, native_gop_gpu_failures, native_gop_gpu_abandoned;
-extern "C" void *memprobe_cpu_to_processor(int) __asm__("_cpu_to_processor");
-extern "C" void *memprobe_thread_bind(void *) __asm__("_thread_bind");
-extern "C" int memprobe_thread_block(void *) __asm__("_thread_block");
 extern kmod_info_t g_kernel_kmod_info;
 extern "C" volatile uint32_t native_adreno_io_coherent;
 extern "C" volatile uint32_t native_adreno_coherent_skips[4];
@@ -950,59 +947,7 @@ void cacheSetup() {
     report("after");
 }
 
-// Memory bandwidth and latency on an A55 and an A76, with loops the same as a Debian baseline's on this hardware (Debian: chase 132-136 ns,
-// A76 read 11-13 GB/s; here without a vote 195-199 ns and 8 GB/s, after coachz_wifi.c's DDR vote 134-142 ns and 11-12 GB/s on hardware).
-// Run 40 s after the driver starts, then again once the vote (coachz-ddr-vote=1 at start, 2 at 150 s) has been sent, labelled with its result.
-extern "C" volatile uint32_t coachz_ddr_voted;
 extern "C" void coachz_gpu_trace_start(void);   // bsd/dev/coachz_trace.c, coachz-gpu-trace=1
-void memoryProbeRun(volatile uint64_t *b, const char *label) {
-    enum : uint32_t {Bytes = 32u << 20, Line = 64, Passes = 8, Hops = 2000000};
-    static const int cpus[2] = {0, 6};
-    for (int c = 0; c < 2; ++c) {
-        memprobe_thread_bind(memprobe_cpu_to_processor(cpus[c]));
-        memprobe_thread_block(nullptr);
-        for (int round = 0; round < 3; ++round) {
-            uint64_t sum = 0;
-            uint64_t start = ringNow(nullptr);
-            for (uint32_t p = 0; p < Passes; ++p) for (uint32_t i = 0; i < Bytes / 8; i += 4) sum += b[i] + b[i + 1] + b[i + 2] + b[i + 3];
-            const uint64_t read = ringNow(nullptr) - start;
-            start = ringNow(nullptr);
-            for (uint32_t p = 0; p < Passes; ++p) for (uint32_t i = 0; i < Bytes / 8; i += 4) {b[i] = p; b[i + 1] = p; b[i + 2] = p; b[i + 3] = p;}
-            const uint64_t write = ringNow(nullptr) - start;
-            const uint32_t lines = Bytes / Line, step = (40503u % lines) | 1u;
-            volatile uint32_t *q = reinterpret_cast<volatile uint32_t *>(b);
-            for (uint32_t i = 0; i < lines; ++i) q[i * Line / 4] = ((i + step) % lines) * Line / 4;
-            start = ringNow(nullptr);
-            uint32_t at = 0;
-            for (uint32_t i = 0; i < Hops; ++i) at = q[at];
-            const uint64_t chase = ringNow(nullptr) - start;
-            printf("COACHZ mem%s: cpu %d read %llu MB/s write %llu MB/s chase %llu ns (%u %llu)\n", label, cpus[c],
-                static_cast<unsigned long long>(uint64_t(Bytes) * Passes / (read ? read : 1)), static_cast<unsigned long long>(uint64_t(Bytes) * Passes / (write ? write : 1)),
-                static_cast<unsigned long long>(chase * 1000 / Hops), at, static_cast<unsigned long long>(sum & 1));
-        }
-    }
-    memprobe_thread_bind(nullptr);
-    memprobe_thread_block(nullptr);
-}
-
-void memoryProbeThread(void *, wait_result_t) {
-    IOSleep(40000);
-    IOBufferMemoryDescriptor *memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, static_cast<IOOptionBits>(kIODirectionInOut) | kIOMemoryPhysicallyContiguous, 32u << 20, 4096);
-    if (!memory) {
-        printf("COACHZ mem: no buffer\n");
-        return;
-    }
-    volatile uint64_t *b = static_cast<volatile uint64_t *>(memory->getBytesNoCopy());
-    memoryProbeRun(b, "");
-    unsigned vote = 0;
-    if (PE_parse_boot_argn("coachz-ddr-vote", &vote, sizeof(vote)) && (vote == 1 || vote == 2)) {
-        for (unsigned waited = 0; waited < 600 && !coachz_ddr_voted; ++waited) IOSleep(1000);
-        IOSleep(2000);
-        memoryProbeRun(b, coachz_ddr_voted == 1 ? " voted" : coachz_ddr_voted == 2 ? " vote-failed" : " no-vote");
-    }
-    memory->release();
-}
-
 // The SQE firmware, the kit's GPU context and the CP's first packets.
 bool startCp(volatile uint8_t *smmu, size_t smmuBytes, const uint32_t *sqe, uint32_t sqeBytes) {
     *reinterpret_cast<volatile uint32_t *>(smmu + SmmuScr0) = *reinterpret_cast<volatile uint32_t *>(smmu + SmmuScr0) | SmmuKitGlobal;
@@ -1251,7 +1196,6 @@ extern "C" int coachz_gpu_driver_start(volatile uint8_t *core, volatile uint8_t 
     printf("COACHZ gpu9: accelerator %d\n", accelerator);
     thread_t thread = THREAD_NULL;
     if (kernel_thread_start(reportThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
-    if (kernel_thread_start(memoryProbeThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
     cacheSetup();
     if (kernel_thread_start(rateThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
     native_adreno_power_get = pmGet;

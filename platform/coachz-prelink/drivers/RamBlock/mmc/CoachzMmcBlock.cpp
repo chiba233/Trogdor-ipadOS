@@ -22,7 +22,6 @@ int coachz_sdcc_enabled(int slot);
 int coachz_sdcc_write(int slot, uint64_t block, uint32_t count, const void *data);
 int coachz_sdcc_writable(int slot);
 int coachz_sdcc_write_allowed(int slot, uint64_t block, uint32_t count);
-void coachz_sdcc_write_selftest(int slot);
 void coachz_mmc_start(void);
 kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
 void thread_deallocate(thread_t);
@@ -142,7 +141,6 @@ static void coachz_mmc_slot_thread(void *parameter, wait_result_t)
   const int slot = static_cast<int>(reinterpret_cast<uintptr_t>(parameter));
   uint64_t blocks = 0;
   if (!coachz_sdcc_open(slot, &blocks)) return;
-  coachz_sdcc_write_selftest(slot);   // before anything above the driver can use the disk
   IOService *resources = IOService::getResourceService();
   CoachzMmcBlock *device = OSTypeAlloc(CoachzMmcBlock);
   bool started = device && device->init(nullptr) && device->setSlot(slot, blocks) && resources && device->attach(resources);

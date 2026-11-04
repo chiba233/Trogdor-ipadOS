@@ -62,9 +62,9 @@ class MmcTests(unittest.TestCase):
         # Each window by its GPT name at exactly where it was carved; the log and Data only with the system on this disk.
         self.assertIn('{"coachz-scratch", 242171904ull, 2097152ull, 0},', source)
         self.assertIn('{"coachz-log", 126803968ull, 524288ull, 1},', source)
-        self.assertIn('{"coachz-data", 127328256ull, 114843648ull, 1},', source)
-        # The write test's probes just outside scratch would land in Data, which ends where scratch starts.
-        self.assertIn('if (slot == 0 && coachz_emmc_root()) return;', source)
+        self.assertIn('{"coachz-data", 127328256ull, 113795072ull, 1},', source)
+        # The boot-time write and speed self-test is gone: nothing writes the card or the eMMC unasked at boot.
+        self.assertNotIn('coachz_sdcc_write_selftest', source)
         write = source[source.index('int coachz_sdcc_write(int slot, uint64_t block, uint32_t count, const void *source)'):]
         check = write.index('s->writes_refused++;')
         self.assertLess(check, write.index('request(s, &cmd, &d)'))   # the window is checked before any command

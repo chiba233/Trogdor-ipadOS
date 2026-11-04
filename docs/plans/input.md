@@ -7,7 +7,7 @@
 | 位置 | 内容 | 启用方式 |
 |---|---|---|
 | `patches/xnu/coachz-prelink-input.patch` | `iokit/Kernel/CoachzInput.cpp`：在 `IOHIDResource` 下、触摸数字化仪旁边发布 ShengHidInput 的键盘/Consumer 设备（`native_hid_input_allocate`，报告 1 为 boot 键盘，报告 2 的第 1～3 位为 Power、音量加、音量减），并为它加一个内核 IOHIDEventDriver personality（与 CoachzHid.cpp 给数字化仪的做法相同）；每 20 ms 用 `EC_CMD_MKBP_INFO` 读 EC 按键的**当前状态**，变化时发报告 2；导出 `coachz_input_keyboard_report()` 给 USB 键盘发报告 1 | `series` 中放在电池补丁之后；`coachz-buttons=1`（只有音量）或 `=3`（加上电源键） |
-| `drivers/RamBlock/coachz_usb_hid.c` | Zed 底座键盘（USB `18d1:504c` 的接口 0）：`usb_hid_init()` 留在 report protocol、SET_IDLE 0、开一个 interrupt-IN 队列，12 字节报告的按键进 report 1，顶排 18 个动作键进 report 4；`coachz_usb_hid_poll()` 取报告转给上面的函数；`coachz_usb_enumerate_hubs()` 开机时只轮询 hub 一秒 | 见同目录 `README.md` 的五步接线 |
+| `drivers/RamBlock/coachz_usb_hid.c`、`coachz_zed_input.c` | Zed 底座键盘（USB `18d1:504c` 的接口 0）和触控板（接口 2）。`coachz_usb_hid.c` 是 libpayload 传输：`usb_hid_init()` 留在 report protocol、SET_IDLE 0、开 interrupt-IN 队列，`coachz_usb_hid_poll()` 取报告，`coachz_usb_enumerate_hubs()` 开机时只轮询 hub 一秒。`coachz_zed_input.c` 是与传输无关的解码：12 字节报告的按键进 report 1，顶排 18 个动作键进 report 4，触控板换算成鼠标进 report 5；Apple USB 栈下由 `CoachzUsbHost.cpp` 的 HID 桥接喂它（`docs/plans/usb-host.md`） | 见同目录 `README.md` 的五步接线 |
 
 `input.patch` 与 `speaker.patch` 互不依赖，都以 `battery.patch` 为前提；电池→扬声器→输入、电池→输入→扬声器两种顺序都已验证能打上。
 

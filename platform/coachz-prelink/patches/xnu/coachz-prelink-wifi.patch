@@ -730,8 +730,8 @@
 + * disk for wifi_mpss_boot.
 + */
 +#define WIFI_FW_BLOB_USB (144ull << 20)
-+/* With the system on the eMMC the kernel partition is coachz-kernel (GPT entry 6, at block 107954176): the blob is 143 MiB into it, as on the USB disk. */
-+#define WIFI_FW_BLOB_EMMC ((107954176ull << 9) + (143ull << 20))
++/* With the system on the eMMC the kernel partition is coachz-kernel (GPT entry 6, 512 MiB at block 241123328): the blob is 143 MiB into it, as on the USB disk. */
++#define WIFI_FW_BLOB_EMMC ((241123328ull << 9) + (143ull << 20))
 +static uint64_t wifi_fw_blob = WIFI_FW_BLOB_USB;
 +static uint8_t wifi_fw_header[4096];
 +static uint8_t *volatile wifi_mba_image;

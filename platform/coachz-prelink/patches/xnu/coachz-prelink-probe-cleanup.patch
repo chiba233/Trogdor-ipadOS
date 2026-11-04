@@ -1,0 +1,1034 @@
+--- a/bsd/dev/coachz_sample.c
++++ b/bsd/dev/coachz_sample.c
+@@ -18,8 +18,7 @@
+ extern void coachz_sample_task(const char *, int, task_t);
+ extern void coachz_root_prepare(void);
+ extern void coachz_usb_report(void);
+-extern int coachz_usermanager_report(void);
+-extern int coachz_springboard_report(void);
++extern int coachz_periodic_report(void);
+ 
+ static int
+ coachz_sample_proc(proc_t p, __unused void *arg)
+@@ -71,8 +70,7 @@
+ 
+ 		(void)tsleep(&chan, PZERO, "coachz", 10 * hz);
+ 		coachz_thermal_poll(); /* before diagnostic early-continue branches */
+-		/* Keep the captured note readable on the wrapping screen console. */
+-		if (coachz_springboard_report() || coachz_usermanager_report() || ++ticks < 6) {
++		if (coachz_periodic_report() || ++ticks < 6) {
+ 			continue;
+ 		}
+ 		ticks = 0;
+@@ -80,7 +78,6 @@
+ 		printf("COACHZ alive: %lu s\n", (unsigned long)sec);
+ 		proc_iterate(PROC_ALLPROCLIST, coachz_sample_proc, NULL, NULL, NULL);
+ 		coachz_usb_report();
+-		(void)coachz_usermanager_report();
+ 	}
+ }
+ 
+--- a/bsd/dev/coachz_touch.c
++++ b/bsd/dev/coachz_touch.c
+@@ -119,7 +119,6 @@
+ }
+ 
+ /* For the periodic report (osfmk/arm64/coachz_thread.c). */
+-char coachz_touch_status[3][160];
+ volatile uint32_t coachz_touch_reports;
+ 
+ /*
+@@ -148,16 +147,11 @@
+ #define FRAME_CONTACTS 10
+ /*
+  * coachz-touch-flip: bit 0 mirrors x, bit 1 mirrors y, bit 2 swaps the axes (applied after mirroring), so the panel orientation
+- * can be matched from a boot argument alone. The stroke record keeps raw controller coordinates for that decision.
++ * can be matched from a boot argument alone.
+  */
+ static unsigned touch_flip;
+-static uint32_t stroke_count, stroke_frames;
+-static int stroke_first[2] = { -1, -1 }, stroke_last[2] = { -1, -1 };
+-char coachz_touch_stroke[160];
+-/* What the latest frame left down: the contacts with their tip switch set, since when, and when a report last arrived. When the
+- * interface stops answering, these say whether the controller still reports a finger down (one never lifted) or nothing at all. */
+-static volatile uint32_t touch_down_now, touch_down_most;
+-static volatile uint64_t touch_down_since, touch_report_at;
++/* When a report last arrived: the sticky-fingers release runs 100 ms after it. */
++static volatile uint64_t touch_report_at;
+ 
+ /*
+  * Frames as hid-multitouch.c assembles them for this part's class (Debian binds hid-multitouch with quirks 0x51c10, MT_CLS_WIN_8:
+@@ -171,7 +165,6 @@
+ static struct { int id; unsigned x, y; } frame_contact[FRAME_CONTACTS];
+ static unsigned frame_count, frame_expected, frame_received;
+ static uint8_t frame_seen[128], touch_active[128];
+-static uint32_t frame_palms, frame_continued, frame_duplicates, frame_sticky;
+ 
+ /*
+  * input_mt_get_slot_by_key, which mt_compute_slot uses for this class: a contact keeps its slot while it is down, a new one takes the
+@@ -180,7 +173,6 @@
+  * path index of MAX_PATH_COUNT (30) or more; the controller's own identifiers roll through 0..127.
+  */
+ static struct { bool active; unsigned key; } mt_slot[FRAME_CONTACTS];
+-static uint32_t frame_slots_most, frame_slot_overflow, frame_new_contacts, frame_raw_id_most, frame_raw_id_high;
+ 
+ static int
+ mt_slot_by_key(unsigned key, const bool *used)
+@@ -194,20 +186,9 @@
+ 		if (!mt_slot[s].active && !used[s]) {
+ 			mt_slot[s].active = true;
+ 			mt_slot[s].key = key;
+-			frame_new_contacts++;
+-			if (key > frame_raw_id_most) {
+-				frame_raw_id_most = key;
+-			}
+-			if (key >= 30) {
+-				frame_raw_id_high++;
+-			}
+-			if (s + 1 > frame_slots_most) {
+-				frame_slots_most = s + 1;
+-			}
+ 			return (int)s;
+ 		}
+ 	}
+-	frame_slot_overflow++;
+ 	return -1;
+ }
+ 
+@@ -223,8 +204,6 @@
+ 	const unsigned contact_count = input[3 + REPORT_FINGERS * 8];
+ 	if (contact_count > 0) {
+ 		frame_expected = contact_count;
+-	} else if (frame_received) {
+-		frame_continued++;
+ 	}
+ 	for (unsigned finger = 0; finger < REPORT_FINGERS; finger++) {
+ 		if (frame_received >= frame_expected) {
+@@ -233,7 +212,6 @@
+ 		const uint8_t *f = input + 3 + finger * 8;
+ 		const unsigned id = f[1] >> 1;
+ 		if (frame_seen[id]) {
+-			frame_duplicates++;
+ 			continue;
+ 		}
+ 		frame_seen[id] = 1;
+@@ -243,7 +221,6 @@
+ 			continue;
+ 		}
+ 		if (!(f[1] & 1)) {
+-			frame_palms++;
+ 			continue;
+ 		}
+ 		if (frame_count < FRAME_CONTACTS) {
+@@ -273,7 +250,6 @@
+ 	frame_count = frame_received = 0;
+ 	bzero(frame_seen, sizeof(frame_seen));
+ 	bzero(touch_active, sizeof(touch_active));
+-	frame_sticky++;
+ 	publish_frame();
+ }
+ 
+@@ -302,14 +278,6 @@
+ 		}
+ 		used[slot] = true;
+ 		if (!count) {
+-			if (stroke_first[0] < 0) {
+-				stroke_first[0] = (int)rx;
+-				stroke_first[1] = (int)ry;
+-				stroke_frames = 0;
+-			}
+-			stroke_last[0] = (int)rx;
+-			stroke_last[1] = (int)ry;
+-			stroke_frames++;
+ 		}
+ 		unsigned ux = (touch_flip & 1) ? 12960 - rx : rx, uy = (touch_flip & 2) ? 8640 - ry : ry;
+ 		ids[count] = slot;
+@@ -326,22 +294,7 @@
+ 		if (!used[s]) {
+ 			mt_slot[s].active = false;
+ 		}
+-	}
+-	const uint64_t at = mach_absolute_time();
+-	if (count && !touch_down_now) {
+-		touch_down_since = at;
+ 	}
+-	if (count > touch_down_most) {
+-		touch_down_most = count;
+-	}
+-	touch_down_now = count;
+-	if (!count && stroke_first[0] >= 0) {
+-		stroke_count++;
+-		snprintf(coachz_touch_stroke, sizeof(coachz_touch_stroke),
+-		    "K43 stroke %u: raw first %d,%d last %d,%d over %u frames (x 0..12960 along 2160 px, y 0..8640), flip %u",
+-		    stroke_count, stroke_first[0], stroke_first[1], stroke_last[0], stroke_last[1], stroke_frames, touch_flip);
+-		stroke_first[0] = -1;
+-	}
+ 	uint32_t seq = native_touch_seq;
+ 	native_touch_seq = seq + 1;
+ 	__asm__ volatile ("dmb ish" ::: "memory");
+@@ -710,32 +663,24 @@
+ static void
+ touch_thread(__unused void *arg, __unused wait_result_t result)
+ {
+-	char *s0 = coachz_touch_status[0], *s1 = coachz_touch_status[1], *s2 = coachz_touch_status[2];
+ 	int err = 0;
+ 	extern int armcpu_spi_attach(uint32_t, bool, void (*)(void *), void *, uint32_t *, uint64_t *);   /* ArmCpu.cpp, IOReturn */
+ 
+-	snprintf(s0, 160, "K42 touch: mapping");
+ 	st.gcc = ml_io_map(GCC_PA, 0x60000);
+ 	st.north = ml_io_map(TLMM_NORTH_PA, 0x10000);
+ 	st.west = ml_io_map(TLMM_WEST_PA + GPIO_CFG(115), 0x2000) - GPIO_CFG(115);
+ 	st.se = ml_io_map(SE4_PA, 0x4000);
+ 	if (!st.gcc || !st.north || st.west == (vm_offset_t)-GPIO_CFG(115) || !st.se) {
+-		snprintf(s0, 160, "K42 touch: MMIO mapping failed");
++		printf("COACHZ touch: MMIO mapping failed\n");
+ 		goto out;
+ 	}
+-	/* What firmware left: votes, S4 branch, DFS, SE firmware and FIFOs, the pins, the interrupt level and its TLMM configuration. */
+-	snprintf(s0, 160, "K42 touch: fw vote %x cbcr %x dfs %x/%x se fw %x status %x hw %x/%x pins 8 %x/%x 9 %x/%x intr %x/%x",
+-	    rd(st.gcc, GCC_VOTE), rd(st.gcc, GCC_S4_CBCR), rd(st.gcc, GCC_S4_DFS_CMD), rd(st.gcc, GCC_S4_DFS_L0),
+-	    rd(st.se, SE_FW), rd(st.se, SE_STATUS), rd(st.se, SE_HW_TX), rd(st.se, SE_HW_RX), rd(st.north, GPIO_CFG(8)),
+-	    rd(st.north, GPIO_IO(8)), rd(st.north, GPIO_CFG(9)), rd(st.north, GPIO_IO(9)), rd(st.north, GPIO_INTR_CFG(9)),
+-	    rd(st.north, GPIO_INTR_STATUS(9)));
+ 	if (!clocks_on()) {
+-		snprintf(s1, 160, "K42 touch: clocks: cbcr %x dfs %x/%x", rd(st.gcc, GCC_S4_CBCR),
++		printf("COACHZ touch: clocks: cbcr %x dfs %x/%x\n", rd(st.gcc, GCC_S4_CBCR),
+ 		    rd(st.gcc, GCC_S4_DFS_CMD), rd(st.gcc, GCC_S4_DFS_L0));
+ 		goto out;
+ 	}
+ 	if (!engine_init()) {
+-		snprintf(s1, 160, "K42 touch: SE4 not an idle I2C engine with 32-bit FIFOs: fw %x status %x hw %x/%x",
++		printf("COACHZ touch: SE4 not an idle I2C engine with 32-bit FIFOs: fw %x status %x hw %x/%x\n",
+ 		    rd(st.se, SE_FW), rd(st.se, SE_STATUS), rd(st.se, SE_HW_TX), rd(st.se, SE_HW_RX));
+ 		goto out;
+ 	}
+@@ -760,7 +705,7 @@
+ 		err = reg_read(HID_DESC_REG, st.desc, sizeof(st.desc));
+ 	}
+ 	if (err) {
+-		snprintf(s1, 160, "K42 touch: address probe / HID descriptor %d irq %x status %x int %x", err, st.irq_seen,
++		printf("COACHZ touch: address probe / HID descriptor %d irq %x status %x int %x\n", err, st.irq_seen,
+ 		    rd(st.se, SE_STATUS), rd(st.north, GPIO_IO(9)));
+ 		goto out;
+ 	}
+@@ -770,11 +715,10 @@
+ 	st.max_input = le16_at(st.desc + 10);
+ 	st.command_reg = le16_at(st.desc + 16);
+ 	st.data_reg = le16_at(st.desc + 18);
+-	snprintf(s1, 160, "K42 touch: desc len %u bcd %x vid %04x pid %04x ver %x | report %u at %x, input %x max %u, cmd %x data %x",
+-	    le16_at(st.desc), le16_at(st.desc + 2), le16_at(st.desc + 20), le16_at(st.desc + 22), le16_at(st.desc + 24),
+-	    st.report_length, st.report_reg, st.input_reg, st.max_input, st.command_reg, st.data_reg);
+ 	if (le16_at(st.desc) != 30 || le16_at(st.desc + 2) != 0x0100 || !st.report_length || st.report_length > MAX_RX ||
+ 	    st.max_input < 2 || st.max_input > sizeof(st.input)) {
++		printf("COACHZ touch: HID descriptor not usable: len %u bcd %x report %u max input %u\n", le16_at(st.desc), le16_at(st.desc + 2),
++		    st.report_length, st.max_input);
+ 		goto out;
+ 	}
+ 	/* i2c_hid_init_irq: GPIO9 level low (msm_gpio_irq_set_type: target the apps processor, raw status on, level, active low,
+@@ -787,13 +731,13 @@
+ 	st.gicd = ml_io_map(GICD_PA, 0x1000);
+ 	const bool foreign = st.gicd && (rd(st.gicd, GICD_ISPENDR(TLMM_SUMMARY_INTID)) & (1u << (TLMM_SUMMARY_INTID % 32u)));
+ 	if (!st.gicd || foreign) {
+-		printf("K42 touch: TLMM summary interrupt %s, not attached\n", st.gicd ? "already pending from another GPIO" : "unmapped GIC");
++		printf("COACHZ touch: TLMM summary interrupt %s, not attached\n", st.gicd ? "already pending from another GPIO" : "unmapped GIC");
+ 		goto out;
+ 	}
+ 	const int attached = armcpu_spi_attach(TLMM_SUMMARY_INTID, false, touch_irq, NULL, &readback, &router);
+-	printf("K42 touch: TLMM summary interrupt %u attached 0x%x (gic 0x%x router 0x%llx), GPIO9 intr cfg %x\n", TLMM_SUMMARY_INTID,
+-	    (unsigned)attached, readback, router, rd(st.north, GPIO_INTR_CFG(9)));
+-	if (attached) {
++	if (attached) {
++		printf("COACHZ touch: TLMM summary interrupt %u not attached: 0x%x (gic 0x%x router 0x%llx)\n", TLMM_SUMMARY_INTID,
++		    (unsigned)attached, readback, router);
+ 		goto out;
+ 	}
+ 	irq_unmask();
+@@ -811,7 +755,7 @@
+ 			}
+ 		}
+ 		if (st.reset_pending) {
+-			printf("K42 touch: device did not ack reset within 1000 ms\n");
++			printf("COACHZ touch: device did not ack reset within 1000 ms\n");
+ 			st.reset_pending = false;
+ 		}
+ 		err = set_power(true);
+@@ -820,25 +764,15 @@
+ 		err = reg_read(st.report_reg, st.report, st.report_length);
+ 	}
+ 	if (err) {
+-		snprintf(s2, 160, "K42 touch: power / reset / report descriptor %d irq %x", err, st.irq_seen);
++		printf("COACHZ touch: power / reset / report descriptor %d irq %x\n", err, st.irq_seen);
+ 		goto out;
+ 	}
+-	printf("K42 touch: reset acknowledged %u, interrupts %u (spurious %u), report descriptor %u bytes\n", resets_done, st.irqs,
+-	    st.spurious, st.report_length);
+ 	/* i2c_hid_start and open: reports go to the digitizer from now on. */
+ 	st.started = true;
+ 	coachz_hid_touch_start();
+-	/* Every interrupt: one report read, then unmasked (the line, still low, interrupts again). A line per second with input. */
+-	extern volatile uint64_t native_gop_gpu_completions __attribute__((weak));
+-	/* ShengHidInput (patches/feeds): what its event driver handed backboardd (collections, fingers, identifiers held touched,
+-	 * duplicates, hands, touches begun twice, untouches without a touch, cancels). */
+-	extern volatile uint32_t coachz_hid_observed[8] __attribute__((weak));
+-	uint32_t irqs_last = st.irqs, reports_last = coachz_touch_reports, hid_last = native_touch_hid_reports, spurious_last = st.spurious;
+-	unsigned errors_last = 0, unasked_last = 0, short_last = 0, quiet = 0;
+-	uint64_t frames_last = &native_gop_gpu_completions ? native_gop_gpu_completions : 0, second_start = mach_absolute_time(), one_second;
+-	uint64_t heartbeat = second_start, interval, sticky;
++	/* Every interrupt: one report read, then unmasked (the line, still low, interrupts again). */
++	uint64_t heartbeat = mach_absolute_time(), interval, sticky;
+ 	nanoseconds_to_absolutetime(100 * NSEC_PER_MSEC, &sticky);
+-	nanoseconds_to_absolutetime(NSEC_PER_SEC, &one_second);
+ 	nanoseconds_to_absolutetime(10 * NSEC_PER_SEC, &interval);
+ 	for (;;) {
+ 		if (irq_wait(100)) {
+@@ -850,65 +784,15 @@
+ 		if (now - touch_report_at >= sticky && touch_any_active()) {
+ 			touch_release_all();
+ 		}
+-		if (now - second_start >= one_second) {
+-			const uint32_t irqs = st.irqs - irqs_last, reports = coachz_touch_reports - reports_last;
+-			const unsigned problems = (input_errors - errors_last) + (resets_unasked - unasked_last) + (short_reads - short_last) +
+-			    (st.spurious - spurious_last);
+-			if (irqs || problems || !quiet) {
+-				const uint64_t frames = &native_gop_gpu_completions ? native_gop_gpu_completions : 0;
+-				uint64_t held = 0;
+-				if (touch_down_now) {
+-					absolutetime_to_nanoseconds(now - touch_down_since, &held);
+-				}
+-				printf("K45 touch 1s: interrupts %u, reports %u to HID %u, frames %llu, read errors %u, unasked resets %u, bad lengths %u, "
+-				    "spurious %u%s, line %s, intr cfg %x\n", irqs, reports,
+-				    native_touch_hid_reports - hid_last, frames - frames_last, input_errors - errors_last, resets_unasked - unasked_last,
+-				    short_reads - short_last, st.spurious - spurious_last, st.storm ? " (storm: interrupt disabled)" : "",
+-				    (rd(st.north, GPIO_IO(9)) & 1u) ? "high" : "low", rd(st.north, GPIO_INTR_CFG(9)));
+-				/* Lines of their own: the log ring cuts a long one. */
+-				printf("K47 down %u for %llu ms, most %u, strokes %u, palms %u continued %u duplicates %u sticky %u\n", touch_down_now,
+-				    held / NSEC_PER_MSEC, touch_down_most, stroke_count, frame_palms, frame_continued, frame_duplicates, frame_sticky);
+-				printf("K47 slots most %u overflow %u, new contacts %u, raw id most %u, at 30 or more %u\n", frame_slots_most,
+-				    frame_slot_overflow, frame_new_contacts, frame_raw_id_most, frame_raw_id_high);
+-				printf("K47 hid out %u fingers %u held %u dup %u hand %u rebegin %u lone up %u cancel %u\n",
+-				    &coachz_hid_observed ? coachz_hid_observed[0] : 0, &coachz_hid_observed ? coachz_hid_observed[1] : 0,
+-				    &coachz_hid_observed ? coachz_hid_observed[2] : 0, &coachz_hid_observed ? coachz_hid_observed[3] : 0,
+-				    &coachz_hid_observed ? coachz_hid_observed[4] : 0, &coachz_hid_observed ? coachz_hid_observed[5] : 0,
+-				    &coachz_hid_observed ? coachz_hid_observed[6] : 0, &coachz_hid_observed ? coachz_hid_observed[7] : 0);
+-			}
+-			/* Each second's own frames, printed or not: a line after quiet seconds used to report their sum. */
+-			frames_last = &native_gop_gpu_completions ? native_gop_gpu_completions : 0;
+-			quiet = !irqs && !problems;
+-			irqs_last = st.irqs;
+-			reports_last = coachz_touch_reports;
+-			hid_last = native_touch_hid_reports;
+-			spurious_last = st.spurious;
+-			errors_last = input_errors;
+-			unasked_last = resets_unasked;
+-			short_last = short_reads;
+-			second_start = now;
+-		}
+ 		if (now - heartbeat >= interval) {
+ 			heartbeat = now;
+ 			uint64_t ns;
+ 			absolutetime_to_nanoseconds(heartbeat, &ns);
+ 			printf("K44 alive %llu s, touch reports %u, interrupts %u, io_submap %llu KiB\n", ns / NSEC_PER_SEC, coachz_touch_reports,
+ 			    st.irqs, coachz_io_submap_bytes / 1024);
+-			if (touch_down_now) {
+-				/* Reports stopped with a contact down: the digitizer still holds that touch. */
+-				uint64_t held = 0, quiet_ns = 0;
+-				absolutetime_to_nanoseconds(now - touch_down_since, &held);
+-				absolutetime_to_nanoseconds(now - touch_report_at, &quiet_ns);
+-				printf("K45 touch: %u contacts down for %llu ms, last report %llu ms ago, line %s\n", touch_down_now, held / NSEC_PER_MSEC,
+-				    quiet_ns / NSEC_PER_MSEC, (rd(st.north, GPIO_IO(9)) & 1u) ? "high" : "low");
+-			}
+ 		}
+-		const uint8_t *p = st.input;
+-		snprintf(s2, 160, "K42 touch: reports %u interrupts %u errors %u resets %u/%u, to HID %u fingers %u: %02x%02x %02x %02x%02x%02x%02x",
+-		    coachz_touch_reports, st.irqs, input_errors, resets_done, resets_unasked, native_touch_hid_reports, native_touch_count, p[0], p[1],
+-		    p[2], p[3], p[4], p[5], p[6]);
+ 		if (st.dead) {
+-			printf("K42 touch: I2C engine stopped\n");
++			printf("COACHZ touch: I2C engine stopped\n");
+ 			break;
+ 		}
+ 	}
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1898,28 +1898,10 @@
+ 	int create_corpse = FALSE;
+ 	bool corpse_source = false;
+ 	task_t task = proc_task(p);
+-
+-	/* Observe usermanagerd exits without assuming their caller; retain normal task counts too. */
+-	if (!strcmp(p->p_name, "usermanagerd") || !strcmp(p->p_comm, "usermanagerd")) {
+-		extern void coachz_usermanager_exit(int, unsigned, uint64_t, const char *, task_t, int, int, int);
+-		os_reason_t reason = p->p_exit_reason;
+-		coachz_usermanager_exit(proc_getpid(p), reason ? reason->osr_namespace : 0,
+-		    reason ? reason->osr_code : 0, exit_reason_get_string_desc(reason), task,
+-		    p == current_proc(), proc_getpid(current_proc()), rv);
+-	}
+-
+ 
+ 	if (p == current_proc() && rv) {
+ 		extern void coachz_crash_capture(const char *, int, int);
+ 		coachz_crash_capture(p->p_name, proc_getpid(p), rv);
+-	}
+-
+-	if (!strcmp(p->p_name, "SpringBoard") || !strcmp(p->p_comm, "SpringBoard")) {
+-		extern void coachz_springboard_exit(int, int, unsigned, uint64_t, const char *, task_t, int, int);
+-		os_reason_t reason = p->p_exit_reason;
+-		coachz_springboard_exit(proc_getpid(p), rv, reason ? reason->osr_namespace : 0,
+-		    reason ? reason->osr_code : 0, exit_reason_get_string_desc(reason), task,
+-		    p == current_proc(), proc_getpid(current_proc()));
+ 	}
+ 
+ 	if (p->p_crash_behavior != 0 || p == initproc) {
+--- a/bsd/kern/sys_generic.c
++++ b/bsd/kern/sys_generic.c
+@@ -680,11 +680,6 @@
+ 	uio_t uio;
+ 	int spacetype = IS_64BIT_PROCESS(p) ? UIO_USERSPACE64 : UIO_USERSPACE32;
+ 
+-	if ((fd == 1 || fd == 2) &&
+-	    (!strcmp(p->p_name, "SpringBoard") || !strcmp(p->p_comm, "SpringBoard"))) {
+-		extern void coachz_springboard_write(int, uint64_t, uint64_t);
+-		coachz_springboard_write(fd, buf, nbyte);
+-	}
+ 	if (fd == 1 || fd == 2) {
+ 		extern int coachz_oslog_match(const char *);
+ 		extern void coachz_oslog_write(const char *, int, uint64_t, uint64_t);
+@@ -692,11 +687,6 @@
+ 			coachz_oslog_write(p->p_name, proc_getpid(p), buf, nbyte);
+ 		}
+ 	}
+-	if ((fd == 1 || fd == 2) &&
+-	    (!strcmp(p->p_name, "usermanagerd") || !strcmp(p->p_comm, "usermanagerd"))) {
+-		extern void coachz_usermanager_write(int, int, uint64_t, uint64_t);
+-		coachz_usermanager_write(proc_getpid(p), fd, buf, nbyte);
+-	}
+ 
+ 	if (nbyte > INT_MAX) {
+ 		*retval = 0;
+--- a/osfmk/arm64/coachz_thread.c
++++ b/osfmk/arm64/coachz_thread.c
+@@ -64,268 +64,9 @@
+ 	printf("COACHZ critical regs: x0 0x%llx x1 0x%llx x19 0x%llx x20 0x%llx\n",
+ 	    (unsigned long long)get_saved_state_reg(state, 0), (unsigned long long)get_saved_state_reg(state, 1),
+ 	    (unsigned long long)get_saved_state_reg(state, 19), (unsigned long long)get_saved_state_reg(state, 20));
+-}
+-
+-/* The first abnormal exit is evidence even when another task processes it. Only a self-exit
+- * can safely use copyin for its user frames. Publish the note after construction.
+- */
+-void coachz_usermanager_write(int pid, int fd, uint64_t address, uint64_t size);
+-void coachz_usermanager_exit(int, unsigned, uint64_t, const char *, task_t, int, int, int);
+-int coachz_usermanager_report(void);
+-static char coachz_um_output[4096];
+-static uint32_t coachz_um_output_used;
+-static char coachz_um_failure[2048];
+-static uint32_t coachz_um_captured;
+-static unsigned coachz_um_normal_exits;
+-static int coachz_um_normal_pid;
+-static char coachz_um_normal_tail[512];
+-
+-void
+-coachz_usermanager_write(int pid, int fd, uint64_t address, uint64_t size)
+-{
+-	char bytes[256];
+-	uint32_t length = size > sizeof(bytes) - 1 ? sizeof(bytes) - 1 : (uint32_t)size;
+-	uint32_t at;
+-
+-	if (!length || os_atomic_load(&coachz_um_captured, acquire) || copyin(address, bytes, length)) {
+-		return;
+-	}
+-	bytes[length] = 0;
+-	at = os_atomic_add_orig(&coachz_um_output_used, length + 1, relaxed);
+-	if (at < sizeof(coachz_um_output) - 1) {
+-		uint32_t room = (uint32_t)sizeof(coachz_um_output) - 1 - at;
+-		uint32_t count = length < room ? length : room;
+-		memcpy(coachz_um_output + at, bytes, count);
+-		if (count < room) {
+-			coachz_um_output[at + count] = '\n';
+-		}
+-	}
+-	printf("COACHZ usermanagerd[%d] fd%d: %s\n", pid, fd, bytes);
+-}
+-
+-void
+-coachz_usermanager_exit(int pid, unsigned ns, uint64_t code, const char *description,
+-    task_t task, int self, int caller, int status)
+-{
+-	arm_saved_state_t *state;
+-	uint64_t fp, sp;
+-	size_t used;
+-
+-	/* The -t boot task exits normally before the long-running daemon starts.
+-	 * Keep its tail separately; it must not consume the later failure slot.
+-	 */
+-	if (status == 0) {
+-		if (!os_atomic_cmpxchg(&coachz_um_captured, 0, 1, acq_rel)) {
+-			return;
+-		}
+-		used = strnlen(coachz_um_output, sizeof(coachz_um_output));
+-		unsigned start = used > sizeof(coachz_um_normal_tail) - 1 ?
+-		    (unsigned)(used - (sizeof(coachz_um_normal_tail) - 1)) : 0;
+-		snprintf(coachz_um_normal_tail, sizeof(coachz_um_normal_tail), "%s", coachz_um_output + start);
+-		memset(coachz_um_output, 0, sizeof(coachz_um_output));
+-		os_atomic_store(&coachz_um_output_used, 0, relaxed);
+-		coachz_um_normal_pid = pid;
+-		coachz_um_normal_exits++;
+-		os_atomic_store(&coachz_um_captured, 0, release);
+-		return;
+-	}
+-	if (!os_atomic_cmpxchg(&coachz_um_captured, 0, 1, acq_rel)) {
+-		return;
+-	}
+-	used = snprintf(coachz_um_failure, sizeof(coachz_um_failure),
+-	    "COACHZ UM v3 exit[%d]: status 0x%x self %d caller %d\n"
+-	    "COACHZ UM reason: namespace %u code 0x%llx description %.200s\n",
+-	    pid, status, self, caller, ns, (unsigned long long)code, description ? description : "none");
+-	if (task == TASK_NULL) {
+-		goto done;
+-	}
+-	used += snprintf(coachz_um_failure + used, sizeof(coachz_um_failure) - used,
+-	    "COACHZ UM image: header 0x%llx cache-slide 0x%x\n",
+-	    (unsigned long long)task->mach_header_vm_address, task->task_shared_region_slide);
+-	if (!self) {
+-		thread_t thread;
+-		unsigned index = 0;
+-		task_lock(task);
+-		queue_iterate(&task->threads, thread, thread_t, task_threads) {
+-			if (index == 3) {
+-				break;
+-			}
+-			state = find_user_regs(thread);
+-			used += snprintf(coachz_um_failure + used, sizeof(coachz_um_failure) - used,
+-			    "COACHZ UM target t%u (sample): pc 0x%llx lr 0x%llx x16 0x%llx\n",
+-			    index++, state ? (unsigned long long)get_saved_state_pc(state) : 0ULL,
+-			    state ? (unsigned long long)get_saved_state_lr(state) : 0ULL,
+-			    state ? (unsigned long long)get_saved_state_reg(state, 16) : 0ULL);
+-		}
+-		task_unlock(task);
+-		goto done;
+-	}
+-	state = find_user_regs(current_thread());
+-	if (!state) {
+-		goto done;
+-	}
+-	used += snprintf(coachz_um_failure + used, sizeof(coachz_um_failure) - used,
+-	    "COACHZ UM state: pc 0x%llx lr 0x%llx\n",
+-	    (unsigned long long)get_saved_state_pc(state), (unsigned long long)get_saved_state_lr(state));
+-	sp = get_saved_state_sp(state);
+-	fp = get_saved_state_fp(state);
+-	for (unsigned index = 0; index < 8 && used < sizeof(coachz_um_failure) - 100; index++) {
+-		uint64_t frame[2];
+-		if ((fp & 15) || fp < sp || fp - sp > 65536 || copyin(fp, frame, sizeof(frame))) {
+-			break;
+-		}
+-		used += snprintf(coachz_um_failure + used, sizeof(coachz_um_failure) - used,
+-		    "COACHZ UM frame %u: fp 0x%llx lr 0x%llx\n", index,
+-		    (unsigned long long)fp, (unsigned long long)frame[1]);
+-		if (frame[0] <= fp) {
+-			break;
+-		}
+-		fp = frame[0];
+-	}
+-done:
+-	os_atomic_store(&coachz_um_captured, 2, release);
+-	printf("%s", coachz_um_failure);
+-}
+-
+-int
+-coachz_usermanager_report(void)
+-{
+-	unsigned phase = os_atomic_load(&coachz_um_captured, acquire);
+-	printf("COACHZ UM v3 init: normal exits %u last pid %d\n",
+-	    coachz_um_normal_exits, coachz_um_normal_pid);
+-	if (coachz_um_normal_exits) {
+-		printf("COACHZ UM init stdout/stderr tail:\n%s\n", coachz_um_normal_tail);
+-	}
+-	if (phase != 2) {
+-		printf("COACHZ UM v3: waiting for abnormal exit (capture %u)\n", phase);
+-		return 0;
+-	}
+-	size_t length = strnlen(coachz_um_output, sizeof(coachz_um_output));
+-	unsigned start = length > 1024 ? (unsigned)(length - 1024) : 0;
+-	printf("COACHZ UM v3 abnormal stdout/stderr tail:\n%s\n%s",
+-	    coachz_um_output + start, coachz_um_failure);
+-	return 1;
+-}
+-
+-/* Keep SpringBoard's first abnormal exit separate from usermanagerd's accepted
+- * initialization observations. This is a passive screen diagnostic, not a driver.
+- */
+-void coachz_springboard_write(int, uint64_t, uint64_t);
+-void coachz_springboard_exit(int, int, unsigned, uint64_t, const char *, task_t, int, int);
+-int coachz_springboard_report(void);
+-static char coachz_sb_output[2048];
+-static uint32_t coachz_sb_output_used;
+-static char coachz_sb_failure[3072];
+-static uint32_t coachz_sb_captured;
+-
+-void
+-coachz_springboard_write(int fd, uint64_t address, uint64_t size)
+-{
+-	char bytes[256];
+-	uint32_t length = size > sizeof(bytes) - 1 ? sizeof(bytes) - 1 : (uint32_t)size;
+-	uint32_t at;
+-
+-	if (!length || os_atomic_load(&coachz_sb_captured, acquire) || copyin(address, bytes, length)) {
+-		return;
+-	}
+-	at = os_atomic_add_orig(&coachz_sb_output_used, length + 1, relaxed);
+-	if (at < sizeof(coachz_sb_output) - 1) {
+-		uint32_t room = (uint32_t)sizeof(coachz_sb_output) - 1 - at;
+-		uint32_t count = length < room ? length : room;
+-		memcpy(coachz_sb_output + at, bytes, count);
+-		if (count < room) {
+-			coachz_sb_output[at + count] = '\n';
+-		}
+-	}
+-	(void)fd;
+-}
+-
+-void
+-coachz_springboard_exit(int pid, int status, unsigned ns, uint64_t code,
+-    const char *description, task_t task, int self, int caller)
+-{
+-	arm_saved_state_t *state;
+-	uint64_t fp, sp;
+-	size_t used;
+-
+-	if (!status || !os_atomic_cmpxchg(&coachz_sb_captured, 0, 1, acq_rel)) {
+-		return;
+-	}
+-	used = snprintf(coachz_sb_failure, sizeof(coachz_sb_failure),
+-	    "COACHZ SB v1 exit[%d]: status 0x%x self %d caller %d\n"
+-	    "COACHZ SB reason: namespace %u code 0x%llx description %.200s\n",
+-	    pid, status, self, caller, ns, (unsigned long long)code, description ? description : "none");
+-	if (task == TASK_NULL) {
+-		goto done;
+-	}
+-	used += snprintf(coachz_sb_failure + used, sizeof(coachz_sb_failure) - used,
+-	    "COACHZ SB image: header 0x%llx cache-slide 0x%x\n",
+-	    (unsigned long long)task->mach_header_vm_address, task->task_shared_region_slide);
+-	if (!self) {
+-		thread_t thread;
+-		unsigned index = 0;
+-		task_lock(task);
+-		queue_iterate(&task->threads, thread, thread_t, task_threads) {
+-			if (index == 3) {
+-				break;
+-			}
+-			state = find_user_regs(thread);
+-			used += snprintf(coachz_sb_failure + used, sizeof(coachz_sb_failure) - used,
+-			    "COACHZ SB target t%u (sample): pc 0x%llx lr 0x%llx x16 0x%llx\n",
+-			    index++, state ? (unsigned long long)get_saved_state_pc(state) : 0ULL,
+-			    state ? (unsigned long long)get_saved_state_lr(state) : 0ULL,
+-			    state ? (unsigned long long)get_saved_state_reg(state, 16) : 0ULL);
+-		}
+-		task_unlock(task);
+-		goto done;
+-	}
+-	state = find_user_regs(current_thread());
+-	if (!state) {
+-		goto done;
+-	}
+-	used += snprintf(coachz_sb_failure + used, sizeof(coachz_sb_failure) - used,
+-	    "COACHZ SB state: pc 0x%llx lr 0x%llx x16 0x%llx\n",
+-	    (unsigned long long)get_saved_state_pc(state), (unsigned long long)get_saved_state_lr(state),
+-	    (unsigned long long)get_saved_state_reg(state, 16));
+-	/* FBSDisplayMode validation keeps the object in x19 and width/height/scale override in x25/x26/x24. */
+-	used += snprintf(coachz_sb_failure + used, sizeof(coachz_sb_failure) - used,
+-	    "COACHZ SB regs: x19 0x%llx x24 0x%llx x25 0x%llx x26 0x%llx\n",
+-	    (unsigned long long)get_saved_state_reg(state, 19), (unsigned long long)get_saved_state_reg(state, 24),
+-	    (unsigned long long)get_saved_state_reg(state, 25), (unsigned long long)get_saved_state_reg(state, 26));
+-	{
+-		uint64_t object[10];
+-		if (!copyin(get_saved_state_reg(state, 19), object, sizeof(object))) {
+-			for (unsigned index = 1; index < 10; index += 3) {
+-				used += snprintf(coachz_sb_failure + used, sizeof(coachz_sb_failure) - used,
+-				    "COACHZ SB x19+%02x: %016llx %016llx %016llx\n", index * 8,
+-				    (unsigned long long)object[index], (unsigned long long)object[index + 1],
+-				    index + 2 < 10 ? (unsigned long long)object[index + 2] : 0ULL);
+-			}
+-		}
+-	}
+-	sp = get_saved_state_sp(state);
+-	fp = get_saved_state_fp(state);
+-	for (unsigned index = 0; index < 12 && used < sizeof(coachz_sb_failure) - 100; index++) {
+-		uint64_t frame[2];
+-		if ((fp & 15) || fp < sp || fp - sp > 65536 || copyin(fp, frame, sizeof(frame))) {
+-			break;
+-		}
+-		used += snprintf(coachz_sb_failure + used, sizeof(coachz_sb_failure) - used,
+-		    "COACHZ SB frame %u: fp 0x%llx lr 0x%llx\n", index,
+-		    (unsigned long long)fp, (unsigned long long)frame[1]);
+-		if (frame[0] <= fp) {
+-			break;
+-		}
+-		fp = frame[0];
+-	}
+-done:
+-	os_atomic_store(&coachz_sb_captured, 2, release);
+-	printf("%s", coachz_sb_failure);
+ }
+ 
+-/* The first SIGKILLs sent through kill(), and the first lsd and SpringBoard starts and exits,
+- * with seconds since boot, so the report shows who killed SpringBoard while it waited on lsd.
+- */
++/* The first SIGKILLs sent through kill(), with seconds since boot, for the K36 line; and the pids the reports follow. */
+ struct coachz_launch_event {
+ 	uint32_t seconds;
+ 	int pid;
+@@ -336,15 +77,9 @@
+ };
+ static struct coachz_launch_event coachz_kills[6];
+ static uint32_t coachz_kill_count;
+-static struct coachz_launch_event coachz_launches[10];
+-static uint32_t coachz_launch_count;
+-/* lsd seen while the first SpringBoard waits on it: two snapshots, 45 s and 80 s after that start. */
+ static int coachz_lsd_pid;
+ static int coachz_bbd_pid;
+ static int coachz_sb_pid;
+-static uint32_t coachz_sb_started;
+-static char coachz_lsd_snapshots[2][1024];
+-static uint32_t coachz_lsd_snapshot_count;
+ void coachz_launch_signal(int, const char *, int, const char *, int);
+ void coachz_launch_process(int, const char *, int, int);
+ 
+@@ -358,17 +93,9 @@
+ }
+ 
+ /*
+- * k39: backboardd's side of the first SpringBoard kill, taken once in the kill() call itself. The killing thread's user
+- * frames say why it kills; the other backboardd threads that are not waiting for a message or parked (a user lock, a
+- * condition variable...) show what could keep SpringBoard's check-in from being answered. For each: hint, pc, lr, x16
+- * (syscall), x1/x2 (a ulock_wait's address and expected value) with the word now at x1, then the user frame chain.
+- */
+-static char coachz_kill_capture[2048];
+-static uint32_t coachz_kill_captured;
+-/*
+  * coachz-diag: the diagnostics added after k36, off unless asked for: they answer one question each and print a lot.
+- * Bit 0 times each core, bit 1 groups waiting threads by kernel stack, bit 2 records the
+- * SpringBoard kill, bit 3 reads the frame source's memory attribute (CoachzDisplay.cpp).
++ * Bit 0 times each core, bit 1 groups waiting threads by kernel stack, bit 3 reads the frame source's memory attribute
++ * (CoachzDisplay.cpp).
+  */
+ static unsigned
+ coachz_diag(void)
+@@ -401,72 +128,10 @@
+ 	return used;
+ }
+ 
+-static void
+-coachz_capture_kill(uint32_t seconds)
+-{
+-	struct {
+-		uint64_t pc, lr, fp, sp, x16, x1, x2;
+-		unsigned hint;
+-	} seen[4] = { 0 };
+-	unsigned count = 0, threads;
+-	thread_t self = current_thread(), thread;
+-	task_t task = current_task();
+-	vm_map_t map = current_map();
+-	char *out = coachz_kill_capture;
+-	const size_t size = sizeof(coachz_kill_capture);
+-	size_t used;
+-
+-	task_lock(task);
+-	threads = task->thread_count;
+-	queue_iterate(&task->threads, thread, thread_t, task_threads) {
+-		unsigned hint = (unsigned)thread->block_hint;
+-		arm_saved_state_t *saved = find_user_regs(thread);
+-		/* Slot 0 is the killer; then threads that wait on something other than a message or the workqueue. */
+-		unsigned slot = thread == self ? 0 : count + 1;
+-		if (!saved || (thread != self && (count == 3 || hint == 2 || hint == 3 || hint == 15))) {
+-			continue;
+-		}
+-		seen[slot].hint = hint;
+-		seen[slot].pc = get_saved_state_pc(saved);
+-		seen[slot].lr = get_saved_state_lr(saved);
+-		seen[slot].fp = get_saved_state_fp(saved);
+-		seen[slot].sp = get_saved_state_sp(saved);
+-		seen[slot].x16 = get_saved_state_reg(saved, 16);
+-		seen[slot].x1 = get_saved_state_reg(saved, 1);
+-		seen[slot].x2 = get_saved_state_reg(saved, 2);
+-		if (thread != self) {
+-			count++;
+-		}
+-	}
+-	task_unlock(task);
+-	used = snprintf(out, size, "K39 kill at %u s: backboardd %u threads, slide 0x%x, %u others\n", seconds, threads,
+-	    task->task_shared_region_slide, count);
+-	for (unsigned slot = 0; slot <= count && used < size; slot++) {
+-		uint32_t word = 0;
+-		if (seen[slot].x1 && copyin((user_addr_t)seen[slot].x1, &word, sizeof(word))) {
+-			word = 0xdeadbeef;
+-		}
+-		used += snprintf(out + used, size - used, " %s h%u pc %llx lr %llx x16 %lld x1 %llx x2 %llx [x1] %x:",
+-		    slot ? "T" : "KILLER", seen[slot].hint, seen[slot].pc, seen[slot].lr, (long long)seen[slot].x16,
+-		    seen[slot].x1, seen[slot].x2, word);
+-		if (used < size) {
+-			used += coachz_user_frames(out + used, size - used, map, seen[slot].fp, seen[slot].sp, slot ? 10 : 14);
+-		}
+-		if (used < size) {
+-			used += snprintf(out + used, size - used, "\n");
+-		}
+-	}
+-	os_atomic_store(&coachz_kill_captured, 1, release);
+-}
+-
+ void
+ coachz_launch_signal(int sender, const char *sender_name, int target, const char *target_name, int signum)
+ {
+ 	uint32_t index;
+-	if (signum == 9 && (coachz_diag() & 4) && !strcmp(sender_name, "backboardd") && !strcmp(target_name, "SpringBoard") &&
+-	    os_atomic_cmpxchg(&coachz_kill_captured, 0, 2, relaxed)) {
+-		coachz_capture_kill(coachz_launch_seconds());
+-	}
+ 	if (signum != 9 || (index = os_atomic_inc_orig(&coachz_kill_count, relaxed)) >= 6) {
+ 		return;
+ 	}
+@@ -492,7 +157,6 @@
+ 			coachz_wifid_pid = exited ? 0 : pid;
+ 		}
+ 	}
+-	uint32_t index;
+ 	if (!exited && !strcmp(name, "SpringBoard")) {
+ 		os_atomic_store(&coachz_sb_pid, pid, relaxed);
+ 	}
+@@ -500,18 +164,10 @@
+ 		os_atomic_store(&coachz_bbd_pid, pid, relaxed);
+ 		return;
+ 	}
+-	if ((strcmp(name, "lsd") && strcmp(name, "SpringBoard")) ||
+-	    (index = os_atomic_inc_orig(&coachz_launch_count, relaxed)) >= 10) {
+-		return;
+-	}
+-	coachz_launches[index] = (struct coachz_launch_event){ .seconds = coachz_launch_seconds(),
+-		                                                .pid = pid, .other_pid = exited, .status = status };
+ 	if (!exited && !strcmp(name, "lsd")) {
+ 		os_atomic_store(&coachz_lsd_pid, pid, relaxed);
+-	} else if (!exited && !coachz_sb_started) {
+-		coachz_sb_started = coachz_launches[index].seconds;
+ 	}
+-	strlcpy(coachz_launches[index].name, name, sizeof(coachz_launches[index].name));
++	(void)status;
+ }
+ 
+ struct proc;
+@@ -519,77 +175,6 @@
+ extern int proc_rele(struct proc *);
+ extern task_t proc_task(struct proc *);
+ 
+-static void
+-coachz_lsd_snapshot(char *out, size_t size, uint32_t now)
+-{
+-	struct proc *p = proc_find(os_atomic_load(&coachz_lsd_pid, relaxed));
+-	uint64_t pc[5] = {}, lr[5] = {}, x16[5] = {}, fp = 0, sp = 0;
+-	unsigned state[5] = {}, hint[5] = {}, count = 0, threads;
+-	size_t used;
+-	task_t task;
+-	thread_t thread;
+-	vm_map_t map;
+-
+-	if (!p) {
+-		snprintf(out, size, "COACHZ LSD at %u s: lsd not found\n", now);
+-		return;
+-	}
+-	task = proc_task(p);
+-	task_lock(task);
+-	threads = task->thread_count;
+-	queue_iterate(&task->threads, thread, thread_t, task_threads) {
+-		arm_saved_state_t *saved = find_user_regs(thread);
+-		if (count == 5) {
+-			break;
+-		}
+-		state[count] = (unsigned)thread->state;
+-		hint[count] = (unsigned)thread->block_hint;
+-		if (saved) {
+-			pc[count] = get_saved_state_pc(saved);
+-			lr[count] = get_saved_state_lr(saved);
+-			x16[count] = get_saved_state_reg(saved, 16);
+-			if (!count) {
+-				fp = get_saved_state_fp(saved);
+-				sp = get_saved_state_sp(saved);
+-			}
+-		}
+-		count++;
+-	}
+-	task_unlock(task);
+-	used = snprintf(out, size, "COACHZ LSD at %u s (SB +%u s): threads %u header 0x%llx slide 0x%x\n", now,
+-	    now - coachz_sb_started, threads, (unsigned long long)task->mach_header_vm_address,
+-	    task->task_shared_region_slide);
+-	for (unsigned index = 0; index < count && used < size; index++) {
+-		used += snprintf(out + used, size - used, "COACHZ LSD t%u state 0x%x hint %u pc 0x%llx lr 0x%llx x16 0x%llx\n",
+-		    index, state[index], hint[index], (unsigned long long)pc[index], (unsigned long long)lr[index],
+-		    (unsigned long long)x16[index]);
+-	}
+-	/* The main thread's frame chain, read from lsd's own map. */
+-	map = get_task_map_reference(task);
+-	if (map) {
+-		if (used < size) {
+-			used += snprintf(out + used, size - used, "COACHZ LSD t0 frames:");
+-		}
+-		for (unsigned index = 0; index < 8 && used < size; index++) {
+-			uint64_t frame[2];
+-			if ((fp & 15) || fp < sp || fp - sp > 65536 ||
+-			    vm_map_read_user(map, (vm_map_offset_t)fp, frame, sizeof(frame)) != KERN_SUCCESS) {
+-				break;
+-			}
+-			used += snprintf(out + used, size - used, " 0x%llx", (unsigned long long)frame[1]);
+-			if (frame[0] <= fp) {
+-				break;
+-			}
+-			fp = frame[0];
+-		}
+-		if (used < size) {
+-			snprintf(out + used, size - used, "\n");
+-		}
+-		vm_map_deallocate(map);
+-	}
+-	proc_rele(p);
+-}
+-
+ /* ArmCpu's secondary-CPU evidence (steps: 1 nub, 2 registered, 3 start thread, 4 CPU_ON, 5 initCPU, 6 GIC, 7 running),
+  * each core's CurrentEL and MIDR (part 0x805 A55, 0x804 A76), and the cluster type XNU registered it with.
+  */
+@@ -640,7 +225,6 @@
+ 	{
+ 		static uint64_t reported_frames;
+ 		static uint32_t reported_seconds;
+-		static uint64_t memcpy_mbs;
+ 		static const char names[3][4] = { "A55", "A76", "L3" };
+ 		uint64_t frames = coachz_frame_stats[0];
+ 		uint32_t now = coachz_launch_seconds();
+@@ -654,23 +238,6 @@
+ 			    armcpu_freq[domain][2], armcpu_freq[domain][3], armcpu_freq[domain][4], armcpu_freq[domain][5]);
+ 		}
+ 		printf("\n");
+-		if (!memcpy_mbs) {
+-			/* Larger than the L3: this is DRAM, which no CPU loop shows. */
+-			const size_t size = 4 * 1024 * 1024;
+-			void *from = kalloc_data(size, Z_WAITOK | Z_ZERO), *to = kalloc_data(size, Z_WAITOK | Z_ZERO);
+-			if (from && to) {
+-				uint64_t start = mach_absolute_time(), ns;
+-				for (unsigned pass = 0; pass < 8; pass++) {
+-					memcpy(to, from, size);
+-					__asm__ volatile ("" : : "r" (to) : "memory");
+-				}
+-				absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
+-				memcpy_mbs = 8 * size * 1000 / (ns ? ns : 1);
+-			}
+-			kfree_data(from, size);
+-			kfree_data(to, size);
+-		}
+-		printf("COACHZ mem: memcpy %llu MB/s\n", memcpy_mbs);
+ 	}
+ }
+ 
+@@ -721,29 +288,6 @@
+ {
+ 	coachz_smp_report();
+ 	coachz_bbd_report();
+-	uint32_t kills = os_atomic_load(&coachz_kill_count, relaxed);
+-	uint32_t launches = os_atomic_load(&coachz_launch_count, relaxed);
+-	printf("COACHZ LS v1: %u SIGKILL, %u lsd/SpringBoard events, now %u s\n", kills, launches,
+-	    coachz_launch_seconds());
+-	for (uint32_t index = 0; index < kills && index < 6; index++) {
+-		printf("COACHZ LS kill %u s: %s(%d) -> %s(%d)\n", coachz_kills[index].seconds,
+-		    coachz_kills[index].name, coachz_kills[index].pid,
+-		    coachz_kills[index].other_name, coachz_kills[index].other_pid);
+-	}
+-	for (uint32_t index = 0; index < launches && index < 10; index++) {
+-		printf("COACHZ LS %u s: %s(%d) %s 0x%x\n", coachz_launches[index].seconds,
+-		    coachz_launches[index].name, coachz_launches[index].pid,
+-		    coachz_launches[index].other_pid ? "exit" : "exec", coachz_launches[index].status);
+-	}
+-	uint32_t now = coachz_launch_seconds(), taken = coachz_lsd_snapshot_count;
+-	if (taken < 2 && coachz_sb_started && os_atomic_load(&coachz_lsd_pid, relaxed) &&
+-	    now >= coachz_sb_started + (taken ? 80 : 45)) {
+-		coachz_lsd_snapshot(coachz_lsd_snapshots[taken], sizeof(coachz_lsd_snapshots[taken]), now);
+-		coachz_lsd_snapshot_count = taken + 1;
+-	}
+-	for (uint32_t index = 0; index < coachz_lsd_snapshot_count; index++) {
+-		printf("%s", coachz_lsd_snapshots[index]);
+-	}
+ }
+ 
+ /*
+@@ -1170,11 +714,9 @@
+ 		int pids[3] = { os_atomic_load(&coachz_bbd_pid, relaxed), os_atomic_load(&coachz_sb_pid, relaxed),
+ 			        os_atomic_load(&coachz_lsd_pid, relaxed) };
+ 		unsigned which = turn++ % 3;
+-		/* In the console band, the touch lines below need the room; the kill record and wait groups are already understood. */
++		/* Off in the console band; wait groups only with coachz-diag bit 1. */
+ 		if (coachz_compact || !(coachz_diag() & 2)) {
+ 			(void)which;
+-		} else if (os_atomic_load(&coachz_kill_captured, acquire) == 1) {
+-			printf("%s", coachz_kill_capture);
+ 		} else {
+ 			coachz_wait_report(pids[which], labels[which]);
+ 		}
+@@ -1182,31 +724,16 @@
+ 	{
+ 		/* Touchscreen stage 1 (bsd/dev/coachz_touch.c, coachz-touch=1): started once from here, after boot. */
+ 		extern void coachz_touch_start(void);
+-		extern char coachz_touch_status[3][160], coachz_hid_status[160], coachz_hid_live[160], coachz_touch_stroke[160];
+ 		coachz_touch_start();
+ 		{
+ 			extern void coachz_bridge_start(void);
+ 			coachz_bridge_start();
+ 			extern void coachz_staged_mark_built(void);
+ 			coachz_staged_mark_built();
+-		}
+-		if (coachz_hid_status[0]) {
+-			printf("%.160s\n", coachz_hid_status);
+-		}
+-		if (coachz_hid_live[0]) {
+-			printf("%.160s\n", coachz_hid_live);
+-		}
+-		if (coachz_touch_stroke[0]) {
+-			printf("%.160s\n", coachz_touch_stroke);
+ 		}
+-		for (unsigned line = 0; line < 3; line++) {
+-			if (coachz_touch_status[line][0]) {
+-				printf("%.160s\n", coachz_touch_status[line]);
+-			}
+-		}
+ 	}
+ 	uint32_t kills = os_atomic_load(&coachz_kill_count, relaxed);
+-	printf("K36 SB capture %u, %u SIGKILL", os_atomic_load(&coachz_sb_captured, acquire), kills);
++	printf("K36 %u SIGKILL", kills);
+ 	if (kills) {
+ 		uint32_t last = (kills < 6 ? kills : 6) - 1;
+ 		printf(", last %s(%d) -> %s(%d) at %u s", coachz_kills[last].name, coachz_kills[last].pid,
+@@ -1215,25 +742,20 @@
+ 	printf(", now %u s\n", coachz_launch_seconds());
+ }
+ 
++int coachz_periodic_report(void);
++
++/* Every ten seconds from bsd/dev/coachz_sample.c; 1 skips its full sampler. */
+ int
+-coachz_springboard_report(void)
++coachz_periodic_report(void)
+ {
+-	unsigned phase = os_atomic_load(&coachz_sb_captured, acquire);
+ 	if (coachz_compact) {
+-		/* Only the measurement block fits the console band; returning 1 also skips the full sampler. */
++		/* Only the measurement block fits the console band. */
+ 		coachz_measure_report();
+ 		return 1;
+ 	}
+ 	coachz_launch_report();
+ 	coachz_measure_report();
+-	if (phase != 2) {
+-		printf("COACHZ SB v1: waiting for abnormal exit (capture %u)\n", phase);
+-		return 0;
+-	}
+-	size_t length = strnlen(coachz_sb_output, sizeof(coachz_sb_output));
+-	unsigned start = length > 512 ? (unsigned)(length - 512) : 0;
+-	printf("COACHZ SB stdout/stderr tail:\n%s\n%s", coachz_sb_output + start, coachz_sb_failure);
+-	return 1;
++	return 0;
+ }
+ 
+ /*

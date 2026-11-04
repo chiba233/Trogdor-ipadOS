@@ -18,9 +18,14 @@ patch_series = ["arch:patches/xnu/series", "device:patches/xnu/series"]
 # The profile's list, with the USB stack and the driver that uses it.
 archives = ["build-corecrypto-14.py", "build-corecrypto-14.py --namespace", "component:ArmDTPlatform", "component:ArmCpu",
   "component:SoftwareAES", "build-software-aes-bindings.py", "build-mockfs-fixture.py", "build-libpthread-kernel.py",
-  "component:RamBlock", "../drivers/RamBlock/build-usb-stack.py", "build-coachz-display.py", "component:AppleKeyStoreState", "component:ShengHidInput", "build-coachz-backlight.py", "build-coachz-audio.py", "build-coachz-gpu.py", "build-coachz-wifi-net.py"]
+  "component:RamBlock", "../drivers/RamBlock/build-usb-stack.py", "build-coachz-display.py", "component:AppleKeyStoreState", "component:ShengHidInput", "build-coachz-backlight.py", "build-coachz-audio.py", "build-coachz-gpu.py", "build-coachz-wifi-net.py", "build-coachz-usb-host.py"]
 
 [kernel.prelink]
 # The restore RAM disk mounts tmpfs: the OS profile's list does not include it. The Wi-Fi registry derives from the original
 # IONetworkingFamily (tools/record_network_bindings.py), which the Apple USB host stack and every USB network driver also need.
-extra_args = ["--root", "com.apple.filesystems.tmpfs", "--root", "com.apple.iokit.IONetworkingFamily"]
+# The Apple USB host stack (coachz-usb-host=1, CoachzUsbHost.cpp): the controller class, hubs, composite devices and HID.
+extra_args = ["--root", "com.apple.filesystems.tmpfs", "--root", "com.apple.iokit.IONetworkingFamily",
+  "--root", "com.apple.driver.usb.AppleUSBHostT8011", "--root", "com.apple.driver.usb.AppleUSBHub",
+  "--root", "com.apple.driver.usb.AppleUSBHostCompositeDevice", "--root", "com.apple.driver.usb.IOUSBHostHIDDevice",
+  "--root", "com.apple.driver.RTBuddy", "--root", "com.apple.driver.AppleARMPMU",
+  "--root", "com.apple.driver.AppleEmbeddedTempSensor"]

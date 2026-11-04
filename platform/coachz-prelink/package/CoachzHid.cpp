@@ -24,9 +24,6 @@ extern "C" IOService *coachz_temperature_hid_allocate(unsigned index);
 extern "C" volatile uint32_t coachz_motion_ready;
 extern "C" kern_return_t OSKextLoadKextWithIdentifier(const char *);
 extern "C" {
-char coachz_hid_status[160];
-// Refreshed each second: the event driver below the digitizer, its user clients (backboardd's connection), and the reports.
-char coachz_hid_live[160];
 extern volatile uint32_t native_touch_hid_reports;
 volatile uint32_t native_hid_input_events[8];
 volatile int native_hid_input_results[8]={-1,-1,-1,-1,-1,-1,-1,-1};
@@ -58,23 +55,9 @@ void native_hid_input_observed(unsigned event,int result) {
 // Called by the device's one-second timer. Once IOHIDEventDriver has matched, publish on the event service and its interface what
 // backboardd classifies a built-in touch screen by (BKHIDDirectTouchEventProcessor drops digitizer events from other services):
 // Built-In, DisplayIntegrated and the Digitizer/Touch Screen primary usage. Set once: every change notifies its user clients.
-static unsigned countUserClients(IORegistryEntry *entry) {
-    unsigned count=0;OSIterator *it=entry->getChildIterator(gIOServicePlane);if(!it)return 0;
-    while(OSObject *child=it->getNextObject()) {
-        IORegistryEntry *next=OSDynamicCast(IORegistryEntry,child);
-        if(next && next->metaCast("IOUserClient"))count++;
-    }
-    it->release();return count;
-}
-
 __attribute__((noinline)) void native_hid_live_checkpoint(IOService *device) {
     static IORegistryEntry *publishedFor;
     IORegistryEntry *driver=findEventDriver(device,4);
-    snprintf(coachz_hid_live,sizeof(coachz_hid_live),
-        "K43 hid live: driver %s user clients %u built-in %d usage %d | reports %u handleReport n %u last 0x%x",
-        driver?driver->getMetaClass()->getClassName():"none",driver?countUserClients(driver):0,
-        driver?driver->getProperty("Built-In")!=nullptr:-1,driver?driver->getProperty("PrimaryUsagePage")!=nullptr:-1,
-        native_touch_hid_reports,native_hid_input_events[6],native_hid_input_results[6]);
     if(!driver || publishedFor==driver || !device->getProperty("Built-In"))return;
     publishedFor=driver;
     driver->setProperty("Built-In",kOSBooleanTrue);driver->setProperty("DisplayIntegrated",kOSBooleanTrue);
@@ -111,7 +94,7 @@ static bool addEventDriverPersonality(unsigned usagePage,unsigned usageValue,con
     return added;
 }
 
-// Runs once on the touch thread after the controller answered. Each step leaves its result in coachz_hid_status.
+// Runs once on the touch thread after the controller answered; prints only when the digitizer did not start.
 void coachz_hid_touch_start(void) {
     static bool started;
     if(started)return;
@@ -170,8 +153,8 @@ void coachz_hid_touch_start(void) {
         }
     }
     printf("COACHZ thermal: HID temperature services %u of %u\n",temperatureStarted,coachz_temperature_hid_count());
-    snprintf(coachz_hid_status,sizeof(coachz_hid_status),"K42 hid: family %d driver %d IOHIDDevice size %u resource %d meta %d personality %d attached %d started %d",
-        family,driver,size,resource!=nullptr,registered,personality,attached,running);
+    if(!running)printf("COACHZ hid: digitizer not started: family %d driver %d IOHIDDevice size %u resource %d meta %d personality %d attached %d\n",
+        family,driver,size,resource!=nullptr,registered,personality,attached);
     OSSafeReleaseNULL(resource);
 }
 }

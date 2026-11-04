@@ -126,17 +126,35 @@ int coachz_usb_read(uint64_t block, uint32_t count, void **data) {
 /* coachz-usb-keyboard=1: the Zed keyboard behind the hub (coachz_usb_hid.c). */
 extern void coachz_usb_enumerate_hubs(unsigned ms, usbdev_t *disk);
 extern int PE_parse_boot_argn(const char *, void *, int);
-int coachz_usb_keyboard_enabled(void) {
-    static int enabled = -1;
-    if (enabled < 0) {
+/* coachz-usb-keyboard=1 routes the base into the keyboard device (coachz_zed_input.c) over whichever stack owns the controller. With
+   coachz-usb-host=1 that is Apple's (CoachzUsbHost.cpp, its HID bridge): this stack never starts, so its own transport is off. */
+extern int coachz_usb_host_enabled(void);
+int coachz_usb_keyboard_requested(void) {
+    static int requested = -1;
+    if (requested < 0) {
         unsigned value = 0;
-        enabled = PE_parse_boot_argn("coachz-usb-keyboard", &value, sizeof(value)) && value == 1;
+        requested = PE_parse_boot_argn("coachz-usb-keyboard", &value, sizeof(value)) && value == 1;
     }
-    return enabled;
+    return requested;
+}
+int coachz_usb_keyboard_enabled(void) {
+    return coachz_usb_keyboard_requested() && !coachz_usb_host_enabled();
 }
 
 /* The system on the eMMC: no disk to wait for; the controller, the hubs and the keyboard behind them. */
 extern int coachz_usb_soc_init(void);
+
+/* Apple's host stack (CoachzUsbHost.cpp): the SoC bring-up without the libpayload stack. Its DWC3 event buffer comes from this
+   file's DMA pool, which only the libpayload paths mapped: without the pool the bring-up failed ("map failed") and the controller
+   stayed off. */
+int coachz_usb_host_soc_init(void) {
+    if (!pool_va) {
+        pool_va = ml_io_map_wcomb(POOL_BASE, POOL_BYTES);
+        if (!pool_va) return 0;
+        memset((void *)pool_va, 0, POOL_BYTES);
+    }
+    return coachz_usb_soc_init();
+}
 
 int coachz_usb_open_keyboard(void) {
     xhci_va = ml_io_map(XHCI_BASE, XHCI_BYTES);

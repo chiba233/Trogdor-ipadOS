@@ -43,7 +43,6 @@ int coachz_sdcc_removable(int slot);
 int coachz_sdcc_enabled(int slot);
 int coachz_sdcc_write(int slot, uint64_t block, uint32_t count, const void *data);
 int coachz_sdcc_writable(int slot);
-void coachz_sdcc_write_selftest(int slot);
 
 /* ------------------------------------------------------------------ board facts (sc7180.dtsi, sc7180-trogdor.dtsi) */
 #define GCC_WINDOW_PA    0x00112000u   /* SDCC1 0x112000-0x112fff and SDCC2 0x114000-0x114fff, GCC offsets minus 0x12000 */
@@ -64,7 +63,6 @@ void coachz_sdcc_write_selftest(int slot);
 #define SCRATCH_OFF      0x1000ul
 #define XFER_OFF         0x2000ul
 #define MAX_BLOCKS       960u          /* 480 KiB a request: at HS400 most of a request's time is then the transfer, not its commands */
-#define TEST_BLOCKS_AT   128u          /* what the write test moves at a time */
 
 enum { PM_UNDEFINED, PM_OFF, PM_UP, PM_ON };
 
@@ -1226,7 +1224,7 @@ int coachz_sdcc_prepare(void)
 static const struct { const char *name; uint64_t first, blocks; int root_only; } emmc_windows[] = {
     {"coachz-scratch", 242171904ull, 2097152ull, 0},
     {"coachz-log", 126803968ull, 524288ull, 1},
-    {"coachz-data", 127328256ull, 114843648ull, 1},
+    {"coachz-data", 127328256ull, 113795072ull, 1},  /* 512 MiB at its end went to coachz-kernel */
 };
 #define EMMC_WINDOWS (sizeof(emmc_windows) / sizeof(emmc_windows[0]))
 static uint64_t window_first[EMMC_WINDOWS], window_blocks[EMMC_WINDOWS];
@@ -1419,90 +1417,4 @@ int coachz_sdcc_write(int slot, uint64_t block, uint32_t count, const void *sour
         return 0;
     }
     return 1;
-}
-
-/* A block's test image: fixed by its LBA, so a later boot, or Linux, can check it independently of this run. */
-static void test_block(uint64_t block, uint32_t *words)
-{
-    for (uint32_t i = 0; i < 128u; i++) words[i] = (uint32_t)block * 2654435761u ^ i * 0x9e3779b1u ^ 0xc0ac4a12u;
-}
-
-/*
- * coachz-emmc=2: the write path on the last MiB of the window, on the eMMC only (a card's contents are the owner's). First whether the
- * previous boot's image survived the reset, then the refusals at both ends of the window, single-block then multi-block writes, and a
- * read-back. The image stays in place.
- */
-#define TEST_BLOCKS 2048u
-void coachz_sdcc_write_selftest(int slot)
-{
-    if (!write_requested(slot) || !coachz_sdcc_writable(slot)) return;
-    struct sdcc *s = &slots[slot];
-    /* With the system here the writes just outside the scratch window would land in the Data volume, which ends where it starts. */
-    if (slot == 0 && coachz_emmc_root()) return;
-    const uint64_t start = s->write_start + s->write_blocks - TEST_BLOCKS;
-    static uint32_t want[128], chunk[128 * TEST_BLOCKS_AT];
-    void *data;
-    uint32_t survived = 0, mismatches = 0, refused = 0, single = 0, multi = 0;
-    for (uint32_t b = 0; b < TEST_BLOCKS; b += TEST_BLOCKS_AT) {
-        if (!coachz_sdcc_read(slot, start + b, TEST_BLOCKS_AT, &data)) { printf("COACHZ mmc %s: test read failed\n", s->name); return; }
-        __builtin_memcpy(chunk, data, sizeof(chunk));
-        for (uint32_t k = 0; k < TEST_BLOCKS_AT; k++) {
-            test_block(start + b + k, want);
-            if (!__builtin_memcmp(want, &chunk[128u * k], sizeof(want))) survived++;
-        }
-    }
-    /* Each of these must come back refused, before any command reaches the card. */
-    test_block(0, want);
-    refused += !coachz_sdcc_write(slot, s->write_start - 1u, 1, want);
-    refused += !coachz_sdcc_write(slot, s->write_start - 1u, 2, want);
-    refused += !coachz_sdcc_write(slot, s->write_start + s->write_blocks, 1, want);
-    refused += !coachz_sdcc_write(slot, s->write_start + s->write_blocks - 1u, 2, want);
-    const unsigned must_refuse = s->write_start ? 5u : 4u;   /* a whole card has no first block to keep */
-    if (s->write_start) refused += !coachz_sdcc_write(slot, 0, 1, want);
-    if (refused != must_refuse) { printf("COACHZ mmc %s: window let a write through (%u of %u refused), test stops\n", s->name, refused, must_refuse); return; }
-    const uint64_t began = now_us();
-    uint32_t b = 0;
-    for (; b < 8u; b++) {
-        test_block(start + b, want);
-        if (!coachz_sdcc_write(slot, start + b, 1, want)) goto failed;
-        single++;
-    }
-    for (; b < TEST_BLOCKS; ) {
-        const uint32_t n = TEST_BLOCKS - b < TEST_BLOCKS_AT ? TEST_BLOCKS - b : TEST_BLOCKS_AT;
-        for (uint32_t k = 0; k < n; k++) test_block(start + b + k, &chunk[128u * k]);
-        if (!coachz_sdcc_write(slot, start + b, n, chunk)) goto failed;
-        multi += n;
-        b += n;
-    }
-    const uint64_t wrote = now_us();
-    for (b = 0; b < TEST_BLOCKS; ) {
-        const uint32_t n = TEST_BLOCKS - b < TEST_BLOCKS_AT ? TEST_BLOCKS - b : TEST_BLOCKS_AT;
-        if (!coachz_sdcc_read(slot, start + b, n, &data)) goto failed;
-        __builtin_memcpy(chunk, data, n * 512u);
-        for (uint32_t k = 0; k < n; k++) {
-            test_block(start + b + k, want);
-            if (__builtin_memcmp(want, &chunk[128u * k], sizeof(want))) mismatches++;
-        }
-        b += n;
-    }
-    const uint64_t read_back = now_us();
-    printf("COACHZ mmc %s: write test at %llu: previous image %u of %u, refused 5 of 5 outside the window, %u single and %u multi blocks written, "
-        "read back %u mismatches; write %llu KB/s, read %llu KB/s\n", s->name, (unsigned long long)start, survived, TEST_BLOCKS, single, multi,
-        mismatches, (unsigned long long)(TEST_BLOCKS * 512ull * 1000u / (wrote - began ? wrote - began : 1u)),
-        (unsigned long long)(TEST_BLOCKS * 512ull * 1000u / (read_back - wrote ? read_back - wrote : 1u)));
-    /* A longer sequential read inside the window, without copying the buffer: the bus and the driver alone. */
-    const uint64_t blocks = 64ull * 2048u;
-    const uint64_t read_began = now_us();
-    for (uint64_t at = 0; at + MAX_BLOCKS <= blocks; at += MAX_BLOCKS) {
-        if (!coachz_sdcc_read(slot, start - blocks + at, MAX_BLOCKS, &data)) {
-            printf("COACHZ mmc %s: read test stopped at block %llu\n", s->name, (unsigned long long)at);
-            return;
-        }
-    }
-    const uint64_t read_took = now_us() - read_began;
-    printf("COACHZ mmc %s: read 64 MiB in %llu ms, %llu KB/s\n", s->name, (unsigned long long)(read_took / 1000u),
-        (unsigned long long)(blocks * 512ull * 1000u / (read_took ? read_took : 1u)));
-    return;
-failed:
-    printf("COACHZ mmc %s: write test stopped at block %u (%u single, %u multi written)\n", s->name, b, single, multi);
 }

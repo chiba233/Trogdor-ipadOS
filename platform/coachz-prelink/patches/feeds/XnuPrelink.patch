@@ -1,0 +1,94 @@
+--- a/native_prelink.py
++++ b/native_prelink.py
+@@ -126,8 +126,29 @@
+         raise ValueError(f'Kernel target {address:#x} has {len(choices)} native address candidates: {names}')
+     return next(iter(choices))
+ 
+ 
++def coachz_usb_declared_dependencies(entries, original_data, roots):
++    """Two stale AppleSMC library declarations in the qualified ARM64 cache.
++
++    Neither library exists in that cache. Keep every executable, pointer and
++    instruction relocation check: any real reference must still resolve against
++    a selected component or an exact native kernel export.
++    """
++    usb = 'com.apple.driver.usb.AppleUSBHostT8011'
++    if usb not in roots:
++        return []
++    if hashlib.sha256(original_data).hexdigest() != 'f18b4df865405f2a287b84977d7aca745e056d656d9fc9df1662970ce2969de7':
++        raise ValueError('USB dependency normalization requires the qualified kernelcache')
++    expected = {'com.apple.iokit.IOACPIFamily': '1.4', 'com.apple.driver.watchdog': '1.0.0'}
++    libraries = entries['com.apple.driver.AppleSMC']['OSBundleLibraries']
++    if any(key in entries or libraries.get(key) != version for key, version in expected.items()):
++        raise ValueError('Unexpected AppleSMC dependency metadata')
++    for key in expected:
++        del libraries[key]
++    return sorted(expected)
++
++
+ def plan(native_data, original_data, roots, slide):
+     if slide % 4096:
+         raise ValueError('Rebasing must preserve native 4K alignment')
+     native, original = macho(native_data), macho(original_data)
+@@ -142,8 +163,9 @@
+         identifier = entry['CFBundleIdentifier']
+         if identifier in entries:
+             raise ValueError('Duplicate prelink identifier')
+         entries[identifier] = entry
++    normalized_dependencies = coachz_usb_declared_dependencies(entries, original_data, roots)
+     selected, interfaces = set(), set()
+     pending = list(roots)
+     while pending:
+         identifier = pending.pop()
+@@ -176,9 +198,17 @@
+     for identifier in codeless:
+         entry = entries[identifier]
+         executable_keys = ('CFBundleExecutable', '_PrelinkExecutableLoadAddr',
+             '_PrelinkExecutableSourceAddr', '_PrelinkExecutableSize', '_PrelinkKmodInfo')
+-        if any(key in entry for key in executable_keys) or not isinstance(entry.get('IOKitPersonalities'), dict) or not entry['IOKitPersonalities']:
++        # The qualified USB platform-properties bundle carries x86_64-only data,
++        # no ARM64 personality and no executable. Preserve the inert metadata;
++        # never promote its foreign-architecture personalities into active ones.
++        inert_usb_profile = (identifier == 'com.apple.driver.usb.AppleUSBHostPlatformProperties'
++                             and hashlib.sha256(original_data).hexdigest() == 'f18b4df865405f2a287b84977d7aca745e056d656d9fc9df1662970ce2969de7'
++                             and isinstance(entry.get('IOKitPersonalities_x86_64'), dict)
++                             and bool(entry['IOKitPersonalities_x86_64']))
++        active = isinstance(entry.get('IOKitPersonalities'), dict) and bool(entry['IOKitPersonalities'])
++        if any(key in entry for key in executable_keys) or not (active or inert_usb_profile):
+             raise ValueError('Codeless component must contain personalities and no executable fields: ' + identifier)
+     owned.sort(key=lambda item: item[:3])
+     for left, right in zip(owned, owned[1:]):
+         if left[1] > right[0]:
+@@ -238,8 +268,9 @@
+         extents.append({'module': identifier, 'segment': segment['name'],
+                         'va': start + slide, 'size': end - start})
+     return {'native_sha256': hashlib.sha256(native_data).hexdigest(),
+             'original_sha256': hashlib.sha256(original_data).hexdigest(),
++            'normalized_dependencies': normalized_dependencies,
+             'slide': slide, 'components': sorted(selected - codeless),
+             'codeless_components': sorted(codeless), 'kernel_interfaces': sorted(interfaces),
+             'pointer_counts': dict(Counter(binding['kind'] for binding in bindings)),
+             'extents': extents, 'bindings': bindings, 'images_modified': False,
+--- a/emit_prelink.py
++++ b/emit_prelink.py
+@@ -8,9 +8,9 @@
+ from pathlib import Path
+ import struct
+ import xml.etree.ElementTree as ET
+ 
+-from native_prelink import backed_offset, exports, macho, plan, unserialize_xml
++from native_prelink import backed_offset, exports, macho, plan, unserialize_xml, coachz_usb_declared_dependencies
+ 
+ # Standard SHA-256 round constants, stored as 64 little-endian words. Some
+ # assemblers embed these data in executable sections; do not decode as code.
+ SHA256_K_DIGEST = '74ef7306e7452d6859b6463ce496b8df30925f69e1b2969e1f3f34bbc9c6af04'
+@@ -128,8 +128,9 @@
+     old_info = next(s for s in parent if s['name'] == '__PRELINK_INFO')
+     at = backed_offset(parent, old_info['va'], old_info['filesize'], len(original_data))
+     metadata = unserialize_xml(original_data[at:at + old_info['filesize']])
+     entries = {e['CFBundleIdentifier']: e for e in metadata['_PrelinkInfoDictionary']}
++    coachz_usb_declared_dependencies(entries, original_data, roots)
+     modules = {}
+     for identifier in report['components']:
+         va = entries[identifier]['_PrelinkExecutableLoadAddr']
+         modules[identifier] = macho(original_data, backed_offset(parent, va, 32, len(original_data)))

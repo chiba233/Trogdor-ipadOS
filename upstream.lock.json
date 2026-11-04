@@ -44,6 +44,21 @@
     "unixnu-gpu": {
       "url": "https://github.com/UniXNU/UniXNU.git",
       "commit": "d6bd3ddc9aedced553e2d2737e47b331d07f60a3"
+    },
+    "coachz-launchctl": {
+      "url": "https://github.com/ProcursusTeam/launchctl.git",
+      "ref": "v1.1.1",
+      "commit": "5e8330ed52734c0819ac9cc0e5925afdc729dd25",
+      "license": "BSD-2-Clause",
+      "files": [
+        "LICENSE",
+        "launchctl.h",
+        "launchctl.xml",
+        "os_alloc_once.h",
+        "xpc_helper.c",
+        "xpc_private.h"
+      ],
+      "content_sha256": "72c48878886d2acf45602edd88725d6d3a3e826d8e6b069a7a0d53071ca545d9"
     }
   }
 }
