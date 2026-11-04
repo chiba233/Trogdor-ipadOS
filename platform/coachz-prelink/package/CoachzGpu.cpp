@@ -729,10 +729,11 @@ unsigned governorTarget(unsigned level, uint64_t dBusy, uint64_t dAlways, bool t
     return target;
 }
 
-// Runtime power as Linux's msm driver has it for A618 (no IFPC): 66 ms after the last submission the GMU slumbers, and the next submission
+// Runtime power for A618 (no IFPC): 66 ms after the last work retires the GMU slumbers, and the next submission
 // brings it back through the whole start. Armed by the power button (coachz_gpu_pm_arm), so a failure can only follow that press.
 volatile uint32_t gPmArmed;
-volatile uint64_t gPmLastSubmit;
+volatile uint64_t gPmLastSubmit, gPmLastBusy;
+uint32_t gPmRetireHolds, gPmBusyHolds;
 uint32_t gPmSleeps, gPmWakes;
 void pmSleep() {
     const uint64_t began = mach_absolute_time();
@@ -748,7 +749,9 @@ void pmSleep() {
 }
 // Under the publisher's lock, before a submission: the firmware and hw_init again, then what startCp does after them.
 void pmGet() {
-    gPmLastSubmit = mach_absolute_time();
+    const uint64_t now = mach_absolute_time();
+    __atomic_store_n(&gPmLastSubmit, now, __ATOMIC_RELEASE);
+    __atomic_store_n(&gPmLastBusy, now, __ATOMIC_RELEASE);
     if (!__atomic_load_n(&gPmAsleep, __ATOMIC_SEQ_CST)) return;
     const uint64_t began = mach_absolute_time();
     const int status = coachz_gpu_pm_resume();
@@ -779,11 +782,29 @@ void pmGet() {
         int(waited), (mach_absolute_time() - began) / 19, gPmDropped);
 }
 void pmThread(void *, wait_result_t) {
+    uint32_t retired = 0;
     for (;;) {
         IOSleep(20);
-        if (!gPmArmed || gPmAsleep || mach_absolute_time() - gPmLastSubmit < 19200 * 66) continue;
+        if (!gPmArmed || __atomic_load_n(&gPmAsleep, __ATOMIC_ACQUIRE)) continue;
         native_adreno_publisher_lock(1);
-        if (!gRing.outstanding() && mach_absolute_time() - gPmLastSubmit >= 19200 * 66) pmSleep();
+        const uint64_t now = mach_absolute_time();
+        const uint32_t completed = gRing.completedFence(); // shared fence memory, not GX MMIO
+        const bool pending = completed != gRing.lastSubmitted();
+        // Linux msm_gpu.c::retire_submit marks last busy before the final
+        // autosuspend put. Submission age alone can expire while work runs.
+        if (pending || completed != retired) {
+            if (pending) ++gPmBusyHolds;
+            if (completed != retired) ++gPmRetireHolds;
+            retired = completed;
+            __atomic_store_n(&gPmLastBusy, now, __ATOMIC_RELEASE);
+        } else if (now - __atomic_load_n(&gPmLastBusy, __ATOMIC_ACQUIRE) >= 19200 * 66) {
+            const uint32_t n = gPmSleeps + 1;
+            if (n <= 4 || !(n & (n - 1)))
+                printf("COACHZ gpu pm: idle %u submit %llu ms retire %llu ms held busy %u retire %u\n", n,
+                    (now - __atomic_load_n(&gPmLastSubmit, __ATOMIC_ACQUIRE)) / 19200,
+                    (now - __atomic_load_n(&gPmLastBusy, __ATOMIC_ACQUIRE)) / 19200, gPmBusyHolds, gPmRetireHolds);
+            pmSleep();
+        }
         native_adreno_publisher_lock(0);
     }
 }

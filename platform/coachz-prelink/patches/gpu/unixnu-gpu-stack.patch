@@ -2,7 +2,7 @@ diff --git a/drivers/AdrenoMetal/bridge/patches/0026-coachz-copy-profile.patch b
 new file mode 100644
 --- /dev/null
 +++ b/drivers/AdrenoMetal/bridge/patches/0026-coachz-copy-profile.patch
-@@ -0,0 +1,948 @@
+@@ -0,0 +1,970 @@
 +diff --git a/crates/metal2vulkan/src/bind/graphics.rs b/crates/metal2vulkan/src/bind/graphics.rs
 +--- a/crates/metal2vulkan/src/bind/graphics.rs
 ++++ b/crates/metal2vulkan/src/bind/graphics.rs
@@ -503,11 +503,33 @@ new file mode 100644
 +diff --git a/crates/metal2vulkan-runtime/src/pipeline/render.rs b/crates/metal2vulkan-runtime/src/pipeline/render.rs
 +--- a/crates/metal2vulkan-runtime/src/pipeline/render.rs
 ++++ b/crates/metal2vulkan-runtime/src/pipeline/render.rs
-+@@ -677,8 +677,77 @@
++@@ -677,8 +677,99 @@
 +     }
 + }
 +
 + impl RenderPipelineState {
+++    /// Original-geometry private target: preserve stage code and interfaces.
+++    /// The reference audit replays the pass, so memory-writing shaders remain out.
+++    pub fn coachz_identity(&self, hashes: &mut [u64; 4]) -> Result<u32, Error> {
+++        let Kind::Graphics(state) = &self.0 else { return Ok(1) };
+++        let base = state.base();
+++        let mut mask = 0u32;
+++        if base.graphics.rasterization_samples.as_raw() != 1 || base.graphics.tessellation.is_some()
+++            || base.graphics.writes_viewport_index || base.graphics.rasterizer_discard
+++            || base.graphics.depth_format.is_some() || base.graphics.stencil_format.is_some()
+++            || base.graphics.alpha_to_coverage { mask |= 1; }
+++        if base.interface.needs_handle_translation || base.interface.reaches_command_buffers
+++            || !base.interface.texture_writing_stages.is_empty() || base.graphics.vertex_writes_memory
+++            || base.interface.slots.values().any(|slot| matches!(slot,
+++                metal2vulkan::pipeline::SlotInterface::Buffer(buffer) if buffer.access.write)) { mask |= 2; }
+++        for module in &base.stages {
+++            let at = match module.stage.as_raw() { 1 => 0, 16 => 1, _ => { mask |= 1; continue } };
+++            let hash = module.spirv.iter().fold(0xcbf29ce484222325u64, |h,w| (h ^ u64::from(*w)).wrapping_mul(0x100000001b3));
+++            hashes[at] = hash;hashes[at+2] = hash;
+++        }
+++        Ok(mask)
+++    }
+++
 ++    /// Coachz's single-sample quarter turn. Check features whose lane/sample or
 ++    /// indirect-resource semantics are not covered, then compile the real variant
 ++    /// before any command switches its target. A refusal leaves the original state usable.

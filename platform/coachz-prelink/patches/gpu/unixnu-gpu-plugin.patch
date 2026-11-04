@@ -305,7 +305,84 @@ diff --git a/GpuScanoutPresenter.h b/GpuScanoutPresenter.h
 diff --git a/NativeAdrenoMetalPlugin.mm b/NativeAdrenoMetalPlugin.mm
 --- a/NativeAdrenoMetalPlugin.mm
 +++ b/NativeAdrenoMetalPlugin.mm
-@@ -93,9 +93,10 @@
+@@ -81,8 +81,76 @@
+ }
+ static bool writeTask(uintptr_t address, const void *data, size_t size) {
+     return vm_write(mach_task_self(), address, (vm_offset_t) data, (mach_msg_type_number_t) size) == KERN_SUCCESS;
+ }
++extern "C" void native_bridge_coachz_scaler_state(const char *text);
++// QuartzCore 21H461 option table: DISABLE_DETACHED +0x15,
++// FORCE_COPY_SURFACE_MSR +0xa0, FORCE_COPY_SURFACE_GPU +0xa1.
++// Keep layers in the normal compositor and select the GPU for eligible copies.
++static void configureSurfaceCopies(bool emit) {
++#if defined(__arm64e__)
++    (void)emit;
++#else
++    if (strcmp(getprogname(), "backboardd")) return;
++    const char *names[] = {"CA_DISABLE_DETACHED", "CA_FORCE_COPY_SURFACE_GPU", "CA_FORCE_COPY_SURFACE_MSR"};
++    const char *values[] = {"1", "1", "0"};
++    unsigned environment = 0;
++    for (unsigned i = 0; i < 3; ++i)
++        if (setenv(names[i], values[i], 1) == 0) environment |= 1u << i;
++    void *entry = dlsym(RTLD_DEFAULT, "CARenderServerStart");
++    Dl_info image = {};
++    bool matched = false;
++    unsigned applied = 0;
++    uint8_t actual[3] = {255, 255, 255};
++    bool wrote = false;
++    if (entry && dladdr(entry, &image) && image.dli_fname && strstr(image.dli_fname, "/QuartzCore.framework/")) {
++        const uintptr_t header = (uintptr_t)image.dli_fbase;
++        constexpr uintptr_t pinnedHeader = 0x189429000ull;
++        const intptr_t slide = (intptr_t)header - (intptr_t)pinnedHeader;
++        struct Gate {
++            uintptr_t address;
++            uint32_t words[3];
++        };
++        constexpr Gate gates[] = {
++            {0x189566794ull, {0xb0359da8, 0x394e1508, 0x35003f08}},
++            {0x1896e5f4cull, {0xd03591a9, 0x39504129, 0x35ffff89}},
++            {0x1896e5f5cull, {0xd03591a8, 0x39504508, 0x35001d08}},
++        };
++        matched = (uintptr_t)entry == (uintptr_t)(0x189651efcull + slide);
++        for (const Gate &gate : gates) {
++            uint32_t words[3] = {};
++            if (!readTask(gate.address + slide, words, sizeof words) || memcmp(words, gate.words, sizeof words)) matched = false;
++        }
++        if (matched) {
++            constexpr uintptr_t options = 0x1f491b370ull;
++            constexpr unsigned offsets[] = {0x15, 0xa1, 0xa0};
++            constexpr uint8_t wanted[] = {1, 1, 0};
++            for (unsigned i = 0; i < 3; ++i) {
++                const uintptr_t address = options + offsets[i] + slide;
++                if (!readTask(address, &actual[i], 1)) continue;
++                if (actual[i] != wanted[i]) {
++                    if (!writeTask(address, &wanted[i], 1)) continue;
++                    wrote = true;
++                    if (!readTask(address, &actual[i], 1)) continue;
++                }
++                if (actual[i] == wanted[i]) applied |= 1u << i;
++            }
++        }
++    }
++    static unsigned samples, writes, previous = ~0u;
++    if (wrote) ++writes;
++    if (!emit) return;
++    ++samples;
++    const unsigned state = environment | (matched ? 8u : 0u) | (applied << 4);
++    if (samples <= 2 || !(samples & (samples - 1)) || state != previous || wrote) {
++        char text[96];
++        snprintf(text, sizeof text, "SC route n%u match%u env%x applied%x detach%u gpu%u msr%u writes%u",
++                 samples, matched ? 1u : 0u, environment, applied, actual[0], actual[1], actual[2], writes);
++        native_bridge_coachz_scaler_state(text);
++    }
++    previous = state;
++#endif
++}
+ // EXPERIMENT (second report onward): this display path takes plain 8-bit BGRA only, so tell the render server's display that it has neither the deep
+ // (10-bit) framebuffer nor universal buffer compression. Whether the state it reads those from is the whole story is what the markers show.
+ // EXPERIMENT (boot-arg sheng-fb-bgra=1): the render server's framebuffer format with every other virtualized answer left as it is.
+ // framebuffer_pixel_format (24A446 0x184461838) takes RGhA on `tbnz w8, #0` at 0x184461928 when CADeviceIsVirtualized (byte 0x1e701bdd9) is 1;
+@@ -93,9 +161,10 @@
      char args[1100] = {};
      size_t size = sizeof args - 1;
      return sysctlbyname("kern.bootargs", args, &size, nullptr, 0) == 0 && strstr(args, key);
@@ -317,6 +394,36 @@ diff --git a/NativeAdrenoMetalPlugin.mm b/NativeAdrenoMetalPlugin.mm
      uint32_t word = 0;
      if (!readTask(site, &word, sizeof word)) return 0x6E40;
      if (word == 0xd503201f) return 0x6E42;
+@@ -146,8 +215,9 @@
+ #if defined(__arm64e__)
+     (void)gpu;
+     return;   // the addresses above are the 21H461 cache's; the arm64e (iPadOS 27) build must not read or write them
+ #endif
++    configureSurfaceCopies(true);
+     ++gReports;
+     static DisplaySample before;
+     static bool changed;
+     Class serverClass = NSClassFromString(@"CAWindowServer");
+@@ -294,8 +364,9 @@
+     static bool tried;
+     @synchronized([NativeAdrenoMetalDeviceBase class]) {
+         if (tried) return device;
+         tried = true;
++        configureSurfaceCopies(false);
+         exceptiondiag::start(); // the throw site of an uncaught exception, for the kernel's THROW row (ExceptionDiag.h)
+         // No concurrent binning in any Metal process: with it BV ran ahead of BR and the two stopped waiting on each other inside a pass
+         // (int-261p, int-262, and in system memory int-265). Without it Turnip's autotune picks tile memory (GMEM) or system memory per
+         // pass: i553 forced system memory for every pass, the GPU busy 19 % at 680 MHz. A tile store writes whole 16x4 blocks, which the
+@@ -478,8 +549,9 @@
+             snprintf(text, sizeof text, "PUB no device: %.40s", nmb_last_error());
+             streamText(*gpu, text);
+             return nil;
+         }
++        configureSurfaceCopies(true);
+         gpu->mark(0x6802);
+         // The status line (GPU8) every ten seconds (sheng-diag=1), and the display hand-off client on its own thread: both only read or serve,
+         // neither is the discovery's.
+         pthread_t monitor, scanout;
 diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 --- a/NativeBridgeMetalFrontend.mm
 +++ b/NativeBridgeMetalFrontend.mm
@@ -331,7 +438,7 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
  #include <pthread.h>
  #include <functional>
  #include <string>
-@@ -648,8 +650,26 @@
+@@ -648,8 +650,33 @@
   memcpy(gLastProblems[1],gLastProblems[0],sizeof gLastProblems[0]);
   strlcpy(gLastProblems[0],what.UTF8String?:"?",sizeof gLastProblems[0]);
  }
@@ -354,11 +461,18 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 +  }
 + }
 +}
++// The copy-route readback has its own Note 3 record, independent of the
++// rotating problem rows and Vulkan error counters.
++extern "C" void native_bridge_coachz_scaler_state(const char *text) {
++ uint32_t words[24]={};
++ if(text)memcpy(words,text,strnlen(text,95));
++ nbNote(3,words,24);
++}
  extern "C" void native_bridge_metal_note(const char *what) {noteProblem([NSString stringWithUTF8String:what]?:@"?");}
  // NMB_LOG_STDERR: also on stderr (a daemon's NSLog reaches only the unified log, which a bring-up board does not read).
  static bool logToStderr() {static bool on=getenv("NMB_LOG_STDERR")!=nullptr;return on;}
  // The GPU stack's log lines (log-gpu=1 on the boot line: the plugin sets SHENG_LOG_GPU): NSLog output, the pipeline journal. The problem notes that feed
-@@ -1020,15 +1040,59 @@
+@@ -1020,15 +1047,62 @@
  @property(nonatomic) uint32_t pvrtc;   // the PVRTC format the texture was asked for, decoded into its RGBA8 (0: none)
  - (void)replacePvrtcRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes length:(size_t)length;
  @property(nonatomic) NmbTextureDescriptor descriptor;
@@ -385,6 +499,9 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 + std::atomic<uint32_t> plainWriters; // leases held through completion, including uncommitted writes
 +}
 +@property(nonatomic,strong) NBTexture *texture;
++@property(nonatomic,strong) NBTexture *nativeTexture; // physical geometry, internal only
++@property(nonatomic,strong) id nativeQueue;
++@property(nonatomic) BOOL nativeValid;
 +@property(nonatomic) uint32_t surfaceID;
 +@property(nonatomic) BOOL shown,turned,promoting,valid;
 +@property(nonatomic) uint32_t writeSerial;
@@ -402,7 +519,7 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 +@interface CoachzFrameWrite : NSObject
 +@property(nonatomic,strong) NBTexture *texture;
 +@property(nonatomic) MTLScissorRect damage;
-+@property(nonatomic) BOOL partial,coherent,sealed,sealPlanned;
++@property(nonatomic) BOOL partial,coherent,sealed,sealPlanned,nativeConverted;
 +@property(nonatomic) uintptr_t passCaller;
 +@property(nonatomic) uint32_t passActions; // load in bits 0..3, store in bits 4..7
 +@property(nonatomic,strong) CoachzFrame *plainLease;
@@ -418,7 +535,7 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
  // The render server counts the surfaces it textures in use while the textures live (countUse).
  static const bool gCountsSurfaceUse=!strcmp(getprogname(),"backboardd");
  // A no-copy import keeps its pages until the runtime frees it, which can be after the buffer object goes (a command buffer still using
-@@ -1254,8 +1318,14 @@
+@@ -1254,8 +1328,14 @@
    out->format=pvrtcCarrier(out->format);out->usage|=MTLTextureUsageShaderRead;
   }
   return true;
@@ -433,7 +550,7 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
  - (NSUInteger)allocatedSize {return nmb_texture_allocated_size(_handle);}
  - (BOOL)isAliasable {return nmb_texture_is_aliasable(_handle);}
  - (void)makeAliasable {if(!nmb_texture_make_aliasable(_handle))NBLOG(@"native-metal: texture makeAliasable: %@",lastError());}
-@@ -1281,8 +1351,9 @@
+@@ -1281,8 +1361,9 @@
  - (BOOL)isDrawable {return _descriptor.is_drawable!=0;}
  - (IOSurfaceRef)iosurface {return _surface;}
  - (NSUInteger)iosurfacePlane {return 0;}
@@ -443,7 +560,7 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
  - (NSUInteger)bufferBytesPerRow {return _rowBytes;}
  - (id<MTLTexture>)parentTexture {return _parent;}
  - (NSUInteger)rotation {return _descriptor.rotation;}
-@@ -1295,9 +1366,13 @@
+@@ -1295,9 +1376,13 @@
  - (id<MTLTexture>)view:(NmbTexture *)handle {
   if(!handle){NBLOG(@"native-metal: texture view refused: %@",lastError());return nil;}
   NBTexture *view=[NBTexture new];view.handle=handle;NmbTextureDescriptor descriptor;nmb_texture_describe(handle,&descriptor);view.descriptor=descriptor;
@@ -457,7 +574,7 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
  }
  - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format {
   if(isPvrtc(format))format=(MTLPixelFormat)pvrtcCarrier(format);
-@@ -1380,12 +1455,14 @@
+@@ -1380,12 +1465,14 @@
    sys_dcache_flush(reinterpret_cast<void *>(it->first),it->second);
    gSurfaceFlushBytes+=it->second;gTimeSurfaceFlush.add(began);
   }
@@ -475,12 +592,12 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
   texture.buffer=buffer;texture.offset=offset;texture.rowBytes=row;return texture;
  }
  // myron: a two-plane extended-range surface ('b3a8', RGB10A8_2P_XR10) whose planes report no row bytes. IOSurfaceGetBytesPerRowOfPlane
-@@ -1454,8 +1531,16 @@
+@@ -1454,14 +1541,23 @@
   texture.buffer=self;texture.offset=offset;texture.rowBytes=row;return (id<MTLTexture>)texture;
  }
  @end
 
-+static bool coachzMirrorFrames(NmbCommandBuffer *commands,NSMutableArray *writes,NSMutableSet *owners,uint32_t guards,NSDictionary *surfaceGuards);
++static bool coachzMirrorFrames(NmbCommandBuffer *commands,NSMutableArray *writes,NSMutableSet *owners,uint32_t guards,NSDictionary *surfaceGuards,NSMutableArray *exports=nullptr);
 +static CoachzFrameWrite *coachzTrackFramePass(NSMutableArray *,NBTexture *,MTLRenderPassAttachmentDescriptor *,bool);
 +static void coachzFrameDraw(NSMutableArray *,const std::vector<MTLScissorRect> &);
 +static bool coachzIsTrackedFrame(NBTexture *);
@@ -492,7 +609,129 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
  @interface NBLibrary : NBObject
  @property(nonatomic) NmbLibrary *handle;
  @property(nonatomic,strong) id storage;          // what keeps the metallib's bytes mapped: its functions' bitcode, for stitching
-@@ -1751,11 +1836,18 @@
+ @property(nonatomic) const uint8_t *bytes;
+ @property(nonatomic) size_t length;
++@property(nonatomic,strong) NSData *coachzLibraryDigest;
+ - (id<MTLFunction>)nb_newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values zeroRest:(BOOL)zeroRest
+                                     error:(NSError **)error;
+ @end
+ @interface NBFunction : NBObject
+@@ -1471,8 +1567,10 @@
+ @property(nonatomic) MTLFunctionType functionType;
+ @property(nonatomic) std::string constantsText;   // name:type:hex of each constant value it was specialized with (the journal's)
+ @property(nonatomic,strong) NBLibrary *library;      // where it came from (stitching reads its bitcode), and the values it was
+ @property(nonatomic,strong) NSData *bitCodeHashData;
++@property(nonatomic) BOOL coachzZeroRest;
++@property(nonatomic) uint64_t coachzFunctionMode;
+ @property(nonatomic,strong) MTLFunctionConstantValues *constantValues;   // specialized with (nil: none), for the zero-rest rebuild of a refused pipeline
+ @end
+ @interface NBFunctionConstant : NSObject
+ @property(nonatomic,copy) NSString *name;
+@@ -1559,8 +1657,60 @@
+ // without them create_metal_dag ended in a null program and iconservicesagent crashed in create_program_and_arguments. Such a function has
+ // no runtime handle: it is stitched from its bitcode (functionBitcode) and refused as a pipeline's own function.
+ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name);
+ static bool forEachLibraryEntry(NBLibrary *library,const std::function<bool(const std::string &,int)> &visit);
++static std::atomic<uint64_t> gCoachzCacheHit[3],gCoachzCacheMiss[3],gCoachzCacheKeyUs;
++static void coachzKeyBytes(NSMutableData *key,const void *bytes,size_t length) {
++ const uint64_t n=length;[key appendBytes:&n length:sizeof n];if(length)[key appendBytes:bytes length:length];
++}
++static bool coachzFunctionKey(NSMutableData *key,NBFunction *function) {
++ if(!function){coachzKeyBytes(key,nullptr,0);return true;}
++ NBLibrary *library=function.library;
++ if(!library.bytes || !library.length)return false;
++ @synchronized(library) {
++  if(!library.coachzLibraryDigest) {
++   CC_SHA256_CTX context;CC_SHA256_Init(&context);
++   for(size_t at=0;at<library.length;) {
++    const size_t n=std::min(library.length-at,(size_t)(1u<<20));
++    CC_SHA256_Update(&context,library.bytes+at,(CC_LONG)n);at+=n;
++   }
++   unsigned char digest[CC_SHA256_DIGEST_LENGTH];CC_SHA256_Final(digest,&context);
++   library.coachzLibraryDigest=[NSData dataWithBytes:digest length:sizeof digest];
++  }
++ }
++ coachzKeyBytes(key,library.coachzLibraryDigest.bytes,library.coachzLibraryDigest.length);
++ for(NSString *text in @[function.sourceName?:@"",function.name?:@""]) {
++  NSData *data=[text dataUsingEncoding:NSUTF8StringEncoding];coachzKeyBytes(key,data.bytes,data.length);
++ }
++ coachzKeyBytes(key,function.constantsText.data(),function.constantsText.size());
++ const uint64_t mode=function.coachzFunctionMode;coachzKeyBytes(key,&mode,sizeof mode);return true;
++}
++static NSCache<NSData *,NBFunction *> *coachzFunctionCache() {
++ static NSCache *cache=[] {NSCache *c=[NSCache new];c.countLimit=256;return c;}();return cache;
++}
++static NSData *coachzSpecializationKey(NBLibrary *library,NSString *name,const std::string &constants,uint64_t mode) {
++ if(!name)return nil;
++ const uint64_t began=nowUs();
++ NBFunction *function=[NBFunction new];function.library=library;function.name=name;function.sourceName=name;function.constantsText=constants;
++ function.coachzZeroRest=mode==2;function.coachzFunctionMode=mode;
++ NSMutableData *key=[NSMutableData data];[key appendBytes:&mode length:sizeof mode];
++ const bool ok=coachzFunctionKey(key,function);gCoachzCacheKeyUs+=nowUs()-began;return ok?key:nil;
++}
++static NBFunction *coachzCopyFunction(NBFunction *source) {
++ NmbFunction *handle=nmb_function_copy(source.handle);if(!handle)return nil;
++ NBFunction *copy=[NBFunction new];copy.handle=handle;copy.name=source.name;copy.sourceName=source.sourceName;
++ copy.functionType=source.functionType;copy.constantsText=source.constantsText;copy.library=source.library;
++ copy.constantValues=[source.constantValues copy];copy.coachzZeroRest=source.coachzZeroRest;copy.coachzFunctionMode=source.coachzFunctionMode;return copy;
++}
++static NBFunction *coachzCachedFunction(NSData *key) {
++ if(!key)return nil;
++ NBFunction *cached=[coachzFunctionCache() objectForKey:key];
++ NBFunction *copy=cached?coachzCopyFunction(cached):nil;
++ if(copy)gCoachzCacheHit[0]++;else gCoachzCacheMiss[0]++;return copy;
++}
++static void coachzKeepFunction(NSData *key,NBFunction *function) {
++ if(key)if(NBFunction *copy=coachzCopyFunction(function))[coachzFunctionCache() setObject:copy forKey:key];
++}
+ @implementation NBLibrary
+ - (void)dealloc {nmb_library_release(_handle);}
+ - (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values error:(NSError **)error {
+  return [self nb_newFunctionWithName:name constantValues:values zeroRest:NO error:error];
+@@ -1592,8 +1742,10 @@
+   char head[32];if(!c.name)snprintf(head,sizeof head,"#%llu",(unsigned long long)c.index);
+   text+=text.empty()?"":" ";text+=c.name?c.name:head;snprintf(head,sizeof head,":%llu:",(unsigned long long)c.type);text+=head;
+   for(uint64_t i=0;i<c.length;i++){snprintf(head,sizeof head,"%02x",((const uint8_t *)c.bytes)[i]);text+=head;}
+  }
++ NSData *cacheKey=coachzSpecializationKey(self,name,text,zeroRest?2:1);
++ if(NBFunction *cached=coachzCachedFunction(cacheKey)){if(error)*error=nil;return (id<MTLFunction>)cached;}
+  const uint64_t functionBegan=nowUs();
+  NmbFunction *handle=(zeroRest?nmb_function_new_specialized_zero_rest:nmb_function_new_specialized)(_handle,name.UTF8String,constants.data(),
+      (uint32_t)constants.size());gTimeFunction.add(functionBegan);
+  // One S line per specialization (int-155: every QuartzCore pipeline was made on its draw, and a refused generic function would leave its
+@@ -1607,9 +1759,10 @@
+   noteProblem([NSString stringWithFormat:@"specialized function %@: %@",name,lastError()]);
+   if(error)*error=nbError([NSString stringWithFormat:@"specialized function: %@",lastError()]);return nil;
+  }
+  NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.sourceName=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
+- function.constantsText=text;function.library=self;function.constantValues=snapshot;if(error)*error=nil;return (id<MTLFunction>)function;
++ function.constantsText=text;function.library=self;function.constantValues=snapshot;function.coachzZeroRest=zeroRest;function.coachzFunctionMode=zeroRest?2:1;
++ coachzKeepFunction(cacheKey,function);if(error)*error=nil;return (id<MTLFunction>)function;
+ }
+ - (void)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values completionHandler:(void (^)(id<MTLFunction>,NSError *))handler {
+  NSError *error=nil;id<MTLFunction> function=[self newFunctionWithName:name constantValues:values error:&error];
+  handler(function,error);
+@@ -1654,16 +1807,18 @@
+ }
+ - (id<MTLFunction>)newFunctionWithName:(NSString *)name {
+  const uint64_t functionBegan=nowUs();
+  if(NBFunction *kernel=ciKernelFunction(self,name)){gTimeFunction.add(functionBegan);return (id<MTLFunction>)kernel;}
++ NSData *cacheKey=coachzSpecializationKey(self,name,std::string(),0);
++ if(NBFunction *cached=coachzCachedFunction(cacheKey)){gTimeFunction.add(functionBegan);return (id<MTLFunction>)cached;}
+  NmbFunction *handle=name?nmb_function_new(_handle,name.UTF8String):nullptr;gTimeFunction.add(functionBegan);
+  if(!handle) {
+   static std::atomic<int> told{0};
+   if(told.fetch_add(1)<64)NBLOG(@"native-metal: function %@ refused: %@",name,lastError());
+   return nil;
+  }
+  NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.sourceName=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
+- function.library=self;return (id<MTLFunction>)function;
++ function.library=self;coachzKeepFunction(cacheKey,function);return (id<MTLFunction>)function;
+ }
+ // Shader priming (PrimeShaders.h): the function with each of its function constants set to zero, or nil.
+ - (id<MTLFunction>)nb_newFunctionWithZeroConstants:(NSString *)name {
+  NmbFunction *handle=name?nmb_function_new_zero_constants(_handle,name.UTF8String):nullptr;
+@@ -1751,11 +1906,18 @@
  - (void)dealloc {nmb_compute_pipeline_release(_handle);}
  - (NSUInteger)maxTotalThreadsPerThreadgroup {return nmb_compute_pipeline_max_threads(_handle);}
  - (NSUInteger)threadExecutionWidth {return nmb_compute_pipeline_execution_width(_handle);}
@@ -512,13 +751,13 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
  @end
  @implementation NBRenderPipeline
  - (void)dealloc {nmb_render_pipeline_release(_handle);}
-@@ -1913,8 +2005,34 @@
+@@ -1913,8 +2075,52 @@
    fwrite(IOSurfaceGetBaseAddress(surface),1,alloc,out);fclose(out);
   }
   if(manifest)fclose(manifest);
  }
 +@interface CoachzTurnColor : NSObject
-+@property(nonatomic,strong) NBTexture *source,*rotated;
++@property(nonatomic,strong) NBTexture *source,*rotated,*control;
 +@property(nonatomic) uint32_t slot,load,store,bytesPerPixel;
 +@end
 +@implementation CoachzTurnColor
@@ -543,25 +782,55 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 +- (void)dealloc {if(!_finished)coachzReleaseTurnAudit(self);}
 +@end
 +static void coachzFinishTurnAudits(id commandBuffer);
++static void coachzFinishExports(id commandBuffer);
++@interface CoachzExport : NSObject
++@property(nonatomic,strong) NBBuffer *report;
++@property(nonatomic) uint64_t bytes;
++@property(nonatomic) BOOL compared,check;
++@end
++@implementation CoachzExport
++@end
++static bool coachzFlushPending(id commandBuffer,uint32_t continuingSurface,
++ const std::unordered_set<uint32_t> *accesses=nullptr,uint32_t boundary=0);
++static void coachzReturnScratch(id commandBuffer);
++static std::atomic<uint64_t> gCoachzBindSkip[5],gCoachzBindCalls;
++static std::atomic<uint64_t> gCoachzDependencyPasses,gCoachzDependencyCalls,gCoachzDependencyReplayUs;
++static std::atomic<uint64_t> gCoachzOwnerRecorded,gCoachzOwnerEncoded;
++struct CoachzBinding {
++ id object=nil;uint64_t value=0;bool known=false;
++ std::vector<uint8_t> bytes;
++};
  @interface NBCommandBuffer : NBObject {
  @public
   EncodedWork encodedWork;   // the command buffer's single encoder thread, not global counter deltas
   uint64_t createdUs;
-@@ -1930,8 +2048,13 @@
+@@ -1930,11 +2136,24 @@
  @property(nonatomic) uint64_t committedUs;
  @property(nonatomic) uint32_t commitIndex;
  @property(nonatomic,strong) NSMutableArray *scheduledHandlers,*completedHandlers;
  @property(nonatomic,strong) NSMutableSet *surfaces;
 +@property(nonatomic,strong) NSMutableArray *coachzFrameWrites;
 +@property(nonatomic,strong) NSMutableArray *coachzTurnAudits;
++// Encode-thread only. An immutable prefix, never a back-reference to an encoder.
++@property(nonatomic,strong) NSArray *coachzPendingSeal;
++@property(nonatomic) uint32_t coachzPendingSurface;
++@property(nonatomic,strong) NSMutableArray *coachzScratch;
++@property(nonatomic,strong) NSMutableArray *coachzExports;
 +@property(nonatomic) uint32_t coachzMirrorGuards; // unbounded compute writes affect the whole command
 +@property(nonatomic,strong) NSMutableDictionary<NSNumber *,NSNumber *> *coachzFrameGuards;
 +- (void)coachzGuardSurface:(IOSurfaceRef)surface reason:(uint32_t)reason;
  // Runtime handles retain GPU storage, but only the Objective-C owner retains
  // a no-copy deallocator, its memory owner and texture/heap ancestry.
- @property(nonatomic,strong) NSMutableSet *resourceOwners;
+-@property(nonatomic,strong) NSMutableSet *resourceOwners;
++@property(nonatomic,strong) NSMutableSet *resourceOwners; // recording thread only
++@property(nonatomic,strong) NSMutableSet *coachzEncodedOwners; // encoding thread only
++@property(nonatomic) BOOL coachzNativeCheckFailed;
++@property(nonatomic) BOOL coachzMayHavePending; // recording-thread hint, not a GPU completion
  // The sampled sources watched for a rewrite while the GPU could read them (gWatchSources), kept alive until completion.
-@@ -1952,9 +2075,34 @@
+ @property(nonatomic,strong) NSMutableSet *sampled;
+ - (void)watchTexture:(NBTexture *)texture;
+ @property(nonatomic,strong) dispatch_group_t handlers;
+@@ -1952,9 +2171,40 @@
   NmbTexture *source,*destination;
   uint64_t sourceLevel,sourceSlice,destinationLevel,destinationSlice;
   std::array<uint64_t,3> sourceOrigin,destinationOrigin,size;
@@ -569,13 +838,17 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 -@interface NBEncoder : NBObject
 +@interface NBEncoder : NBObject {
 +@public
-+ BOOL coachzDeferred,coachzSelected,coachzAuditing;
++ BOOL coachzDeferred,coachzSelected,coachzAuditing,coachzNative;
++ BOOL coachzDependencyDeferred,coachzUnknownAccess;
++ uint32_t coachzDependencyKind;
++ std::unordered_set<uint32_t> coachzAccesses;
 + uint32_t coachzTurnReject,coachzTurnDraws;
 + uint64_t coachzTurnBegan;
 + std::vector<std::function<void()>> coachzCalls;
 + size_t coachzHeldBytes;
++ std::unordered_map<uint32_t,CoachzBinding> coachzBindings;
 + std::shared_ptr<NmbRenderPassDescriptor> coachzPass;
-+ NBTexture *coachzTarget,*coachzTurnView;
++ NBTexture *coachzTarget,*coachzTurnView,*coachzNativeView;
 + CoachzFrame *coachzTurnFrame;
 + CoachzFrameWrite *coachzTurnWrite;
 + NSMutableSet *coachzTurnPipelines;
@@ -593,11 +866,13 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 +- (void)coachzResolveDeferred;
 +- (void)coachzFlushDeferred;
 +- (void)coachzWatchResource:(id)resource;
++- (void)coachzNoteAccess:(id)resource;
++- (BOOL)coachzSame:(uint32_t)kind stage:(uint32_t)stage index:(NSUInteger)index object:(id)object value:(uint64_t)value;
  @property(nonatomic) NmbEncoder *handle;
  @property(nonatomic,strong) NBCommandBuffer *commandBuffer;
  @property(nonatomic) std::vector<SingleSampleCopy> resolveCopies;
  @property(nonatomic,strong) NSMutableArray *dumpEntries;   // its NATIVE_METAL_DUMP_CB targets, given its label at endEncoding
-@@ -2144,9 +2292,36 @@
+@@ -2144,9 +2394,39 @@
   std::unique_lock<std::mutex> lock(t.lock);
   const uint64_t target=t.queued;
   t.idle.wait(lock,[&]{return t.done>=target;});
@@ -609,7 +884,7 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 +template<class F> static void recordEncode(NBEncoder *encoder,F &&work) {
 + encoder->coachzCalls.emplace_back(std::forward<F>(work));
 + if(encoder->coachzCalls.size()>=4096) {
-+  encoder->coachzTurnReject|=128;[encoder coachzResolveDeferred];
++  encoder->coachzTurnReject|=128;encoder->coachzUnknownAccess=YES;[encoder coachzResolveDeferred];
 + }
 +}
 +// Ordinary encoders keep the original allocation-free batching. Only a
@@ -625,6 +900,9 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 +static bool coachzSealQuarter(NBEncoder *);
 +static bool coachzMakeAudit(NBEncoder *);
 +static bool coachzSeedMrt(NBEncoder *);
++static bool coachzPrepareControl(NBEncoder *);
++static bool coachzSeedNative(NBEncoder *);
++static bool coachzStoreNative(NBEncoder *);
 +static bool coachzStoreMrt(NBEncoder *);
 +static void coachzSelectMrt(NBEncoder *);
 +static bool coachzSetupQuarter(NBRenderEncoder *,NBTexture *,MTLRenderPassDescriptor *,CoachzFrameWrite *);
@@ -635,7 +913,25 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
  static std::mutex gRuntimeHandleLock;
  static void waitForResource(id resource) {
   encodeDrain();   // every committed command buffer's uses recorded
-@@ -2224,9 +2399,44 @@
+@@ -2205,8 +2485,17 @@
+ @implementation NBEncoder {
+  std::unique_ptr<DrawStateNote> _drawNote;
+ }
+ - (void)dealloc {if(_handle)nmb_encoder_discard(_handle);}
++// Encoder-local Metal state persists across draws, not across encoder lifetimes.
++// Retain the identity so allocator address reuse cannot turn a new object into a hit.
++- (BOOL)coachzSame:(uint32_t)kind stage:(uint32_t)stage index:(NSUInteger)index object:(id)object value:(uint64_t)value {
++ gCoachzBindCalls++;
++ if(index>=32 || stage>2)return NO; // let the runtime validate unsupported indices
++ CoachzBinding &bound=coachzBindings[(kind<<16)|(stage<<8)|(uint32_t)index];
++ if(bound.known && bound.object==object && bound.value==value){gCoachzBindSkip[kind]++;return YES;}
++ bound.object=object;bound.value=value;bound.known=true;bound.bytes.clear();return NO;
++}
+ // A setter of `kind` at `key` (UINT32_MAX: one not compared) binding `object` with `value`, for the draw-stats tally.
+ - (void)noteState:(uint32_t)kind key:(uint32_t)key object:(const void *)object value:(uint64_t)value {
+  if(!_drawNote)_drawNote.reset(new DrawStateNote);
+  if(key!=UINT32_MAX) {
+@@ -2224,9 +2513,74 @@
  - (bool)check:(bool)ok what:(const char *)what {
   if(!ok)[_commandBuffer refuse:[NSString stringWithFormat:@"%s: %@",what,lastError()]];
   return ok;
@@ -647,7 +943,14 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 + auto calls=std::make_shared<std::vector<std::function<void()>>>(std::move(coachzCalls));
 + auto factory=self.coachzFactory;self.coachzFactory=nil;
 + encodeLater([self,calls,factory]{
++  const uint64_t replayBegan=nowUs();
++  const uint32_t continuing=self->coachzSelected && !self->coachzAuditing?IOSurfaceGetID(self->coachzTarget.surface):0;
++  const auto *accesses=self->coachzDependencyDeferred && !self->coachzUnknownAccess?&self->coachzAccesses:nullptr;
++  if(!coachzFlushPending(self.commandBuffer,continuing,accesses,self->coachzDependencyKind)){[self check:false what:"deferred surface boundary"];return;}
 +  auto open=[&]{self.handle=factory();return [self check:self.handle!=nullptr what:"deferred render encoder"];};
++  if((self->coachzSelected || self->coachzAuditing) && self->coachzNative && !coachzSeedNative(self)) {
++   [self check:false what:"physical private seed"];return;
++  }
 +  if((self->coachzSelected || self->coachzAuditing) && !coachzSeedMrt(self)) {
 +   [self check:false what:"quarter-turn MRT seed"];
 +   return;
@@ -659,6 +962,14 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 +    for(double &component:attachment.clear)component=0;
 +   }
 +   self->coachzSelected=NO;
++   if(!coachzPrepareControl(self)){[self check:false what:"identity audit setup"];return;}
++   const NmbRenderPassDescriptor original=*self->coachzPass;
++   for(CoachzTurnColor *color in self->coachzTurnColors)self->coachzPass->colors[color.slot].texture=color.control.handle;
++   if(!open())return;
++   for(auto &call:*calls)call();
++   NmbEncoder *control=self.handle;self.handle=nullptr;
++   if(![self check:nmb_encoder_end(control) what:"identity audit pass end"])return;
++   *self->coachzPass=original;
 +   if(!open())return;
 +   for(auto &call:*calls)call();
 +   NmbEncoder *reference=self.handle;self.handle=nullptr;
@@ -668,10 +979,25 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 +  }
 +  if(!open())return;
 +  for(auto &call:*calls)call();
++  if(self->coachzDependencyDeferred) {
++   gCoachzDependencyPasses++;gCoachzDependencyCalls+=calls->size();gCoachzDependencyReplayUs+=nowUs()-replayBegan;
++  }
 + });
 +}
++- (void)coachzNoteAccess:(id)resource {
++ if(resource) {
++  IOSurfaceRef surface=nullptr;
++  if([resource isKindOfClass:[NBTexture class]]) {
++   NBTexture *texture=(NBTexture *)resource,*root=coachzGpuRoot(texture);
++   surface=texture.surface?:root.surface;
++   if(!surface)surface=[root coachzLinearBackingBuffer].importedSurface;
++  } else if([resource isKindOfClass:[NBBuffer class]])surface=[(NBBuffer *)resource importedSurface];
++  if(surface)coachzAccesses.insert(IOSurfaceGetID(surface));
++ }
++}
 +- (void)coachzWatchResource:(id)resource {
-+ if(coachzDeferred)for(CoachzTurnColor *color in coachzTurnColors)
++ [self coachzNoteAccess:resource];
++ if(coachzDeferred && !coachzDependencyDeferred)for(CoachzTurnColor *color in coachzTurnColors)
 +  if(coachzResourceAliases(resource,color.source))coachzTurnReject|=2;
 +}
  - (void)endEncoding {
@@ -680,7 +1006,7 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
   if(_dumpDraws)dumpLine(_commandBuffer,[NSString stringWithFormat:@"pass %u: %u draws %@",_commandBuffer.dumpPasses,_dumpDraws,self.label?:@""]);
   if(_dumpRuns.count>1 || _dumpDraws>6)for(NSArray *run in _dumpRuns)
    dumpLine(_commandBuffer,[NSString stringWithFormat:@"pass %u run: draws %@..%lu | %@ | depth %@",_commandBuffer.dumpPasses,run[2],
-@@ -2241,8 +2451,13 @@
+@@ -2241,8 +2595,14 @@
            [self check:nmb_blit_copy_texture(blit,c.source,c.sourceSlice,c.sourceLevel,c.sourceOrigin.data(),c.size.data(),
              c.destination,c.destinationSlice,c.destinationLevel,c.destinationOrigin.data()) what:"single-sample resolve"];
           [self check:nmb_encoder_end(blit) what:"single-sample resolve end"];
@@ -689,12 +1015,13 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 +        if(self->coachzSelected) {
 +         if(self->coachzAuditing && !coachzMakeAudit(self)){[self check:false what:"quarter-turn audit"];return;}
 +         if(!coachzStoreMrt(self)){[self check:false what:"quarter-turn MRT store"];return;}
++         if(self->coachzNative && !self->coachzAuditing && !coachzStoreNative(self)){[self check:false what:"physical private store"];return;}
 +         if(!coachzSealQuarter(self))[self check:false what:"quarter-turn surface synchronization"];
          });
   encodeFlush();
  }
  - (void)insertDebugSignpost:(NSString *)s {(void)s;}
-@@ -2300,9 +2515,11 @@
+@@ -2300,11 +2660,14 @@
  }
  // Stage 0 compute, 1 vertex, 2 fragment (the bridge's numbering).
  - (void)buffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {
@@ -704,9 +1031,12 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 + if(buffer && [(NBBuffer *)buffer importedSurface])[_commandBuffer coachzGuardSurface:[(NBBuffer *)buffer importedSurface] reason:4];
   if(gDrawStats)[self noteState:kDSBuffer key:stage<<8|(uint32_t)index object:(__bridge const void *)buffer value:offset];
   if(dumpMaybe(_commandBuffer))[self dumpBind:buffer?@[buffer,@(offset)]:nil index:index stage:stage];
++ if([self coachzSame:0 stage:stage index:index object:buffer value:offset])return;
   ENCODE([self check:nmb_encoder_set_buffer(self->_handle,stage,buffer?[(NBBuffer *)buffer handle]:nullptr,offset,(uint32_t)index) what:"setBuffer"]);
  }
-@@ -2316,9 +2533,11 @@
+ - (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index stage:(uint32_t)stage {
+  if(texture && ![(id)texture isKindOfClass:[NBTexture class]]){[_commandBuffer refuse:@"foreign texture"];return;}
+@@ -2316,18 +2679,22 @@
    dumpNote(_commandBuffer,_commandBuffer.dumpTargets,texture,0,0,
             [NSString stringWithFormat:@"kernel %u texture %lu",_commandBuffer.dumpKernels,(unsigned long)index]);
    if(_commandBuffer.dumpTargets.count>before)[_dumpEntries addObject:_commandBuffer.dumpTargets.lastObject];
@@ -717,14 +1047,33 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
   [self dumpBind:texture index:index stage:stage+4];
   if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
   if(texture && gWatchSources)[_commandBuffer watchTexture:(NBTexture *)texture];
++ if([self coachzSame:1 stage:stage index:index object:texture value:0])return;
   ENCODE([self check:nmb_encoder_set_texture(self->_handle,stage,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index) what:"setTexture"]);
-@@ -2335,15 +2554,20 @@
+ }
+ - (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index stage:(uint32_t)stage {
+  if(sampler && ![(id)sampler isKindOfClass:[NBSampler class]]){[_commandBuffer refuse:@"foreign sampler"];return;}
+  [self dumpBind:sampler index:index stage:stage+8];
+  if(gDrawStats)[self noteState:kDSSampler key:stage<<8|(uint32_t)index object:(__bridge const void *)sampler value:0];
++ if([self coachzSame:2 stage:stage index:index object:sampler value:0])return;
+  ENCODE([self check:nmb_encoder_set_sampler(self->_handle,stage,sampler?[(NBSampler *)sampler handle]:nullptr,(uint32_t)index) what:"setSamplerState"]);
+ }
+ - (void)sampler:(id<MTLSamplerState>)sampler lodMin:(float)lodMin max:(float)lodMax index:(NSUInteger)index stage:(uint32_t)stage {
+  if(sampler && ![(id)sampler isKindOfClass:[NBSampler class]]){[_commandBuffer refuse:@"foreign sampler"];return;}
+@@ -2335,15 +2702,29 @@
   if(sampler && !clamped){[_commandBuffer refuse:@"sampler with LOD clamps refused"];return;}
   [self sampler:(id<MTLSamplerState>)clamped index:index stage:stage];
  }
  - (void)bytes:(const void *)bytes length:(NSUInteger)length index:(NSUInteger)index stage:(uint32_t)stage {
++ if(index<32 && stage<=2) {
++  CoachzBinding &bound=coachzBindings[(stage<<8)|(uint32_t)index];
++  gCoachzBindCalls++;
++  if(bytes && length && length<=4096 && bound.known && !bound.object && bound.value==UINT64_MAX &&
++     bound.bytes.size()==length && !memcmp(bound.bytes.data(),bytes,length)){gCoachzBindSkip[3]++;return;}
++  bound.object=nil;bound.known=false;bound.bytes.clear();
++  if(bytes && length && length<=4096){bound.bytes.assign((const uint8_t *)bytes,(const uint8_t *)bytes+length);bound.value=UINT64_MAX;bound.known=true;}
++ }
 + if(coachzDeferred) {
-+  if(length>(1u<<20)-coachzHeldBytes){coachzTurnReject|=128;[self coachzResolveDeferred];}
++  if(length>(1u<<20)-coachzHeldBytes){coachzTurnReject|=128;coachzUnknownAccess=YES;[self coachzResolveDeferred];}
 +  else coachzHeldBytes+=length;
 + }
   if(dumpMaybe(_commandBuffer))[self dumpBind:[NSData dataWithBytes:bytes length:length] index:index stage:stage];
@@ -736,31 +1085,53 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
  }
  - (void)fence:(id<MTLFence>)fence stages:(uint64_t)stages update:(bool)update {
 + if(coachzDeferred)coachzTurnReject|=16;
++ coachzUnknownAccess=YES;
   if(![(id)fence isKindOfClass:[NBFence class]]){[_commandBuffer refuse:@"foreign fence"];return;}
   ENCODE(NmbFence *handle=[(NBFence *)fence handle];
          [self check:update?nmb_encoder_update_fence(self->_handle,handle,stages):nmb_encoder_wait_fence(self->_handle,handle,stages)
                 what:update?"updateFence":"waitForFence"]);
-@@ -2387,8 +2611,9 @@
+@@ -2353,8 +2734,16 @@
+ - (void)offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {
+  id bound=_dumpBound[@(stage<<8|(uint32_t)index)];
+  if(gDrawStats)[self noteState:kDSOffset key:stage<<8|(uint32_t)index object:nullptr value:offset];
+  if([bound isKindOfClass:[NSArray class]])[self dumpBind:@[bound[0],@(offset)] index:index stage:stage];
++ if(index<32 && stage<=2) {
++  CoachzBinding &bound=coachzBindings[(stage<<8)|(uint32_t)index];
++  if(bound.known && bound.object) {
++   gCoachzBindCalls++;
++   if(bound.value==offset){gCoachzBindSkip[0]++;return;}
++   bound.value=offset;
++  } else {bound.known=false;bound.bytes.clear();}
++ }
+  ENCODE([self check:nmb_encoder_set_buffer_offset(self->_handle,stage,offset,(uint32_t)index) what:"setBufferOffset"]);
+ }
+ @end
+
+@@ -2387,8 +2776,10 @@
  - (void)setThreadgroupMemoryLength:(NSUInteger)n atIndex:(NSUInteger)i {
   ENCODE([self check:nmb_compute_set_threadgroup_memory(self.handle,(uint32_t)n,(uint32_t)i) what:"setThreadgroupMemoryLength"]);
  }
  - (void)dispatch:(MTLSize)size group:(MTLSize)group threads:(bool)threads {
++ coachzUnknownAccess=YES;
 + self.commandBuffer.coachzMirrorGuards|=1;
   gDispatches++;self.commandBuffer->encodedWork.dispatches++;
   const std::array<uint64_t,3> s={size.width,size.height,size.depth},g={group.width,group.height,group.depth};
   ENCODE([self check:nmb_compute_dispatch(self.handle,s.data(),g.data(),threads) what:"dispatch"]);
  }
-@@ -2396,8 +2621,9 @@
+@@ -2396,23 +2787,43 @@
  - (void)dispatchThreadgroups:(MTLSize)t threadsPerThreadgroup:(MTLSize)g {[self dispatch:t group:g threads:false];}
  - (void)dispatchThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)buffer indirectBufferOffset:(NSUInteger)offset threadsPerThreadgroup:(MTLSize)group {
   if(![(id)buffer isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign indirect buffer"];return;}
   [self.commandBuffer.resourceOwners addObject:buffer];
++ coachzUnknownAccess=YES;
 + self.commandBuffer.coachzMirrorGuards|=1;
   gDispatches++;self.commandBuffer->encodedWork.dispatches++;
   const std::array<uint64_t,3> g={group.width,group.height,group.depth};
   ENCODE([self check:nmb_compute_dispatch_indirect(self.handle,[(NBBuffer *)buffer handle],offset,g.data()) what:"indirect dispatch"]);
  }
-@@ -2406,13 +2632,30 @@
+-- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u {(void)r;(void)u;}
++- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u {[self coachzWatchResource:r];(void)u;}
+ - (void)memoryBarrierWithScope:(MTLBarrierScope)s {(void)s;}
  @end
 
  @interface NBRenderEncoder : NBEncoder
@@ -770,7 +1141,7 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 +- (void)coachzRecordDraw;
  @end
  @implementation NBRenderEncoder
-+- (void)coachzResolveDeferred {coachzResolveQuarter(self);}
++- (void)coachzResolveDeferred {if(coachzDependencyDeferred)[self coachzFlushDeferred];else coachzResolveQuarter(self);}
 +- (void)coachzRecordDraw {
 + if(_coachzRenderWrites)coachzFrameDraw(_coachzRenderWrites,_coachzScissors);
 + if(coachzDeferred && coachzCaptureTrace) {
@@ -787,11 +1158,12 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 +  [coachzTurnPipelines addObject:state];
 +  coachzCurrentDraw.pipeline=(NBRenderPipeline *)state;
 + }
++ if([self coachzSame:4 stage:0 index:0 object:state value:0])return;
   noteFormats(self.passKey|((uint64_t)((NBRenderPipeline *)state).stateFormat<<32));
   if(gDrawStats)[self noteState:kDSPipeline key:0 object:(__bridge const void *)state value:0];
   ENCODE([self check:nmb_render_set_pipeline(self.handle,[(NBRenderPipeline *)state handle]) what:"setRenderPipelineState"]);
  }
-@@ -2450,37 +2693,56 @@
+@@ -2450,37 +2861,56 @@
   for(NSUInteger k=0;k<r.length;k++)[self sampler:s[k] lodMin:a[k] max:b[k] index:r.location+k stage:2];
  }
  - (void)setDepthStencilState:(id<MTLDepthStencilState>)state {
@@ -852,7 +1224,7 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
  // The runtime takes cull mode, winding and fill mode together; this encoder keeps Metal's defaults until each is set.
  - (void)raster {
   NSNumber *cull=objc_getAssociatedObject(self,"cull"),*winding=objc_getAssociatedObject(self,"winding"),*fill=objc_getAssociatedObject(self,"fill");
-@@ -2491,16 +2753,19 @@
+@@ -2491,16 +2921,19 @@
  - (void)setCullMode:(MTLCullMode)m {objc_setAssociatedObject(self,"cull",@(m),OBJC_ASSOCIATION_RETAIN);[self raster];}
  - (void)setFrontFacingWinding:(MTLWinding)w {objc_setAssociatedObject(self,"winding",@(w),OBJC_ASSOCIATION_RETAIN);[self raster];}
  - (void)setTriangleFillMode:(MTLTriangleFillMode)f {objc_setAssociatedObject(self,"fill",@(f),OBJC_ASSOCIATION_RETAIN);[self raster];}
@@ -872,7 +1244,7 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
  }
  - (void)setFragmentTexture:(id<MTLTexture>)t atTextureIndex:(NSUInteger)ti samplerState:(id<MTLSamplerState>)s atSamplerIndex:(NSUInteger)si {
   [self texture:t index:ti stage:2];[self sampler:s index:si stage:2];
-@@ -2517,9 +2782,11 @@
+@@ -2517,9 +2950,11 @@
  - (void)setStencilFrontReferenceValue:(uint32_t)f backReferenceValue:(uint32_t)b {
   if(gDrawStats)[self noteState:kDSOther key:UINT32_MAX object:nullptr value:0];ENCODE([self check:nmb_render_set_stencil_reference(self.handle,f,b) what:"setStencilReferenceValues"]);
  }
@@ -885,40 +1257,52 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
  // NATIVE_METAL_SKIP_DRAWS=PASS:FIRST:LAST: every command buffer's render pass PASS (counted from 1) leaves out its draws FIRST..LAST
  // (counted from 1), to find which draws make what a frame shows.
  - (BOOL)skipDraw {
-@@ -2533,8 +2800,10 @@
+@@ -2533,8 +2968,10 @@
   return skip.pass && self.commandBuffer.dumpPasses==skip.pass && index>=skip.first && index<=skip.last;
  }
  - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b {
   if([self skipDraw])return;
-+ if(coachzDeferred){if(t!=MTLPrimitiveTypeTriangle && t!=MTLPrimitiveTypeTriangleStrip)coachzTurnReject|=32;if(n && i)coachzTurnDraws++;}
++ if(coachzDeferred){if(!coachzNative && t!=MTLPrimitiveTypeTriangle && t!=MTLPrimitiveTypeTriangleStrip)coachzTurnReject|=32;if(n && i)coachzTurnDraws++;}
 + [self coachzRecordDraw];
   gDraws++;self.commandBuffer->encodedWork.draws++;if(gDrawStats)[self noteDraw];
   if(dumpMaybe(self.commandBuffer))[self dumpDraw:[NSString stringWithFormat:@"prim %lu start %lu count %lu instances %lu base %lu",(unsigned long)t,(unsigned long)s,(unsigned long)n,
                   (unsigned long)i,(unsigned long)b]];
   ENCODE([self check:nmb_render_draw(self.handle,t,(uint32_t)s,(uint32_t)n,(uint32_t)i,(uint32_t)b) what:"drawPrimitives"]);
-@@ -2549,8 +2818,10 @@
+@@ -2549,8 +2986,10 @@
                  instanceCount:(NSUInteger)i baseVertex:(NSInteger)v baseInstance:(NSUInteger)bi {
   if(![(id)b isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign index buffer"];return;}
   [self.commandBuffer.resourceOwners addObject:b];
   if([self skipDraw])return;
-+ if(coachzDeferred){[self coachzWatchResource:b];if(t!=MTLPrimitiveTypeTriangle && t!=MTLPrimitiveTypeTriangleStrip)coachzTurnReject|=32;if(n && i)coachzTurnDraws++;}
++ if(coachzDeferred){[self coachzWatchResource:b];if(!coachzNative && t!=MTLPrimitiveTypeTriangle && t!=MTLPrimitiveTypeTriangleStrip)coachzTurnReject|=32;if(n && i)coachzTurnDraws++;}
 + [self coachzRecordDraw];
   gDraws++;self.commandBuffer->encodedWork.draws++;if(gDrawStats)[self noteDraw];
   if(dumpMaybe(self.commandBuffer) && dumpShown(self.dumpDraws+1)) {
    const uint8_t *indices=(const uint8_t *)b.contents;const unsigned size=k==MTLIndexTypeUInt16?2:4;
    NSMutableString *first=[NSMutableString string];
-@@ -2587,8 +2858,10 @@
+@@ -2574,9 +3013,9 @@
+ // A buffer a patch draw reads, kept alive with the command buffer; NO (refused) for one this frontend did not make.
+ - (BOOL)own:(id<MTLBuffer>)b what:(NSString *)what {
+  if(!b)return YES;
+  if(![(id)b isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:[@"foreign " stringByAppendingString:what]];return NO;}
+- [self.commandBuffer.resourceOwners addObject:b];return YES;
++ [self.commandBuffer.resourceOwners addObject:b];[self coachzWatchResource:b];return YES;
+ }
+ - (void)setTessellationFactorBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o instanceStride:(NSUInteger)stride {
+  if(![self own:b what:@"tessellation factor buffer"])return;
+  ENCODE([self check:nmb_render_set_tessellation_factor_buffer(self.handle,b?[(NBBuffer *)b handle]:nullptr,o,stride) what:"setTessellationFactorBuffer"]);
+@@ -2587,8 +3026,11 @@
  - (void)patches:(NSUInteger)points start:(NSUInteger)start count:(NSUInteger)count patchIndex:(id<MTLBuffer>)pi offset:(NSUInteger)po
            points:(id<MTLBuffer>)ci offset:(NSUInteger)co instances:(NSUInteger)instances base:(NSUInteger)base indirect:(id<MTLBuffer>)ib offset:(NSUInteger)io {
   if(![self own:pi what:@"patch index buffer"] || ![self own:ci what:@"control point index buffer"] || ![self own:ib what:@"indirect buffer"])return;
   if([self skipDraw])return;
 + if(coachzDeferred)coachzTurnReject|=32;
++ if(ib)coachzUnknownAccess=YES;
 + [self coachzRecordDraw];
   gDraws++;self.commandBuffer->encodedWork.draws++;if(gDrawStats)[self noteDraw];
   if(dumpMaybe(self.commandBuffer))[self dumpDraw:[NSString stringWithFormat:@"patches %lu start %lu count %lu instances %lu base %lu%@",(unsigned long)points,(unsigned long)start,
                   (unsigned long)count,(unsigned long)instances,(unsigned long)base,ib?@" indirect":@""]];
   ENCODE([self check:nmb_render_draw_patches(self.handle,(uint32_t)points,(uint32_t)start,(uint32_t)count,pi?[(NBBuffer *)pi handle]:nullptr,po,
-@@ -2614,9 +2887,17 @@
+@@ -2614,9 +3056,17 @@
        indirectBufferOffset:(NSUInteger)io {
   if(!ci || !ib){[self.commandBuffer refuse:@"nil control point index or indirect buffer"];return;}
   [self patches:n start:0 count:0 patchIndex:pi offset:po points:ci offset:co instances:0 base:0 indirect:ib offset:io];
@@ -937,7 +1321,26 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
  - (void)waitForFence:(id<MTLFence>)fence beforeStages:(MTLRenderStages)stages {[self fence:fence stages:stages update:false];}
  @end
 
-@@ -2650,15 +2931,17 @@
+@@ -2627,16 +3077,16 @@
+ // command buffer like any invalid argument, not abort the host process.
+ #define NB_OBJECTS(...) ((__unsafe_unretained id[]){__VA_ARGS__})
+ - (bool)buffers:(__unsafe_unretained id *)objects count:(size_t)count {
+  for(size_t i=0;i<count;i++)if(![objects[i] isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"missing or foreign blit buffer"];return false;}
+- for(size_t i=0;i<count;i++)[self.commandBuffer.resourceOwners addObject:objects[i]];
++ for(size_t i=0;i<count;i++){[self.commandBuffer.resourceOwners addObject:objects[i]];[self coachzWatchResource:objects[i]];}
+  return true;
+ }
+ - (bool)textures:(__unsafe_unretained id *)objects count:(size_t)count {
+  for(size_t i=0;i<count;i++) {
+   id o=objects[i];
+   if(![o isKindOfClass:[NBTexture class]]){[self.commandBuffer refuse:@"missing or foreign blit texture"];return false;}
+-  [self.commandBuffer.resourceOwners addObject:o];
++  [self.commandBuffer.resourceOwners addObject:o];[self coachzWatchResource:o];
+   if([(NBTexture *)o surface])[self.commandBuffer.surfaces addObject:o];
+  }
+  return true;
+ }
+@@ -2650,15 +3100,17 @@
  }
  - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
                toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dO {
@@ -955,7 +1358,7 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
   if(sl>s.mipmapLevelCount || nl>s.mipmapLevelCount-sl || dl>d.mipmapLevelCount || nl>d.mipmapLevelCount-dl ||
      ss>slices(s) || ns>slices(s)-ss || ds>slices(d) || ns>slices(d)-ds) {[self.commandBuffer refuse:@"texture copy range out of bounds"];return;}
   for(NSUInteger slice=0;slice<ns;slice++)for(NSUInteger level=0;level<nl;level++) {
-@@ -2669,8 +2952,9 @@
+@@ -2669,8 +3121,9 @@
   }
  }
  - (void)copyFromTexture:(id<MTLTexture>)s toTexture:(id<MTLTexture>)d {
@@ -965,7 +1368,7 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
   for(NSUInteger slice=0;slice<slices;slice++)for(NSUInteger level=0;level<levels;level++) {
    MTLSize size=MTLSizeMake(MAX(s.width>>level,(NSUInteger)1),MAX(s.height>>level,(NSUInteger)1),MAX(s.depth>>level,(NSUInteger)1));
    [self copyFromTexture:s sourceSlice:slice sourceLevel:level sourceOrigin:MTLOriginMake(0,0,0) sourceSize:size toTexture:d destinationSlice:slice
-@@ -2680,8 +2964,9 @@
+@@ -2680,8 +3133,9 @@
  - (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)o sourceBytesPerRow:(NSUInteger)row sourceBytesPerImage:(NSUInteger)image
              sourceSize:(MTLSize)z toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level
       destinationOrigin:(MTLOrigin)dO {
@@ -975,7 +1378,7 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
    const NmbTextureDescriptor t=[(NBTexture *)d descriptor];
    GLOG(@"native-metal: texture-log %llu bufferToTexture size %lux%lu origin %lu,%lu level %lu slice %lu | rows %lu image %lu offset %lu "
          @"buffer %lu%s | texture %llux%llu fmt %llu options %llx",(unsigned long long)gTexturesLogged.load(),(unsigned long)z.width,
-@@ -2882,8 +3167,16 @@
+@@ -2882,8 +3336,16 @@
   [(id<MTLCommandBuffer>)readback commit];
  }
 
@@ -992,25 +1395,32 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
  static char kUserDictionaryKey;
  - (id)userDictionary {
   @synchronized(self) {
-@@ -2894,9 +3187,9 @@
+@@ -2894,9 +3356,9 @@
  }
  // iPadOS 27: QuartzCore names the tasks a command buffer works for (GPU time attribution), on every buffer; there is no such accounting here.
  - (void)setResponsibleTaskIDs:(const void *)ids count:(NSUInteger)count {(void)ids;(void)count;}
  - (instancetype)init {
 - if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
-+ if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_coachzFrameWrites=[NSMutableArray array];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
++ if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_coachzFrameWrites=[NSMutableArray array];_resourceOwners=[NSMutableSet set];_coachzEncodedOwners=[NSMutableSet set];_coachzExports=[NSMutableArray array];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
   if(self){createdUs=nowUs();createCpu=threadCpuUs();createTid=threadIdLow();earlyEligible=onRenderServerThread();sampleWindowOpen();}
   return self;
  }
  - (void)dealloc {nmb_command_buffer_release(_handle);}
-@@ -2960,11 +3253,12 @@
+@@ -2959,12 +3421,19 @@
+ // nil it called address 0 (i568: WidgetRenderer_Default crashed eight launches running, then hit its open cap and lost the device).
  - (id)encoder:(NBEncoder *)encoder make:(NmbEncoder *(^)(void))make what:(NSString *)what {
   if(self.committed){[self refuse:[what stringByAppendingString:@" after commit"]];return nil;}
   encoder.commandBuffer=self;
++ encoder->coachzDependencyKind=[encoder isKindOfClass:[NBRenderEncoder class]]?1:
++  [encoder isKindOfClass:[NBComputeEncoder class]]?2:3;
++ if(!encoder->coachzDeferred && self.coachzMayHavePending) {
++  encoder->coachzDeferred=YES;encoder->coachzDependencyDeferred=YES;
++ }
   make=[make copy];   // the caller's block literal is on its stack; the encoding thread calls it later
 - ENCODE(NmbEncoder *handle=make();
 + if(encoder->coachzDeferred)encoder.coachzFactory=make;
-+ else {ENCODE(NmbEncoder *handle=make();
++ else {ENCODE(if(!coachzFlushPending(self,0)){[self refuse:@"surface encoder boundary"];return;}
++        NmbEncoder *handle=make();
          if(!handle)[self refuse:[NSString stringWithFormat:@"%@: %@",what,lastError()]];
 -        encoder.handle=handle);
 +        encoder.handle=handle);}
@@ -1018,7 +1428,7 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
   if(_dumpPending.count) {
    if(!_dumpTargets)_dumpTargets=[NSMutableArray array];
    [_dumpTargets addObjectsFromArray:_dumpPending];encoder.dumpEntries=_dumpPending;_dumpPending=nil;
-@@ -2983,11 +3277,27 @@
+@@ -2983,11 +3452,27 @@
   gBlits++;encodedWork.blits++;
   NmbCommandBuffer *handle=_handle;
   return [self encoder:[NBBlitEncoder new] make:^{return nmb_blit_encoder_new(handle);} what:@"blitCommandEncoder"];
@@ -1046,7 +1456,7 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
   if(dumpMaybe(self)) {
    if(!_dumpTargets)_dumpTargets=[NSMutableArray array];
    _dumpPending=[NSMutableArray array];
-@@ -3027,14 +3337,21 @@
+@@ -3027,14 +3512,21 @@
   auto attachment=[&](MTLRenderPassAttachmentDescriptor *a,NmbPassAttachment &out)->bool {
    if(!a.texture)return true;
    if(![(id)a.texture isKindOfClass:[NBTexture class]])return false;
@@ -1068,7 +1478,7 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
     if(singleSample()) {
      if(resolves) {
       if(a.loadAction!=MTLLoadActionLoad && a.storeAction==MTLStoreActionMultisampleResolve) {
-@@ -3071,11 +3388,22 @@
+@@ -3071,11 +3563,29 @@
    [_resourceOwners addObject:d.visibilityResultBuffer];
    pass.visibility=[(NBBuffer *)d.visibilityResultBuffer handle];
   }
@@ -1083,6 +1493,13 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 +  auto recordedPass=render->coachzPass;
 +  make=^{return nmb_render_encoder_new(handle,recordedPass.get());};
 + } else make=^{return nmb_render_encoder_new(handle,&pass);};
++ for(unsigned i=0;i<8;i++) {
++  [render coachzNoteAccess:d.colorAttachments[i].texture];
++  [render coachzNoteAccess:d.colorAttachments[i].resolveTexture];
++ }
++ [render coachzNoteAccess:d.depthAttachment.texture];[render coachzNoteAccess:d.depthAttachment.resolveTexture];
++ [render coachzNoteAccess:d.stencilAttachment.texture];[render coachzNoteAccess:d.stencilAttachment.resolveTexture];
++ [render coachzNoteAccess:d.visibilityResultBuffer];
 + id<MTLRenderCommandEncoder> made=[self encoder:render make:make what:@"renderCommandEncoder"];
   if(made) {
    ((NBRenderEncoder *)made).resolveCopies=std::move(resolveCopies);
@@ -1092,20 +1509,38 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
    const uint64_t big=t0 && (uint64_t)t0.width*t0.height>=2000000;
    ((NBRenderEncoder *)made).passKey=(t0?(uint64_t)t0.pixelFormat:0)|((uint64_t)d.colorAttachments[0].loadAction<<16)|
     (uint64_t)([(id)t0 isKindOfClass:[NBTexture class]] && ((NBTexture *)t0).surface?1:0)<<18|big<<19;
-@@ -3119,8 +3447,12 @@
+@@ -3090,9 +3600,10 @@
+ - (void)enqueue {}
+ - (void)event:(id<MTLEvent>)event value:(uint64_t)value signal:(bool)signal {
+  if(![(id)event isKindOfClass:[NBEvent class]]){[self refuse:@"foreign event"];return;}
+  if(self.committed){[self refuse:@"event encoded after commit"];return;}
+- ENCODE(NmbEvent *handle=[(NBEvent *)event handle];
++ ENCODE(if(!coachzFlushPending(self,0,nullptr,0)){[self refuse:@"surface event boundary"];return;}
++        NmbEvent *handle=[(NBEvent *)event handle];
+         if(!(signal?nmb_command_buffer_signal_event(self->_handle,handle,value):nmb_command_buffer_wait_event(self->_handle,handle,value)))
+          [self refuse:[NSString stringWithFormat:@"%s: %@",signal?"encodeSignalEvent":"encodeWaitForEvent",lastError()]]);
+ }
+ - (void)encodeSignalEvent:(id<MTLEvent>)event value:(uint64_t)value {[self event:event value:value signal:true];}
+@@ -3119,11 +3630,17 @@
  }
  // After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
  - (void)finish {
   flushSurfaces(_surfaces);
 + coachzFinishTurnAudits(self);
-+ coachzCompleteFrameWrites(_coachzFrameWrites,!self.failedLocally && nmb_command_buffer_metal_error_code(_handle)==0,self.commitIndex);
++ coachzFinishExports(self);
++ coachzReturnScratch(self);
++ coachzCompleteFrameWrites(_coachzFrameWrites,!self.failedLocally && !self.coachzNativeCheckFailed && nmb_command_buffer_metal_error_code(_handle)==0,self.commitIndex);
 + for(CoachzFrameWrite *write in _coachzFrameWrites)[write releasePlainLease];
 + [_coachzFrameWrites removeAllObjects];[_coachzFrameGuards removeAllObjects];
   // Actual GPU completion (or a local refusal that never submitted) is the
   // release point. A retained completed command must not pin every old frame.
-  [_surfaces removeAllObjects];[_resourceOwners removeAllObjects];
+- [_surfaces removeAllObjects];[_resourceOwners removeAllObjects];
++ [_surfaces removeAllObjects];[_resourceOwners removeAllObjects];[_coachzEncodedOwners removeAllObjects];
   @synchronized(gInFlight){[gInFlight removeObject:self];}
-@@ -3153,8 +3485,14 @@
+  // Surfaces this command buffer kept alive may now have no other owner: their held imports go.
+  trimHeldImports(false);
+  // A local refusal never reaches the runtime's completion: its runtime command buffer, which holds every resource its encoders
+@@ -3153,8 +3670,14 @@
    watched.clear();[_sampled removeAllObjects];
   }
   // The runtime reports Vulkan's DeviceLost as Metal's code 11 (see -error).
@@ -1120,18 +1555,79 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
    for(MTLCommandBufferHandler block in completedHandlers)block((id<MTLCommandBuffer>)self);
    dispatch_group_leave(self->_handlers);
    if(lost)endRenderServerAfterGpuLoss();
-@@ -3181,8 +3519,10 @@
+@@ -3181,11 +3704,17 @@
   encodeFlush();
  }
  // The runtime's half of a commit, on the encoding thread after the command buffer's encoders.
  - (void)submit {
-+ if(!self.encodeFailure && !coachzMirrorFrames(_handle,_coachzFrameWrites,_resourceOwners,self.coachzMirrorGuards,self.coachzFrameGuards))
++ if(!self.encodeFailure && !coachzFlushPending(self,0,nullptr,4))[self refuse:@"surface commit boundary"];
++ if(!self.encodeFailure && !coachzMirrorFrames(_handle,_coachzFrameWrites,_coachzEncodedOwners,self.coachzMirrorGuards,self.coachzFrameGuards,_coachzExports))
 +  [self refuse:[@"frame writeback: " stringByAppendingString:lastError()]];
   if(!self.encodeFailure) {
++  gCoachzOwnerRecorded+=_resourceOwners.count;gCoachzOwnerEncoded+=_coachzEncodedOwners.count;
    flushSurfaces(_surfaces);
-   if(gLogTextures)dumpSurfacesOnce(_surfaces,_resourceOwners);
+-  if(gLogTextures)dumpSurfacesOnce(_surfaces,_resourceOwners);
++  if(gLogTextures) {
++   NSMutableSet *all=[_resourceOwners mutableCopy];[all unionSet:_coachzEncodedOwners];dumpSurfacesOnce(_surfaces,all);
++  }
    for(WatchedSource &source:watched){source.hash=hashSource(source.bytes,source.length);gSourcesWatched[source.surface]++;}
-@@ -4146,10 +4486,1209 @@
+   // Completion owns this reference; the runtime orders the non-owning scheduled callback before it.
+   void *context=(__bridge_retained void *)self;
+   const uint64_t appIndex=self.dumpReadback?0:gAppCommits.fetch_add(1)+1;
+@@ -3948,8 +4477,52 @@
+  for(NSUInteger index=0;index<31;++index)p->mutability[index]=d.buffers[index].mutability;
+  return true;
+ }
+
++// The key includes all bridge-visible fixed state and the ordered linked functions.
++// Reflection and binary-archive options use the original creation path.
++static NSCache<NSData *,NBRenderPipeline *> *coachzRenderCache() {
++ static NSCache *cache=[] {NSCache *c=[NSCache new];c.countLimit=128;return c;}();return cache;
++}
++static NSCache<NSData *,NBComputePipeline *> *coachzComputeCache() {
++ static NSCache *cache=[] {NSCache *c=[NSCache new];c.countLimit=128;return c;}();return cache;
++}
++static NSData *coachzRenderKey(MTLRenderPipelineDescriptor *descriptor,const NBRenderDescriptor &p) {
++ const uint64_t began=nowUs();NSMutableData *key=[NSMutableData data];
++ NmbRenderPipelineDescriptor fixed=p;fixed.vertex=nullptr;fixed.fragment=nullptr;
++ fixed.vertex_linked=nullptr;fixed.vertex_private_linked=nullptr;fixed.fragment_linked=nullptr;fixed.fragment_private_linked=nullptr;
++ [key appendBytes:&fixed length:sizeof fixed];
++ bool ok=coachzFunctionKey(key,(NBFunction *)descriptor.vertexFunction) && coachzFunctionKey(key,(NBFunction *)descriptor.fragmentFunction);
++ MTLLinkedFunctions *stages[2]={descriptor.vertexLinkedFunctions,descriptor.fragmentLinkedFunctions};
++ for(MTLLinkedFunctions *linked:stages) {
++  for(NSArray *functions in @[linked.functions?:@[],linked.privateFunctions?:@[]]) {
++   const uint64_t count=functions.count;[key appendBytes:&count length:sizeof count];
++   for(NBFunction *function in functions)ok=coachzFunctionKey(key,function) && ok;
++  }
++ }
++ gCoachzCacheKeyUs+=nowUs()-began;return ok?key:nil;
++}
++static NSData *coachzComputeKey(NBFunction *function,const NmbComputePipelineDescriptor &p,NSArray *linked,NSArray *privateLinked) {
++ const uint64_t began=nowUs();NSMutableData *key=[NSMutableData data];
++ NmbComputePipelineDescriptor fixed=p;fixed.function=nullptr;fixed.linked=nullptr;fixed.private_linked=nullptr;
++ [key appendBytes:&fixed length:sizeof fixed];bool ok=coachzFunctionKey(key,function);
++ for(NSArray *functions in @[linked?:@[],privateLinked?:@[]]) {
++  const uint64_t count=functions.count;[key appendBytes:&count length:sizeof count];
++  for(NBFunction *entry in functions)ok=coachzFunctionKey(key,entry) && ok;
++ }
++ gCoachzCacheKeyUs+=nowUs()-began;return ok?key:nil;
++}
++static NBRenderPipeline *coachzCopyRender(NBRenderPipeline *source) {
++ NmbRenderPipeline *handle=nmb_render_pipeline_copy(source.handle);if(!handle)return nil;
++ NBRenderPipeline *copy=[NBRenderPipeline new];copy.handle=handle;copy.stateFormat=source.stateFormat;
++ copy->coachzColorMask=source->coachzColorMask;copy->coachzColorWrites=source->coachzColorWrites;
++ copy->coachzBlendState=source->coachzBlendState;copy.coachzFragmentName=source.coachzFragmentName;copy.dumpInfo=source.dumpInfo;
++ return copy;
++}
++static NBComputePipeline *coachzCopyCompute(NBComputePipeline *source) {
++ NmbComputePipeline *handle=nmb_compute_pipeline_copy(source.handle);if(!handle)return nil;
++ NBComputePipeline *copy=[NBComputePipeline new];copy.handle=handle;return copy;
++}
+ // ---- binary archives ----
+ @interface NBBinaryArchive : NBObject
+ @property(nonatomic) NmbBinaryArchive *handle;
+ @end
+@@ -4146,10 +4719,1492 @@
   gNoCopyAll++;if(context)gNoCopyMade++;
   NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;buffer.wrapped=pointer;
   return (id<MTLBuffer>)buffer;
@@ -1200,8 +1696,17 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 +static std::atomic<uint64_t> gCoachzTargetKinds[3],gCoachzTargetWhole,gCoachzTargetUnion;
 +static std::atomic<uint64_t> gCoachzReuseSubset,gCoachzReuseViews,gCoachzReuseBusy,gCoachzReuseCross;
 +static std::atomic<uint64_t> gCoachzTurnCandidates,gCoachzTurnRuns,gCoachzTurnAuditCount,gCoachzTurnAuditGood,gCoachzTurnAuditBad;
++static std::atomic<uint64_t> gCoachzTurnAuditNextUs,gCoachzAuditWarm,gCoachzAuditPending,gCoachzAuditRate;
++static std::atomic<uint32_t> gCoachzTurnAuditInFlight;
 +static std::atomic<uint64_t> gCoachzTurnRejected[10],gCoachzTurnPrepareUs,gCoachzTurnPixels,gCoachzTurnSeals;
 +static std::atomic<uint64_t> gCoachzTurnEntryRejected[10];
++static std::atomic<uint64_t> gCoachzSealMerged,gCoachzSealBoundaries,gCoachzSealDeferred,gCoachzSealUnrelated;
++static std::atomic<uint64_t> gCoachzSealReasons[5]; // unknown, render, compute, blit, commit
++static std::atomic<uint64_t> gCoachzNativeChecked,gCoachzNativeBad,gCoachzNativeCheckMissing;
++static std::atomic<bool> gCoachzNativeDisabled;
++static std::atomic<uint64_t> gCoachzExportPacked,gCoachzExportCompared,gCoachzExportBytes,gCoachzExportSamples,gCoachzExportChanged,gCoachzExportFailed;
++static std::atomic<uint32_t> gCoachzExportRatio{512}; // EWMA, 0..1024, sampled dirty groups
++static std::atomic<uint64_t> gCoachzExportFallback[3]; // geometry, pipeline, report allocation
 +static std::atomic<uint64_t> gCoachzMrtSeeds,gCoachzMrtStores,gCoachzMrtInBytes,gCoachzMrtOutBytes;
 +static std::atomic<uint64_t> gCoachzMrtRefused[8];
 +// Preserve the actual creation failure outside the 48-row telemetry table. The
@@ -1396,7 +1901,7 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 + bool encoded=false;
 + if(turned) {
 +  if(plain.surface)[seed.surfaces addObject:plain];
-+  encoded=coachzFrameTransfer(seed.handle,plain,texture,true,seed.resourceOwners);
++  encoded=coachzFrameTransfer(seed.handle,plain,texture,true,seed.coachzEncodedOwners);
 + } else {
 +  id<MTLBlitCommandEncoder> blit=[commands blitCommandEncoder];
 +  if(blit) {
@@ -1423,7 +1928,7 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 + if((int32_t)(frame.writeSerial-seedSerial)>0) {
 +  os_unfair_lock_unlock(&gCoachzFrameLock);gCoachzSeedRaced++;return nil;
 + }
-+ frame.texture=texture;frame.turned=turned;frame.importDescriptor=imported;frame.valid=YES;frame.writeSerial=seedSerial;
++ frame.texture=texture;frame.turned=turned;frame.importDescriptor=imported;frame.valid=YES;frame.nativeValid=NO;frame.writeSerial=seedSerial;
 + gCoachzSeeds++;
 + if(fresh)gCoachzPromoted++;
 + os_unfair_lock_unlock(&gCoachzFrameLock);
@@ -1732,6 +2237,7 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 +  // Only a mirror actually encoded for this command (or a coherent no-op)
 +  // establishes equality. A mutable weak backing is not a completion receipt.
 +  frame.valid=completed && frame.texture && write.coherent;
++  if(!completed || !write.coherent)frame.nativeValid=NO;
 +  (completed && root==frame.texture && view.coachzDirect?gCoachzPrivateWrites:gCoachzPlainWrites)++;
 + }
 + os_unfair_lock_unlock(&gCoachzFrameLock);
@@ -1794,16 +2300,81 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 +   (unsigned long long)(found?write.passCaller-(uintptr_t)info.dli_fbase:0));note(line);
 + }
 +}
-+static bool coachzMirrorFrames(NmbCommandBuffer *commands,NSMutableArray *surfaces,NSMutableSet *owners,uint32_t guards,NSDictionary *surfaceGuards) {
++// 1 encoded, 0 keep the existing transfer, -1 command-local encoding failure.
++static int coachzExportFrame(NmbCommandBuffer *commands,NBTexture *source,NBTexture *target,NSMutableSet *owners,
++ NSMutableArray *reports,const MTLScissorRect &rect) {
++ NBBuffer *destination=[target coachzLinearBackingBuffer];
++ const bool straight=source.width==target.width && source.height==target.height;
++ const bool turned=source.width==target.height && source.height==target.width;
++ const uint64_t row=target.rowBytes,offset=target.offset;
++ if(!reports || !destination || (!straight && !turned) || rect.width<4 || !rect.height || rect.x%4 ||
++    (rect.width%4 && rect.x+rect.width!=target.width) || offset%16 || row%16 || row<target.width*4 ||
++    source.pixelFormat!=MTLPixelFormatBGRA8Unorm || target.pixelFormat!=MTLPixelFormatBGRA8Unorm ||
++    offset>destination.length || target.height>(destination.length-offset)/row || row/4>UINT32_MAX ||
++    target.width>UINT32_MAX-3u || target.height>UINT32_MAX || target.height>UINT32_MAX/(row/4)) {gCoachzExportFallback[0]++;return 0;}
++ static std::mutex pipelineLock;static NBComputePipeline *pipeline;
++ {
++  std::lock_guard<std::mutex> guard(pipelineLock);
++  if(!pipeline) {
++   size_t bytes=0;const void *air=nmb_scanout_convert_air(&bytes);
++   id<MTLLibrary> library=air?native_bridge_metal_library_with_air(air,bytes):nil;
++   id<MTLFunction> function=[library newFunctionWithName:@"coachz_export4"];NSError *error=nil;
++   if(function)pipeline=(NBComputePipeline *)[gDeviceObject newComputePipelineStateWithFunction:function error:&error];
++  }
++ }
++ if(!pipeline){gCoachzExportFallback[1]++;return 0;}
++ NBBuffer *stats=[NBBuffer new];stats.handle=nmb_buffer_new(gDevice,16,MTLResourceStorageModeShared,nullptr);
++ stats.options=MTLResourceStorageModeShared;
++ if(!stats.handle){gCoachzExportFallback[2]++;return 0;}
++ const bool compare=gCoachzExportRatio.load()<768;
++ const uint32_t parameters[12]={(uint32_t)target.width,(uint32_t)target.height,(uint32_t)(row/4),straight?0u:1u,
++  (uint32_t)rect.x,(uint32_t)rect.y,(uint32_t)rect.width,(uint32_t)rect.height,compare?1u:0u,0,0,0};
++ const uint64_t threads[3]={(rect.width+3)/4,rect.height,1},group[3]={16,8,1};
++ [owners addObject:source];[owners addObject:target];[owners addObject:destination];[owners addObject:pipeline];[owners addObject:stats];
++ NmbEncoder *encoder=nmb_compute_encoder_new(commands);if(!encoder)return -1;
++ const bool ok=nmb_compute_set_pipeline(encoder,pipeline.handle) && nmb_encoder_set_texture(encoder,0,source.handle,0) &&
++  nmb_encoder_set_buffer(encoder,0,destination.handle,offset,0) && nmb_encoder_set_bytes(encoder,0,parameters,sizeof parameters,1) &&
++  nmb_encoder_set_buffer(encoder,0,stats.handle,0,2) && nmb_compute_dispatch(encoder,threads,group,true);
++ if(!ok){nmb_encoder_discard(encoder);return -1;}
++ if(!nmb_encoder_end(encoder))return -1;
++ CoachzExport *record=[CoachzExport new];record.report=stats;record.bytes=(uint64_t)rect.width*rect.height*4;record.compared=compare;
++ [reports addObject:record];gCoachzExportPacked++;gCoachzExportBytes+=record.bytes;if(compare)gCoachzExportCompared++;
++ return 1;
++}
++static void coachzFinishExports(id object) {
++ NBCommandBuffer *commands=object;
++ const bool good=!commands.failedLocally && nmb_command_buffer_metal_error_code(commands.handle)==0;
++ for(CoachzExport *record in commands.coachzExports) {
++  if(record.check) {
++   uint32_t result[4]={};
++   if(good && record.report.contents){sys_dcache_flush(record.report.contents,256);memcpy(result,record.report.contents,sizeof result);}
++   const uint64_t n=++gCoachzNativeChecked;
++   const bool valid=good && result[0]==128;
++   if(!valid || result[1]){gCoachzNativeBad++;gCoachzNativeDisabled=true;commands.coachzNativeCheckFailed=YES;}
++   char note[96];snprintf(note,sizeof note,"TR physical check%llu valid%u rows%u diff%u delta%u",(unsigned long long)n,valid?1u:0u,result[0],result[1],result[3]);
++   uint32_t words[24]={};memcpy(words,note,strnlen(note,95));nbNote(3,words,24);continue;
++  }
++  if(!good || !record.report.contents){gCoachzExportFailed++;continue;}
++  uint32_t stats[4]={};sys_dcache_flush(record.report.contents,sizeof stats);memcpy(stats,record.report.contents,sizeof stats);
++  if(!stats[0] || stats[1]>stats[0]){gCoachzExportFailed++;continue;}
++  gCoachzExportSamples+=stats[0];gCoachzExportChanged+=stats[1];
++  const uint32_t ratio=(uint32_t)((uint64_t)stats[1]*1024/stats[0]);
++  uint32_t old=gCoachzExportRatio.load();
++  while(!gCoachzExportRatio.compare_exchange_weak(old,(old*7+ratio)/8)){}
++ }
++ [commands.coachzExports removeAllObjects];
++}
++static bool coachzMirrorFrames(NmbCommandBuffer *commands,NSMutableArray *surfaces,NSMutableSet *owners,uint32_t guards,NSDictionary *surfaceGuards,NSMutableArray *exports) {
 + NSMutableSet *seen=[NSMutableSet set];
 + NmbEncoder *blit=nullptr;bool ok=true;
 + // Only the last writer to a surface determines the direction of synchronization.
 + for(CoachzFrameWrite *write in surfaces.reverseObjectEnumerator) {
 +  NBTexture *view=write.texture;
-+  NBTexture *root=nil,*resident=nil,*backing=nil;uint32_t surfaceID=0;bool turned=false,valid=false;
++  NBTexture *root=nil,*resident=nil,*backing=nil,*native=nil;uint32_t surfaceID=0;bool turned=false,valid=false,nativeValid=false;
 +  os_unfair_lock_lock(&gCoachzFrameLock);
 +  CoachzFrame *frame=coachzFrameForWrite(view,&root);
 +  resident=frame.texture;backing=view.coachzBacking;surfaceID=frame.surfaceID;turned=frame.turned;valid=frame.valid;
++  native=frame.nativeTexture;nativeValid=frame.nativeValid;
 +  // A physical plain root itself owns its import; its public buffer getter is nil.
 +  if(!backing && !view.coachzDirect && root.surface && !root.rotation && root.pixelFormat==MTLPixelFormatBGRA8Unorm &&
 +     root.width==IOSurfaceGetWidth(root.surface) && root.height==IOSurfaceGetHeight(root.surface))backing=root;
@@ -1844,6 +2415,9 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 +  NBTexture *target=source==resident?backing:resident;
 +  MTLScissorRect damage={0,0,resident.width,resident.height};
 +  const bool out=source==resident;
++  if(!out || !write.nativeConverted || surfaceGuard) {
++   nativeValid=false;os_unfair_lock_lock(&gCoachzFrameLock);frame.nativeValid=NO;os_unfair_lock_unlock(&gCoachzFrameLock);
++  }
 +  // Out: damage in private coordinates. In: damage in the physical plane's, from straight plain writers.
 +  const NSUInteger damageWidth=out?resident.width:backing.width,damageHeight=out?resident.height:backing.height;
 +  uint32_t fullReasons=0;
@@ -1880,7 +2454,17 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 +  if(!partial)damage={0,0,resident.width,resident.height};
 +  if(!damage.width || !damage.height){coachzMarkFrameCoherent(surfaces,surfaceID);gCoachzEmptyMirrors++;gCoachzMirrorSaved+=fullBytes;continue;}
 +  const uint64_t bytes=(uint64_t)damage.width*damage.height*4;
-+  if(turned) {
++  bool exported=false;
++  if(out) {
++   MTLScissorRect physical=turned?MTLScissorRect{damage.y,resident.width-damage.x-damage.width,damage.height,damage.width}:damage;
++   if(blit){ok=nmb_encoder_end(blit);blit=nullptr;if(!ok)break;}
++   NBTexture *exportSource=nativeValid && write.nativeConverted && native?native:source;
++   const int result=coachzExportFrame(commands,exportSource,target,owners,exports,physical);
++   if(result<0){ok=false;break;}exported=result>0;
++  }
++  if(exported) {
++   // The destination's physical bytes, including alpha, are already published.
++  } else if(turned) {
 +   if(blit){ok=nmb_encoder_end(blit);blit=nullptr;if(!ok)break;}
 +   // plane(y, W-1-x) = private(x,y): rotate only the target scissor,
 +   // keeping the full viewport/UV transform and nearest sampling unchanged.
@@ -1941,11 +2525,11 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 + return a<=b?b-a<n:a-b<m;
 +}
 +static std::array<double,6> coachzQuarterViewport(NBEncoder *encoder,std::array<double,6> v) {
-+ if(!encoder->coachzSelected)return v;
++ if(!encoder->coachzSelected || encoder->coachzNative)return v;
 + return {(double)encoder->coachzTarget.height-v[1]-v[3],v[0],v[3],v[2],v[4],v[5]};
 +}
 +static std::array<uint64_t,4> coachzQuarterScissor(NBEncoder *encoder,std::array<uint64_t,4> values) {
-+ if(!encoder->coachzSelected)return values;
++ if(!encoder->coachzSelected || encoder->coachzNative)return values;
 + const MTLScissorRect r=coachzClipDamage({values[0],values[1],values[2],values[3]},encoder->coachzTarget.width,encoder->coachzTarget.height);
 + return {encoder->coachzTarget.height-r.y-r.height,r.x,r.height,r.width};
 +}
@@ -1974,19 +2558,57 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 + default:return 0;
 + }
 +}
++static std::mutex gCoachzScratchLock;
++static NSMutableArray<NBTexture *> *gCoachzScratchPool;
++static uint64_t gCoachzScratchBytes;
++static std::atomic<uint64_t> gCoachzScratchHit,gCoachzScratchMiss,gCoachzScratchTransient,gCoachzScratchDropped;
++static uint64_t coachzScratchSize(NBTexture *t) {
++ return (uint64_t)t.width*t.height*coachzMrtPixelBytes(t.pixelFormat);
++}
++static NBTexture *coachzTakeScratch(MTLTextureDescriptor *d) {
++ {
++  std::lock_guard<std::mutex> guard(gCoachzScratchLock);
++  for(NSUInteger i=0;i<gCoachzScratchPool.count;i++) {
++   NBTexture *t=gCoachzScratchPool[i];
++   if(t.width==d.width && t.height==d.height && t.pixelFormat==d.pixelFormat && t.storageMode==d.storageMode) {
++    gCoachzScratchBytes-=coachzScratchSize(t);[gCoachzScratchPool removeObjectAtIndex:i];gCoachzScratchHit++;return t;
++   }
++  }
++ }
++ gCoachzScratchMiss++;return (NBTexture *)[gDeviceObject newTextureWithDescriptor:d];
++}
++static void coachzReturnScratch(id object) {
++ NBCommandBuffer *commands=object;
++ // A failed submitted command may have incomplete resource use. Do not recycle it.
++ const bool good=!commands.failedLocally && nmb_command_buffer_metal_error_code(commands.handle)==0;
++ std::lock_guard<std::mutex> guard(gCoachzScratchLock);
++ if(!gCoachzScratchPool)gCoachzScratchPool=[NSMutableArray array];
++ for(NBTexture *texture in commands.coachzScratch) {
++  const uint64_t bytes=coachzScratchSize(texture);
++  if(good && gCoachzScratchPool.count<8 && bytes<=(32u<<20)-gCoachzScratchBytes) {
++   [gCoachzScratchPool addObject:texture];gCoachzScratchBytes+=bytes;
++  } else gCoachzScratchDropped++;
++ }
++ [commands.coachzScratch removeAllObjects];
++}
 +static bool coachzPrepareMrt(NBEncoder *encoder) {
 + for(CoachzTurnColor *color in encoder->coachzTurnColors) {
-+  if(color.slot==0){color.rotated=encoder->coachzTurnView;continue;}
++  if(color.slot==0){color.rotated=encoder->coachzNative?encoder->coachzNativeView:encoder->coachzTurnView;continue;}
 +  MTLTextureDescriptor *descriptor=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:color.source.pixelFormat
-+   width:color.source.height height:color.source.width mipmapped:NO];
-+  descriptor.storageMode=MTLStorageModePrivate;
-+  descriptor.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;
-+  color.rotated=(NBTexture *)[gDeviceObject newTextureWithDescriptor:descriptor];
++   width:encoder->coachzNative?color.source.width:color.source.height height:encoder->coachzNative?color.source.height:color.source.width mipmapped:NO];
++  // No incoming or outgoing texels: let the runtime use transient attachment
++  // backing, including its own preservation if a pass has to split internally.
++  const bool transient=color.load!=MTLLoadActionLoad && color.store==MTLStoreActionDontCare;
++  descriptor.storageMode=transient?MTLStorageModeMemoryless:MTLStorageModePrivate;
++  descriptor.usage=transient?MTLTextureUsageRenderTarget:MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;
++  color.rotated=coachzTakeScratch(descriptor);
 +  if(!color.rotated) {
 +   char note[96];snprintf(note,sizeof note,"TR mrt alloc slot%u f%u %.55s",color.slot,(unsigned)color.source.pixelFormat,lastError().UTF8String?:"unknown");
-+   coachzTurnNote(note);
-+   return false;
++   coachzTurnNote(note);return false;
 +  }
++  if(transient)gCoachzScratchTransient++;
++  if(!encoder.commandBuffer.coachzScratch)encoder.commandBuffer.coachzScratch=[NSMutableArray array];
++  [encoder.commandBuffer.coachzScratch addObject:color.rotated];
 +  [encoder.commandBuffer.resourceOwners addObject:color.rotated];
 + }
 + return true;
@@ -2001,13 +2623,77 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 +   for(double &component:attachment.clear)component=0;
 +  }
 + }
-+ pass.width=encoder->coachzTurnView.width;
-+ pass.height=encoder->coachzTurnView.height;
-+ pass.coachz_quarter_turn=1;
++ pass.width=encoder->coachzNative?encoder->coachzTarget.width:encoder->coachzTurnView.width;
++ pass.height=encoder->coachzNative?encoder->coachzTarget.height:encoder->coachzTurnView.height;
++ pass.coachz_quarter_turn=encoder->coachzNative?0:1;
++}
++// Match the private target/MRT storage while keeping the original geometry and
++// shaders. The control separates layout/GMEM effects from quarter-turn effects.
++static bool coachzPrepareControl(NBEncoder *encoder) {
++ NmbEncoder *blit=nullptr;bool ok=true;
++ for(CoachzTurnColor *color in encoder->coachzTurnColors) {
++  MTLTextureDescriptor *descriptor=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:color.source.pixelFormat
++   width:color.source.width height:color.source.height mipmapped:NO];
++  descriptor.storageMode=color.rotated.storageMode;
++  descriptor.usage=descriptor.storageMode==MTLStorageModeMemoryless?MTLTextureUsageRenderTarget:MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;
++  color.control=(NBTexture *)[gDeviceObject newTextureWithDescriptor:descriptor];
++  if(!color.control){ok=false;break;}
++  [encoder.commandBuffer.coachzEncodedOwners addObject:color.control];
++  if(color.load!=MTLLoadActionLoad)continue;
++  if(!blit)blit=nmb_blit_encoder_new(encoder.commandBuffer.handle);
++  if(!blit){ok=false;break;}
++  const uint64_t origin[3]={0,0,0},size[3]={color.source.width,color.source.height,1};
++  if(!nmb_blit_copy_texture(blit,color.source.handle,0,0,origin,size,color.control.handle,0,0,origin)){ok=false;break;}
++ }
++ if(blit && !nmb_encoder_end(blit))ok=false;
++ return ok;
++}
++static std::atomic<uint64_t> gCoachzNativeSeed,gCoachzNativeSeedBytes,gCoachzNativeStore,gCoachzNativeStoreBytes;
++static std::atomic<uint64_t> gCoachzNativeReuse;
++static bool coachzSameShapeCopy(NBEncoder *encoder,NBTexture *source,NBTexture *target) {
++ NmbEncoder *blit=nmb_blit_encoder_new(encoder.commandBuffer.handle);if(!blit)return false;
++ const uint64_t origin[3]={0,0,0},size[3]={source.width,source.height,1};
++ const bool ok=nmb_blit_copy_texture(blit,source.handle,0,0,origin,size,target.handle,0,0,origin);
++ if(!ok){nmb_encoder_discard(blit);return false;}return nmb_encoder_end(blit);
++}
++static bool coachzSeedNative(NBEncoder *encoder) {
++ CoachzFrame *frame=encoder->coachzTurnFrame;
++ os_unfair_lock_lock(&gCoachzFrameLock);const bool valid=frame.nativeValid;os_unfair_lock_unlock(&gCoachzFrameLock);
++ if(valid){gCoachzNativeReuse++;return true;}
++ if(!coachzFrameTransfer(encoder.commandBuffer.handle,encoder->coachzTurnView,encoder->coachzNativeView,false,
++  encoder.commandBuffer.coachzEncodedOwners))return false;
++ gCoachzNativeSeed++;gCoachzNativeSeedBytes+=(uint64_t)encoder->coachzTarget.width*encoder->coachzTarget.height*4;
++ // Execution-side state. Any plain/other canonical writer invalidates it in
++ // mirrorFrames before a later pass is opened. Failed completion clears it too.
++ os_unfair_lock_lock(&gCoachzFrameLock);frame.nativeValid=YES;os_unfair_lock_unlock(&gCoachzFrameLock);
++ return true;
++}
++static bool coachzStoreNative(NBEncoder *encoder) {
++ if(!coachzFrameTransfer(encoder.commandBuffer.handle,encoder->coachzNativeView,encoder->coachzTurnView,true,
++  encoder.commandBuffer.coachzEncodedOwners))return false;
++ encoder->coachzTurnWrite.nativeConverted=YES;
++ os_unfair_lock_lock(&gCoachzFrameLock);encoder->coachzTurnFrame.nativeValid=YES;os_unfair_lock_unlock(&gCoachzFrameLock);
++ const uint64_t n=++gCoachzNativeStore;gCoachzNativeStoreBytes+=(uint64_t)encoder->coachzTarget.width*encoder->coachzTarget.height*4;
++ if(n<=8) {
++  NBComputePipeline *pipeline=coachzTurnAuditPipeline();
++  NBBuffer *report=[NBBuffer new];report.handle=nmb_buffer_new(gDevice,256,MTLResourceStorageModeShared,nullptr);report.options=MTLResourceStorageModeShared;
++  if(!pipeline || !report.handle){gCoachzNativeCheckMissing++;return true;}
++  [encoder.commandBuffer.coachzEncodedOwners addObject:report];[encoder.commandBuffer.coachzEncodedOwners addObject:pipeline];
++  const uint32_t dimensions[4]={(uint32_t)encoder->coachzTarget.width,(uint32_t)encoder->coachzTarget.height,0,0};
++  const uint64_t threads[3]={128,128,1},group[3]={16,8,1};
++  NmbEncoder *compute=nmb_compute_encoder_new(encoder.commandBuffer.handle);if(!compute)return false;
++  const bool ok=nmb_compute_set_pipeline(compute,pipeline.handle) && nmb_encoder_set_texture(compute,0,encoder->coachzNativeView.handle,0) &&
++   nmb_encoder_set_texture(compute,0,encoder->coachzTurnView.handle,1) && nmb_encoder_set_buffer(compute,0,report.handle,0,0) &&
++   nmb_encoder_set_bytes(compute,0,dimensions,sizeof dimensions,1) && nmb_compute_dispatch(compute,threads,group,true);
++  if(!ok){nmb_encoder_discard(compute);return false;}if(!nmb_encoder_end(compute))return false;
++  CoachzExport *check=[CoachzExport new];check.report=report;check.check=YES;[encoder.commandBuffer.coachzExports addObject:check];
++ }
++ return true;
 +}
 +static bool coachzSeedMrt(NBEncoder *encoder) {
 + for(CoachzTurnColor *color in encoder->coachzTurnColors)if(color.slot && color.load==MTLLoadActionLoad) {
-+  if(!coachzFrameTransfer(encoder.commandBuffer.handle,color.source,color.rotated,true,encoder.commandBuffer.resourceOwners))return false;
++  if(encoder->coachzNative?!coachzSameShapeCopy(encoder,color.source,color.rotated):
++     !coachzFrameTransfer(encoder.commandBuffer.handle,color.source,color.rotated,true,encoder.commandBuffer.coachzEncodedOwners))return false;
 +  gCoachzMrtSeeds++;
 +  gCoachzMrtInBytes+=(uint64_t)color.source.width*color.source.height*color.bytesPerPixel;
 + }
@@ -2016,7 +2702,8 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 +static bool coachzStoreMrt(NBEncoder *encoder) {
 + if(encoder->coachzAuditing)return true;
 + for(CoachzTurnColor *color in encoder->coachzTurnColors)if(color.slot && color.store==MTLStoreActionStore) {
-+  if(!coachzFrameTransfer(encoder.commandBuffer.handle,color.rotated,color.source,false,encoder.commandBuffer.resourceOwners))return false;
++  if(encoder->coachzNative?!coachzSameShapeCopy(encoder,color.rotated,color.source):
++     !coachzFrameTransfer(encoder.commandBuffer.handle,color.rotated,color.source,false,encoder.commandBuffer.coachzEncodedOwners))return false;
 +  gCoachzMrtStores++;
 +  gCoachzMrtOutBytes+=(uint64_t)color.source.width*color.source.height*color.bytesPerPixel;
 + }
@@ -2107,8 +2794,10 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 + }
 + if(reason)return false;
 + encoder->coachzTarget=texture;encoder->coachzTurnFrame=frame;encoder->coachzTurnWrite=write;
++ static const bool native=[] {const char *v=getenv("NATIVE_METAL_COACHZ_PHYSICAL");return !v || strcmp(v,"0");}();
++ encoder->coachzNative=native;
 + encoder->coachzTurnPipelines=[NSMutableSet set];encoder->coachzTurnBegan=nowUs();encoder->coachzDeferred=YES;
-+ encoder->coachzCaptureTrace=gCoachzTurnAuditCount.load()<8;
++ encoder->coachzCaptureTrace=!gCoachzTurnAuditInFlight.load() && nowUs()>=gCoachzTurnAuditNextUs.load();
 + encoder->coachzCurrentDraw.viewport={0,0,(double)width,(double)height,0,1};
 + encoder->coachzCurrentDraw.scissor={0,0,width,height};
 + return true;
@@ -2117,6 +2806,7 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 + if(!encoder->coachzDeferred)return;
 + const uint64_t prepareBegan=nowUs();
 + uint32_t reason=encoder->coachzTurnReject;
++ if(encoder->coachzNative && gCoachzNativeDisabled.load())reason|=4;
 + if(!encoder->coachzTurnDraws)reason|=256;
 + NBCommandBuffer *commands=encoder.commandBuffer;
 + CoachzFrame *frame=encoder->coachzTurnFrame;
@@ -2136,7 +2826,8 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 +  @synchronized(pipeline) {
 +   if(!pipeline->coachzTurnChecked) {
 +    pipeline->coachzTurnHashes={};
-+    pipeline->coachzTurnMask=nmb_render_pipeline_quarter_turn(pipeline.handle,pipeline->coachzTurnHashes.data());
++    pipeline->coachzTurnMask=encoder->coachzNative?nmb_render_pipeline_identity(pipeline.handle,pipeline->coachzTurnHashes.data()):
++     nmb_render_pipeline_quarter_turn(pipeline.handle,pipeline->coachzTurnHashes.data());
 +    pipeline->coachzTurnChecked=YES;
 +    char note[96];snprintf(note,sizeof note,"TR program mask%x vs%llx fs%llx newvs%llx",pipeline->coachzTurnMask,
 +     (unsigned long long)pipeline->coachzTurnHashes[0],(unsigned long long)pipeline->coachzTurnHashes[1],(unsigned long long)pipeline->coachzTurnHashes[2]);coachzTurnNote(note);
@@ -2147,7 +2838,7 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 +   }
 +   if(pipeline->coachzTurnMask)reason|=4;
 +   auto key=pipeline->coachzTurnHashes;
-+   key[2]^=encoder->coachzTurnLayout;
++   key[2]^=encoder->coachzTurnLayout^(encoder->coachzNative?0x504859534943414cull:0);
 +   key[3]^=(encoder->coachzTurnLayout<<1)|(encoder->coachzTurnLayout>>63);
 +   programs.push_back(key);
 +  }
@@ -2161,10 +2852,10 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 +   for(const auto &key:programs) {
 +    auto &program=gCoachzTurnPrograms[key];program.seen++;
 +    if(program.state==3)reason|=4;
-+    else if(program.state==1)reason|=64;
-+    else if(program.state==0){audit=true;if(program.seen<3)reason|=64;}
++    else if(program.state==1){reason|=64;gCoachzAuditPending++;}
++    else if(program.state==0){audit=true;if(program.seen<3){reason|=64;gCoachzAuditWarm++;}}
 +   }
-+   if(audit && gCoachzTurnAuditCount.load()>=8)reason|=64;
++   if(audit && (gCoachzTurnAuditInFlight.load() || nowUs()<gCoachzTurnAuditNextUs.load())){reason|=64;gCoachzAuditRate++;}
 +  }
 + }
 + if(!reason && audit) {
@@ -2176,11 +2867,30 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 +   encoder->coachzTarget.coachzBacking?:coachzGpuRoot(encoder->coachzTarget),MTLPixelFormatBGRA8Unorm);
 +  if(!encoder->coachzTurnView)reason|=1;
 + }
++ if(!reason && encoder->coachzNative) {
++  @synchronized(frame) {
++   if(frame.nativeQueue && frame.nativeQueue!=commands.queue)reason|=1;
++   else {
++    if(!frame.nativeTexture) {
++     MTLTextureDescriptor *d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
++      width:encoder->coachzTarget.width height:encoder->coachzTarget.height mipmapped:NO];
++     d.storageMode=MTLStorageModePrivate;d.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;
++     NBTexture *made=(NBTexture *)[gDeviceObject newTextureWithDescriptor:d];
++     os_unfair_lock_lock(&gCoachzFrameLock);frame.nativeTexture=made;frame.nativeQueue=commands.queue;os_unfair_lock_unlock(&gCoachzFrameLock);
++    }
++    encoder->coachzNativeView=frame.nativeTexture;
++   }
++  }
++  if(!encoder->coachzNativeView)reason|=8;
++  else [commands.resourceOwners addObject:encoder->coachzNativeView];
++ }
 + if(!reason && !coachzPrepareMrt(encoder))reason|=8;
 + if(!reason && audit) {
 +  std::lock_guard<std::mutex> guard(gCoachzTurnProgramsLock);
 +  for(const auto &key:programs)if(gCoachzTurnPrograms[key].state==1)reason|=64;
-+  if(!reason){for(const auto &key:programs)if(gCoachzTurnPrograms[key].state==0)gCoachzTurnPrograms[key].state=1;gCoachzTurnAuditCount++;}
++  if(!reason && (gCoachzTurnAuditInFlight.load() || nowUs()<gCoachzTurnAuditNextUs.load())){reason|=64;gCoachzAuditRate++;}
++  if(!reason){for(const auto &key:programs)if(gCoachzTurnPrograms[key].state==0)gCoachzTurnPrograms[key].state=1;
++   gCoachzTurnAuditInFlight++;gCoachzTurnAuditNextUs=nowUs()+500000;gCoachzTurnAuditCount++;}
 + }
 + encoder->coachzTurnPrograms=programs;
 + if(!reason) {
@@ -2194,6 +2904,7 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 +  }
 +  encoder->coachzTurnWrite.sealPlanned=YES;
 +  if(!audit) {
++   commands.coachzMayHavePending=YES;
 +   coachzSelectMrt(encoder);
 +   CoachzFrameWrite *write=encoder->coachzTurnWrite;
 +   const MTLScissorRect d=coachzClipDamage(write.damage,encoder->coachzTarget.width,encoder->coachzTarget.height);
@@ -2211,6 +2922,37 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 +   (unsigned long long)n,encoder->coachzTurnDraws,encoder->coachzCalls.size(),(unsigned long long)took);coachzTurnNote(note);
 +  snprintf(note,sizeof note,"TR mrt traffic seed%llu in%llu store%llu out%llu",(unsigned long long)gCoachzMrtSeeds.load(),
 +   (unsigned long long)gCoachzMrtInBytes.load(),(unsigned long long)gCoachzMrtStores.load(),(unsigned long long)gCoachzMrtOutBytes.load());coachzTurnNote(note);
++  snprintf(note,sizeof note,"TR bind calls%llu skip b%llu t%llu s%llu bytes%llu p%llu",(unsigned long long)gCoachzBindCalls.load(),
++   (unsigned long long)gCoachzBindSkip[0].load(),(unsigned long long)gCoachzBindSkip[1].load(),(unsigned long long)gCoachzBindSkip[2].load(),
++   (unsigned long long)gCoachzBindSkip[3].load(),(unsigned long long)gCoachzBindSkip[4].load());coachzTurnNote(note);
++  snprintf(note,sizeof note,"TR scratch hit%llu new%llu transient%llu drop%llu",(unsigned long long)gCoachzScratchHit.load(),
++   (unsigned long long)gCoachzScratchMiss.load(),(unsigned long long)gCoachzScratchTransient.load(),(unsigned long long)gCoachzScratchDropped.load());coachzTurnNote(note);
++  snprintf(note,sizeof note,"TR seals deferred%llu merged%llu boundaries%llu",(unsigned long long)gCoachzSealDeferred.load(),
++   (unsigned long long)gCoachzSealMerged.load(),(unsigned long long)gCoachzSealBoundaries.load());coachzTurnNote(note);
++  snprintf(note,sizeof note,"TR deps kept%llu flush u%llu r%llu c%llu b%llu commit%llu",(unsigned long long)gCoachzSealUnrelated.load(),
++   (unsigned long long)gCoachzSealReasons[0].load(),(unsigned long long)gCoachzSealReasons[1].load(),
++   (unsigned long long)gCoachzSealReasons[2].load(),(unsigned long long)gCoachzSealReasons[3].load(),(unsigned long long)gCoachzSealReasons[4].load());coachzTurnNote(note);
++  snprintf(note,sizeof note,"TR physical mode%u seed%llu reuse%llu rotate%llu",encoder->coachzNative?1u:0u,
++   (unsigned long long)gCoachzNativeSeed.load(),(unsigned long long)gCoachzNativeReuse.load(),(unsigned long long)gCoachzNativeStore.load());coachzTurnNote(note);
++  snprintf(note,sizeof note,"TR physical verify%llu bad%llu missing%llu disabled%u",(unsigned long long)gCoachzNativeChecked.load(),
++   (unsigned long long)gCoachzNativeBad.load(),(unsigned long long)gCoachzNativeCheckMissing.load(),gCoachzNativeDisabled.load()?1u:0u);coachzTurnNote(note);
++  snprintf(note,sizeof note,"TR physical bytes seed%llu rotate%llu",(unsigned long long)gCoachzNativeSeedBytes.load(),
++   (unsigned long long)gCoachzNativeStoreBytes.load());coachzTurnNote(note);
++  snprintf(note,sizeof note,"TR export packed%llu compare%llu bytes%llu failed%llu",(unsigned long long)gCoachzExportPacked.load(),
++   (unsigned long long)gCoachzExportCompared.load(),(unsigned long long)gCoachzExportBytes.load(),(unsigned long long)gCoachzExportFailed.load());coachzTurnNote(note);
++  snprintf(note,sizeof note,"TR export sample%llu changed%llu ratio%u fallback%llu/%llu/%llu",(unsigned long long)gCoachzExportSamples.load(),
++   (unsigned long long)gCoachzExportChanged.load(),gCoachzExportRatio.load(),(unsigned long long)gCoachzExportFallback[0].load(),
++   (unsigned long long)gCoachzExportFallback[1].load(),(unsigned long long)gCoachzExportFallback[2].load());coachzTurnNote(note);
++  snprintf(note,sizeof note,"TR capture passes%llu calls%llu replay%lluus",(unsigned long long)gCoachzDependencyPasses.load(),
++   (unsigned long long)gCoachzDependencyCalls.load(),(unsigned long long)gCoachzDependencyReplayUs.load());coachzTurnNote(note);
++  snprintf(note,sizeof note,"TR owners record%llu encode%llu",(unsigned long long)gCoachzOwnerRecorded.load(),
++   (unsigned long long)gCoachzOwnerEncoded.load());coachzTurnNote(note);
++  snprintf(note,sizeof note,"TR cache fn%llu/%llu render%llu/%llu compute%llu/%llu key%lluus",
++   (unsigned long long)gCoachzCacheHit[0].load(),(unsigned long long)gCoachzCacheMiss[0].load(),
++   (unsigned long long)gCoachzCacheHit[1].load(),(unsigned long long)gCoachzCacheMiss[1].load(),
++   (unsigned long long)gCoachzCacheHit[2].load(),(unsigned long long)gCoachzCacheMiss[2].load(),(unsigned long long)gCoachzCacheKeyUs.load());coachzTurnNote(note);
++  snprintf(note,sizeof note,"TR admission active%u warm%llu pending%llu rate%llu",gCoachzTurnAuditInFlight.load(),
++   (unsigned long long)gCoachzAuditWarm.load(),(unsigned long long)gCoachzAuditPending.load(),(unsigned long long)gCoachzAuditRate.load());coachzTurnNote(note);
 +  snprintf(note,sizeof note,"TR span n%llu wall%lluus held%zu",(unsigned long long)n,
 +   (unsigned long long)(nowUs()-encoder->coachzTurnBegan),encoder->coachzHeldBytes);coachzTurnNote(note);
 + }
@@ -2219,17 +2961,17 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 +static bool coachzMakeAudit(NBEncoder *encoder) {
 + NBCommandBuffer *commands=encoder.commandBuffer;
 + CoachzTurnAudit *audit=encoder->coachzAuditLease;
-+ const size_t bytes=audit.colors.count*256;
++ const size_t bytes=audit.colors.count*512;
 + std::vector<uint32_t> initial(bytes/sizeof(uint32_t),0);
-+ for(size_t i=0;i<audit.colors.count;i++)initial[i*64+2]=UINT32_MAX;
++ for(size_t i=0;i<audit.colors.count*2;i++)initial[i*64+2]=UINT32_MAX;
 + NBBuffer *report=[NBBuffer new];
 + report.handle=nmb_buffer_new(gDevice,bytes,MTLResourceStorageModeShared,initial.data());
 + report.options=MTLResourceStorageModeShared;
 + if(!report.handle)return false;
 + audit.report=report;
-+ [commands.resourceOwners addObject:report];
-+ [commands.resourceOwners addObject:encoder->coachzAuditPipeline];
-+ [commands.resourceOwners addObject:encoder->coachzTurnView];
++ [commands.coachzEncodedOwners addObject:report];
++ [commands.coachzEncodedOwners addObject:encoder->coachzAuditPipeline];
++ [commands.coachzEncodedOwners addObject:encoder->coachzTurnView];
 + const uint64_t threads[3]={128,128,1},group[3]={16,8,1};
 + NmbEncoder *compute=nmb_compute_encoder_new(commands.handle);
 + if(!compute)return false;
@@ -2237,26 +2979,58 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 + for(NSUInteger i=0;ok && i<audit.colors.count;i++) {
 +  CoachzTurnColor *color=audit.colors[i];
 +  if(color.store!=MTLStoreActionStore)continue;
-+  const uint32_t dimensions[4]={(uint32_t)color.source.width,(uint32_t)color.source.height,0,0};
++  const uint32_t dimensions[4]={(uint32_t)color.source.width,(uint32_t)color.source.height,encoder->coachzNative?1u:0u,0};
 +  ok=nmb_encoder_set_texture(compute,0,color.source.handle,0) && nmb_encoder_set_texture(compute,0,color.rotated.handle,1) &&
 +   nmb_encoder_set_buffer(compute,0,report.handle,i*256,0) && nmb_encoder_set_bytes(compute,0,dimensions,sizeof dimensions,1) &&
 +   nmb_compute_dispatch(compute,threads,group,true);
++  if(ok) {
++   const uint32_t identity[4]={(uint32_t)color.source.width,(uint32_t)color.source.height,1,0};
++   ok=nmb_encoder_set_texture(compute,0,color.control.handle,1) &&
++    nmb_encoder_set_buffer(compute,0,report.handle,(audit.colors.count+i)*256,0) &&
++    nmb_encoder_set_bytes(compute,0,identity,sizeof identity,1) && nmb_compute_dispatch(compute,threads,group,true);
++  }
 + }
 + if(!ok){nmb_encoder_discard(compute);return false;}
 + return nmb_encoder_end(compute);
 +}
++static bool coachzFlushPending(id object,uint32_t continuingSurface,const std::unordered_set<uint32_t> *accesses,uint32_t boundary) {
++ NBCommandBuffer *commands=object;
++ NSArray *prefix=commands.coachzPendingSeal;
++ if(!prefix)return true;
++ if(continuingSurface && continuingSurface==commands.coachzPendingSurface) {
++  // The next pass reads only the private attachment. Alias/fence/compute use
++  // already refuses direct selection; every other encoder flushes before opening.
++  gCoachzSealMerged++;return true;
++ }
++ if(accesses && !accesses->count(commands.coachzPendingSurface)) {
++  gCoachzSealUnrelated++;return true;
++ }
++ const bool ok=coachzMirrorFrames(commands.handle,(NSMutableArray *)prefix,commands.coachzEncodedOwners,0,nil,commands.coachzExports);
++ if(ok) {
++  for(CoachzFrameWrite *write in prefix)write.sealed=YES;
++  commands.coachzPendingSeal=nil;commands.coachzPendingSurface=0;
++  gCoachzTurnSeals++;gCoachzSealBoundaries++;gCoachzSealReasons[std::min(boundary,4u)]++;
++ }
++ return ok;
++}
 +static bool coachzSealQuarter(NBEncoder *encoder) {
-+ // At endEncoding the prefix is immutable. Later encoders may already have
-+ // recorded their writes on the calling thread, so never inspect the live list.
-+ const bool ok=coachzMirrorFrames(encoder.commandBuffer.handle,(NSMutableArray *)encoder->coachzTurnPrefix,
-+  encoder.commandBuffer.resourceOwners,0,nil);
-+ if(ok) {for(CoachzFrameWrite *write in encoder->coachzTurnPrefix)write.sealed=YES;gCoachzTurnSeals++;}
++ NBCommandBuffer *commands=encoder.commandBuffer;
++ if(!encoder->coachzAuditing) {
++  // Replaced by a later immutable prefix only when that pass continued this
++  // resident image. The union of all unsealed damage survives until flush.
++  commands.coachzPendingSeal=encoder->coachzTurnPrefix;
++  commands.coachzPendingSurface=IOSurfaceGetID(encoder->coachzTarget.surface);
++  gCoachzSealDeferred++;return true;
++ }
++ const bool ok=coachzMirrorFrames(commands.handle,(NSMutableArray *)encoder->coachzTurnPrefix,commands.coachzEncodedOwners,0,nil,commands.coachzExports);
++ if(ok){for(CoachzFrameWrite *write in encoder->coachzTurnPrefix)write.sealed=YES;gCoachzTurnSeals++;}
 + return ok;
 +}
 +static void coachzReleaseTurnAudit(id object) {
 + CoachzTurnAudit *audit=object;
 + std::lock_guard<std::mutex> guard(gCoachzTurnProgramsLock);
 + for(const auto &key:audit.programs)if(gCoachzTurnPrograms[key].state==1)gCoachzTurnPrograms[key].state=0;
++ gCoachzTurnAuditInFlight--;
 +}
 +static void coachzFinishTurnAudits(id object) {
 + NBCommandBuffer *commands=object;
@@ -2276,12 +3050,16 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 +    coachzTurnNote(note);
 +   }
 +  }
-+  if(bytes)sys_dcache_flush(bytes,audit.colors.count*256);
++  if(bytes)sys_dcache_flush(bytes,audit.colors.count*512);
 +  bool valid=complete && bytes,good=true;
 +  std::vector<std::array<uint32_t,3>> badPixels; // slot, x, y
 +  for(NSUInteger i=0;i<audit.colors.count;i++) {
 +   CoachzTurnColor *color=audit.colors[i];
 +   if(color.store!=MTLStoreActionStore)continue;
++   uint32_t control[4]={};
++   if(bytes)memcpy(control,(uint8_t *)bytes+(audit.colors.count+i)*256,sizeof control);
++   char controlNote[96];snprintf(controlNote,sizeof controlNote,"TR identity slot%u rows%u diff%u delta%u",color.slot,control[0],control[1],control[3]);
++   coachzTurnNote(controlNote);
 +   uint32_t data[4]={};
 +   if(bytes)memcpy(data,(uint8_t *)bytes+i*256,sizeof data);
 +   valid&=data[0]==128;
@@ -2325,6 +3103,7 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 +  {
 +   std::lock_guard<std::mutex> guard(gCoachzTurnProgramsLock);
 +   for(const auto &key:audit.programs)if(gCoachzTurnPrograms[key].state==1)gCoachzTurnPrograms[key].state=good?2:valid?3:0;
++   gCoachzTurnAuditInFlight--;
 +  }
 +  audit.finished=YES;
 +  if(good)gCoachzTurnAuditGood++;else if(valid)gCoachzTurnAuditBad++;
@@ -2341,7 +3120,7 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
   if(gLogTextures && textureLogTurn())
    GLOG(@"native-metal: texture-log %llu texture %llux%llu fmt %llu type %llu levels %llu usage %llx options %llx %s",
          (unsigned long long)gTexturesLogged.load(),(unsigned long long)descriptor.width,(unsigned long long)descriptor.height,
-@@ -4162,8 +5701,9 @@
+@@ -4162,8 +6217,9 @@
  }
  // The surface's pages are the texels: its mapping in this process is imported without a copy (pinned by the kernel, mapped into the GPU's
  // 4 KiB context by Turnip), so every process that imports the surface renders and samples the same memory.
@@ -2351,7 +3130,7 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
   // the plane's own address and rows. Only a plain surface has no planes, and then only plane 0 exists.
   const size_t planes=surface?IOSurfaceGetPlaneCount(surface):0;
   if(!surface || !d || (planes?plane>=planes:plane!=0)){refuseSurface(1,surface,d,plane,0,0);return nil;}
-@@ -4175,14 +5715,21 @@
+@@ -4175,14 +6231,21 @@
   size_t row=planes?IOSurfaceGetBytesPerRowOfPlane(surface,plane):IOSurfaceGetBytesPerRow(surface);
   size_t computed[4];   // myron: a 'b3a8' surface without plane rows
   if(!row && plane<2 && b3a8Planes(surface,allocation,computed)){start=(uintptr_t)base+computed[plane*2];row=computed[plane*2+1];}
@@ -2374,7 +3153,79 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
  - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {
   const void *bytes=nullptr;size_t size=0;dispatch_data_t mapped=dispatch_data_create_map(data,&bytes,&size);
   const uint64_t libraryBegan=nowUs();
-@@ -4398,8 +5945,20 @@
+@@ -4290,8 +6353,16 @@
+ - (id<MTLComputePipelineState>)newComputePipelineStateWithFunction:(id<MTLFunction>)function options:(MTLPipelineOption)options
+                                                          reflection:(MTLAutoreleasedComputePipelineReflection *)reflection error:(NSError **)error {
+  if(reflection)*reflection=nil;
+  if(![(id)function isKindOfClass:[NBFunction class]] || ![(NBFunction *)function handle]){if(error)*error=nbError(@"foreign function");return nil;}
++ NmbComputePipelineDescriptor canonical={};canonical.function=[(NBFunction *)function handle];canonical.max_call_stack_depth=1;
++ const uint64_t cacheBegan=nowUs();
++ NSData *cacheKey=options==MTLPipelineOptionNone && !reflection?coachzComputeKey((NBFunction *)function,canonical,nil,nil):nil;
++ if(cacheKey) {
++  NBComputePipeline *cached=[coachzComputeCache() objectForKey:cacheKey];
++  if(cached)if(NBComputePipeline *copy=coachzCopyCompute(cached)){gTimePipeline.add(cacheBegan);gCoachzCacheHit[2]++;gPipelines++;if(error)*error=nil;return (id<MTLComputePipelineState>)copy;}
++  gCoachzCacheMiss[2]++;
++ }
+  const NmbPipelineOptions creation={(uint64_t)options,nullptr,0};
+  const uint64_t pipelineBegan=nowUs();
+  NmbComputePipeline *handle=nmb_compute_pipeline_new_with_options(gDevice,[(NBFunction *)function handle],&creation);
+  NBFunction *built=(NBFunction *)function;
+@@ -4309,17 +6380,27 @@
+   NmbComputePipelineDescriptor p={};p.function=built.handle;p.max_call_stack_depth=1;
+   *reflection=(MTLComputePipelineReflection *)computeReflection(&p);
+  }
+  nbNotePipeline(true,true,nowUs()-pipelineBegan,0,0,0,((NBFunction *)function).name.UTF8String,"-","");
+- NBComputePipeline *state=[NBComputePipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;return (id<MTLComputePipelineState>)state;
++ NBComputePipeline *state=[NBComputePipeline new];state.handle=handle;gPipelines++;
++ if(cacheKey)if(NBComputePipeline *copy=coachzCopyCompute(state))[coachzComputeCache() setObject:copy forKey:cacheKey];
++ if(error)*error=nil;return (id<MTLComputePipelineState>)state;
+ }
+ - (id<MTLComputePipelineState>)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d options:(MTLPipelineOption)options
+                                                        reflection:(MTLAutoreleasedComputePipelineReflection *)reflection error:(NSError **)error {
+  if(reflection)*reflection=nil;
+  NmbComputePipelineDescriptor p={};std::vector<NmbFunction *> linked,privateLinked;
+  if(!computeDescriptor(d,&p,linked,privateLinked,error))return nil;
+  std::vector<NmbBinaryArchive *> archives;
+  if(!pipelineArchives(d.binaryArchives,archives,error))return nil;
++ const uint64_t cacheBegan=nowUs();
++ NSData *cacheKey=options==MTLPipelineOptionNone && !reflection && archives.empty()?
++  coachzComputeKey((NBFunction *)d.computeFunction,p,d.linkedFunctions.functions,d.linkedFunctions.privateFunctions):nil;
++ if(cacheKey) {
++  NBComputePipeline *cached=[coachzComputeCache() objectForKey:cacheKey];
++  if(cached)if(NBComputePipeline *copy=coachzCopyCompute(cached)){copy.label=d.label;gTimePipeline.add(cacheBegan);gCoachzCacheHit[2]++;gPipelines++;if(error)*error=nil;return (id<MTLComputePipelineState>)copy;}
++  gCoachzCacheMiss[2]++;
++ }
+  const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
+  const uint64_t pipelineBegan=nowUs();
+  NmbComputePipeline *handle=nmb_compute_pipeline_new_with_descriptor(gDevice,&p,&creation);
+  // Metal builds a kernel that reads a constant nobody set; the runtime refuses it: once more with those constants zero.
+@@ -4334,8 +6415,9 @@
+   return failWith<id<MTLComputePipelineState>>(error,@"compute pipeline",nil);
+  }
+  if(reflection && wantsReflection(options))*reflection=(MTLComputePipelineReflection *)computeReflection(&p);
+  NBComputePipeline *state=[NBComputePipeline new];state.handle=handle;state.label=d.label;gPipelines++;
++ if(cacheKey)if(NBComputePipeline *copy=coachzCopyCompute(state))[coachzComputeCache() setObject:copy forKey:cacheKey];
+  if(error)*error=nil;return (id<MTLComputePipelineState>)state;
+ }
+ // iPadOS 27's QuartzCore builds its backdrop compute pipelines (Liquid Glass luma, backdrop capture) with this short form: unanswered, the
+ // render server got nil and aborted with "Metal failed to build compute pipeline" on the first backdrop (a respring).
+@@ -4369,8 +6451,15 @@
+   delete p;return nil;
+  }
+  std::vector<NmbBinaryArchive *> archives;
+  if(!pipelineArchives(d.binaryArchives,archives,error)){delete p;return nil;}
++ const uint64_t cacheBegan=nowUs();
++ NSData *cacheKey=options==MTLPipelineOptionNone && !reflection && archives.empty()?coachzRenderKey(d,*p):nil;
++ if(cacheKey) {
++  NBRenderPipeline *cached=[coachzRenderCache() objectForKey:cacheKey];
++  if(cached)if(NBRenderPipeline *copy=coachzCopyRender(cached)){delete p;gTimePipeline.add(cacheBegan);gCoachzCacheHit[1]++;gPipelines++;if(error)*error=nil;return (id<MTLRenderPipelineState>)copy;}
++  gCoachzCacheMiss[1]++;
++ }
+  const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
+  const uint64_t pipelineBegan=nowUs();const NBCost costBegan=NBCost::now();
+  uint64_t cacheBefore[10]={};if(!gJournalPath.empty())nmb_device_work_stats(gDevice,cacheBefore);
+  uint32_t programVs=0,programFs=0;nbLastProgram(&programVs,&programFs);   // clear what an earlier creation on this thread left
+@@ -4398,9 +6487,22 @@
    if(error)*error=nbError([@"render pipeline: " stringByAppendingString:why]);
    return nil;
   }
@@ -2392,10 +3243,12 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 + }
 + state.coachzFragmentName=d.fragmentFunction.name;
   if(dumpRange().first)state.dumpInfo=renderDumpInfo(d);
++ if(cacheKey)if(NBRenderPipeline *copy=coachzCopyRender(state))[coachzRenderCache() setObject:copy forKey:cacheKey];
   return (id<MTLRenderPipelineState>)state;
  }
  // The asynchronous forms make the pipeline on the caller's thread and call the handler before returning, as the library's
-@@ -4568,8 +6127,34 @@
+ // newFunctionWithName:constantValues:completionHandler: does (RenderBox's pipeline loader, Core Image's bilateral solver).
+@@ -4568,8 +6670,34 @@
   return gDeviceObject;
  }
 
@@ -2430,7 +3283,7 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
   NmbLibrary *handle=gDevice?nmb_library_new(gDevice,bytes,length,true):nullptr;if(!handle)return nil;
   NBLibrary *library=[NBLibrary new];library.handle=handle;return library;
  }
-@@ -4678,12 +6263,42 @@
+@@ -4678,12 +6806,42 @@
  }
  // The telemetry table the plugin streams to the kernel's log: newline-separated rows of at most 90 characters.
  extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
@@ -2473,7 +3326,7 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
   row("S c%llu/%llu d%llu p%llu x%llu R%llu D%llu F%llu M%lluk C%llu B%llu",(unsigned long long)gCommits.load(),(unsigned long long)gCommitFailures.load(),
    (unsigned long long)gCompleted.load(),(unsigned long long)gPipelines.load(),(unsigned long long)gProblems.load(),(unsigned long long)gPasses.load(),
    (unsigned long long)gDraws.load(),(unsigned long long)gFullScreenPasses.load(),(unsigned long long)(gBiggestPass.load()>>10),
-@@ -4747,8 +6362,16 @@
+@@ -4747,8 +6905,16 @@
    uint64_t tc[8]={};
    if(nmb_device_texture_counts(gDevice,tc))
     row("L inp %llu/%llu rf %llu/%llu sh %llu cp %llu bk %llu rt %llu",(unsigned long long)tc[0],(unsigned long long)tc[1],(unsigned long long)tc[2],
@@ -2490,7 +3343,7 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
    {
     std::lock_guard<std::mutex> lock(gUnalignedLock);
     if(gUnalignedCount)
-@@ -4776,34 +6399,8 @@
+@@ -4776,34 +6942,8 @@
      (unsigned long long)(mc[4]>>20),(unsigned long long)(mc[5]>>20),(unsigned long long)mc[6],(unsigned long long)mc[7],
      (unsigned long long)mc[8],(unsigned long long)mc[9],(unsigned long long)(bc[5]>>20),(unsigned long long)(bc[6]>>20),
      (unsigned long long)bc[2],(unsigned long long)bc[3]);
@@ -2525,7 +3378,7 @@ diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
    // addresses relative to their image (+offset in the plugin, whose link map NativeAdrenoMetal.map names them; *offset in another).
    {
     uint64_t sites[3*12]={};
-@@ -4823,10 +6420,8 @@
+@@ -4823,10 +6963,8 @@
       frames[3],frames[4]);
      row("MA%zub %s %s %s %s %s",i,frames[5],frames[6],frames[7],frames[8],frames[9]);
     }
@@ -2556,7 +3409,36 @@ diff --git a/NativeMetalBridgePhase.h b/NativeMetalBridgePhase.h
 diff --git a/bridge/NativeMetalObjects.h b/bridge/NativeMetalObjects.h
 --- a/bridge/NativeMetalObjects.h
 +++ b/bridge/NativeMetalObjects.h
-@@ -294,10 +294,12 @@
+@@ -161,16 +161,18 @@
+ // The library's function with every function constant it declares set to zero (shader priming), or null.
+ NmbFunction *nmb_function_new_zero_constants(NmbLibrary *, const char *name);
+ /* nmb_function_new_specialized, with every declared constant the caller left out set to zero (false for a bool). */
+ NmbFunction *nmb_function_new_specialized_zero_rest(NmbLibrary *, const char *name, const struct NmbConstant *constants, uint32_t count);
++NmbFunction *nmb_function_copy(const NmbFunction *);
+ void nmb_function_release(NmbFunction *);
+ bool nmb_function_set_specialized_name(NmbFunction *, const char *);
+ /* Metal's MTLFunctionType (1 vertex, 2 fragment, 3 kernel, ...). */
+ uint64_t nmb_function_type(const NmbFunction *);
+ uint64_t nmb_function_patch_type(const NmbFunction *);              /* MTLPatchType */
+ int64_t nmb_function_patch_control_point_count(const NmbFunction *); /* -1: no patch, or no count stated */
+
+ NmbComputePipeline *nmb_compute_pipeline_new(NmbDevice *, NmbFunction *);
++NmbComputePipeline *nmb_compute_pipeline_copy(const NmbComputePipeline *);
+ void nmb_compute_pipeline_release(NmbComputePipeline *);
+ uint64_t nmb_compute_pipeline_max_threads(const NmbComputePipeline *);
+ uint64_t nmb_compute_pipeline_execution_width(const NmbComputePipeline *);
+
+@@ -216,8 +218,9 @@
+ /* The archive makes the state as the matching new call does and keeps what it used (addRender/ComputePipelineFunctionsWithDescriptor:). */
+ bool nmb_binary_archive_add_render(NmbBinaryArchive *, const struct NmbRenderPipelineDescriptor *);
+ bool nmb_binary_archive_add_compute(NmbBinaryArchive *, NmbFunction *);
+ bool nmb_binary_archive_add_compute_descriptor(NmbBinaryArchive *, const struct NmbComputePipelineDescriptor *);
++NmbRenderPipeline *nmb_render_pipeline_copy(const NmbRenderPipeline *);
+ void nmb_render_pipeline_release(NmbRenderPipeline *);
+ // A pipeline's reflection, as its creation's `reflection:` answers it, in JSON: {"vertex":[...],"fragment":[...]} for a render pipeline,
+ // {"bindings":[...]} for a compute pipeline; each binding has Metal's raw values and a buffer's nested struct/array/pointer types. Null: refused.
+ typedef struct NmbReflection NmbReflection;
+@@ -294,10 +297,13 @@
  struct NmbRenderPassDescriptor {
      struct NmbPassAttachment colors[8], depth, stencil;
      uint64_t width, height, array_length, samples;
@@ -2564,12 +3446,13 @@ diff --git a/bridge/NativeMetalObjects.h b/bridge/NativeMetalObjects.h
 +    uint64_t coachz_quarter_turn; /* physical-plane render coordinates to private rotation 3 */
  };
  NmbEncoder *nmb_render_encoder_new(NmbCommandBuffer *, const struct NmbRenderPassDescriptor *);
++uint32_t nmb_render_pipeline_identity(const NmbRenderPipeline *, uint64_t hashes[4]);
 +uint32_t nmb_render_pipeline_quarter_turn(const NmbRenderPipeline *, uint64_t hashes[4]);
  bool nmb_encoder_end(NmbEncoder *);
  void nmb_encoder_discard(NmbEncoder *);
 
  /* stage: 0 compute, 1 vertex, 2 fragment */
-@@ -346,8 +348,18 @@
+@@ -346,8 +352,18 @@
  bool nmb_blit_texture_to_buffer(NmbEncoder *, NmbTexture *source, uint64_t slice, uint64_t level, const uint64_t origin[3],
                                  const uint64_t size[3], NmbBuffer *destination, uint64_t offset, uint64_t bytes_per_row,
                                  uint64_t bytes_per_image);
@@ -2632,7 +3515,39 @@ diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
          // Flags bit 0x400: a format of blocks, which the alignment query has refused already.
          if info.flags & 0x400 != 0 || info.words[0] == 0 {
              return Err(format!("pixel format {format} has no texel size"));
-@@ -1687,8 +1696,21 @@
+@@ -1452,8 +1461,15 @@
+         Ok(boxed(NmbFunction(function)))
+     })
+ }
+
++/// # Safety
++/// The source remains live for this call. The returned wrapper owns its clone.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn nmb_function_copy(source: *const NmbFunction) -> *mut NmbFunction {
++    guard(std::ptr::null_mut(), || Ok(boxed(NmbFunction(get(source)?.0.clone()))))
++}
++
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_function_release(function: *mut NmbFunction) {
+     release(function)
+ }
+@@ -1557,8 +1573,15 @@
+         let resolved = unsafe { pipeline_options(options)? };
+         let state = get(device)?.0.new_compute_pipeline_state(&compute_descriptor(descriptor)?, &resolved).map_err(e("compute pipeline"))?;
+         Ok(boxed(NmbComputePipeline(state)))
+     })
++}
++
++/// # Safety
++/// The source remains live for this call. The returned wrapper owns its clone.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn nmb_compute_pipeline_copy(source: *const NmbComputePipeline) -> *mut NmbComputePipeline {
++    guard(std::ptr::null_mut(), || Ok(boxed(NmbComputePipeline(get(source)?.0.clone()))))
+ }
+
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_compute_pipeline_release(pipeline: *mut NmbComputePipeline) {
+@@ -1687,8 +1710,34 @@
          Ok(boxed(NmbRenderPipeline(state)))
      })
  }
@@ -2650,11 +3565,40 @@ diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
 +    })
 +}
 +
++/// # Safety
++/// The pipeline is live and hashes names four writable u64 values.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn nmb_render_pipeline_identity(pipeline: *const NmbRenderPipeline, hashes: *mut u64) -> u32 {
++    guard(0x80000000, || {
++        if hashes.is_null() { return Err("null identity hashes".into()); }
++        let mut values = [0; 4];
++        let mask = get(pipeline)?.0.coachz_identity(&mut values).map_err(e("identity pipeline"))?;
++        unsafe { std::ptr::copy_nonoverlapping(values.as_ptr(), hashes, 4); }
++        Ok(mask)
++    })
++}
++
  fn render_descriptor(descriptor: *const NmbRenderPipelineDescriptor) -> Result<RenderPipelineDescriptor, String> {
          let d = get(descriptor)?;
          // Each stage's linked functions ride on its function descriptor, as the compute pipeline's do (compute_descriptor).
          let stage_linked = |functions, count, private, private_count| -> Result<LinkedFunctions, String> {
-@@ -2426,8 +2448,9 @@
+@@ -1755,8 +1804,15 @@
+             tessellation.factor_scale_enabled = t.factor_scale_enabled != 0;
+             out.tessellation = Some(tessellation);
+         }
+         Ok(out)
++}
++
++/// # Safety
++/// The source remains live for this call. The returned wrapper owns its clone.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn nmb_render_pipeline_copy(source: *const NmbRenderPipeline) -> *mut NmbRenderPipeline {
++    guard(std::ptr::null_mut(), || Ok(boxed(NmbRenderPipeline(get(source)?.0.clone()))))
+ }
+
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_render_pipeline_release(pipeline: *mut NmbRenderPipeline) {
+@@ -2426,8 +2482,9 @@
      pub height: u64,
      pub array_length: u64,
      pub samples: u64,
@@ -2664,7 +3608,7 @@ diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
 
  fn texture_of(a: &NmbPassAttachment) -> Result<Option<Texture>, String> {
      if a.texture.is_null() { Ok(None) } else { Ok(Some(get(a.texture)?.0.clone())) }
-@@ -2438,8 +2461,9 @@
+@@ -2438,8 +2495,9 @@
                                           -> *mut NmbEncoder {
      guard(std::ptr::null_mut(), || {
          let d = get(descriptor)?;
@@ -2674,7 +3618,7 @@ diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
              slot.texture = texture_of(a)?;
              slot.resolve_texture = optional(a.resolve_texture)?.map(|t| t.0.clone());
              slot.resolve_level = a.resolve_level;
-@@ -3041,4 +3065,64 @@
+@@ -3041,4 +3099,64 @@
          let queue = get(device)?.0.new_command_queue_with_max_command_buffer_count(count).map_err(e("command queue"))?;
          Ok(Box::into_raw(Box::new(NmbQueue(queue))))
      })
@@ -2742,7 +3686,7 @@ diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
 diff --git a/shaders/scanout_convert.ll b/shaders/scanout_convert.ll
 --- a/shaders/scanout_convert.ll
 +++ b/shaders/scanout_convert.ll
-@@ -105,12 +105,236 @@
+@@ -105,12 +105,377 @@
  done:
    ret void
  }
@@ -2903,7 +3847,11 @@ diff --git a/shaders/scanout_convert.ll b/shaders/scanout_convert.ll
 +  %xy = insertelement <2 x i32> %xy0, i32 %y, i32 1
 +  %rx = sub i32 %hm, %y
 +  %rxy0 = insertelement <2 x i32> poison, i32 %rx, i32 0
-+  %rxy = insertelement <2 x i32> %rxy0, i32 %x, i32 1
++  %quarterxy = insertelement <2 x i32> %rxy0, i32 %x, i32 1
++  %identityp = getelementptr i32, ptr addrspace(2) %dims, i64 2
++  %identityflag = load i32, ptr addrspace(2) %identityp, align 4
++  %identity = icmp ne i32 %identityflag, 0
++  %rxy = select i1 %identity, <2 x i32> %xy, <2 x i32> %quarterxy
 +  %a0 = call { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1) %reference, <2 x i32> %xy, i32 0, i32 0)
 +  %b0 = call { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1) %turned, <2 x i32> %rxy, i32 0, i32 0)
 +  %a = extractvalue { <4 x float>, i8 } %a0, 0
@@ -2973,14 +3921,151 @@ diff --git a/shaders/scanout_convert.ll b/shaders/scanout_convert.ll
 +}
 +declare { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, i32, i32)
 +
++
++; Coachz: four physical-plane pixels per invocation, including the final 1..3
++; pixels without a vector overrun. Mode 1 suppresses identical 16-byte stores.
++; Statistics sample one group out of 256, not every pixel.
++define internal i32 @coachz_export_pixel(ptr addrspace(1) %src, i32 %x, i32 %y, i32 %h, i32 %rotate) alwaysinline {
++entry:
++  %rotated = icmp ne i32 %rotate, 0
++  %last = sub i32 %h, 1
++  %rx = sub i32 %last, %y
++  %sx = select i1 %rotated, i32 %rx, i32 %x
++  %sy = select i1 %rotated, i32 %x, i32 %y
++  %v0 = insertelement <2 x i32> poison, i32 %sx, i32 0
++  %v = insertelement <2 x i32> %v0, i32 %sy, i32 1
++  %raw = call { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1) %src, <2 x i32> %v, i32 0, i32 0)
++  %rgba = extractvalue { <4 x float>, i8 } %raw, 0
++  %scaled = fmul <4 x float> %rgba, <float 255.0, float 255.0, float 255.0, float 255.0>
++  %rounded = fadd <4 x float> %scaled, <float 0.5, float 0.5, float 0.5, float 0.5>
++  %codes = fptoui <4 x float> %rounded to <4 x i32>
++  %r = extractelement <4 x i32> %codes, i32 0
++  %g = extractelement <4 x i32> %codes, i32 1
++  %b = extractelement <4 x i32> %codes, i32 2
++  %a = extractelement <4 x i32> %codes, i32 3
++  %rr = shl i32 %r, 16
++  %gg = shl i32 %g, 8
++  %aa = shl i32 %a, 24
++  %br = or i32 %b, %rr
++  %ga = or i32 %gg, %aa
++  %pixel = or i32 %br, %ga
++  ret i32 %pixel
++}
++
++define void @coachz_export4(ptr addrspace(1) %src, ptr addrspace(1) %dst, ptr addrspace(2) %p, ptr addrspace(1) %stats, <2 x i32> %gid) {
++entry:
++  %p_h = getelementptr i32, ptr addrspace(2) %p, i64 1
++  %h = load i32, ptr addrspace(2) %p_h, align 4
++  %p_stride = getelementptr i32, ptr addrspace(2) %p, i64 2
++  %stride = load i32, ptr addrspace(2) %p_stride, align 4
++  %p_rotate = getelementptr i32, ptr addrspace(2) %p, i64 3
++  %rotate = load i32, ptr addrspace(2) %p_rotate, align 4
++  %p_ox = getelementptr i32, ptr addrspace(2) %p, i64 4
++  %ox = load i32, ptr addrspace(2) %p_ox, align 4
++  %p_oy = getelementptr i32, ptr addrspace(2) %p, i64 5
++  %oy = load i32, ptr addrspace(2) %p_oy, align 4
++  %p_width = getelementptr i32, ptr addrspace(2) %p, i64 6
++  %width = load i32, ptr addrspace(2) %p_width, align 4
++  %p_height = getelementptr i32, ptr addrspace(2) %p, i64 7
++  %height = load i32, ptr addrspace(2) %p_height, align 4
++  %p_mode = getelementptr i32, ptr addrspace(2) %p, i64 8
++  %mode = load i32, ptr addrspace(2) %p_mode, align 4
++  %gx = extractelement <2 x i32> %gid, i32 0
++  %gy = extractelement <2 x i32> %gid, i32 1
++  %x4 = shl i32 %gx, 2
++  %x = add i32 %x4, %ox
++  %y = add i32 %gy, %oy
++  %endx = add i32 %ox, %width
++  %validx = icmp ult i32 %x4, %width
++  %validy = icmp ult i32 %gy, %height
++  %valid = and i1 %validx, %validy
++  br i1 %valid, label %body, label %done
++body:
++  %row = mul i32 %y, %stride
++  %index = add i32 %row, %x
++  %index64 = zext i32 %index to i64
++  %out = getelementptr i32, ptr addrspace(1) %dst, i64 %index64
++  %x3 = add i32 %x, 3
++  %full = icmp ult i32 %x3, %endx
++  br i1 %full, label %vector, label %tail0
++vector:
++  %c0 = call i32 @coachz_export_pixel(ptr addrspace(1) %src, i32 %x, i32 %y, i32 %h, i32 %rotate)
++  %pack0 = insertelement <4 x i32> poison, i32 %c0, i32 0
++  %x_1 = add i32 %x, 1
++  %c1 = call i32 @coachz_export_pixel(ptr addrspace(1) %src, i32 %x_1, i32 %y, i32 %h, i32 %rotate)
++  %pack1 = insertelement <4 x i32> %pack0, i32 %c1, i32 1
++  %x_2 = add i32 %x, 2
++  %c2 = call i32 @coachz_export_pixel(ptr addrspace(1) %src, i32 %x_2, i32 %y, i32 %h, i32 %rotate)
++  %pack2 = insertelement <4 x i32> %pack1, i32 %c2, i32 2
++  %x_3 = add i32 %x, 3
++  %c3 = call i32 @coachz_export_pixel(ptr addrspace(1) %src, i32 %x_3, i32 %y, i32 %h, i32 %rotate)
++  %pack3 = insertelement <4 x i32> %pack2, i32 %c3, i32 3
++  %sxmask = and i32 %gx, 63
++  %symask = and i32 %gy, 3
++  %samplex = icmp eq i32 %sxmask, 0
++  %sampley = icmp eq i32 %symask, 0
++  %sample = and i1 %samplex, %sampley
++  %compare = icmp ne i32 %mode, 0
++  %readold = or i1 %compare, %sample
++  br i1 %readold, label %old, label %store
++old:
++  %previous = load <4 x i32>, ptr addrspace(1) %out, align 16
++  %eq = icmp eq <4 x i32> %previous, %pack3
++  %eq0 = extractelement <4 x i1> %eq, i32 0
++  %eq1 = extractelement <4 x i1> %eq, i32 1
++  %eq2 = extractelement <4 x i1> %eq, i32 2
++  %eq3 = extractelement <4 x i1> %eq, i32 3
++  %eq01 = and i1 %eq0, %eq1
++  %eq23 = and i1 %eq2, %eq3
++  %equal = and i1 %eq01, %eq23
++  br i1 %sample, label %count, label %decide
++count:
++  %counted = atomicrmw add ptr addrspace(1) %stats, i32 1 monotonic, align 4
++  %changed = xor i1 %equal, true
++  %changed32 = zext i1 %changed to i32
++  %sp1 = getelementptr i32, ptr addrspace(1) %stats, i64 1
++  %changedcount = atomicrmw add ptr addrspace(1) %sp1, i32 %changed32 monotonic, align 4
++  br label %decide
++decide:
++  %skip = and i1 %compare, %equal
++  br i1 %skip, label %done, label %store
++store:
++  store <4 x i32> %pack3, ptr addrspace(1) %out, align 16
++  br label %done
++tail0:
++  %tx0 = add i32 %x, 0
++  %tp0 = getelementptr i32, ptr addrspace(1) %out, i64 0
++  %tc0 = call i32 @coachz_export_pixel(ptr addrspace(1) %src, i32 %tx0, i32 %y, i32 %h, i32 %rotate)
++  store i32 %tc0, ptr addrspace(1) %tp0, align 4
++  %tn0 = add i32 %x, 1
++  %tv0 = icmp ult i32 %tn0, %endx
++  br i1 %tv0, label %tail1, label %done
++tail1:
++  %tx1 = add i32 %x, 1
++  %tp1 = getelementptr i32, ptr addrspace(1) %out, i64 1
++  %tc1 = call i32 @coachz_export_pixel(ptr addrspace(1) %src, i32 %tx1, i32 %y, i32 %h, i32 %rotate)
++  store i32 %tc1, ptr addrspace(1) %tp1, align 4
++  %tn1 = add i32 %x, 2
++  %tv1 = icmp ult i32 %tn1, %endx
++  br i1 %tv1, label %tail2, label %done
++tail2:
++  %tx2 = add i32 %x, 2
++  %tp2 = getelementptr i32, ptr addrspace(1) %out, i64 2
++  %tc2 = call i32 @coachz_export_pixel(ptr addrspace(1) %src, i32 %tx2, i32 %y, i32 %h, i32 %rotate)
++  store i32 %tc2, ptr addrspace(1) %tp2, align 4
++  br label %done
++done:
++  ret void
++}
++
  !llvm.module.flags = !{!0, !1, !2, !3, !4, !5, !6, !7, !8}
 -!air.kernel = !{!9, !22}
-+!air.kernel = !{!9, !22, !26, !46}
++!air.kernel = !{!9, !22, !26, !46, !52}
  !air.compile_options = !{!17, !18}
  !llvm.ident = !{!19}
  !air.version = !{!20}
  !air.language_version = !{!21}
-@@ -140,4 +364,33 @@
+@@ -140,4 +505,39 @@
  !22 = !{ptr @scanout_opaque, !10, !23}
  !23 = !{!12, !13, !25, !24}
  !24 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"gid"}
@@ -3014,3 +4099,9 @@ diff --git a/shaders/scanout_convert.ll b/shaders/scanout_convert.ll
 +!49 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.read", !"air.arg_type_name", !"texture2d<float, read>", !"air.arg_name", !"turned"}
 +!50 = !{i32 2, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"report"}
 +!51 = !{i32 3, !"air.buffer", !"air.buffer_size", i32 16, !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"uint4", !"air.arg_name", !"dims"}
++
++!52 = !{ptr @coachz_export4, !10, !53}
++!53 = !{!48, !54, !55, !56, !16}
++!54 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"uint4", !"air.arg_name", !"destination"}
++!55 = !{i32 2, !"air.buffer", !"air.buffer_size", i32 48, !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"uint4", !"air.arg_name", !"parameters"}
++!56 = !{i32 3, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"statistics"}

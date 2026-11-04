@@ -443,3 +443,141 @@ GPU 构建已完成，addon 为 14,332,184 字节、20 项文件，包含 prime 
 启动 45，保留日志覆盖 932 秒。首个 backboardd 的 `try13257 run1073`，八次对照均零差异。随后进程中两次对照分别有七个和两个异常像素，最大通道差为两个和一个 8-bit 单位；异常现场已包含原始像素与绘制、混合状态，最后一个进程 run 为零。
 
 backboardd 两次 SIGABRT 的 asi 为 `Failed to create IOSurfaceAccelerator`，调用栈经 `detach_layer`、`IOMFBDisplay::copy_surface` 和 `create_new_iosa_manager`。前一条匹配失败为 AppleM2ScalerCSCDriver；SpringBoard 和 chronod 随后退出。整次启动没有 panic 或 DeviceLost。提交到完成的累计均值为 73.6 ms，包含界面重启及重新初始化，没有固定操作窗口，不能直接和此前累计均值比较。
+
+
+### 图层复制路由修订，待实机
+
+针对 `detach_layer` 经 IOSurfaceAccelerator 创建失败退出的现场，采用 QuartzCore 自带的路径选择。backboardd 初始化 Metal 时设置 `CA_DISABLE_DETACHED=1`、`CA_FORCE_COPY_SURFACE_GPU=1`、`CA_FORCE_COPY_SURFACE_MSR=0`，保留图层的常规合成，并为符合条件的表面复制选择 GPU。
+
+这些选项可能已被 QuartzCore 缓存，因此同时写入这份 21H461 镜像的控制字节。写入前要求 CARenderServerStart 相对 QuartzCore 头的位置以及三个分支各三条指令均匹配；环境和缓存值分别记录。已有十秒报告回调继续读取配置，缓存值变化时重设并记录写入次数。作用域为 backboardd 的 arm64 构建。
+
+`SC route` 独立 Note 3 包含 n、match、env、applied、detach、gpu、msr、writes。env/applied 的位 1、2、4 分别对应禁止 detach、选择 GPU copy、关闭强制 MSR。期望 match1 env7 applied7 detach1 gpu1 msr0；首次、配置变化与幂次采样保留记录。env 表示 setenv 成功，applied 表示实际缓存字节读回符合配置。它们不等同于一次表面复制已经执行。
+
+#### 当前镜像的源码级定位依据
+
+输入为原始 SystemOS 中的 arm64 QuartzCore，镜像头为 `0x189429000`，CARenderServerStart 为 `0x189651efc`。只读扫描字符串和选项名称指针表得到下列索引，既有 GENERIC_SHADERS 的 0x55/0x56 与原记录一致。
+
+| 索引 | 名称 | 缓存字节 |
+|---|---|---|
+| 0x15 | CA_DISABLE_DETACHED | 0x1f491b385 |
+| 0xa0 | CA_FORCE_COPY_SURFACE_MSR | 0x1f491b410 |
+| 0xa1 | CA_FORCE_COPY_SURFACE_GPU | 0x1f491b411 |
+
+`ca_debug_options` 基址为 `0x1f491b370`。detach 分支读取 0x15，非零时选择现有 reason 0x10 分支。
+
+```text
+189566794  b0359da8  adrp x8, 1f491b000
+189566798  394e1508  ldrb w8, [x8, 385]
+18956679c  35003f08  cbnz w8, 189566f7c
+189566f7c             mov w24, 10
+```
+
+copy_surface 在 MSR 选项非零时选择其路径；GPU 选项的读取还受调用 flags 的 0xc00 位约束，更早的其他 flags 分支也可能选择 MSR，因此 GPU 选项只适用于可走该分支的复制。
+
+```text
+1896e5f4c  d03591a9  adrp x9, 1f491b000
+1896e5f50  39504129  ldrb w9, [x9, 410]
+1896e5f54  35ffff89  cbnz w9, 1896e5f44
+1896e5f58             cbz w8, 1896e5f68
+1896e5f5c  d03591a8  adrp x8, 1f491b000
+1896e5f60  39504508  ldrb w8, [x8, 411]
+1896e5f64  35001d08  cbnz w8, 1896e6304
+1896e6304             mov w27, 0
+1896e6308             mov w22, 1
+```
+
+本次对这两个既有路径选择配置进行接入，沿用 GPU addon 的正常构建和发布机制。参考整体 Metal 接入结构见 [UniXNU GPU 文档](https://unixnu.com/zh/porting/gpu)。
+
+需要新 addon 与配套信任缓存，可沿用现有内核。下一轮核对 SC route 生效读回、相同操作下的 backboardd 存活、IOSurfaceAccelerator/AppleM2ScalerCSCDriver 的错误，以及 direct run、mirror/sync 和分离操作窗口后的性能。此项尚待实机验收。
+
+复制路由修订已完成前端语法检查和惯例 GPU 编译、签名、打包，addon 为 14,342,840 字节、20 项文件，配套信任缓存含三个签名哈希。SC route 的生效读回、崩溃场景覆盖及性能仍待实机确认。
+
+
+### 渲染链批量优化，待实机
+
+启动 46 的日志覆盖 222 秒：直接渲染 run289、对照 6/4/2，私有呈现 shown609、plain0；mirror 722 次、9,387,286,708 字节。异常样本为少量通道相差一个 8-bit 单位，继续按程序隔离，不放宽零差异准入。SC route 已读到 match1 env7 applied7，窗口内没有界面进程退出；该窗口尚未覆盖此前 932 秒的退出场景。
+
+本批同时调整四处：
+
+1. **同步时机。** 已准入的相邻直渲染 pass 在同一命令缓冲里继续使用同一私有表面，保留各 pass 的 damage，延迟合并拷回。审核 pass、其他表面、普通 render、compute、blit 的 encoder 打开前，以及 commit 前，先同步已挂起的不可变写入前缀。别名、fence 和未知访问仍会拒绝直渲染；跨命令缓冲的发布边界不变。`TR seals` 的 deferred、merged、boundaries 分别回答延迟 pass 数、相邻合并数和实际同步边界数。
+2. **临时附件寿命。** 额外 MRT 附件按尺寸、格式及 storage mode 精确复用，仅在实际 GPU 完成后回池；失败命令不回池。最多保留八项，按完整像素容量保守计费且总额不超过 32 MiB。`TR scratch hit/new/drop` 区分复用、创建和未保留项。
+3. **丢弃型附件。** 不 Load 且 DontCare Store 的额外附件改为 memoryless，交给现有 runtime 的 transient attachment 与 split-pass 保留逻辑；Load/Store 附件维持私有存储和已有 seed/store。`TR scratch transient` 记录命中次数。依据为固定 metal2vulkan 源码 `texture.rs` 的 Memoryless 分配以及 `render_pass.rs::memoryless_actions` 和 split-pass backing，不引入新的硬件寄存器行为。
+4. **编码状态。** 每个 encoder 分别缓存 buffer+offset、texture、sampler、pipeline 和最多 4 KiB 的常量内容；完全相同的绑定不再排队跨桥调用。常量按字节比较；buffer/bytes 共用槽位失效规则，offset 更新缓存。缓存保留对象身份，encoder 结束即失效；资源别名检查和所有权登记仍先执行。`TR bind` 给出调用与各类跳过数，不把跳过次数当帧率收益。
+
+验收一起观察：画面/截图/切换快照是否正常、direct run 与 audit、mirror 字节及 in/out、seals 合并率、scratch 复用和 transient、绑定跳过数，以及固定操作窗口内的 G/H/J 和进程退出。需要重新构建 addon 与配套信任缓存；可沿用现有内核。构建与源码检查不算实机通过，本批暂不提交。
+
+本批已通过前端语法检查、补丁适用检查和正常 GPU 完整构建，构建退出码为 0。标准目录中的 addon 为 14,345,448 字节、20 项文件，配套信任缓存含三个签名哈希；现有壁纸与 prime list 保留。新增公开内容的隐私扫描为零命中。尚无本批实机数据，优化命中率、画面正确性与性能收益均待上述同轮验收。
+
+
+### 启动 48 的 GPU 结果与后续批量优化
+
+日志环覆盖启动后 876 秒。首个 backboardd 的直渲染为 try9994/run518，审核 8/7/1；失败样本只有一个像素、一个通道单位的差异，继续回退。私有呈现 shown7181/plain2143，mirror7456 次、99,658,642,936 字节，in3126 次因完整覆盖而不能缩区。G 累计均值 11,707 us，包含启动和不同操作，不能当作受控性能比较。MRT 临时附件 hit518/new2/transient520，实际减少了创建；同步 deferred511/merged0/boundaries511，绑定约 108 万次且跳过为零，这两条在此负载未产生预期收益。各计数为各自最后一次打印，不构成同一时间截面的精确比率。
+
+本次 backboardd 因错误释放 SIGABRT，SpringBoard 随后被结束。统一日志的 malloc 信息为 `pointer being freed was not allocated`；崩溃报告调用链为 `find_zone_and_free -> CoreFoundation::__rehashs -> NativeAdrenoMetal`，模块内返回点 0x67c0c 的指令序列与 `coachzFrameTransfer` 中解开 pipeline mutex 后的连续两个 `owners addObject` 相符。该集合也被记录侧的 buffer/texture/attachment 绑定追加，存在记录侧和执行侧并发修改的真实缺口。本次未见 GPU panic、DeviceLost 或 KMD fail；这不等于 EL0 稳定性通过。
+
+新一批沿整条渲染链继续推进：
+
+- **资源保留。** `resourceOwners` 由记录侧独占，新增 `coachzEncodedOwners` 由执行侧独占；mirror、MRT seed/store、审核报告以及内部 seed 转移保留到执行侧集合。两者都在真实完成后释放，避免同一个 NSMutableSet 在两侧同时 rehash。纹理日志需要全集时，仅在 commit 的执行侧合并副本。`TR owners` 记录两侧累计保留数。
+- **审核覆盖。** 去掉进程生命周期最多八次的上限，改为最多一个审核在途、相邻启动至少隔 500 ms。仍需零像素差异才准入，失败程序保持隔离；完成或取消都会释放在途名额。`TR admission` 分开记录预热、同程序在途和限速等待。
+- **依赖与同步。** 在命令缓冲已有计划直渲染之后，普通 encoder 收集附件及显式绑定的表面身份，再在执行侧打开。无关 render/blit 可保留挂起的私有写；访问该表面、未知 compute、fence、event 和 commit 仍先刷新。大 payload/过长调用序列的中途退回也强制刷新。`TR deps` 区分 kept 和实际刷新类型，`TR capture` 记录额外捕获的 pass/call 与 replay 时间。
+- **函数特化。** 新增按库内容 SHA-256、函数名、常量和创建模式区分的进程内缓存。命中返回新的对象及 runtime wrapper，保持 specializedName、标签和常量快照独立，避免重复函数创建；不复用现有按对象序号生成的 bitCodeHash。
+- **Render pipeline。** 完整桥接描述符去掉瞬时指针，连同阶段函数内容及有序 linked/private functions 建键。普通、无 reflection/archives 约束的成功结果可复用；每次返回独立 wrapper，颜色状态和 quarter-turn 检查状态不共用可变前端对象。
+- **Compute pipeline。** 短函数形式和完整描述符均按函数内容、线程限制、mutability 和 linked functions 建键；保留原来的 zero-rest 重试及 reflection 路径。函数缓存设置 256 项目标，render/compute 缓存各 128 项目标，由 NSCache 在压力下回收。仅成功结果入缓存。`TR cache` 记录三类 hit/miss 和建键耗时；命中也计入管线请求耗时。
+
+缓存的 runtime wrapper 通过已固定 metal2vulkan 对象的 Clone 语义复制；`pipeline/render.rs` 将 RenderPipelineState 明确标为便宜 retain 且 Send+Sync。未新增硬件寄存器访问，也未修改内核构建配置。
+
+同轮验收：错误释放是否再现，审核能否超过八次并继续得到零差异准入，run/shown 覆盖与画面/截图/快照，同窗口 mirror 字节和 deps 刷新原因，函数/render/compute 缓存命中及 T/G/H/J 耗时，长时间存活和 DeviceLost。需要更新 addon 与配套信任缓存，可沿用现有内核；源码检查与构建不代表实机通过，本批暂不提交。
+
+本批前端语法检查、补丁适用检查与正常 GPU 全量构建通过，构建退出码为 0。标准目录 addon 为 14,356,520 字节、20 项文件，配套信任缓存含三个签名哈希；原壁纸和 prime list 保留。公开新增内容的隐私扫描零命中。本批尚无实机结果，未提交。
+
+
+### 打包导出、跨帧相同比较与完成侧空闲计时，待实机
+
+启动 50 的回写共 1555 次、20,904,054,472 字节，刷新采样 render90/commit165，kept4/merged0。启动 53 覆盖 182 秒，597 次、8,012,454,288 字节，kept0/merged0；审核 11/9/2，错误为少量通道一个 8-bit 单位，未见核心界面退出、GPU panic 或 DeviceLost。后者经历 61 次 slumber/resume，唤醒平均 12,916 us、最长 17,086 us。窗口和操作不同，不作性能因果比较。
+
+commit 的共享页发布不能直接省略，快照及外部读取仍依赖这些完成像素。本批保持该语义，从导出实现及跨帧相同数据的写入开销推进：
+
+- `coachz_export4` 以整数像素坐标读取私有 BGRA8Unorm 纹理，每线程输出四个物理平面像素，恢复原始 8-bit 通道后写成一个对齐的 16 字节块。直向及 90 度旋转均走此路径，末尾不足四个像素逐个写入，保留原 alpha，绝不写入行尾 padding/tag。
+- 目标共享 buffer、行距、偏移、范围、格式或矩形不符合条件时沿用原 transfer。输入私有纹理继续使用现有 UBWC；未给它增加 storage-image 写权限。导出无需额外的 render pass、sampler 或线性目标 attachment。
+- 比较模式逐块对比目标已有字节，只跳过完全相同的块。GPU 每 256 个完整块抽样一次记录变化率，完成侧用 EWMA 在比较与直接写入之间切换；直接写入模式仍抽样，从而能重新发现静态画面。此模式不改变任何像素，也不推迟跨进程发布。
+- `TR export packed/compare/bytes/failed` 记录路径执行及逻辑覆盖量，`sample/changed/ratio/fallback` 记录抽样变化率、策略和回退原因。bytes 是逻辑导出量，抽样也不是精确显存带宽或节省量。收益须结合同窗口 GPU 耗时判断。
+
+审核增加同方向私有目标对照：同一批只读 shader、输入和 draw 序列先画到未旋转的私有 control，再执行原参考和 quarter-turn；MRT control 的 storage 与变体一致。原有 sparse GPU 比较额外记录 `TR identity slot/rows/diff/delta`，用于区分目标布局/GMEM 与旋转产生的差异。它只增加诊断证据，不放宽零差异准入，失败仍隔离。
+
+GPU 电源计时按主线的完成侧语义修订：主线 [msm_gpu.c 的 retire_submit](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/msm/msm_gpu.c#L654) 在退役时调用 `pm_runtime_mark_last_busy`，活动提交减到零后才 `pm_runtime_put_autosuspend`。原实现仅按提交时间计时，长工作完成时 66 ms 可能已经耗尽。现在在 publisher 锁内观察同一次 shared fence 快照与 issued fence；仍有工作或完成 fence 前进时重置 busy 起点，之后才累计原有 66 ms。`gpu pm: idle` 打印 submit/busy 年龄与两类延长次数。未新增 GX MMIO 或选择器读回，也未关闭 runtime PM。
+
+交付分两部分：addon 与信任缓存包含新导出和 identity 对照；完成侧电源计时位于 `CoachzGpu.cpp`，需要下一次内核构建带入。本批只编译 addon，GPU board 源码只做现有内核参数下的语法检查。实机同时核对导出命中/回退、颜色/alpha/截图、抽样策略与 GPU 耗时、identity/quarter 对照，以及带入内核修订后的 idle/wake 行。尚未实机验收，暂不提交。
+
+本批 AIR 组装、前端语法、GPU board 单文件语法及补丁适用检查通过，正常 GPU 全量构建退出码为 0。标准目录 addon 为 14,364,448 字节、20 项文件，配套信任缓存含三个签名哈希。构建插件包含新 export 与 identity 路径。隐私扫描零命中，尚无本批实机结果；电源源码修订尚待内核构建带入，未提交。
+
+### 启动 56 的结果与同方向私有渲染，待实机
+
+日志环覆盖 178 秒。打包导出执行 packed215/compare215、逻辑覆盖 2,899,754,880 字节，failed0；抽样 719,820 组中变化 113,576 组，约 84.2% 完全相同。这是抽样相同比例，不是带宽节省比例。同方向私有 control 的 identity 对照为零差异，quarter-turn 对照出现 14 个像素、最多一个通道单位的差异；它将问题缩到附加旋转/范围/坐标路径，尚未定位具体指令。run31，mirror361 次、4,868,890,752 字节，反向同步 in148 且全为 wide。G 累计均值 26,447 us，约 70.3% 的 frame-gpu 样本不少于 16 ms；无固定操作窗口，不作版本性能比较。
+
+完成侧空闲计时已随内核实际执行：19 次 slumber/resume 全部 status0，resume 平均 12,414 us、最长 15,882 us；idle 行已记录 pending/progress 延长。窗口内未见 GPU panic、DeviceLost、KMD fail 或核心界面退出，仅覆盖短时间运行。
+
+本批默认新增同方向私有目标路径：
+
+- 物理方向的持久私有 BGRA8 目标使用原 shader、viewport、scissor 和原 pass 范围，单独建立准入 key 域。身份路径不再要求 quarter-turn 的 quad/插值或三角形限制；仍拒绝内存写副作用、depth/stencil、tessellation、多采样、未知访问等未覆盖条件。实际 draw 参考审核仍须零差异，失败程序隔离。
+- 每个表面保留内部同方向目标，并限制同一命令队列复用。目标有效时不再从规范旋转纹理反向 seed；普通写、其他规范写、重新 seed、非 coherent 写或失败完成使其失效，再次使用前恢复内容。
+- pass 结束后在 GPU 内将同方向目标更新到既有旋转私有表示，保留外部别名及呈现契约。共享页仍按现有完成边界发布；打包导出可直接读取同方向目标。额外 MRT 的 Load/Store 使用同方向纹理复制，原有临时池及 memoryless 规则继续使用。
+- 前八次实际表示转换增加稀疏零差异检查；无效结果或差异会禁用后续新路径并使相关完成状态退回共享像素。它验证内部复制的方向/格式映射，不替代 shader 参考审核或画面验收。
+- `TR physical mode/seed/reuse/rotate` 与 `bytes seed/rotate` 分开记录反向初始化、持久复用和额外规范转换成本；bytes 为逻辑像素量。`verify/bad/missing/disabled` 及逐次 `check valid/rows/diff/delta` 检查转换。新增私有到私有复制可能抵消直接渲染收益，须用同一操作窗口的 G/H/J 和命中率判断总效果，不能只看 run 增加。
+
+固定 metal2vulkan 的 `RenderPipelineState` 原阶段代码与接口是身份准入依据；没有新增硬件 MMIO 或改动内核参数。调试开关 `NATIVE_METAL_COACHZ_PHYSICAL=0` 保留旧 quarter-turn 路径，正常构建参数及输出位置不变。
+
+交付需要新 addon 与配套信任缓存，可沿用启动 56 已带入完成侧空闲计时的内核。本批尚未实机，重点一起核对：新准入和 run、identity/实际审核、physical 检查、seed/reuse/rotate 成本、反向同步及 mirror、颜色/方向/截图/快照，以及固定窗口性能和长期存活。不提交尚未实机确认的改动。
+
+本批前端语法、补丁适用及隐私检查通过，正常 GPU 全量构建退出码为 0。标准目录 addon 为 14,367,888 字节、20 项文件，配套信任缓存含三个签名哈希。需要同时替换两份产物，可沿用当前内核；尚未实机验收，未提交。
+
+### 启动 58：同方向私有渲染的阶段性结果
+
+内核日志覆盖 182 秒、无丢失。最终表计为 try436/run150、audit15/15/0；八次实际表示转换检查均 valid1、rows128、diff0、delta0，verify8/bad0/missing0/disabled0。原 shader 的同方向私有渲染已实际执行并通过现有稀疏审核；它不等同于完整画面、截图和切换快照全部验收。
+
+最近一次事件计数为 seed38/reuse104/rotate127，逻辑初始化 512,514,816 字节、规范表示更新 1,712,878,464 字节。表计同步 out288/in58，其中 inpart1、wide57；mirror346 次、4,626,728,392 字节，part3，区域缩减累计 39,853,880 字节。事件与表计各自取最后一次打印，采样时刻不同，不能相加或强行对齐。
+
+打包导出 packed257/compare257，逻辑覆盖 3,439,824,256 字节、failed0，三类 fallback 都为零；抽样 853,884 组、变化 188,929 组，不把相同比例当实际带宽节省。同步 deferred127/merged2/boundaries125，无关依赖 kept14，render 刷新 53 次、commit 刷新 72 次；逐 pass 更新旋转表示与低合并率仍需继续优化。
+
+G 累计 n822、均值 27,791 us、最大 176 ms；frame-gpu 818 个样本中 557 个不少于 16 ms，约 68.1%。没有固定操作窗口，不能据此认定版本变快或变慢。内核日志未见 panic、KMD fail、DeviceLost、核心界面进程退出或 GPU IRQ 错误；现有统一日志覆盖的界面活动窗口也未筛到相关 GPU 错误，仅为短窗口证据。最后记录一次 slumber，status0；此前 19 次恢复的证据见上一节。
+
+本次保存已构建且已执行的新路径、打包导出、资源保留分离、缓存及诊断、完成侧空闲计时。直渲染覆盖与现有零差异采样成立，长期稳定性、完整像素一致性及性能收益仍保留上述边界；不以构建成功替代实机结果。
