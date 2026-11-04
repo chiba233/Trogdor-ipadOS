@@ -557,10 +557,10 @@ static void esim_reset(void)
     esim_slots(1, 0);
     CHECK(esim.slots.euicc == 2 && esim.slots.active == 1 && esim.slots.eid_len == 16);
 }
-static void esim_tape_command(uint8_t command, uint8_t cid, const uint8_t *data, uint32_t n, uint32_t total, uint32_t index, uint32_t now)
+static void esim_tape_part(uint8_t command, uint8_t cid, const uint8_t *data, uint32_t n, uint32_t total, uint32_t index, uint8_t final, uint32_t now)
 {
     uint8_t s[1600] = { 0 }, out[128], header[6] = { 1, 0x12, 0x34, 0x56, 0x78, 2 }, payload[1505] = { 0 };
-    header[0] = command;
+    header[0] = command; payload[0] = final;
     cbd_wr16(payload + 1, total); cbd_wr16(payload + 3, index); memcpy(payload + 5, data, n);
     uint32_t w = cbd_tlv(s + 7, sizeof s - 7, 1, header, sizeof header);
     w += cbd_tlv(s + 7 + w, sizeof s - 7 - w, 0x10, payload, n + 5);
@@ -568,6 +568,10 @@ static void esim_tape_command(uint8_t command, uint8_t cid, const uint8_t *data,
     const uint32_t answer = cbe_host(&esim, 1, cid, s, 7 + w, out, sizeof out, now);
     CHECK(answer && answer != CBE_DEFERRED && !cbd_error(out + 6, answer - 6));
     CHECK(cbd_rd16(out + 7) == 9 + index && out[4] == 0xe5 && out[5] == cid);
+}
+static void esim_tape_command(uint8_t command, uint8_t cid, const uint8_t *data, uint32_t n, uint32_t total, uint32_t index, uint32_t now)
+{
+    esim_tape_part(command, cid, data, n, total, index, 1, now);
 }
 static void esim_tape(const uint8_t *data, uint32_t n, uint32_t total, uint32_t index)
 {
@@ -720,6 +724,26 @@ static void test_esim(void)
     struct cbe_seg segments[8];
     CHECK(cbe_segments(bpp, sizeof bpp, segments, 8) == 7);
     for (unsigned i = 0; i < 7; i++) CHECK(segments[i].off == offsets[i] && segments[i].len == lengths[i]);
+
+    /* Real Tape framing: one transaction, independent part indexes, final flag only on the last part.
+     * The first BF36 header declares more than a transport chunk; nothing may run before its tail. */
+    uint8_t large_bpp[2016] = { 0xbf, 0x36, 0x82, 0x07, 0xdb, 0xbf, 0x23, 0,
+                               0xa3, 0x82, 0x07, 0xd4, 0x86, 0x82, 0x07, 0xd0 };
+    esim_reset();
+    esim_tape_part(CBE_TAPE_LOAD_BPP, 9, large_bpp, 8, 1, 0, 0, 2);
+    cbe_tick(&esim, 2); CHECK(esim.active < 0 && !esim.req_len && !esim.done_pending);
+    esim_tape_part(CBE_TAPE_LOAD_BPP, 9, large_bpp + 8, 4, 1, 0, 0, 3);
+    esim_tape_part(CBE_TAPE_LOAD_BPP, 9, large_bpp + 12, 1500, 2, 0, 1, 4);
+    cbe_tick(&esim, 4); CHECK(esim.active < 0 && !esim.req_len && !esim.done_pending);
+    esim_tape_part(CBE_TAPE_LOAD_BPP, 9, large_bpp + 1512, 504, 2, 1, 1, 5);
+    int assembled = -1;
+    for (unsigned i = 0; i < CBE_JOBS; i++) if (esim.job[i].state == CBE_J_READY) assembled = (int)i;
+    CHECK(assembled >= 0);
+    if (assembled >= 0) {
+        CHECK(esim.job[assembled].len == sizeof large_bpp && esim.job[assembled].cap == sizeof large_bpp);
+        CHECK(!memcmp(esim.in + esim.job[assembled].off, large_bpp, sizeof large_bpp));
+    }
+    cbe_tick(&esim, 6); CHECK(esim.active >= 0 && esim.seg_count == 3 && !esim.done_pending);
 
     /* Challenge/authenticate reuse the same channel until LoadBoundProfilePackage completes. */
     const uint8_t session_der[] = { 0xbf, 0x2e, 0 };

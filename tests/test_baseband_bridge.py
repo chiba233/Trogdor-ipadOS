@@ -127,6 +127,49 @@ class BasebandBridgeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             compat.validate_compat(image)
 
+        # The local-signup gate uses a separate virtual address in the same pinned executable.
+        # Retarget the fixture's text segment and exercise the optional eSIM edit through that mapping.
+        image[112] ^= 1
+        struct.pack_into('<Q', image, 56, compat.ESIM_GUARD_ADDRESS)
+        image[0x100:] = compat.ESIM_ORIGINAL_GUARD
+        tail = 0x100 + compat.ESIM_FLOW_GUARD_ADDRESS - compat.ESIM_GUARD_ADDRESS
+        image.extend(bytes(tail + len(compat.ESIM_FLOW_GUARD) - len(image)))
+        image[tail:tail + len(compat.ESIM_FLOW_GUARD)] = compat.ESIM_FLOW_GUARD
+        install = 0x100 + compat.ESIM_INSTALL_GUARD_ADDRESS - compat.ESIM_GUARD_ADDRESS
+        image.extend(bytes(install + len(compat.ESIM_INSTALL_GUARD) - len(image)))
+        image[install:install + len(compat.ESIM_INSTALL_GUARD)] = compat.ESIM_INSTALL_GUARD
+        eligibility = 0x100 + compat.ESIM_ELIGIBILITY_GUARD_ADDRESS - compat.ESIM_GUARD_ADDRESS
+        image.extend(bytes(eligibility + len(compat.ESIM_ELIGIBILITY_GUARD) - len(image)))
+        image[eligibility:] = compat.ESIM_ELIGIBILITY_GUARD
+        struct.pack_into('<Q', image, 64, len(image) - 0x100)
+        struct.pack_into('<Q', image, 80, len(image) - 0x100)
+        corrupt = bytearray(image)
+        corrupt[eligibility] ^= 1
+        unchanged = bytes(corrupt)
+        with self.assertRaises(ValueError):
+            compat.patch_esim(corrupt)
+        self.assertEqual(corrupt, unchanged)  # Reject every edit before changing any guarded window.
+        compat.patch_esim(image)
+        branch = compat.ESIM_BRANCH_ADDRESS - compat.ESIM_GUARD_ADDRESS
+        expected = bytearray(compat.ESIM_ORIGINAL_GUARD)
+        expected[branch:branch + 4] = struct.pack('<I', 0xd503201f)
+        self.assertEqual(image[0x100:0x100 + len(expected)], expected)
+        branch = tail + compat.ESIM_FLOW_ADDRESS - compat.ESIM_FLOW_GUARD_ADDRESS
+        self.assertEqual(image[branch:branch + 4], struct.pack('<I', 0x2a0803e0))
+        branch = install + compat.ESIM_INSTALL_ADDRESS - compat.ESIM_INSTALL_GUARD_ADDRESS
+        self.assertEqual(image[branch:branch + 4], struct.pack('<I', 0xd503201f))
+        branch = eligibility + compat.ESIM_ELIGIBILITY_ADDRESS - compat.ESIM_ELIGIBILITY_GUARD_ADDRESS
+        instruction = struct.unpack_from('<I', image, branch)[0]
+        self.assertEqual(instruction & 0xff00001f, 0x34000008)  # Still CBZ W8: signed-material presence only.
+        immediate = (instruction >> 5) & 0x7ffff
+        if immediate & (1 << 18):
+            immediate -= 1 << 19
+        self.assertEqual(compat.ESIM_ELIGIBILITY_ADDRESS + immediate * 4, 0x1009aa9c0)
+        expected = bytearray(compat.ESIM_ELIGIBILITY_GUARD)
+        offset = compat.ESIM_ELIGIBILITY_ADDRESS - compat.ESIM_ELIGIBILITY_GUARD_ADDRESS
+        expected[offset:offset + 4] = compat.ESIM_ELIGIBILITY
+        self.assertEqual(image[eligibility:eligibility + len(expected)], expected)
+
     def test_firmware_follows_the_modem_files(self):
         sys.path.insert(0, str(ROOT / 'tools'))
         try:

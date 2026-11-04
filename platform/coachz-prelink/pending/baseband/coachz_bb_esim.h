@@ -146,7 +146,7 @@ static inline int cbe_parse_slots(struct cbe_slots *s, const uint8_t *sdu, uint3
 
 /* ------------------------------------------------------------------ BPP segments (SGP.22 2.5.5) */
 /* One BER-TLV header at p: tag (one byte, or 0x1f-class two), definite length up to three bytes. 0 when malformed. */
-static inline uint32_t cbe_der(const uint8_t *p, uint32_t n, uint32_t *tag, uint32_t *len)
+static inline uint32_t cbe_der_header(const uint8_t *p, uint32_t n, uint32_t *tag, uint32_t *len)
 {
     uint32_t at = 0;
     if (n < 2) return 0;
@@ -158,7 +158,12 @@ static inline uint32_t cbe_der(const uint8_t *p, uint32_t n, uint32_t *tag, uint
     else if (l == 0x82u && at + 2u <= n) { *len = (uint32_t)p[at] << 8 | p[at + 1]; at += 2; }
         else if (l == 0x83u && at + 3u <= n) { *len = (uint32_t)p[at] << 16 | (uint32_t)p[at + 1] << 8 | p[at + 2]; at += 3; }
             else return 0;
-    return at + *len <= n ? at : 0;
+    return at;
+}
+static inline uint32_t cbe_der(const uint8_t *p, uint32_t n, uint32_t *tag, uint32_t *len)
+{
+    const uint32_t at = cbe_der_header(p, n, tag, len);
+    return at && *len <= n - at ? at : 0;
 }
 
 struct cbe_seg { uint32_t off, len; };
@@ -216,7 +221,7 @@ enum cbe_reason { CBE_R_NO_SLOTS = 1, CBE_R_NO_EUICC, CBE_R_SWITCH_LIMIT, CBE_R_
 struct cbe_event { uint32_t kind, a, b, c, d, e; };
 
 struct cbe_job {
-    uint8_t state, cmd, slot, channel, cid;
+    uint8_t state, cmd, slot, channel, cid, final_part;
     uint16_t qmi_txn;                 /* CBE_TAPE_EID: the 0x1004 request to answer */
     uint32_t txid, total, next, off, len, cap, seq, deadline;
 };
@@ -623,14 +628,25 @@ static inline uint32_t cbe_host(struct cbe *e, uint32_t channel, uint32_t cid,
         const int empty_session = message == CBE_VINYL_TAPE && cmd == CBE_TAPE_GET_SESSION && !payload;
         if (slot < 1 || slot > 2 || !total || total > CBE_SEGMENTS || index >= total || bytes > CBE_CHUNK ||
             (message == CBE_VINYL_TAPE && !empty_session &&
-             (cmd == CBE_TAPE_EID || !payload || plen < 5 || !bytes || (index + 1 < total && bytes != CBE_CHUNK))))
+             (cmd == CBE_TAPE_EID || !payload || plen < 5 || !bytes || payload[0] > 1 ||
+              (!payload[0] && cmd != CBE_TAPE_LOAD_BPP) || (index + 1 < total && bytes != CBE_CHUNK))))
             error = CBE_ERR_INVALID_ARG;
         else if (found < 0 && index) error = CBE_ERR_INVALID_ARG;
         else {
             if (found < 0) {
                 uint32_t off = 0, cap = message == CBE_VINYL_TAPE ? total * CBE_CHUNK : 0;
-                if (free_job < 0 || !cbe_reserve(e, cap, &off)) error = CBE_ERR_DEVICE_IN_USE;
-                else {
+                /* Tape's flag ends the whole command, while count/index cover only this part.
+                 * LoadBoundProfilePackage repeats {count=1,index=0} for its structural pieces.
+                 * Reserve the declared BF36 size before acknowledging its partial first piece. */
+                if (cmd == CBE_TAPE_LOAD_BPP && payload && !payload[0]) {
+                    uint32_t tag = 0, declared = 0;
+                    const uint32_t header = cbe_der_header(payload + 5, bytes, &tag, &declared);
+                    if (!header || tag != 0xbf36u || header > e->in_cap || declared > e->in_cap - header || bytes > header + declared)
+                        error = CBE_ERR_INVALID_ARG;
+                    else cap = header + declared;
+                }
+                if (!error && (free_job < 0 || !cbe_reserve(e, cap, &off))) error = CBE_ERR_DEVICE_IN_USE;
+                if (!error) {
                     found = free_job;
                     struct cbe_job *j = &e->job[found]; __builtin_memset(j, 0, sizeof *j);
                     j->state = CBE_J_RECEIVING; j->cmd = cmd; j->txid = txid; j->slot = slot;
@@ -640,14 +656,19 @@ static inline uint32_t cbe_host(struct cbe *e, uint32_t channel, uint32_t cid,
             }
             if (!error) {
                 struct cbe_job *j = &e->job[found];
-                if (j->state != CBE_J_RECEIVING || j->cmd != cmd || j->slot != slot || j->total != total || j->next != index)
+                const uint8_t final_part = payload ? payload[0] : 1;
+                if (j->state != CBE_J_RECEIVING || j->cmd != cmd || j->slot != slot || j->next != index ||
+                    (j->next && (j->total != total || j->final_part != final_part)) || bytes > j->cap - j->len)
                     error = CBE_ERR_INVALID_ARG;
                 else {
+                    if (!j->next) { j->total = total; j->final_part = final_part; }
                     if (bytes) __builtin_memcpy(e->in + j->off + j->len, payload + 5, bytes);
                     j->len += bytes; j->next++; j->deadline = now + 30000u;
                     if (j->next == j->total) {
-                        j->state = CBE_J_READY;
-                        cbe_event(e, CBE_EV_REQUEST, cmd, txid, slot, j->len, total);
+                        if (j->final_part) {
+                            j->state = CBE_J_READY;
+                            cbe_event(e, CBE_EV_REQUEST, cmd, txid, slot, j->len, total);
+                        } else j->next = 0;
                     }
                     /* 0x1004 is answered after its real EID read, not acknowledged twice. */
                     if (message == CBE_VINYL_TAPE_EID) return CBE_DEFERRED;

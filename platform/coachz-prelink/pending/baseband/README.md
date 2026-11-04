@@ -42,7 +42,7 @@ Data 卷的统一日志里看 ABM 和 BBUpdater：
 
 ## 真机结果
 
-BBUpdater 接受 SBL（镜像号 0x15）后报告启动成功，ABM engage，53 个 QMI 客户端接到 modem，`pbl`、`sahara`、`qmux1`、`qmux2` 都走自己的通道。modem 的工厂数据（FSG）放进固件块后，“关于本机”显示 IMEI 和 ICCID，SIM 就绪。激活指示带上服务已开通和两个卡槽已接受后，有效 SIM 在 LTE 上注册（漫游）并完成 CS、PS 附着，开机后状态栏直接显示运营商名和信号格（发给 ABM 的队列放 1024 帧：64 帧时开机必溢出，丢掉的应答会让 CommCenter 硬重启基带，或让 SIM 和注册状态停在旧值）；DPM、WDA 设置和数据口绑定都成功。运营商包的配置文件（BSP 0xa000 分段、SetConfig 0xe00d）照苹果基带的应答收下后丢弃，最后一段之后发 FileTransferStatus 0xa001，CommCenter 缓存配置后不再循环重启基带。eSIM 在设置里出现了，页面显示还不对；蜂窝 IPv4 数据已完成 PDP 重建后的网页加载验收，详见 [docs/plans/modem.md](../../../../docs/plans/modem.md)。
+BBUpdater 接受 SBL（镜像号 0x15）后报告启动成功，ABM engage，53 个 QMI 客户端接到 modem，`pbl`、`sahara`、`qmux1`、`qmux2` 都走自己的通道。modem 的工厂数据（FSG）放进固件块后，“关于本机”显示 IMEI 和 ICCID，SIM 就绪。激活指示带上服务已开通和两个卡槽已接受后，有效 SIM 在 LTE 上注册（漫游）并完成 CS、PS 附着，开机后状态栏直接显示运营商名和信号格（发给 ABM 的队列放 1024 帧：64 帧时开机必溢出，丢掉的应答会让 CommCenter 硬重启基带，或让 SIM 和注册状态停在旧值）；DPM、WDA 设置和数据口绑定都成功。运营商包的配置文件（BSP 0xa000 分段、SetConfig 0xe00d）照苹果基带的应答收下后丢弃，最后一段之后发 FileTransferStatus 0xa001，CommCenter 缓存配置后不再循环重启基带。eSIM 原生安装和启用已有实机结果；蜂窝 IPv4 数据已完成 PDP 重建后的网页加载，连接建立和 eSIM 注册期间仍有卡槽掉线，详见 [docs/plans/modem.md](../../../../docs/plans/modem.md)。
 
 ## 没核实的
 
@@ -55,11 +55,11 @@ BBUpdater 接受 SBL（镜像号 0x15）后报告启动成功，ABM engage，53 
 
 `coachz_bb_esim.h` 已补齐并接入 `coachz_baseband.cpp`，随现有 baseband 构建复制：独立 UIM 客户端发现实际 eUICC，Get Card Status 应答及 Card Status Change 指示均添加每槽能力 TLV 0x21，VINYL 的 Tape 请求经 ISD-R 发送，真实结果分片回到 CommCenter。空闲发现不切槽；只有显式 Tape 操作可临时切槽，普通操作结束关闭通道并恢复原卡槽；下载会话按下述生命周期保持通道。切换期间普通 UIM 请求排队，临时卡状态指示不冒充原逻辑 SIM；恢复未确认时不把原 SIM 请求转给另一张卡。
 
-现有主机模型已覆盖 Tape/APDU 分段、能力字段、切槽恢复、续读和超时清理，ASan/UBSan 与 C/C++ 头文件检查通过；这不覆盖 IOKit 并发或真实卡片。卡槽发现及能力发布已有实机日志，本次初始化兼容修订仍待内核构建和实机验收，不能据此宣称 eSIM 菜单、下载、启停、删除或跨重启持久化已工作。下一次按 `COACHZ baseband: esim event` 的阶段读结果；日志不输出 EID、APDU 或 profile 内容。无需重编 GPU addon，也不改变镜像参数；现有 baseband 构建会带入这两个源码文件。详细状态与参考见 [modem 计划](../../../../docs/plans/modem.md#esim-tape-实现待实机)。
+实机已完成原生手动添加、卡片挑战、服务端认证、下载准备、配置包装载和启用命令。完整配置包进入桥接后按结构分段送入卡片，卡片返回 `9000`；原生重新列出一个配置，并报告 `Vinyl install operation succeeded`。蜂窝数据最终能够访问网页，但连接建立仍有掉线重试，eSIM 注册期间另一卡槽也会短暂离线；跨重启持久化和长期稳定性仍待验收。主机模型覆盖 Tape/APDU 分段、能力字段、切槽恢复、续读和超时清理，ASan/UBSan 与 C/C++ 头文件检查通过，不能替代 IOKit 并发或长期实机验证。阶段日志不输出 EID、APDU 或 profile 内容。协议修订只需重编内核，无需重编 GPU addon。
 
-初始化兼容修订（待实机）：原版 Vinyl 驱动启动时先用 `0x1000 / GetCsn` 查询两个槽，通用 `NOT_SUPPORTED (0x5e)` 不会完成 ready 回调。桥接返回明确的 `VINYL_NOCAPABLE_UICC (0x204)`：原版 `asVinylDriverError` 将它映射到 6，`handleClientStarted_sync` 的 CSN 回调明确接受此结果并发布对应槽的 Ready。这里没有 Apple legacy Vinyl CSN，GSMA EID 仍只由 Tape EID 请求读取；不伪造 CSN、不改 SIM Ready 或激活结论。卡状态指示与查询应答保留同一套能力字段，避免插拔后丢失 Tape 能力。这两处已有便携模型覆盖；是否消除冷启动等待及能否继续 ES10 初始化，仍需实机日志确认。
+初始化兼容：原版 Vinyl 驱动启动时先用 `0x1000 / GetCsn` 查询两个槽，通用 `NOT_SUPPORTED (0x5e)` 不会完成 ready 回调。桥接返回明确的 `VINYL_NOCAPABLE_UICC (0x204)`：原版 `asVinylDriverError` 将它映射到 6，`handleClientStarted_sync` 的 CSN 回调明确接受此结果并发布对应槽的 Ready。这里没有 Apple legacy Vinyl CSN，GSMA EID 仍只由 Tape EID 请求读取；不伪造 CSN、不改 SIM Ready 或激活结论。卡状态指示与查询应答保留同一套能力字段，避免插拔后丢失 Tape 能力。这两处已有便携模型覆盖，实机初始化链已继续到真实 ES10 下载流程。
 
-Tape 后续链修订（待实机）：EID/设备能力请求按原版 writer 从 TLV `0x01` 读取，设备能力查询允许不指定槽（原版填 0）。TapeInfo 结果头按原版 parser 的 11 字节布局返回：命令 1、状态 2、保留 2、事务号 4、错误字节 2；原来的 9 字节布局会使结果解析失败。`GetSessionData` 的空请求由桥接返回空恢复记录，`ClearSessionData` 只处理桥接的空记录集合，二者不转成卡片 APDU，不表示已支持跨重启恢复。挑战、服务端认证、准备下载沿用同一 VINYL 客户端的 ISD-R 通道；装载/取消/清理结束、错误、客户端断开或 180 秒无新命令时关闭并恢复原卡槽。其它客户端不插入这一会话。状态日志仍不输出 APDU、EID 或 profile 内容。
+Tape 会话：EID/设备能力请求按原版 writer 从 TLV `0x01` 读取，设备能力查询允许不指定槽（原版填 0）。TapeInfo 结果头按原版 parser 的 11 字节布局返回：命令 1、状态 2、保留 2、事务号 4、错误字节 2；原来的 9 字节布局会使结果解析失败。`GetSessionData` 的空请求由桥接返回空恢复记录，`ClearSessionData` 只处理桥接的空记录集合，二者不转成卡片 APDU，不表示已支持跨重启恢复。挑战、服务端认证、准备下载沿用同一 VINYL 客户端的 ISD-R 通道；装载/取消/清理结束、错误、客户端断开或 180 秒无新命令时关闭并恢复原卡槽。其它客户端不插入这一会话。状态日志仍不输出 APDU、EID 或 profile 内容。
 
 ## 原生 Internet 数据通路
 
@@ -82,3 +82,15 @@ python3 tools/coachz_cellular_compat.py --commcenter ORIGINAL_COMM_CENTER --outp
 GSI 轮询同时按硬件完成指针判断待处理事务。周期诊断保留发送请求数、队列、完成环和全局 IP／UDP 计数，便于区分栈内拒绝、DMA 积压和校验错误。日志仅记录计数和状态。
 
 构建和发布仅包含源码、补丁和准备工具。原始系统文件、签名副本、信任缓存、镜像、工厂校准数据和原始日志保留在本地。
+
+
+## 可选 eSIM 添加入口适配
+
+`tools/coachz_cellular_compat.py --esim` 为固定版本兼容副本加入四处适配。原生流程在旧基带身份下报告没有本地开通能力，GSMA 添加流程位和实际安装路径也检查旧机型默认卡类型。Coachz 的真实卡由 Tape/APDU 桥接提供，因此兼容副本继续原生修改权限、Vinyl 可用性和设置阶段检查，为通过这些检查的结果加入 GSMA 流程位，并让安装请求使用真实 Tape 卡。四个位置分别核对固定指令窗，机型属性沿用现有配置；任一指令窗不符时不执行任何 eSIM 修改。
+
+实机已进入原生扫描和手动输入页面，并完成真实卡片挑战、AuthenticateServer、PrepareDownload 和 LoadBoundProfilePackage。资格检查走过本地材料缺失的降级路径，原生安装同意、卡片认证和服务端交互继续执行；配置包写入后返回成功结果，原生重新列出配置并报告安装成功。
+
+第四处适配仅把本地签名材料缺失的条件分支接到原生已有的软失败降级路径，此路径已有实机结果。有签名材料时继续原有请求，后续 URL、编码和远端资格响应的失败处理保持原样。真实 eUICC 认证、下载包验证和安装同意流程继续由原生实现处理。准备时将 `--esim` 加到已有兼容副本生成命令，打包仍显式指定生成的 CommCenter；副本使用对应的信任缓存和摘要。
+
+
+Tape 的配置包请求有两层分段：TLV `0x10` 的 count/index 只描述当前结构部分，flag 才表示整个命令是否结束。桥接按同一事务保留接收状态，允许各部分从 index 0 重新开始；首段读取 BF36 声明总长并有界分配，最后一部分到齐后才执行原有的 SGP.22 结构切分及 STORE DATA。此前把首段视为完整包，会提前解析失败，并以 `INVALID_ARG` 拒绝后续部分。回归覆盖跨部分累积、部分内分片和结束前不执行，实机完整配置包装载成功。
