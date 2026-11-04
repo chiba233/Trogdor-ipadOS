@@ -135,9 +135,10 @@ static void bb_init(void)
   bb_esim_resp = static_cast<uint8_t *>(IOMallocData(BB_ESIM_BYTES));
   cbe_init(&bb_esim, bb_esim_in, bb_esim_in ? BB_ESIM_BYTES : 0,
            bb_esim_resp, bb_esim_resp ? BB_ESIM_BYTES : 0);
-  // Read-only eUICC answers (coachz_bb_esim.h): 16 KiB for each of the four entries.
-  uint8_t *cache = static_cast<uint8_t *>(IOMallocData(4u * 16384u));
-  cbe_set_cache(&bb_esim, cache, cache ? 4u * 16384u : 0);
+  // Read-only eUICC answers (coachz_bb_esim.h): preserve 16 KiB per entry.
+  const uint32_t cache_bytes = CBE_CACHE_ENTRIES * 16384u;
+  uint8_t *cache = static_cast<uint8_t *>(IOMallocData(cache_bytes));
+  cbe_set_cache(&bb_esim, cache, cache ? cache_bytes : 0);
   cbc_init(&bb_control);
   cbs_init(&bb_sahara, bb_sahara_images, sizeof bb_sahara_images / sizeof bb_sahara_images[0], 0x10000);
 }
@@ -301,12 +302,14 @@ static void bb_pdp_note(uint32_t local_port, uint32_t cid, uint32_t channel, con
     printf("COACHZ pdp: WDS type %u message 0x%x txn %u mux %u family %u active %u error %u address-fields %u\n",
       sdu[0], cbd_rd16(sdu + 3), cbd_rd16(sdu + 1), c.mux, c.family, c.active,
       sdu[0] == 2 ? cbd_error(sdu, n) : 0, c.settings);
-  if (sdu[0] == 2 && cbd_rd16(sdu + 3) == CBP_START && cbd_error(sdu, n)) {
+  const bool start_failed = sdu[0] == 2 && cbd_rd16(sdu + 3) == CBP_START && cbd_error(sdu, n);
+  if (start_failed || (sdu[0] == 4 && cbd_rd16(sdu + 3) == CBP_STATUS && !c.active)) {
+    // libqmi WDS 0x20 responses and 0x22 indications use the same call-end TLVs.
     uint32_t reason_size = 0, verbose_size = 0;
     const uint8_t *reason = cbd_find(sdu, n, 0x10, &reason_size);
     const uint8_t *verbose = cbd_find(sdu, n, 0x11, &verbose_size);
-    printf("COACHZ pdp: start failed cid %u channel %u mux %u family %u reason-present %u reason %u verbose-present %u type %u code %d\n",
-      cid, channel, c.mux, c.family, reason && reason_size == 2u,
+    printf("COACHZ pdp: %s cid %u channel %u mux %u family %u reason-present %u reason %u verbose-present %u type %u code %d\n",
+      start_failed ? "start failed" : "disconnected", cid, channel, c.mux, c.family, reason && reason_size == 2u,
       reason && reason_size == 2u ? cbd_rd16(reason) : 0u, verbose && verbose_size == 4u,
       verbose && verbose_size == 4u ? cbd_rd16(verbose) : 0u,
       verbose && verbose_size == 4u ? static_cast<int16_t>(cbd_rd16(verbose + 2)) : 0);

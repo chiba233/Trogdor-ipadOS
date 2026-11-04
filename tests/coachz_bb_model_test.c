@@ -772,7 +772,7 @@ static void test_esim(void)
 }
 
 /* A repeated read-only query is answered from the cache without a slot switch; a command that changes the card clears it. */
-static uint8_t esim_cache[4 * 1024];
+static uint8_t esim_cache[CBE_CACHE_ENTRIES * 1024];
 static void esim_drain(void)
 {
     uint8_t out[2048], channel = 0;
@@ -796,10 +796,28 @@ static void test_esim_cache(void)
     CHECK(esim.step == CBE_S_IDLE && !esim.freeze && !esim.req_len && esim.switches == switches);
     CHECK(esim.done_pending && esim.done_len == sizeof answer && esim.done_sw1 == 0x90 && !memcmp(esim.resp, answer, sizeof answer));
     esim_drain();
+    /* ListNotification is read-only. Alternating it with GetProfilesInfo must not evict the profiles answer
+     * and switch away from the physical SIM again on every initialization pass. */
+    const uint8_t notifications[] = { 0xbf, 0x28, 0 }, empty_notifications[] = { 0xbf, 0x28, 2, 0xa0, 0 };
+    CHECK(cbe_cacheable(notifications, sizeof notifications));
+    esim_tape_command(7, 10, notifications, sizeof notifications, 1, 0, 20002); esim_open();
+    esim_apdu_response(6007, empty_notifications, sizeof empty_notifications, 0x90, 0);
+    esim_restore(6008); esim_drain();
+    const uint32_t after_notifications = esim.switches;
+    esim_tape_command(13, 11, query, sizeof query, 1, 0, 40000);
+    cbe_tick(&esim, 40001);
+    CHECK(esim.step == CBE_S_IDLE && !esim.req_len && esim.switches == after_notifications);
+    CHECK(esim.done_pending && esim.done_len == sizeof answer && !memcmp(esim.resp, answer, sizeof answer));
+    esim_drain();
+    esim_tape_command(7, 12, notifications, sizeof notifications, 1, 0, 40002);
+    cbe_tick(&esim, 40003);
+    CHECK(esim.step == CBE_S_IDLE && !esim.req_len && esim.switches == after_notifications);
+    CHECK(esim.done_pending && esim.done_len == sizeof empty_notifications && !memcmp(esim.resp, empty_notifications, sizeof empty_notifications));
+    esim_drain();
     esim_tape_command(CBE_TAPE_DELETE, 9, del, sizeof del, 1, 0, 20002); esim_open();
     esim_apdu_response(6007, NULL, 0, 0x90, 0);
     esim_restore(6008);
-    CHECK(!esim.cached[0].used);
+    for (unsigned i = 0; i < CBE_CACHE_ENTRIES; i++) CHECK(!esim.cached[i].used);
     if (!failures) printf("PASS esim read-only query cache\n");
 }
 

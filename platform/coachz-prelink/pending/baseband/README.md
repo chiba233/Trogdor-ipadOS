@@ -42,7 +42,7 @@ Data 卷的统一日志里看 ABM 和 BBUpdater：
 
 ## 真机结果
 
-BBUpdater 接受 SBL（镜像号 0x15）后报告启动成功，ABM engage，53 个 QMI 客户端接到 modem，`pbl`、`sahara`、`qmux1`、`qmux2` 都走自己的通道。modem 的工厂数据（FSG）放进固件块后，“关于本机”显示 IMEI 和 ICCID，SIM 就绪。激活指示带上服务已开通和两个卡槽已接受后，有效 SIM 在 LTE 上注册（漫游）并完成 CS、PS 附着，开机后状态栏直接显示运营商名和信号格（发给 ABM 的队列放 1024 帧：64 帧时开机必溢出，丢掉的应答会让 CommCenter 硬重启基带，或让 SIM 和注册状态停在旧值）；DPM、WDA 设置和数据口绑定都成功。运营商包的配置文件（BSP 0xa000 分段、SetConfig 0xe00d）照苹果基带的应答收下后丢弃，最后一段之后发 FileTransferStatus 0xa001，CommCenter 缓存配置后不再循环重启基带。eSIM 在设置里出现了，页面显示还不对；蜂窝数据已完成短时 IPv4 PDP 和少量收发验收，持续连接仍受重复 eSIM 查询切槽影响，详见 [docs/plans/modem.md](../../../../docs/plans/modem.md)。
+BBUpdater 接受 SBL（镜像号 0x15）后报告启动成功，ABM engage，53 个 QMI 客户端接到 modem，`pbl`、`sahara`、`qmux1`、`qmux2` 都走自己的通道。modem 的工厂数据（FSG）放进固件块后，“关于本机”显示 IMEI 和 ICCID，SIM 就绪。激活指示带上服务已开通和两个卡槽已接受后，有效 SIM 在 LTE 上注册（漫游）并完成 CS、PS 附着，开机后状态栏直接显示运营商名和信号格（发给 ABM 的队列放 1024 帧：64 帧时开机必溢出，丢掉的应答会让 CommCenter 硬重启基带，或让 SIM 和注册状态停在旧值）；DPM、WDA 设置和数据口绑定都成功。运营商包的配置文件（BSP 0xa000 分段、SetConfig 0xe00d）照苹果基带的应答收下后丢弃，最后一段之后发 FileTransferStatus 0xa001，CommCenter 缓存配置后不再循环重启基带。eSIM 在设置里出现了，页面显示还不对；蜂窝 IPv4 数据已完成 PDP 重建后的网页加载验收，详见 [docs/plans/modem.md](../../../../docs/plans/modem.md)。
 
 ## 没核实的
 
@@ -75,6 +75,10 @@ python3 tools/coachz_cellular_compat.py --commcenter ORIGINAL_COMM_CENTER --outp
 
 内核归档携带签名副本，ADT 携带其 SHA-256，信任缓存携带其 cdhash。启动时核对摘要，把副本安装到 Data，再用只读 bindfs 联合挂载到 CoreTelephony Support 目录。准备工具支持可选 `--compact`，需安装 `zopfli`，生成的流仍使用既有 zlib 解压路径。
 
-实机已记录兼容副本挂载成功、WDS `0x20` 成功、`0x2d` 返回地址字段，以及 `pdp_ip0` 的 217 个发送包和 183 个接收包。这覆盖短时 IPv4 数据通路。持续连接仍有 `MMGSDI_CARD_EVT (218)` 断线，日志显示 `GetProfilesInfo (BF2D)` 与 `ListNotification (BF28)` 交替查询、重复切槽。APN 编辑入口、IPv6、跨重启及长时间连接尚待验收。
+实机已记录兼容副本挂载成功、WDS `0x20` 成功和 `0x2d` 返回地址字段。PDP 重建后，`pdp_ip0` 持续收发，发送计数从 1121 增至 2667，接收计数从 1743 增至 5759，驱动队列丢包为 0。统一日志记录了 112 条经该接口的有效 DNS 回复，WebKit 的蜂窝路径和 HTTP 200 响应均已出现，Safari 网页加载通过。APN 编辑入口、IPv6 数据连接、跨重启及长时间连接尚待验收。
+
+两处生命周期修复支撑原生重连。eSIM 的 `ListNotification (BF28)` 与资料查询共用六项只读缓存，每项保留 16 KiB，改变卡片或通知状态的命令清空缓存，避免两项只读查询互相清缓存、重复切走实体卡。蜂窝接口注册 `PF_INET`／`PF_INET6` 的 protocol plumber，初始挂接和重连复用同一回调，保留 `EEXIST` 返回语义。此前 CommCenter 卸载旧 IPv4 协议后，`in_domifattach` 找不到重新挂接入口并返回 `ENXIO (6)`，DNS 发包无法进入驱动；修复后该错误消失。
+
+GSI 轮询同时按硬件完成指针判断待处理事务。周期诊断保留发送请求数、队列、完成环和全局 IP／UDP 计数，便于区分栈内拒绝、DMA 积压和校验错误。日志仅记录计数和状态。
 
 构建和发布仅包含源码、补丁和准备工具。原始系统文件、签名副本、信任缓存、镜像、工厂校准数据和原始日志保留在本地。

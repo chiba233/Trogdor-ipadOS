@@ -197,8 +197,10 @@ b9 用 drivers/RamBlock/coachz_modem.c 按上面的顺序接入，在 Wi-Fi 线�
 
 ## 原生 Internet 数据验收
 
-CommCenter 的 Internet 上下文已能通过显式启用的固定版本兼容副本发起真实 WDS 激活，modem 返回 IPv4 地址，`pdp_ip0` 经 IPA 完成少量双向收发。兼容副本的生成、摘要绑定和打包方式见 [基带桥接说明](../../platform/coachz-prelink/pending/baseband/README.md#原生-internet-数据通路)。
+CommCenter 的 Internet 上下文通过显式启用的固定版本兼容副本发起真实 WDS 激活，modem 返回 IPv4 地址和 DNS，`pdp_ip0` 经 IPA 收发。Safari 经蜂窝路径完成 DNS 解析和 HTTP 页面加载，PDP 重建后收发继续增长。准备和打包方式见 [基带桥接说明](../../platform/coachz-prelink/pending/baseband/README.md#原生-internet-数据通路)。
 
-持续联网仍有卡路由问题。实机 WDS 断线给出 `MMGSDI_CARD_EVT (218)`，相邻 UIM 读取报 `INTERNAL` 或 `UIM_NOT_INITIALIZED`。Tape 的 `GetProfilesInfo (BF2D)`、`ListNotification (BF28)` 交替执行，每项临时切槽往返约 12 秒。现有缓存没有包含 BF28，执行它会清掉已缓存的资料查询结果，形成重复切槽循环。
+重复切槽来自只读查询缓存的遗漏。`GetProfilesInfo (BF2D)` 与 `ListNotification (BF28)` 交替执行时，原缓存把 BF28 当作可能改变卡片的命令并清空资料查询缓存，触发下一轮切槽。BF28 现已加入只读缓存，六种查询各有条目，保留每项 16 KiB；改变卡片或通知状态的命令仍清空缓存。交替查询的便携回归和实机缓存命中均已确认。ListNotification 的列表语义见 SGP.22 第 5.7.9 节，删除通知是第 5.7.11 节的独立操作。[GSMA SGP.22 v2.3](https://www.gsma.com/esim/wp-content/uploads/2021/07/SGP.22-v2.3.pdf)
 
-下一轮修订将 BF28 纳入只读查询缓存，并为六种只读查询保留六个条目。改变卡片或通知状态的命令仍清空缓存。该修订已由原有便携模型复现并验证，持续连接改善尚待实机验收。ListNotification 的只读列表语义见 SGP.22 第 5.7.9 节，删除通知是第 5.7.11 节的独立操作。[GSMA SGP.22 v2.3](https://www.gsma.com/esim/wp-content/uploads/2021/07/SGP.22-v2.3.pdf)
+PDP 重建后的持续加载来自 XNU 协议挂接入口缺失。内核记录 `in_domifattach: proto_plumb returned 6 if=pdp_ip0`，DNS 记录 `Device not configured`，发送请求计数停止增长，DMA 没有积压。原驱动只在开机直接挂接协议，CommCenter 清理旧上下文后无法重新挂回。现按同一 XNU 的 `utun_attach_proto` 约定注册蜂窝接口的 IPv4／IPv6 plumbers，复用初始挂接回调，保留 `EEXIST` 语义。
+
+修复后的实机记录中，plumber 注册成功，`ENXIO` 消失，发送请求及 TX／RX 继续增长。统一日志有 112 条经 `pdp_ip0` 的有效 DNS 回复，WebKit 有蜂窝路径和 HTTP 200 响应。该结果覆盖 IPv4 网页加载及初始化中的 PDP 重建，IPv6 数据连接、APN 编辑入口和长时间连接继续验收。

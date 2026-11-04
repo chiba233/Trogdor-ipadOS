@@ -12,6 +12,14 @@ extern "C" {
 #include <net/bpf.h>
 }
 #include <netinet/in.h>
+extern "C" {
+#include <netinet/ip.h>
+#include <netinet/ip_var.h>
+#include <netinet/udp.h>
+#include <netinet/udp_var.h>
+extern struct ipstat ipstat;
+extern struct udpstat udpstat;
+}
 
 extern "C" int coachz_modem_data_send(uint32_t, const uint8_t *, uint32_t);
 extern "C" void coachz_modem_data_receiver(void (*)(uint32_t, const uint8_t *, uint32_t, uint32_t));
@@ -21,7 +29,7 @@ struct bb_pdp_if {
   ifnet_t ifp;
   mbuf_t head, tail;
   uint32_t queued, families, blocked;
-  uint64_t tx, rx, dropped, busy;
+  uint64_t tx, rx, dropped, busy, requested;
 };
 static bb_pdp_if bb_pdp_ifaces[CBP_INTERFACES];
 static IOLock *bb_pdp_lock;
@@ -36,7 +44,11 @@ static errno_t bb_pdp_demux(ifnet_t, mbuf_t m, char *, protocol_family_t *family
 }
 static errno_t bb_pdp_add_proto(ifnet_t, protocol_family_t f, const ifnet_demux_desc *, uint32_t)
 { return f == PF_INET || f == PF_INET6 ? 0 : EPROTONOSUPPORT; }
-static errno_t bb_pdp_del_proto(ifnet_t, protocol_family_t) { return 0; }
+static errno_t bb_pdp_del_proto(ifnet_t ifp, protocol_family_t family)
+{
+  printf("COACHZ pdp: unplumb unit %u family %u\n", ifnet_unit(ifp), family);
+  return 0;
+}
 static errno_t bb_pdp_input(ifnet_t ifp, protocol_family_t f, mbuf_t m, char *)
 {
   if (proto_input(f, m)) { mbuf_freem(m); ifnet_stat_increment_in(ifp, 0, 0, 1); }
@@ -44,6 +56,16 @@ static errno_t bb_pdp_input(ifnet_t ifp, protocol_family_t f, mbuf_t m, char *)
 }
 static errno_t bb_pdp_pre_output(ifnet_t, protocol_family_t, mbuf_t *, const sockaddr *, void *, char *, char *)
 { return 0; }  // raw IP: no link header, software checksums, no advertised offloads
+// in_domifattach/proto_plumb is used again after CommCenter tears an IP service down.
+// Match XNU's utun_attach_proto contract, including EEXIST for an attached protocol.
+static errno_t bb_pdp_plumb(ifnet_t ifp, protocol_family_t family)
+{
+  ifnet_attach_proto_param proto = {};
+  proto.input = bb_pdp_input; proto.pre_output = bb_pdp_pre_output;
+  const errno_t error = ifnet_attach_protocol(ifp, family, &proto);
+  printf("COACHZ pdp: plumb unit %u family %u result %d\n", ifnet_unit(ifp), family, error);
+  return error;
+}
 static errno_t bb_pdp_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
 {
   switch (cmd) {
@@ -61,6 +83,7 @@ static errno_t bb_pdp_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
 static errno_t bb_pdp_output(ifnet_t ifp, mbuf_t m)
 {
   auto *p = static_cast<bb_pdp_if *>(ifnet_softc(ifp));
+  __atomic_fetch_add(&p->requested, 1u, __ATOMIC_RELAXED);
   const size_t len = mbuf_pkthdr_len(m);
   uint8_t first = 0;
   if (!len || len > ifnet_mtu(ifp) || mbuf_copydata(m, 0, 1, &first)) { mbuf_freem(m); return EMSGSIZE; }
@@ -101,6 +124,9 @@ static void bb_pdp_init()
   if (bb_pdp_initialized) return;
   bb_pdp_lock = IOLockAlloc();
   if (!bb_pdp_lock) return;
+  const errno_t ipv4 = proto_register_plumber(PF_INET, IFNET_FAMILY_CELLULAR, bb_pdp_plumb, nullptr);
+  const errno_t ipv6 = proto_register_plumber(PF_INET6, IFNET_FAMILY_CELLULAR, bb_pdp_plumb, nullptr);
+  printf("COACHZ pdp: protocol plumbers IPv4 %d IPv6 %d\n", ipv4, ipv6);
   for (uint32_t i = 0; i < CBP_INTERFACES; i++) {
     auto *p = &bb_pdp_ifaces[i];
     ifnet_init_eparams init = {};
@@ -120,11 +146,9 @@ static void bb_pdp_init()
       if (error) { ifnet_release(p->ifp); p->ifp = nullptr; }
     }
     if (!error) {
-      ifnet_attach_proto_param proto = {};
-      proto.input = bb_pdp_input; proto.pre_output = bb_pdp_pre_output;
-      error = ifnet_attach_protocol(p->ifp, PF_INET, &proto);
-      if (!error) error = ifnet_attach_protocol(p->ifp, PF_INET6, &proto);
-      if (!error) error = bpf_attach(p->ifp, DLT_RAW, 0, nullptr, nullptr);
+      error = bb_pdp_plumb(p->ifp, PF_INET);
+      if (!error || error == EEXIST) error = bb_pdp_plumb(p->ifp, PF_INET6);
+      if (!error || error == EEXIST) error = bpf_attach(p->ifp, DLT_RAW, 0, nullptr, nullptr);
     }
     printf("COACHZ pdp: pdp_ip%u mux %u registered result %d (initially down)\n", i, i + 1u, error);
   }
@@ -196,7 +220,12 @@ static void bb_pdp_report(unsigned second)
     const auto &p = bb_pdp_ifaces[i];
     printf("COACHZ pdp: %u s unit %u families %u blocked %u queued %u tx %llu rx %llu drop %llu busy %llu\n",
       second, i, p.families, p.blocked, p.queued, p.tx, p.rx, p.dropped, p.busy);
+    if (p.ifp && (p.requested || p.rx)) printf("COACHZ pdp stack: %u s unit %u requested %llu flags 0x%x mtu %u\n",
+      second, i, p.requested, ifnet_flags(p.ifp), ifnet_mtu(p.ifp));
   }
   IOLockUnlock(bb_pdp_lock);
+  printf("COACHZ pdp IP: %u s in %u delivered %u checksum %u short %u badlen %u noroute %u UDP in %u out %u checksum %u noport %u full %u\n",
+    second, ipstat.ips_total, ipstat.ips_delivered, ipstat.ips_badsum, ipstat.ips_tooshort, ipstat.ips_badlen, ipstat.ips_noroute,
+    udpstat.udps_ipackets, udpstat.udps_opackets, udpstat.udps_badsum, udpstat.udps_noport, udpstat.udps_fullsock);
 }
 }

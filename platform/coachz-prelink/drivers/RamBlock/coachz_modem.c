@@ -230,7 +230,20 @@ coachz_modem_qmi(int client, uint32_t node, uint32_t port, const void *body, uin
     cm_step();
 }
 
-/* SPI 311, SPI 432 and the LAN RX ring's IEOB, polled. */
+/* gsi_channel_update checks EV_CH_E_CNTXT_4 for completed transactions. This port polls instead of
+ * running NAPI from an IRQ, so also consult the ring when no IEOB was observed. */
+static int
+cm_event_ready(uint32_t channel)
+{
+    const struct cgs_channel *c = &cm_gsi.t.ch[channel];
+    const uint32_t ring = c->evt_ring;
+    const uint32_t hw = *(volatile uint32_t *)(cm_gsi.virt + CGSI_EV_CH_E_CNTXT_4 + ring * CGSI_EV_CH_E_CNTXT_4_STRIDE);
+    const uint32_t base = (uint32_t)(cm_gsi.ring_phys + cm_gsi.place.evt_offset[ring]);
+    const uint32_t index = (hw - base) / CGS_ELEMENT;
+    return (cm_gsi.ieob_pending & (1u << ring)) || index != cm_gsi.evt_index[ring] % c->event_count;
+}
+
+/* SPI 311, SPI 432 and completion rings, polled. */
 void
 coachz_modem_poll(void)
 {
@@ -238,16 +251,16 @@ coachz_modem_poll(void)
     coachz_ipa_interrupt(&cm_ipa);
     if (cm_state != CM_SET_UP) return;
     coachz_gsi_interrupt(&cm_gsi);
-    if (cm_gsi.ieob_pending & (1u << cm_lan.evt_ring)) {
+    if (cm_event_ready(cm_lan.channel)) {
         cm_gsi.ieob_pending &= ~(1u << cm_lan.evt_ring);
         coachz_ipa_rx_poll(&cm_lan);
     }
     if (!cm_modem_open) return;
-    if (cm_gsi.ieob_pending & (1u << cm_modem_rx.evt_ring)) {
+    if (cm_event_ready(cm_modem_rx.channel)) {
         cm_gsi.ieob_pending &= ~(1u << cm_modem_rx.evt_ring);
         coachz_ipa_rx_poll(&cm_modem_rx);
     }
-    if (cm_gsi.ieob_pending & (1u << cm_modem.tx_evt_ring)) {
+    if (cm_event_ready(cm_modem.tx_channel)) {
         cm_gsi.ieob_pending &= ~(1u << cm_modem.tx_evt_ring);
         coachz_ipa_modem_tx_poll(&cm_modem);
     }
@@ -263,4 +276,8 @@ coachz_modem_report(unsigned second)
         cm_lan.packets, cm_lan.delivered, cm_lan.dropped);
     if (cm_modem_open) printf("COACHZ modem: %u s: channels TX 0:%u RX 3:%u, modem RX packets %llu delivered %llu dropped %llu, TX packets %llu\n",
         second, cm_channel_state(0), cm_channel_state(3), cm_modem_rx.packets, cm_modem_rx.delivered, cm_modem_rx.dropped, cm_modem.tx_packets);
+    if (cm_modem_open) printf("COACHZ modem rings: %u s tx fill %u outstanding %u capacity %u rx posted %u free %u events %u/%u pending 0x%x enabled 0x%x\n",
+        second, cm_modem.tx_fill, cm_modem.tx_outstanding, cm_modem.tx_capacity,
+        cm_modem_rx.outstanding, cm_modem_rx.free_count, cm_gsi.evt_index[cm_modem.tx_evt_ring], cm_gsi.evt_index[cm_modem_rx.evt_ring],
+        cm_gsi.ieob_pending, cm_gsi.ieob_enabled);
 }

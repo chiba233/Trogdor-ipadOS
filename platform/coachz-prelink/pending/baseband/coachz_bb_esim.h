@@ -86,7 +86,7 @@
 #define CBE_DEFERRED UINT32_MAX
 /* Answers to read-only ES10 queries, kept so a repeated query does not switch the physical slot away from the SIM in use:
  * on hardware each switch dropped LTE about 2 s later, and the SIM state change it caused made CommCenter query again. */
-#define CBE_CACHE_ENTRIES 4u
+#define CBE_CACHE_ENTRIES 6u
 #define CBE_CACHE_REQ 64u
 
 static const uint8_t cbe_isdr_aid[16] = { 0xa0, 0x00, 0x00, 0x05, 0x59, 0x10, 0x10, 0xff, 0xff, 0xff, 0xff, 0x89, 0x00, 0x00, 0x01, 0x00 };
@@ -422,11 +422,14 @@ static inline int cbe_session_terminal(uint32_t cmd)
 /* ------------------------------------------------------------------ read-only query cache */
 static inline void cbe_set_cache(struct cbe *e, uint8_t *buf, uint32_t cap) { e->cache = buf; e->cache_cap = buf ? cap : 0; }
 /* SGP.22 queries whose answer only another ES10 command can change: GetEUICCInfo1 (BF20), GetEUICCInfo2 (BF22),
- * GetProfilesInfo (BF2D), EuiccConfiguredAddresses (BF3C), GetEID (BF3E). Never the challenge (BF2E) or notifications. */
+ * ListNotification (BF28), GetProfilesInfo (BF2D), EuiccConfiguredAddresses (BF3C), GetEID (BF3E).
+ * Section 5.7.9 lists notification metadata without consuming it. Removing a notification (BF30), profile
+ * changes and other uncached card commands still invalidate every entry. Never cache the challenge (BF2E).
+ * Keep room for all six query kinds so initialization cannot evict them cyclically. */
 static inline int cbe_cacheable(const uint8_t *req, uint32_t n)
 {
     if (n < 2u || n > CBE_CACHE_REQ || req[0] != 0xbfu) return 0;
-    return req[1] == 0x20u || req[1] == 0x22u || req[1] == 0x2du || req[1] == 0x3cu || req[1] == 0x3eu;
+    return req[1] == 0x20u || req[1] == 0x22u || req[1] == 0x28u || req[1] == 0x2du || req[1] == 0x3cu || req[1] == 0x3eu;
 }
 static inline int cbe_cache_find(const struct cbe *e, uint32_t cmd, const uint8_t *req, uint32_t n)
 {
