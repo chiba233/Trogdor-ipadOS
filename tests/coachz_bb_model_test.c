@@ -593,6 +593,10 @@ static void esim_open(void)
 }
 static void esim_restore(uint32_t now)
 {
+    if (esim.session == CBE_SESSION_BATCH && esim.step == CBE_S_IDLE) {
+        now = esim.session_deadline;
+        cbe_tick(&esim, now);
+    }
     CHECK(esim.step == CBE_S_CLOSE);
     esim_answer(now, NULL, 0, 0);
     CHECK(esim.step == CBE_S_RESTORE);
@@ -612,6 +616,15 @@ static void esim_apdu_response(uint32_t now, const uint8_t *data, uint32_t n, ui
 static void test_esim(void)
 {
     esim_reset();
+    uint8_t start[7], stop[7]; cbd_request(start, 1, 0x20, 0); cbd_request(stop, 2, 0x21, 0);
+    CHECK(!cbe_blocks_data_start(&esim, CBD_SVC_WDS, start, sizeof start));
+    esim.freeze = 1;
+    CHECK(cbe_blocks_data_start(&esim, CBD_SVC_WDS, start, sizeof start));
+    CHECK(!cbe_blocks_data_start(&esim, CBD_SVC_WDS, stop, sizeof stop));
+    CHECK(!cbe_blocks_data_start(&esim, CBE_SVC_UIM, start, sizeof start));
+    esim.freeze = 0; esim.route_failed = 1;
+    CHECK(cbe_blocks_data_start(&esim, CBD_SVC_WDS, start, sizeof start));
+    esim.route_failed = 0;
     /* Card status retains its transaction/other TLVs; the capability array is replaced, not duplicated. */
     const uint8_t card[] = { 2, 0x34, 0x12, 0x2f, 0, 16, 0, 2, 4, 0, 0, 0, 0, 0,
                              0x10, 1, 0, 0xaa, 0x21, 2, 0, 0xff, 0xff };
@@ -765,8 +778,19 @@ static void test_esim(void)
     esim_tape_command(CBE_TAPE_LOAD_BPP, 9, session_der, sizeof session_der, 1, 0, 6011);
     cbe_tick(&esim, 6011); CHECK(esim.step == CBE_S_APDU && esim.switches == 1);
     esim_apdu_response(6012, session_der, sizeof session_der, 0x90, 0);
+    CHECK(esim.session == CBE_SESSION_BATCH && esim.step == CBE_S_IDLE && esim.switches == 1);
+    CHECK(cbe_output(&esim, &channel, out, sizeof out));
+    /* The notification immediately following the package reuses its slot and channel. */
+    const uint8_t notification[] = { 0xbf, 0x28, 0 };
+    esim_tape_command(7, 9, notification, sizeof notification, 1, 0, 6013);
+    cbe_tick(&esim, 6013); CHECK(esim.step == CBE_S_APDU && esim.switches == 1);
+    esim_apdu_response(6014, session_der, sizeof session_der, 0x90, 0);
+    CHECK(cbe_output(&esim, &channel, out, sizeof out));
+    esim_tape_command(CBE_TAPE_ENABLE, 9, session_der, sizeof session_der, 1, 0, 6015);
+    cbe_tick(&esim, 6015); CHECK(esim.step == CBE_S_APDU && esim.switches == 1);
+    esim_apdu_response(6016, session_der, sizeof session_der, 0x90, 0);
     CHECK(!esim.session && esim.step == CBE_S_CLOSE);
-    esim_restore(6013);
+    esim_restore(6017);
     CHECK(esim.switches == 2 && !esim.channel_open && !esim.freeze);
 
     /* A lease with no next command times out through close + restore, not a stuck UIM freeze. */
@@ -789,7 +813,8 @@ static void test_esim(void)
     /* A failed restoration is not reported as a successful operation. */
     esim_reset(); esim_tape(small, sizeof small, 1, 0); esim_open();
     esim_apdu_response(6007, small, sizeof small, 0x90, 0);
-    esim_answer(6008, NULL, 0, 0); CHECK(esim.step == CBE_S_RESTORE);
+    cbe_tick(&esim, esim.session_deadline);
+    esim_answer(9010, NULL, 0, 0); CHECK(esim.step == CBE_S_RESTORE);
     esim_answer(6009, NULL, 0, CBE_ERR_INTERNAL);
     CHECK(esim.done_status == 1 && esim.route_failed && !esim.slots.known);
     if (!failures) printf("PASS esim tape transport and cleanup\n");

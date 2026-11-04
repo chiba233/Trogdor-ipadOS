@@ -59,7 +59,7 @@ BBUpdater 接受 SBL（镜像号 0x15）后报告启动成功，ABM engage，53 
 
 初始化兼容：原版 Vinyl 驱动启动时先用 `0x1000 / GetCsn` 查询两个槽，通用 `NOT_SUPPORTED (0x5e)` 不会完成 ready 回调。桥接返回明确的 `VINYL_NOCAPABLE_UICC (0x204)`：原版 `asVinylDriverError` 将它映射到 6，`handleClientStarted_sync` 的 CSN 回调明确接受此结果并发布对应槽的 Ready。这里没有 Apple legacy Vinyl CSN，GSMA EID 仍只由 Tape EID 请求读取；不伪造 CSN、不改 SIM Ready 或激活结论。卡状态指示与查询应答保留同一套能力字段，避免插拔后丢失 Tape 能力。这两处已有便携模型覆盖，实机初始化链已继续到真实 ES10 下载流程。
 
-Tape 会话：EID/设备能力请求按原版 writer 从 TLV `0x01` 读取，设备能力查询允许不指定槽（原版填 0）。TapeInfo 结果头按原版 parser 的 11 字节布局返回：命令 1、状态 2、保留 2、事务号 4、错误字节 2；原来的 9 字节布局会使结果解析失败。`GetSessionData` 的空请求由桥接返回空恢复记录，`ClearSessionData` 只处理桥接的空记录集合，二者不转成卡片 APDU，不表示已支持跨重启恢复。挑战、服务端认证、准备下载沿用同一 VINYL 客户端的 ISD-R 通道；装载/取消/清理结束、错误、客户端断开或 180 秒无新命令时关闭并恢复原卡槽。其它客户端不插入这一会话。状态日志仍不输出 APDU、EID 或 profile 内容。
+Tape 会话：EID/设备能力请求按原版 writer 从 TLV `0x01` 读取，设备能力查询允许不指定槽（原版填 0）。TapeInfo 结果头按原版 parser 的 11 字节布局返回：命令 1、状态 2、保留 2、事务号 4、错误字节 2；原来的 9 字节布局会使结果解析失败。`GetSessionData` 的空请求由桥接返回空恢复记录，`ClearSessionData` 只处理桥接的空记录集合，二者不转成卡片 APDU，不表示已支持跨重启恢复。挑战、服务端认证、准备下载沿用同一 VINYL 客户端的 ISD-R 通道，交互期间保留 180 秒空闲上限。装载完成后进入有界的通知批次，连续只读查询也可复用通道：空闲 3 秒或批次累计 15 秒后关闭并恢复原卡槽。启用、停用、删除、重置、取消、清理、错误或客户端断开仍触发清理。其它客户端不插入这一会话。状态日志仍不输出 APDU、EID 或 profile 内容。
 
 ## 原生 Internet 数据通路
 
@@ -94,3 +94,10 @@ GSI 轮询同时按硬件完成指针判断待处理事务。周期诊断保留�
 
 
 Tape 的配置包请求有两层分段：TLV `0x10` 的 count/index 只描述当前结构部分，flag 才表示整个命令是否结束。桥接按同一事务保留接收状态，允许各部分从 index 0 重新开始；首段读取 BF36 声明总长并有界分配，最后一部分到齐后才执行原有的 SGP.22 结构切分及 STORE DATA。此前把首段视为完整包，会提前解析失败，并以 `INVALID_ARG` 拒绝后续部分。回归覆盖跨部分累积、部分内分片和结束前不执行，实机完整配置包装载成功。
+
+
+## 卡槽占用与数据建立
+
+切换到 eUICC 会触发真实卡片事件。按 [Hermes 的完整 eUICC 操作边界](https://chromium.googlesource.com/chromiumos/platform2/+/main/hermes/modem_qrtr.cc#976)，配置包后的通知处理不在每条命令之后归还、再借用卡槽；上述短批次兼顾查询合并与恢复期限。与临时切槽对应的 WDS 断线原因 `MMGDSI_CARD_EVENT` 见 [libqmi 的协议枚举](https://chromium.googlesource.com/external/gitlab.freedesktop.org/mobile-broadband/libqmi/+/55e51667274ff9b5f84f92ed305f76647df47f6a/src/libqmi-glib/qmi-enums-wds.h#485)。
+
+临时借用或恢复尚未确认时，新的 WDS Start Network 返回 `DEVICE_IN_USE`，避免给被临时替换的逻辑 SIM 建立错误数据上下文。Stop Network、状态查询与真实断线继续处理，不伪造连接成功或隐藏卡片刷新。批次复用、截止清理和忙状态边界的基础回归已通过；减少切槽与重连次数仍待实机验收。打包使用无临时流程探针、保留必要兼容指令的签名副本和对应信任缓存。

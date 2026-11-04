@@ -321,6 +321,13 @@ static void bb_sim_request(const struct cbq_result &r, const uint8_t *sdu);
 // A request for the modem, with the data port named as this modem has it.
 static void bb_to_modem(const struct cbq_result &r, const uint8_t *sdu)
 {
+  if (cbe_blocks_data_start(&bb_esim, r.service, sdu, r.len)) {
+    const uint32_t n = cbq_private_answer(sdu, r.service, r.cid, CBE_ERR_DEVICE_IN_USE, nullptr, 0, bb_out, sizeof bb_out);
+    if (n) bb_push(r.channel ? CBH_QMUX2 : CBH_QMUX1, bb_out, n);
+    static uint32_t deferred;
+    if (++deferred <= 8) printf("COACHZ pdp: data start deferred during eSIM slot ownership, count %u\n", deferred);
+    return;
+  }
   if (r.service == CBD_SVC_WDS) bb_pdp_note(r.local_port, r.cid, r.channel, sdu, r.len);
   bb_sim_request(r, sdu);
   if (r.service == CBE_SVC_UIM && bb_esim.route_failed) {

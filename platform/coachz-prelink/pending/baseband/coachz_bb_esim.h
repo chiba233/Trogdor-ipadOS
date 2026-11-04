@@ -82,6 +82,10 @@
 #define CBE_TIMEOUT_MS 10000u
 #define CBE_SETTLE_MS 6000u
 #define CBE_SESSION_IDLE_MS 180000u
+#define CBE_BATCH_IDLE_MS 3000u
+#define CBE_BATCH_LIMIT_MS 15000u
+#define CBE_SESSION_INSTALL 1u
+#define CBE_SESSION_BATCH 2u
 #define CBE_EVENTS 32u
 #define CBE_DEFERRED UINT32_MAX
 /* Answers to read-only ES10 queries, kept so a repeated query does not switch the physical slot away from the SIM in use:
@@ -238,7 +242,7 @@ int active;                       /* job index, -1 none */
 uint8_t channel_id, channel_open, switched, restore_phys, get_more, sw1, sw2, route_failed;
 uint32_t deadline, wait_txn, wait_msg, txn, switches;
 uint8_t session, session_channel, session_cid, session_slot;
-uint32_t session_deadline;
+uint32_t session_deadline, session_limit;
 struct cbe_seg seg[CBE_SEGMENTS];
 uint32_t seg_count, seg_index, frag_pos, block;
 /* the request for the modem, when req_len is set */
@@ -315,6 +319,14 @@ w += cbd_tlv(out + w, room - w, CBE_UIM_CAPABILITY_TLV, caps, 2);
 cbd_wr16(out + 5, w - 7u);
 e->card_status_fixed++;
 return w;
+}
+
+/* A temporary eUICC mapping must not establish a data call for the displaced logical SIM.
+ * Reject Start Network as busy; Stop Network, status and all real disconnects still pass. */
+static inline int cbe_blocks_data_start(const struct cbe *e, uint32_t service, const uint8_t *sdu, uint32_t n)
+{
+    return (e->freeze || e->route_failed) && service == CBD_SVC_WDS && cbd_sdu_ok(sdu, n) &&
+        sdu[0] == CBQ_QMI_REQUEST && cbd_rd16(sdu + 3) == 0x20u;
 }
 
 /* ------------------------------------------------------------------ requests for the modem (into e->req) */
@@ -421,7 +433,7 @@ static inline int cbe_session_owner(const struct cbe *e, const struct cbe_job *j
 }
 static inline int cbe_session_terminal(uint32_t cmd)
 {
-    return cmd == CBE_TAPE_LOAD_BPP || cmd == CBE_TAPE_CANCEL || cmd == CBE_TAPE_CLEAR_SESSION ||
+    return cmd == CBE_TAPE_CANCEL || cmd == CBE_TAPE_CLEAR_SESSION ||
         cmd == CBE_TAPE_ENABLE || cmd == CBE_TAPE_DISABLE || cmd == CBE_TAPE_DELETE || cmd == CBE_TAPE_MEMORY_RESET;
 }
 /* ------------------------------------------------------------------ read-only query cache */
@@ -491,13 +503,25 @@ static inline void cbe_finish(struct cbe *e, uint32_t status, uint32_t reason, u
     }
     e->req_len = e->wait_msg = 0;
     const uint32_t cmd = e->done.cmd;
+    const int installing = cmd == CBE_TAPE_CHALLENGE || cmd == CBE_TAPE_AUTHENTICATE || cmd == CBE_TAPE_PREPARE_DOWNLOAD;
+    const int query = cbe_cacheable(e->in + e->done.off, e->done.len);
     if (!status && e->channel_open && !cbe_session_terminal(cmd) &&
-        (e->session || cmd == CBE_TAPE_CHALLENGE || cmd == CBE_TAPE_AUTHENTICATE || cmd == CBE_TAPE_PREPARE_DOWNLOAD)) {
+        (e->session || installing || cmd == CBE_TAPE_LOAD_BPP || query)) {
         if (!e->session) {
             e->session_channel = e->done.channel; e->session_cid = e->done.cid; e->session_slot = e->done.slot;
             cbe_event(e, CBE_EV_SESSION, 1, e->done.slot, cmd, 0, 0);
         }
-        e->session = 1; e->session_deadline = now + CBE_SESSION_IDLE_MS;
+        /* Hermes owns the modem through pending-notification processing, not one APDU at a time.
+         * Tape has no operation-END message here: use a short, bounded batch after the package,
+         * or for consecutive discovery queries. Consent/authentication retain the long lease. */
+        if (installing) e->session = CBE_SESSION_INSTALL;
+        else if (cmd == CBE_TAPE_LOAD_BPP || e->session != CBE_SESSION_INSTALL) {
+            if (cmd == CBE_TAPE_LOAD_BPP || e->session != CBE_SESSION_BATCH) e->session_limit = now + CBE_BATCH_LIMIT_MS;
+            e->session = CBE_SESSION_BATCH;
+        }
+        e->session_deadline = now + (e->session == CBE_SESSION_INSTALL ? CBE_SESSION_IDLE_MS : CBE_BATCH_IDLE_MS);
+        if (e->session == CBE_SESSION_BATCH && (int32_t)(e->session_deadline - e->session_limit) > 0)
+            e->session_deadline = e->session_limit;
         e->step = CBE_S_IDLE; return;
     }
     if (e->session) cbe_event(e, CBE_EV_SESSION, 2, e->session_slot, cmd, status ? 3 : 0, 0);
