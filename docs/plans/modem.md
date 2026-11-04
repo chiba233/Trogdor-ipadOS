@@ -193,3 +193,12 @@ b9 用 drivers/RamBlock/coachz_modem.c 按上面的顺序接入，在 Wi-Fi 线�
 - [Hermes apdu.cc](https://chromium.googlesource.com/chromiumos/platform2/+/main/hermes/apdu.cc)、[uim_cmd.qmi](https://chromium.googlesource.com/chromiumos/platform2/+/main/hermes/uim_cmd.qmi)、[sgp_22.h](https://chromium.googlesource.com/chromiumos/platform2/+/main/hermes/sgp_22.h)：短 APDU 分片、UIM wire schema 和 ISD-R AID。
 - [libqmi UIM schema](https://github.com/linux-mobile-broadband/libqmi/blob/main/data/qmi-service-uim.json)：Logical Channel 0x003f 的 Slot 和 Channel ID TLV，用于关闭已打开的通道。
 - VINYL 和能力字段沿用已核对的 `EURSimCommandDriver`、`VinylQMICommandDriver`、TLV writer/parser 结论；此处仅实现桥接，不复制原始二进制或设备标识。
+
+
+## 原生 Internet 数据验收
+
+CommCenter 的 Internet 上下文已能通过显式启用的固定版本兼容副本发起真实 WDS 激活，modem 返回 IPv4 地址，`pdp_ip0` 经 IPA 完成少量双向收发。兼容副本的生成、摘要绑定和打包方式见 [基带桥接说明](../../platform/coachz-prelink/pending/baseband/README.md#原生-internet-数据通路)。
+
+持续联网仍有卡路由问题。实机 WDS 断线给出 `MMGSDI_CARD_EVT (218)`，相邻 UIM 读取报 `INTERNAL` 或 `UIM_NOT_INITIALIZED`。Tape 的 `GetProfilesInfo (BF2D)`、`ListNotification (BF28)` 交替执行，每项临时切槽往返约 12 秒。现有缓存没有包含 BF28，执行它会清掉已缓存的资料查询结果，形成重复切槽循环。
+
+下一轮修订将 BF28 纳入只读查询缓存，并为六种只读查询保留六个条目。改变卡片或通知状态的命令仍清空缓存。该修订已由原有便携模型复现并验证，持续连接改善尚待实机验收。ListNotification 的只读列表语义见 SGP.22 第 5.7.9 节，删除通知是第 5.7.11 节的独立操作。[GSMA SGP.22 v2.3](https://www.gsma.com/esim/wp-content/uploads/2021/07/SGP.22-v2.3.pdf)

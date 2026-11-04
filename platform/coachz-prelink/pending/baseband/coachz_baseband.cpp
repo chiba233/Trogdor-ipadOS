@@ -301,6 +301,16 @@ static void bb_pdp_note(uint32_t local_port, uint32_t cid, uint32_t channel, con
     printf("COACHZ pdp: WDS type %u message 0x%x txn %u mux %u family %u active %u error %u address-fields %u\n",
       sdu[0], cbd_rd16(sdu + 3), cbd_rd16(sdu + 1), c.mux, c.family, c.active,
       sdu[0] == 2 ? cbd_error(sdu, n) : 0, c.settings);
+  if (sdu[0] == 2 && cbd_rd16(sdu + 3) == CBP_START && cbd_error(sdu, n)) {
+    uint32_t reason_size = 0, verbose_size = 0;
+    const uint8_t *reason = cbd_find(sdu, n, 0x10, &reason_size);
+    const uint8_t *verbose = cbd_find(sdu, n, 0x11, &verbose_size);
+    printf("COACHZ pdp: start failed cid %u channel %u mux %u family %u reason-present %u reason %u verbose-present %u type %u code %d\n",
+      cid, channel, c.mux, c.family, reason && reason_size == 2u,
+      reason && reason_size == 2u ? cbd_rd16(reason) : 0u, verbose && verbose_size == 4u,
+      verbose && verbose_size == 4u ? cbd_rd16(verbose) : 0u,
+      verbose && verbose_size == 4u ? static_cast<int16_t>(cbd_rd16(verbose + 2)) : 0);
+  }
 }
 
 static void bb_sim_request(const struct cbq_result &r, const uint8_t *sdu);
@@ -534,6 +544,12 @@ static void bb_host_write(uint32_t channel, const uint8_t *data, uint32_t len)
     }
     break;
   case CBQ_TO_MODEM:
+    // Apple's report configuration this modem's firmware does not know (coachz_bb_data.h): accepted here, not forwarded.
+    if (cbd_vendor_reporting(r.service, data + CBQ_HDR, r.len)) {
+      const uint32_t n = cbq_private_answer(data + CBQ_HDR, r.service, r.cid, 0, nullptr, 0, bb_out, sizeof bb_out);
+      if (n) bb_push(channel, bb_out, n);
+      break;
+    }
     bb_to_modem(r, data + CBQ_HDR);
     break;
   case CBQ_PRIVATE: {
@@ -1052,6 +1068,15 @@ public:
   IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *, OSObject *, void *) override
   {
     if (!args) return kIOReturnBadArgument;
+    // Capture the first call shape for each helper operation, including the traffic gate.
+    // Payloads can contain network identities. Record only sizes and counts.
+    static uint32_t shapes_seen;
+    if (selector < 32 && !(__atomic_fetch_or(&shapes_seen, 1u << selector, __ATOMIC_RELAXED) & (1u << selector)))
+      printf("COACHZ pdp: appender selector %u scalar-in %u scalar-out %u struct-in %llu struct-out %llu descriptor-in %llu descriptor-out %llu\n",
+        selector, args->scalarInputCount, args->scalarOutputCount,
+        static_cast<unsigned long long>(args->structureInputSize), static_cast<unsigned long long>(args->structureOutputSize),
+        static_cast<unsigned long long>(args->structureInputDescriptor ? args->structureInputDescriptor->getLength() : 0),
+        static_cast<unsigned long long>(args->structureOutputDescriptor ? args->structureOutputDescriptor->getLength() : 0));
     if (selector == 16) {
       if (args->scalarInputCount != 2) return kIOReturnBadArgument;
       return bb_pdp_block(static_cast<uint32_t>(args->scalarInput[0]), static_cast<uint32_t>(args->scalarInput[1]));

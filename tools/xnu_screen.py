@@ -139,7 +139,7 @@ def baseband_tree(root):
     root.child('product').set('baseband-chipset', b'mav16\0')
 
 
-def baseband_firmware(ipsw=None):
+def baseband_firmware(ipsw=None, commcenter=None, commcenter_packed=None):
     """tools/linux_log.py --baseband: the Mav16 .bbfw of the pinned IPSW as the archive coachz_baseband_unpack reads (the GPU addon's layout under
     the magic CZBBFW01: count, total size, then per file its name length, mode, size, zlib size, name and data, each padded to 8 bytes). The
     kernel puts the files in /private/var/coachz/baseband/Mav16. Apple firmware: it only ever goes into the kernel partition, never the repository."""
@@ -152,11 +152,18 @@ def baseband_firmware(ipsw=None):
             raise ValueError('expected one Mav16 bbfw in the IPSW, found %d' % len(names))
         with zipfile.ZipFile(outer.open(names[0])) as bbfw:
             files = [(info.filename, bbfw.read(info)) for info in bbfw.infolist() if not info.is_dir()]
+    if commcenter is not None:
+        from coachz_cellular_compat import validate_compat
+        validate_compat(commcenter)
+        if commcenter_packed is not None and zlib.decompress(commcenter_packed) != commcenter:
+            raise ValueError('compressed CommCenter differs from the signed copy')
+        files.append(('compat/CommCenter', commcenter))
     entries = b''
     for name, data in files:
         encoded = name.encode() + b'\0'
-        packed = zlib.compress(data, 9)
-        entries += struct.pack('<IIQQ', len(encoded), 0o644, len(data), len(packed))
+        packed = commcenter_packed if name == 'compat/CommCenter' and commcenter_packed is not None else zlib.compress(data, 9)
+        mode = 0o755 if name == 'compat/CommCenter' else 0o644
+        entries += struct.pack('<IIQQ', len(encoded), mode, len(data), len(packed))
         entries += encoded + bytes(-len(encoded) % 8) + packed + bytes(-len(packed) % 8)
     total = 24 + len(entries)
     return b'CZBBFW01' + struct.pack('<IIQ', len(files), 0, total) + entries
@@ -218,7 +225,7 @@ def smp_tree(root, count):
 
 
 def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=True, root_uuid=None, cpus=1,
-                 full_screen=False, gmu_firmware_size=0, sqe_firmware_size=0, gpu_addon_size=0, motion_probe=False, wifi_mac=None, gestalt_cache=None, baseband=False):
+                 full_screen=False, gmu_firmware_size=0, sqe_firmware_size=0, gpu_addon_size=0, motion_probe=False, wifi_mac=None, gestalt_cache=None, baseband=False, baseband_compat_hash=None):
     root = read_tree(adt)
     if cpus > 1:
         smp_tree(root, cpus)
@@ -239,6 +246,8 @@ def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=T
         # Starts the cellular bridge (pending/baseband). A /chosen property, because the boot command line has no room left.
         root.child('chosen').set('coachz-baseband', struct.pack('<I', 1))
         baseband_tree(root)
+        if baseband_compat_hash:
+            root.child('chosen').set('coachz-cellular-compat-sha256', baseband_compat_hash)
     if root_uuid:
         root.child('chosen').set('root-matching', root_matching(root_uuid))
         # mount -P 1 of the original launchd exits 66 without it. An identity of this unsigned image set,
@@ -297,7 +306,7 @@ def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=T
 
 def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=False, root_cache=None, root_device=None,
          root_uuid=None, data_seed=None, data_uuid=None, display=False, cpus=1, gpu=0, gmu_firmware=None, sqe_firmware=None, gpu_addon=None,
-         diagnostics=False, wifi_mac=None, root_emmc=False, gestalt_cache=None, baseband=False):
+         diagnostics=False, wifi_mac=None, root_emmc=False, gestalt_cache=None, baseband=False, baseband_commcenter=None):
     if baseband and not prelinked:
         raise ValueError('the cellular bridge needs the prelinked kernel')
     if window & 0x1fffff or memory & 0x1fffff:
@@ -306,6 +315,11 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
     disk_root = root_device or root_uuid
     if disk_root and (not prelinked or not root_cache or ramdisk is not None or command_line or (root_device and root_uuid)):
         raise ValueError('a disk root needs the prelinked kernel, its trust cache and no RAM disk')
+    if baseband_commcenter is not None:
+        if not baseband or not disk_root:
+            raise ValueError('CommCenter compatibility needs the cellular bridge and a disk root')
+        from coachz_cellular_compat import compat_trust_cache
+        root_cache = ([root_cache] if isinstance(root_cache, bytes) else list(root_cache)) + [compat_trust_cache(baseband_commcenter)]
     command_line = command_line or (PRELINK_COMMAND_LINE if prelinked else COMMAND_LINE)
     if root_device:
         if not re.fullmatch(r'disk[0-9]+(s[0-9]+)*', root_device):
@@ -425,7 +439,9 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         ramdisk += bytes(-len(ramdisk) % 4096)
         # The restore volume, from memory or from disk, runs as the restore OS environment; the main OS does not.
         environment = 'restore' if root_cache and not root_uuid else None
-        adt = prelink_tree(adt, window, tree, ramdisk, cache, environment, wifi_mac=wifi_mac, gestalt_cache=gestalt_cache, baseband=baseband, ram_root=not disk_root or bool(data_seed),
+        adt = prelink_tree(adt, window, tree, ramdisk, cache, environment, wifi_mac=wifi_mac, gestalt_cache=gestalt_cache, baseband=baseband,
+                           baseband_compat_hash=hashlib.sha256(baseband_commcenter).digest() if baseband_commcenter is not None else None,
+                           ram_root=not disk_root or bool(data_seed),
                            root_uuid=root_uuid, cpus=cpus, full_screen=display,
                            gmu_firmware_size=len(gmu_firmware) if gmu_firmware else 0, sqe_firmware_size=len(sqe_firmware) if sqe_firmware else 0, gpu_addon_size=len(gpu_addon) if gpu_addon else 0, motion_probe=diagnostics)
         ramdisk = ramdisk + cache + bytes(-len(cache) % 4096)
@@ -475,6 +491,7 @@ def main():
     p.add_argument('--gpu', type=int, default=0, help='prelinked: Adreno 618 bring-up stage 1 to 8, or 9 for the driver (docs/plans/gpu.md)')
     p.add_argument('--root-emmc', action='store_true', help='the system, Data and the log ring on the eMMC partitions')
     p.add_argument('--baseband', action='store_true', help='prelinked: start the cellular bridge (pending/baseband): /chosen/coachz-baseband and the J121AP baseband nodes; its firmware comes with tools/linux_log.py --baseband')
+    p.add_argument('--baseband-commcenter', type=Path, help='with --baseband: signed copy from tools/coachz_cellular_compat.py, also passed to tools/linux_log.py')
     p.add_argument('--gestalt-cache', type=Path, help='a MobileGestalt cache plist the kernel writes before launchd; device data, keep it out of the repository')
     p.add_argument('--wifi-mac', type=Path, help='a file with 12 hex digits: the Wi-Fi address this image uses on every boot')
     p.add_argument('--gpu-addon', type=Path, help='with --gpu 9: the Metal plug-in addon from tools/xnu_gpu_userland.py')
@@ -499,7 +516,8 @@ def main():
                    sqe_firmware=a.sqe_firmware.read_bytes() if a.sqe_firmware else None,
                    gpu_addon=a.gpu_addon.read_bytes() if a.gpu_addon else None, diagnostics=a.diagnostics,
                    wifi_mac=a.wifi_mac.read_text().strip() if a.wifi_mac else None, root_emmc=a.root_emmc,
-                   gestalt_cache=a.gestalt_cache.read_bytes() if a.gestalt_cache else None, baseband=a.baseband)
+                   gestalt_cache=a.gestalt_cache.read_bytes() if a.gestalt_cache else None, baseband=a.baseband,
+                   baseband_commcenter=a.baseband_commcenter.read_bytes() if a.baseband_commcenter else None)
     a.output.parent.mkdir(parents=True, exist_ok=True)
     a.output.write_bytes(payload)
     print('Built screen-output XNU payload', hashlib.sha256(payload).hexdigest())

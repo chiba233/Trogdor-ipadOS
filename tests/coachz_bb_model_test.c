@@ -476,6 +476,17 @@ static void test_data(void)
     CHECK(!cbd_bsp_file_segment(seg_bad, sizeof seg_bad, &fs));
     n = cbq_private_unsupported(act, 0xe5, 2, out, sizeof out);
     CHECK(n == 20 && out[4] == 0xe5 && cbq_rd16(out + 16) == 1 && cbq_rd16(out + 18) == CBQ_ERR_NOT_SUPPORTED);
+    /* Apple's report configuration 0x555b on NAS and WDS is answered here; other messages, services and responses still go to the modem. */
+    const uint8_t freq_req[] = { 0, 7, 0, 0x5b, 0x55, 4, 0, 0xb0, 1, 0, 1 };
+    const uint8_t stats_req[] = { 0, 9, 0, 0x5b, 0x55, 24, 0, 1, 9, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0x10, 9, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 };
+    CHECK(cbd_vendor_reporting(CBD_SVC_NAS, freq_req, sizeof freq_req) && cbd_vendor_reporting(CBD_SVC_WDS, stats_req, sizeof stats_req));
+    CHECK(!cbd_vendor_reporting(CBD_SVC_BSP, freq_req, sizeof freq_req) && !cbd_vendor_reporting(CBD_SVC_NAS, freq_req, sizeof freq_req - 1));
+    uint8_t cell_req[sizeof freq_req]; memcpy(cell_req, freq_req, sizeof freq_req); cell_req[3] = 0x56;   /* 0x5556 is not a setting */
+    uint8_t freq_rsp[sizeof freq_req]; memcpy(freq_rsp, freq_req, sizeof freq_req); freq_rsp[0] = 2;
+    CHECK(!cbd_vendor_reporting(CBD_SVC_NAS, cell_req, sizeof cell_req) && !cbd_vendor_reporting(CBD_SVC_NAS, freq_rsp, sizeof freq_rsp));
+    n = cbq_private_answer(freq_req, CBD_SVC_NAS, 3, 0, NULL, 0, out, sizeof out);
+    CHECK(n == 20 && out[4] == CBD_SVC_NAS && out[5] == 3 && out[6] == 2 && cbq_rd16(out + 7) == 7 && cbq_rd16(out + 9) == 0x555b &&
+          cbq_rd16(out + 16) == 0 && cbq_rd16(out + 18) == 0);
     /* Two WDS clients on one mux: only modem success activates each family, and stopping IPv4 preserves IPv6. */
     struct cbp_client calls[2] = { { 0 }, { 0 } };
     uint8_t wire[64], reply[64], v;

@@ -229,11 +229,15 @@ def main():
                    help="with --xnu-screen: a directory with mba.mbn and qdsp6sw.mbn, stored after the kernel container at 144 MiB of the disk")
     p.add_argument("--baseband", action="store_true",
                    help="with --modem-firmware: the pinned IPSW's Mav16 firmware for the cellular bridge after the modem's files")
+    p.add_argument("--baseband-commcenter", type=Path,
+                   help="with --baseband: signed compatibility copy, identical to the one passed to tools/xnu_screen.py")
     p.add_argument("--xnu-kernel-only", action="store_true",
                    help="with --xnu-root-partition: an image of only the GPT and kernel partition, for a medium that has the containers")
     p.add_argument("--usb-read", action="store_true", help="read three known sectors of the USB medium through the libpayload stack, then Linux; issues no writes")
     p.add_argument("--output", type=Path, default=ROOT / "build/linux-log")
     a = p.parse_args()
+    if a.baseband_commcenter and (not a.baseband or not a.modem_firmware or not a.xnu_screen):
+        p.error('--baseband-commcenter needs --baseband, --modem-firmware and --xnu-screen')
     if sum(map(bool, (a.display_discovery, a.display_pattern, a.display_backlight))) > 1: p.error("choose one display mode")
     if a.xnu_screen and (a.display_discovery or a.display_pattern or a.display_backlight or a.xnu_checkpoint): p.error("xnu screen is its own image")
     if a.usb_read and (a.display_discovery or a.display_pattern or a.display_backlight or a.xnu_checkpoint or a.xnu_screen): p.error("USB read is its own image")
@@ -312,7 +316,11 @@ def main():
     blob, blob_end = [], 0
     if a.modem_firmware:
         from xnu_screen import baseband_firmware
-        blob, blob_end = modem_blob(kpart, a.modem_firmware, baseband_firmware() if a.baseband else None)
+        commcenter = a.baseband_commcenter.read_bytes() if a.baseband_commcenter else None
+        compressed = a.baseband_commcenter.with_suffix('.zlib') if a.baseband_commcenter else None
+        commcenter_packed = compressed.read_bytes() if compressed and compressed.is_file() else None
+        blob, blob_end = modem_blob(kpart, a.modem_firmware,
+                                   baseband_firmware(commcenter=commcenter, commcenter_packed=commcenter_packed) if a.baseband else None)
     disk_mib, kernel_mib = next(sizes for sizes in ((128, 96), (256, 224), (288, 256), (512, 480))
                                 if kpart.stat().st_size <= sizes[1] << 20 and blob_end <= (1 + sizes[1]) << 20)
     root_mib = sum(-(-root.stat().st_size // (1 << 20)) for root in a.xnu_root_partition)
@@ -337,6 +345,8 @@ def main():
         code_files += ("boot/display_ec.c",)
     if a.screen:
         code_files += ("boot/xnu_screen.c", "boot/boot_menu.c", "boot/usb_menu.c", "boot/usb_compat/libpayload-config.h", "tools/usb_stack.py", "boot/xnu-screen.ld", "tools/xnu_screen.py", "tools/xnu_init.py", "tools/coachz_init.S")
+    if a.baseband_commcenter:
+        code_files += ("tools/coachz_cellular_compat.py",)
     if a.usb_read:
         code_files += ("boot/usb_read.c", "tools/usb_stack.py", "boot/usb_compat/libpayload.h")
     report = {"schema": 1, "display_discovery": a.display_discovery, "display_pattern": a.pattern, "display_backlight": a.display_backlight, "xnu_screen": a.screen,

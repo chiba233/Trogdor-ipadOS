@@ -9,7 +9,7 @@
 - `coachz_bb_sahara.h`：sahara 通道上扮演 modem 的设备端。发 HELLO，按 ELF 头、程序头、各段请求列出的镜像，收到的数据丢弃，最后一个镜像的 DONE 应答报完成。 主机回模式 3 时走命令模式（芯片 ID、序列号，再切回模式 0）。`pbl` 通道的方法 5 读 BHI 寄存器（0 序列号、3 MSM ID、4 PK hash），方法 4 `sendImage` 收下即丢。序列号是固定值，不用真实序列号。
 - `coachz_bb_control.h`：`AppleBaseband` UserClient 的方法表。供电、复位、复用等只记录，不动 modem；管理器状态和基带状态原样存取；SPMI、GNSS、时间同步回 unsupported。
 - `coachz_bb_channels.h`：通道名表、匹配用的类名和属性键、两个通道 UserClient 的方法号和参数个数。
-- `coachz_baseband.cpp`：内核 IOKit。发布 `AppleBaseband`、`AppleBasebandPCIControl` 和`libPCITransport` 通道表里每个通道一个 `AppleBasebandPCIInterface`（属性 `ABPInterfaceProtocol`，`matchPropertyTable` 比较它：这个键 IOKit 自己不比较）。pbl、sahara、qmux1、qmux2 有实现，其余目前能打开、写入只计数、读不到数据，第一次打开时记一行日志，UserClient 用苹果的类名（`AppleBasebandUserClient`、`AppleBasebandPCIControlUserClient`、`AppleBasebandPCIUserClient`），沙盒按类名放行。 `AppleIPAppender`（`AppleIPAppenderUserClient`）和 `AppleBasebandPCIMAVPDPManager` 是数据面服务：ABM 的 `data::TransportService` 不检查空指针就用 `ApplePDPHelperInterface`，少了它们 CommCenter 就崩溃。`pdp_ip` 接上之前所有方法回成功和全 0。读写分同步和异步两种，异步按 libIOABP 的约定完成：引用数组第 1 项是回调，第 2 项是 refcon，完成时带一个参数，为字节数。BBUEUR13Loader 在 `pbl` 上读寄存器和 `SendImage`，然后打开 `sahara`，这时发 HELLO。调用方线程只排队；QRTR 收发都在 Wi-Fi 线程上。
+- `coachz_baseband.cpp`：内核 IOKit。发布 `AppleBaseband`、`AppleBasebandPCIControl` 和`libPCITransport` 通道表里每个通道一个 `AppleBasebandPCIInterface`（属性 `ABPInterfaceProtocol`，`matchPropertyTable` 比较它：这个键 IOKit 自己不比较）。pbl、sahara、qmux1、qmux2 有实现，其余目前能打开、写入只计数、读不到数据，第一次打开时记一行日志，UserClient 用苹果的类名（`AppleBasebandUserClient`、`AppleBasebandPCIControlUserClient`、`AppleBasebandPCIUserClient`），沙盒按类名放行。 `AppleIPAppender`（`AppleIPAppenderUserClient`）和 `AppleBasebandPCIMAVPDPManager` 是数据面服务：ABM 的 `data::TransportService` 不检查空指针就用 `ApplePDPHelperInterface`，少了它们 CommCenter 就崩溃。`coachz_bb_pdp.cpp` 发布四个 raw IP `pdp_ip` 接口，按真实 WDS 状态和地址字段更新 IPv4/IPv6 上下文，经 IPA 的 QMAPv4 数据通道收发；尚未实现的方法仍返回占位结果。读写分同步和异步两种，异步按 libIOABP 的约定完成：引用数组第 1 项是回调，第 2 项是 refcon，完成时带一个参数，为字节数。BBUEUR13Loader 在 `pbl` 上读寄存器和 `SendImage`，然后打开 `sahara`，这时发 HELLO。调用方线程只排队；QRTR 收发都在 Wi-Fi 线程上。
 - `patches/xnu/coachz-prelink-baseband.patch`：两处内核改动。
   - `bsd/dev/coachz_wifi.c`：GLINK 起来后调 `coachz_baseband_configure`，发布服务；本地端口 0x4100 起的 QRTR 数据交给桥；NEW_SERVER 和 DEL_SERVER 同步给桥；每毫秒调一次 `coachz_baseband_poll`，把排队的 QMI 请求和 DEL_CLIENT 发出去；周期报告里加一行桥的计数。`coachz_baseband_archive` 从磁盘读整个固件归档并核对 SHA-256。
   - `bsd/kern/kern_exec.c`：有 `/chosen/coachz-baseband` 时，禁用任务清单不再包含 CommCenter。launchd 改写过的清单里 CommCenter 还是 true 就不接受，按新清单重装。在 launchd 之前，把内核分区里的固件文件写到 `/private/var/coachz/baseband/Mav16`，内容不同才写。再用只读联合挂载把它显示在两处：`/private/preboot/<boot-manifest-hash>/usr/local/standalone/firmware/Baseband/Mav16`（ABM 的个性化固件路径），以及 `/usr/standalone/firmware/Baseband/Mav16`。SystemOS 叠在 `/` 上，`/private/preboot` 是 OS 卷的空目录，所以挂载检查只查挂载点本身和固件目录。
@@ -42,7 +42,7 @@ Data 卷的统一日志里看 ABM 和 BBUpdater：
 
 ## 真机结果
 
-BBUpdater 接受 SBL（镜像号 0x15）后报告启动成功，ABM engage，53 个 QMI 客户端接到 modem，`pbl`、`sahara`、`qmux1`、`qmux2` 都走自己的通道。modem 的工厂数据（FSG）放进固件块后，“关于本机”显示 IMEI 和 ICCID，SIM 就绪。激活指示带上服务已开通和两个卡槽已接受后，有效 SIM 在 LTE 上注册（漫游）并完成 CS、PS 附着，开机后状态栏直接显示运营商名和信号格（发给 ABM 的队列放 1024 帧：64 帧时开机必溢出，丢掉的应答会让 CommCenter 硬重启基带，或让 SIM 和注册状态停在旧值）；DPM、WDA 设置和数据口绑定都成功。运营商包的配置文件（BSP 0xa000 分段、SetConfig 0xe00d）照苹果基带的应答收下后丢弃，最后一段之后发 FileTransferStatus 0xa001，CommCenter 缓存配置后不再循环重启基带。eSIM 在设置里出现了，页面显示还不对；蜂窝数据还没有通过，卡点见 [docs/plans/modem.md](../../../../docs/plans/modem.md)。
+BBUpdater 接受 SBL（镜像号 0x15）后报告启动成功，ABM engage，53 个 QMI 客户端接到 modem，`pbl`、`sahara`、`qmux1`、`qmux2` 都走自己的通道。modem 的工厂数据（FSG）放进固件块后，“关于本机”显示 IMEI 和 ICCID，SIM 就绪。激活指示带上服务已开通和两个卡槽已接受后，有效 SIM 在 LTE 上注册（漫游）并完成 CS、PS 附着，开机后状态栏直接显示运营商名和信号格（发给 ABM 的队列放 1024 帧：64 帧时开机必溢出，丢掉的应答会让 CommCenter 硬重启基带，或让 SIM 和注册状态停在旧值）；DPM、WDA 设置和数据口绑定都成功。运营商包的配置文件（BSP 0xa000 分段、SetConfig 0xe00d）照苹果基带的应答收下后丢弃，最后一段之后发 FileTransferStatus 0xa001，CommCenter 缓存配置后不再循环重启基带。eSIM 在设置里出现了，页面显示还不对；蜂窝数据已完成短时 IPv4 PDP 和少量收发验收，持续连接仍受重复 eSIM 查询切槽影响，详见 [docs/plans/modem.md](../../../../docs/plans/modem.md)。
 
 ## 没核实的
 
@@ -60,3 +60,21 @@ BBUpdater 接受 SBL（镜像号 0x15）后报告启动成功，ABM engage，53 
 初始化兼容修订（待实机）：原版 Vinyl 驱动启动时先用 `0x1000 / GetCsn` 查询两个槽，通用 `NOT_SUPPORTED (0x5e)` 不会完成 ready 回调。桥接返回明确的 `VINYL_NOCAPABLE_UICC (0x204)`：原版 `asVinylDriverError` 将它映射到 6，`handleClientStarted_sync` 的 CSN 回调明确接受此结果并发布对应槽的 Ready。这里没有 Apple legacy Vinyl CSN，GSMA EID 仍只由 Tape EID 请求读取；不伪造 CSN、不改 SIM Ready 或激活结论。卡状态指示与查询应答保留同一套能力字段，避免插拔后丢失 Tape 能力。这两处已有便携模型覆盖；是否消除冷启动等待及能否继续 ES10 初始化，仍需实机日志确认。
 
 Tape 后续链修订（待实机）：EID/设备能力请求按原版 writer 从 TLV `0x01` 读取，设备能力查询允许不指定槽（原版填 0）。TapeInfo 结果头按原版 parser 的 11 字节布局返回：命令 1、状态 2、保留 2、事务号 4、错误字节 2；原来的 9 字节布局会使结果解析失败。`GetSessionData` 的空请求由桥接返回空恢复记录，`ClearSessionData` 只处理桥接的空记录集合，二者不转成卡片 APDU，不表示已支持跨重启恢复。挑战、服务端认证、准备下载沿用同一 VINYL 客户端的 ISD-R 通道；装载/取消/清理结束、错误、客户端断开或 180 秒无新命令时关闭并恢复原卡槽。其它客户端不插入这一会话。状态日志仍不输出 APDU、EID 或 profile 内容。
+
+## 原生 Internet 数据通路
+
+固定系统版本的 CommCenter 把 Apple postponement ticket 缺失作为 Internet 上下文的前置阻塞条件。`tools/coachz_cellular_compat.py` 检查原始 SHA-256、Mach-O UUID 和 80 字节指令窗，只改一条条件分支，随后生成保留原有 entitlements 的 ad-hoc 签名副本和匹配的 v2 trust cache。WDS 激活、地址查询和网络返回值继续走原版逻辑。
+
+准备和打包都需显式指定兼容副本。以下路径均相对于项目根目录，输入文件从对应系统版本的原始系统中取得。
+
+```sh
+python3 tools/coachz_cellular_compat.py --commcenter ORIGINAL_COMM_CENTER --output build/coachz-cellular-compat
+# 在现有 xnu_screen.py 和 linux_log.py 打包命令中同时加入
+# --baseband-commcenter build/coachz-cellular-compat/CommCenter
+```
+
+内核归档携带签名副本，ADT 携带其 SHA-256，信任缓存携带其 cdhash。启动时核对摘要，把副本安装到 Data，再用只读 bindfs 联合挂载到 CoreTelephony Support 目录。准备工具支持可选 `--compact`，需安装 `zopfli`，生成的流仍使用既有 zlib 解压路径。
+
+实机已记录兼容副本挂载成功、WDS `0x20` 成功、`0x2d` 返回地址字段，以及 `pdp_ip0` 的 217 个发送包和 183 个接收包。这覆盖短时 IPv4 数据通路。持续连接仍有 `MMGSDI_CARD_EVT (218)` 断线，日志显示 `GetProfilesInfo (BF2D)` 与 `ListNotification (BF28)` 交替查询、重复切槽。APN 编辑入口、IPv6、跨重启及长时间连接尚待验收。
+
+构建和发布仅包含源码、补丁和准备工具。原始系统文件、签名副本、信任缓存、镜像、工厂校准数据和原始日志保留在本地。

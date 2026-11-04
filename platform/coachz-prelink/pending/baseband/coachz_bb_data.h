@@ -326,6 +326,17 @@ static inline uint32_t cbd_bsp_file_answer(const struct cbd_file_segment *f, uin
     return room >= 5u ? cbd_tlv(tlvs, room, 0x40, next, 2) : 0;
 }
 
+/* Apple's Mav16 firmware adds vendor messages to the standard services, and this modem's firmware answers them QMI_ERR_INVALID_QMI_CMD.
+ * Message 0x555b on NAS (frequency reporting mode, TLV 0xb0 of one byte) and on WDS (link statistics, TLVs 0x01 and 0x10 of nine bytes)
+ * only configure reports: CommCenter logs "Could not set frequency reporting mode" and ABM "Failed to Setting link stats" when they fail.
+ * The bridge accepts both without action, as it takes the carrier files; no reports follow. */
+#define CBD_SVC_NAS 0x03u
+#define CBD_VENDOR_REPORTING 0x555bu
+static inline int cbd_vendor_reporting(uint32_t service, const uint8_t *sdu, uint32_t n)
+{
+    return (service == CBD_SVC_NAS || service == CBD_SVC_WDS) && cbd_sdu_ok(sdu, n) && sdu[0] == 0u && cbd_rd16(sdu + 3) == CBD_VENDOR_REPORTING;
+}
+
 /* BSP 0xb001 (queryActivationStatus): TLV 0x01 ChipInformation {u32 chip id, u32 serial number}. CommCenter puts both in the activation
  * postponement info (kCTPostponementInfoBasebandChipID, ...BasebandSerialNumber) and ABM publishes them; unanswered it logs "Unable to
  * get chip id and serial number" on every query. The bridge answers the same two values BBUpdater already read over BHI and sahara. */

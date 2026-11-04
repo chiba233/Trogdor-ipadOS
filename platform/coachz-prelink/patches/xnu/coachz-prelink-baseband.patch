@@ -191,7 +191,7 @@
  		}
  	}
  	kfree_data(data, (size_t)size + 1);
-@@ -8887,9 +8899,200 @@
+@@ -8887,9 +8899,228 @@
  	native_gpu_addon_mount(p, scratch, 0xa00, small_source, sizeof(small_source), small_point, sizeof(small_point), COACHZ_SMALL "/assets/Background Light.HEIC",
  	    COACHZ_SMALL "/Background-Light.jpg", &small_stage, &small_status);
  	printf("COACHZ gpu: wallpaper overlays: flat stage %d status %d, 834 stage %d status %d\n", native_gpu_addon3_stage, native_gpu_addon3_status, small_stage, small_status);
@@ -207,6 +207,7 @@
 + */
 +extern int coachz_baseband_archive(uint8_t **, uint64_t *, size_t *);
 +static volatile int coachz_baseband_files = -1, coachz_baseband_written, coachz_baseband_same, coachz_baseband_failed, coachz_baseband_error;
++static int coachz_baseband_compat_ready;
 +
 +static void
 +coachz_baseband_unpack(proc_t p, user_addr_t scratch, const uint8_t *archive, uint64_t bytes)
@@ -267,12 +268,29 @@
 +		snprintf(path, sizeof(path), "/private/var/coachz/baseband/Mav16/%s", name);
 +		uint8_t *data = kalloc_data(size ? size : 1, Z_WAITOK);
 +		int error = data ? native_gpu_addon_inflate(archive + at, packed, data, size) : ENOMEM;
++		const bool compat = !strcmp(name, "compat/CommCenter");
++		if (!error && compat) {
++			DTEntry chosen = NULL;
++			const void *expected = NULL;
++			unsigned int expected_size = 0;
++			uint8_t digest[32];
++			SHA256_CTX hash;
++			SHA256_Init(&hash);
++			SHA256_Update(&hash, data, (size_t)size);
++			SHA256_Final(digest, &hash);
++			if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
++			    SecureDTGetProperty(chosen, "coachz-cellular-compat-sha256", &expected, &expected_size) != kSuccess ||
++			    expected_size != sizeof(digest) || memcmp(expected, digest, sizeof(digest))) {
++				error = EINVAL;
++			}
++		}
 +		if (!error) {
 +			error = native_gpu_addon_write(path, data, size, mode, ctx);
 +			if (error == ENOENT && !(error = native_gpu_addon_parents(p, scratch, path))) {
 +				error = native_gpu_addon_write(path, data, size, mode, ctx);
 +			}
 +		}
++		if (compat && error <= 0) coachz_baseband_compat_ready = 1;
 +		if (data) {
 +			kfree_data(data, size ? size : 1);
 +		}
@@ -346,6 +364,16 @@
 +		return;
 +	}
 +	coachz_baseband_install(p, scratch);
++	/* A matching signed copy is installed only for the explicit Coachz compatibility payload.
++	 * Its hash is also trusted by that payload. Bindfs keeps the OS volume read-only. */
++	if (coachz_baseband_compat_ready) {
++		static const char source[] = "/private/var/coachz/baseband/Mav16/compat";
++		static const char point[] = "/System/Library/Frameworks/CoreTelephony.framework/Support";
++		static const char executable[] = "/System/Library/Frameworks/CoreTelephony.framework/Support/CommCenter";
++		static volatile int stage, status = -1;
++		native_gpu_addon_mount(p, scratch, 0x400, source, sizeof(source), point, sizeof(point), point, executable, &stage, &status);
++		printf("COACHZ baseband: cellular compatibility ready %d stage %d status %d\n", coachz_baseband_compat_ready, stage, status);
++	}
 +	for (unsigned i = 0; i < sizeof(logging_paths) / sizeof(logging_paths[0]); i++) {
 +		int written = native_gpu_addon_write(logging_paths[i], (const uint8_t *)logging, sizeof(logging) - 1, 0644, vfs_context_current());
 +		if (written == ENOENT && !(written = native_gpu_addon_parents(p, scratch, logging_paths[i]))) {
@@ -392,7 +420,7 @@
  coachz_audio_prepare(proc_t p, user_addr_t scratch)
  {
  	static const char *const directories[] = {"/private/var/coachz", "/private/var/coachz/audio", "/private/var/coachz/audio/CoachzAudio.driver",
-@@ -8965,6 +9168,10 @@
+@@ -8965,6 +9196,10 @@
  	     * registered, so its first caller waits forever; identityservicesd and CommCenter are UniXNU's first-boot XPC wait
  	     * cycle; accessoryupdaterd keeps trustd checking certificates. A disabled job's clients get no answer at once. */
  	    "<plist version=\"1.0\"><dict><key>com.apple.watchdogd</key><true/><key>com.apple.fairplayd.A2</key><true/><key>com.apple.accessoryupdaterd</key><true/><key>com.apple.identityservicesd</key><true/><key>com.apple.CommCenter</key><true/></dict></plist>\n";
@@ -403,7 +431,7 @@
  	int disable = 0;
  	int error;
  
-@@ -8972,7 +9179,7 @@
+@@ -8972,7 +9207,7 @@
  		return 0;
  	}
  	error = coachz_watchdog_policy_file("/private/var/db/com.apple.xpc.launchd/disabled.plist",
@@ -412,7 +440,7 @@
  	if (!error) {
  		/* Prevent first-boot migration from replacing the deliberately installed override. */
  		error = coachz_watchdog_policy_file("/private/var/db/com.apple.xpc.launchd/disabled.migrated", "", 0);
-@@ -9282,6 +9489,7 @@
+@@ -9282,6 +9517,7 @@
  		coachz_setup_prepare();
  		coachz_audio_prepare(p, scratch);
  		coachz_gpu_prepare(p, scratch);

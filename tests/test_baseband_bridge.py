@@ -102,6 +102,31 @@ class BasebandBridgeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             screen.pack(b'', b'', 0, 0, baseband=True)   # the bridge needs the prelinked kernel
 
+    def test_cellular_compat_branch(self):
+        sys.path.insert(0, str(ROOT / 'tools'))
+        try:
+            import coachz_cellular_compat as compat
+        finally:
+            sys.path.remove(str(ROOT / 'tools'))
+        image = bytearray(0x100 + len(compat.ORIGINAL_GUARD))
+        struct.pack_into('<8I', image, 0, 0xfeedfacf, 0x100000c, 0, 2, 2, 96, 0, 0)
+        struct.pack_into('<II16s4Q4I', image, 32, 0x19, 72, b'__TEXT', compat.GUARD_ADDRESS,
+                         len(compat.ORIGINAL_GUARD), 0x100, len(compat.ORIGINAL_GUARD), 5, 5, 0, 0)
+        struct.pack_into('<II16s', image, 104, 0x1b, 24, compat.SOURCE_UUID)
+        image[0x100:] = compat.ORIGINAL_GUARD
+        self.assertEqual(compat.guard_offset(image), 0x100)
+        with self.assertRaises(ValueError):
+            compat.validate_compat(image)
+        at = 0x100 + compat.BRANCH_ADDRESS - compat.GUARD_ADDRESS
+        image[at:at + 4] = compat.COMPAT_BRANCH
+        compat.validate_compat(image)
+        instruction = struct.unpack_from('<I', image, at)[0]
+        self.assertEqual(instruction >> 26, 5)
+        self.assertEqual(compat.BRANCH_ADDRESS + 4 * (instruction & 0x3ffffff), 0x100fa5aa0)
+        image[112] ^= 1
+        with self.assertRaises(ValueError):
+            compat.validate_compat(image)
+
     def test_firmware_follows_the_modem_files(self):
         sys.path.insert(0, str(ROOT / 'tools'))
         try:
