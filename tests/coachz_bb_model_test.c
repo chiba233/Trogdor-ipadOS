@@ -534,20 +534,30 @@ static void esim_answer(uint32_t now, const uint8_t *tlvs, uint32_t n, uint32_t 
     esim.req_len = 0;
     CHECK(cbe_answer(&esim, s, 14 + n, now));
 }
-static void esim_slots(uint32_t now, uint32_t active)
+static void esim_slots_card(uint32_t now, uint32_t active, uint32_t euicc, uint32_t card)
 {
     uint8_t t[96], st[21] = { 2 }, info[15] = { 2 }, eid[19] = { 2, 0, 16 };
     for (unsigned i = 0; i < 2; i++) {
-        cbd_wr32(st + 1 + 10 * i, 2); cbd_wr32(st + 5 + 10 * i, i == active);
+        cbd_wr32(st + 1 + 10 * i, i == euicc || card ? 2 : 1); cbd_wr32(st + 5 + 10 * i, i == active);
         st[9 + 10 * i] = i == active ? 1 : 0;
     }
-    /* Two present cards, slot two an eUICC. Its EID is a synthetic byte sequence. */
-    info[14] = 1;
-    for (unsigned i = 3; i < sizeof eid; i++) eid[i] = (uint8_t)(0xa0 + i);
+    /* Two present cards. The eUICC's EID is a synthetic byte sequence. */
+    info[7 + 7 * euicc] = 1;
+    memset(eid + 1, 0, sizeof eid - 1);
+    eid[1 + euicc] = 16;
+    for (unsigned i = 0; i < 16; i++) eid[2 + euicc + i] = (uint8_t)(0xa0 + i);
     uint32_t n = cbd_tlv(t, sizeof t, 0x10, st, sizeof st);
     n += cbd_tlv(t + n, sizeof t - n, 0x11, info, sizeof info);
     n += cbd_tlv(t + n, sizeof t - n, 0x12, eid, sizeof eid);
     esim_answer(now, t, n, 0);
+}
+static void esim_slots_layout(uint32_t now, uint32_t active, uint32_t euicc)
+{
+    esim_slots_card(now, active, euicc, 1);
+}
+static void esim_slots(uint32_t now, uint32_t active)
+{
+    esim_slots_layout(now, active, 1);
 }
 static void esim_reset(void)
 {
@@ -591,6 +601,20 @@ static void esim_open(void)
     esim_answer(6006, ch, sizeof ch, 0);
     CHECK(esim.step == CBE_S_APDU && esim.channel_open);
 }
+/* The fresh card status every restore publishes (cbe_restore), delivered as coachz_baseband.cpp does: card state 1 present, 0 absent. */
+static const uint8_t *esim_card_publish(uint32_t now, uint8_t state)
+{
+    CHECK(esim.step == CBE_S_CARD_STATUS && esim.wait_msg == CBE_UIM_GET_CARD_STATUS && esim.freeze);
+    const uint8_t card[] = { 0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1, state, 0, 0, 0, 0, 0 };
+    static uint8_t published[CBE_CARD_BYTES];
+    uint8_t tlvs[32];
+    esim_answer(now, tlvs, cbd_tlv(tlvs, sizeof tlvs, 0x10, card, sizeof card), 0);
+    CHECK(esim.card_status_len && esim.card_status_len <= sizeof published);
+    CHECK(esim.card_status[0] == CBQ_QMI_INDICATION && cbd_rd16(esim.card_status + 3) == CBE_UIM_CARD_STATUS_CHANGE);
+    memcpy(published, esim.card_status, esim.card_status_len);
+    esim.card_status_len = 0; esim.needs_card = esim.freeze = 0;
+    return published;
+}
 static void esim_restore(uint32_t now)
 {
     if (esim.session == CBE_SESSION_BATCH && esim.step == CBE_S_IDLE) {
@@ -603,7 +627,9 @@ static void esim_restore(uint32_t now)
     esim_answer(now + 1, NULL, 0, 0);
     cbe_tick(&esim, now + 6001);
     esim_slots(now + 6002, 0);
-    CHECK(esim.step == CBE_S_IDLE && !esim.freeze && !esim.route_failed && esim.slots.active == 1);
+    CHECK(!esim.route_failed && esim.slots.active == 1);
+    esim_card_publish(now + 6003, 1);
+    CHECK(esim.step == CBE_S_IDLE && !esim.freeze);
 }
 static void esim_apdu_response(uint32_t now, const uint8_t *data, uint32_t n, uint8_t sw1, uint8_t sw2)
 {
@@ -870,6 +896,248 @@ static void test_esim_cache(void)
     if (!failures) printf("PASS esim read-only query cache\n");
 }
 
+static void test_esim_selection(void)
+{
+    const uint8_t enable[] = { 0xbf, 0x31, 0 };
+    const uint8_t enabled[] = { 0xbf, 0x31, 3, 0x80, 1, 0 };
+    const uint8_t denied[] = { 0xbf, 0x31, 3, 0x80, 1, 2 };
+    const uint8_t disabled[] = { 0xbf, 0x32, 3, 0x80, 1, 0 };
+    uint8_t out[2048], channel, caps[2];
+    uint32_t len;
+    CHECK(cbe_profile_result(CBE_TAPE_ENABLE, enabled, sizeof enabled) == 0);
+    CHECK(cbe_profile_result(CBE_TAPE_ENABLE, denied, sizeof denied) == 2);
+    CHECK(cbe_profile_result(CBE_TAPE_ENABLE, disabled, sizeof disabled) == UINT32_MAX);
+    CHECK(cbe_profile_result(CBE_TAPE_ENABLE, enabled, sizeof enabled - 1) == UINT32_MAX);
+
+    /* SW9000 with a nonzero ES10c result still restores the physical SIM. */
+    esim_reset();
+    esim_tape_command(CBE_TAPE_ENABLE, 9, enable, sizeof enable, 1, 0, 2); esim_open();
+    esim_apdu_response(6007, denied, sizeof denied, 0x90, 0);
+    esim_restore(6008);
+    CHECK(esim.selected_phys == 1 && esim.route_generation == 0 && !esim.needs_card);
+    CHECK(esim.done_len == sizeof denied && !memcmp(esim.resp, denied, sizeof denied));
+
+    /* A real EnableProfile result keeps the eUICC mapped, then asks for fresh card status. */
+    esim_reset();
+    esim_tape_command(CBE_TAPE_ENABLE, 9, enable, sizeof enable, 1, 0, 2); esim_open();
+    esim_apdu_response(6007, enabled, sizeof enabled, 0x90, 0);
+    CHECK(esim.route_commit && esim.restore_phys == 2 && esim.selected_phys == 1);
+    esim_answer(6008, NULL, 0, 0); CHECK(esim.step == CBE_S_RESTORE_SETTLE);
+    cbe_tick(&esim, 12008); esim_slots(12009, 1);
+    CHECK(esim.selected_phys == 2 && esim.route_generation == 1 && esim.freeze);
+    CHECK(esim.step == CBE_S_CARD_STATUS && esim.wait_msg == CBE_UIM_GET_CARD_STATUS && esim.switches == 1);
+    CHECK(!cbe_output(&esim, &channel, out, sizeof out));
+    /* The indication keeps the modem's card and application states, strips the response result and keeps the original Tape
+     * management slot across the radio-route change. With the eUICC selected its record moves to endpoint two, and endpoint one
+     * (the physical card, present) carries presence only (coachz_bb_slots.h). */
+    const uint8_t card[] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1, 1, 0, 0, 0, 0, 0 };
+    uint8_t tlvs[32];
+    const uint32_t tlv_len = cbd_tlv(tlvs, sizeof tlvs, 0x10, card, sizeof card);
+    esim_answer(12010, tlvs, tlv_len, 0);
+    CHECK(esim.card_status_len && esim.freeze && !cbe_output(&esim, &channel, out, sizeof out));
+    CHECK(esim.card_status[0] == CBQ_QMI_INDICATION && cbd_rd16(esim.card_status + 3) == CBE_UIM_CARD_STATUS_CHANGE);
+    const uint8_t *value = cbd_find(esim.card_status, esim.card_status_len, 0x10, &len);
+    CHECK(value && len == sizeof card + 6u && value[8] == 2 && !memcmp(value, card, 8));
+    CHECK(value && value[9] == 1 && !value[14] && !memcmp(value + 15, card + 9, sizeof card - 9));
+    CHECK(esim.card_mapped == 1);
+    CHECK(!cbd_find(esim.card_status, esim.card_status_len, 0x02, &len));
+    value = cbd_find(esim.card_status, esim.card_status_len, CBE_UIM_CAPABILITY_TLV, &len);
+    CHECK(value && len == 2 && value[0] == CBE_CAP_NONE && value[1] == CBE_CAP_TAPE);
+    esim.card_status_len = 0; esim.needs_card = esim.freeze = 0; esim_drain();
+    cbe_caps(&esim, caps); CHECK(caps[0] == 0 && caps[1] == 2);
+    /* Existing clients still address EID to the same endpoint after the switch. */
+    uint8_t eid_request[24] = { 0 }, eid_header[] = { 3, 0, 0, 0, 2 };
+    uint32_t eid_len = cbd_tlv(eid_request + 7, sizeof eid_request - 7, 1, eid_header, sizeof eid_header);
+    cbd_request(eid_request, 38, CBE_VINYL_TAPE_EID, eid_len);
+    const uint32_t eid_answer = cbe_host(&esim, 1, 9, eid_request, eid_len + 7, out, sizeof out, 12050);
+    CHECK(eid_answer && eid_answer != CBE_DEFERRED && !cbd_error(out + CBQ_HDR, eid_answer - CBQ_HDR));
+    value = cbd_find(out + CBQ_HDR, eid_answer - CBQ_HDR, 0x11, &len);
+    CHECK(value && len == 16 && !memcmp(value, esim.slots.eid, len));
+
+    /* A subsequent management operation on the selected eUICC must not resurrect
+     * the boot-time physical mapping. Replay the original management slot two. */
+    uint8_t query_request[64] = { 0 }, query_header[] = { 13, 2, 0, 0, 0, 2 };
+    const uint8_t query_payload[] = { 1, 1, 0, 0, 0, 0xbf, 0x2d, 0 };
+    uint32_t query_len = cbd_tlv(query_request + 7, sizeof query_request - 7, 1, query_header, sizeof query_header);
+    query_len += cbd_tlv(query_request + 7 + query_len, sizeof query_request - 7 - query_len, 0x10, query_payload, sizeof query_payload);
+    cbd_request(query_request, 39, CBE_VINYL_TAPE, query_len);
+    CHECK(cbe_host(&esim, 1, 9, query_request, query_len + 7, out, sizeof out, 12100));
+    cbe_tick(&esim, 12101);
+    const uint8_t logical_channel[] = { 0x10, 1, 0, 1 };
+    esim_answer(12102, logical_channel, sizeof logical_channel, 0);
+    const uint8_t profiles[] = { 0xbf, 0x2d, 2, 0xa0, 0 };
+    esim_apdu_response(12103, profiles, sizeof profiles, 0x90, 0);
+    esim_drain(); cbe_tick(&esim, esim.session_deadline);
+    esim_answer(15104, NULL, 0, 0);
+    CHECK(esim.selected_phys == 2 && esim.switches == 1 && esim.step == CBE_S_IDLE && !esim.freeze);
+
+    /* Disabling an active eSIM uses the same management slot, selects the physical
+     * route and waits for confirmation. */
+    uint8_t request[64] = { 0 }, header[] = { CBE_TAPE_DISABLE, 1, 0, 0, 0, 2 };
+    const uint8_t payload[] = { 1, 1, 0, 0, 0, 0xbf, 0x32, 0 };
+    uint32_t n = cbd_tlv(request + 7, sizeof request - 7, 1, header, sizeof header);
+    n += cbd_tlv(request + 7 + n, sizeof request - 7 - n, 0x10, payload, sizeof payload);
+    cbd_request(request, 40, CBE_VINYL_TAPE, n);
+    CHECK(cbe_host(&esim, 1, 9, request, n + 7, out, sizeof out, 16000));
+    cbe_tick(&esim, 16001); CHECK(esim.step == CBE_S_OPEN && esim.freeze);
+    esim_answer(16002, logical_channel, sizeof logical_channel, 0);
+    esim_apdu_response(16003, disabled, sizeof disabled, 0x90, 0);
+    CHECK(esim.route_commit && esim.restore_phys == 1);
+    esim_answer(16004, NULL, 0, 0); CHECK(esim.step == CBE_S_RESTORE);
+    esim_answer(16005, NULL, 0, 0);
+    cbe_tick(&esim, 22005); esim_slots(22006, 0);
+    CHECK(esim.selected_phys == 1 && esim.route_generation == 2 && esim.step == CBE_S_CARD_STATUS);
+    /* A failed fresh status query does not unfreeze data onto an unreported SIM. */
+    esim_answer(22007, NULL, 0, CBE_ERR_INTERNAL);
+    CHECK(esim.route_failed && esim.needs_card && !esim.slots.known && esim.done_status);
+    const uint8_t start_network[] = { 0, 1, 0, 0x20, 0, 0, 0 };
+    CHECK(cbe_blocks_data_start(&esim, CBD_SVC_WDS, start_network, sizeof start_network));
+    esim_drain(); cbe_tick(&esim, 27007); esim_slots(27008, 0);
+    CHECK(esim.step == CBE_S_CARD_STATUS && esim.freeze && !esim.route_failed);
+    CHECK(esim.route_generation == 2);
+    esim_answer(27009, tlvs, tlv_len, 0);
+    CHECK(esim.card_status_len && esim.freeze && !esim.done_pending);
+
+    /* Reverse the physical order: eUICC first, initially active physical SIM second.
+     * Selection is derived from modem metadata, never a physical-slot constant. */
+    cbe_init(&esim, esim_in, sizeof esim_in, esim_resp, sizeof esim_resp);
+    cbe_tick(&esim, 0); esim_slots_layout(1, 1, 0);
+    CHECK(esim.selected_phys == 2 && esim.physical_phys == 2 && esim.slots.euicc == 1);
+    esim_tape_command(CBE_TAPE_ENABLE, 9, enable, sizeof enable, 1, 0, 2);
+    cbe_tick(&esim, 3);
+    value = cbd_find(esim.req, esim.req_len, 2, &len);
+    CHECK(value && len == 4 && cbd_rd32(value) == 1);
+    esim_answer(4, NULL, 0, 0); cbe_tick(&esim, 6004); esim_slots_layout(6005, 0, 0);
+    esim_answer(6006, logical_channel, sizeof logical_channel, 0);
+    esim_apdu_response(6007, enabled, sizeof enabled, 0x90, 0);
+    esim_answer(6008, NULL, 0, 0); cbe_tick(&esim, 12008); esim_slots_layout(12009, 0, 0);
+    CHECK(esim.selected_phys == 1 && esim.route_generation == 1 && esim.step == CBE_S_CARD_STATUS);
+
+    /* A bridge restart with the eUICC already mapped also retains endpoint two. */
+    cbe_init(&esim, esim_in, sizeof esim_in, esim_resp, sizeof esim_resp);
+    cbe_tick(&esim, 0); esim_slots_layout(1, 0, 0);
+    cbe_caps(&esim, caps);
+    CHECK(esim.selected_phys == 1 && caps[0] == 0 && caps[1] == CBE_CAP_TAPE);
+
+    /* Legacy unknown commands expose only the command/transaction/slot metadata. */
+    esim_reset();
+    header[0] = 0x14; header[5] = 2;
+    n = cbd_tlv(request + 7, sizeof request - 7, 2, header, sizeof header);
+    cbd_request(request, 41, CBE_VINYL_COMMAND, n);
+    CHECK(!cbe_host(&esim, 1, 9, request, n + 7, out, sizeof out, 2));
+    int observed = 0;
+    struct cbe_event event;
+    while (cbe_take_event(&esim, &event))
+        if (event.kind == CBE_EV_COMMAND) {
+            CHECK(event.a == 0x14 && event.c == 2 && event.d == CBQ_ERR_NOT_SUPPORTED);
+            observed++;
+        }
+    CHECK(observed == 1);
+}
+
+/* A SIM card pulled while an eSIM query had the eUICC mapped: the modem finds the empty slot only when the restore powers it up, and
+ * the indication it raises then falls inside the dropped window, so the restore publishes the real status (cbe_restore). */
+static void test_esim_pulled(void)
+{
+    const uint8_t enable[] = { 0xbf, 0x31, 0 };
+    const uint8_t denied[] = { 0xbf, 0x31, 3, 0x80, 1, 2 };
+    uint32_t len;
+    esim_reset();
+    esim_tape_command(CBE_TAPE_ENABLE, 9, enable, sizeof enable, 1, 0, 2); esim_open();
+    esim_apdu_response(6007, denied, sizeof denied, 0x90, 0);
+    if (esim.session == CBE_SESSION_BATCH && esim.step == CBE_S_IDLE) cbe_tick(&esim, esim.session_deadline);
+    CHECK(esim.step == CBE_S_CLOSE);
+    esim_answer(20000, NULL, 0, 0); CHECK(esim.step == CBE_S_RESTORE && esim.needs_card);
+    esim_answer(20001, NULL, 0, 0); cbe_tick(&esim, 26001);
+    esim_slots_card(26002, 0, 1, 0);
+    CHECK(esim.selected_phys == 1 && esim.route_generation == 0 && !esim.route_failed);
+    const uint8_t *published = esim_card_publish(26003, 0);
+    const uint8_t *value = cbd_find(published, 7u + cbd_rd16(published + 5), 0x10, &len);
+    CHECK(value && len == 15 && value[8] == 1 && value[9] == 0);
+    CHECK(esim.step == CBE_S_IDLE && !esim.freeze);
+}
+
+/* CommCenter's endpoints against the modem's logical slot (coachz_bb_slots.h). */
+static void test_endpoint_slots(void)
+{
+    const int before = failures;
+    /* The modem's status with the eUICC's enabled profile in logical slot one: GW primary application 0 on card 0, Ready. */
+    static const uint8_t aid[] = { 0xa0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02 };
+    uint8_t card[9 + 6 + 14 + sizeof aid], out[96], request[64], mapped[64];
+    uint32_t n = 0;
+    card[n++] = 0x00; card[n++] = 0x00;                                    /* GW primary: application 0, card 0 */
+    for (unsigned i = 0; i < 6; i++) card[n++] = 0xff;                     /* 1x primary, GW and 1x secondary: none */
+    card[n++] = 1;                                                         /* one card */
+    card[n++] = 1; card[n++] = 0; card[n++] = 3; card[n++] = 10; card[n++] = 0; card[n++] = 1;   /* present, one application */
+    card[n++] = 2; card[n++] = 7; card[n++] = 0; card[n++] = 0; card[n++] = 0; card[n++] = 0;    /* USIM, ready */
+    card[n++] = sizeof aid; memcpy(card + n, aid, sizeof aid); n += sizeof aid;
+    for (unsigned i = 0; i < 7; i++) card[n++] = i == 1 ? 1 : 0;
+    CHECK(n == sizeof card);
+    const struct cbl_view esim_on = { 2, 1, { 1, 1 } }, physical_on = { 1, 1, { 1, 1 } }, bad = { 3, 1, { 0, 0 } };
+    CHECK(!cbl_swapped(&physical_on) && cbl_swapped(&esim_on) && !cbl_swapped(&bad));
+    uint32_t m = cbl_card_status(&esim_on, card, sizeof card, out, sizeof out);
+    CHECK(m == sizeof card + 6u && out[8] == 2);
+    CHECK(cbd_rd16(out) == 0x0100u && cbd_rd16(out + 2) == 0xffffu && cbd_rd16(out + 6) == 0xffffu);   /* application 0 on card 1 */
+    CHECK(out[9] == 1 && !out[14]);                                         /* endpoint one: present, no applications */
+    CHECK(!memcmp(out + 15, card + 9, sizeof card - 9));                   /* endpoint two: the modem's record, unchanged */
+    const struct cbl_view absent = { 2, 1, { 0, 1 } };
+    m = cbl_card_status(&absent, card, sizeof card, out, sizeof out);
+    CHECK(m == sizeof card + 6u && out[9] == 0);
+    CHECK(!cbl_card_status(&esim_on, card, sizeof card - 1, out, sizeof out));      /* truncated application */
+    CHECK(!cbl_card_status(&esim_on, card, sizeof card, out, sizeof card));         /* no room for the presence record */
+    card[1] = 1;                                                                  /* an index naming card 1, which is not there */
+    CHECK(!cbl_card_status(&esim_on, card, sizeof card, out, sizeof out));
+    card[1] = 0;
+
+    /* Send APDU for endpoint two goes to logical slot one; for endpoint one it is not ready; others pass. */
+    static const uint8_t apdu[] = { 0x80, 0xe2, 0x91, 0x00, 0x00 };
+    uint8_t slot = 2;
+    uint32_t len = 7;
+    request[0] = 0; cbd_wr16(request + 1, 0x21); cbd_wr16(request + 3, 0x3b);
+    len += cbd_tlv(request + len, sizeof request - len, 0x01, &slot, 1);
+    len += cbd_tlv(request + len, sizeof request - len, 0x02, apdu, sizeof apdu);
+    cbd_wr16(request + 5, len - 7);
+    CHECK(cbl_uim_request(&esim_on, request, len, mapped, sizeof mapped) == CBL_CHANGED);
+    uint32_t got = 0;
+    const uint8_t *selector = cbd_find(mapped, len, 0x01, &got);
+    CHECK(selector && got == 1 && selector[0] == 1 && !memcmp(mapped + 7 + 4, request + 7 + 4, len - 11));
+    request[7 + 3] = 1;
+    CHECK(cbl_uim_request(&esim_on, request, len, mapped, sizeof mapped) == CBL_INACTIVE);
+    CHECK(cbl_uim_request(&physical_on, request, len, mapped, sizeof mapped) == CBL_UNCHANGED);
+    CHECK(cbl_uim_request(&esim_on, request, len, mapped, len - 1) == CBL_MALFORMED);
+
+    /* Read Transparent on the card session of slot two (type 7) uses slot one's (6); the primary session (0) is not renumbered. */
+    uint8_t session[2] = { 7, 0 };
+    len = 7; cbd_wr16(request + 3, 0x20);
+    len += cbd_tlv(request + len, sizeof request - len, 0x01, session, 2);
+    cbd_wr16(request + 5, len - 7);
+    CHECK(cbl_uim_request(&esim_on, request, len, mapped, sizeof mapped) == CBL_CHANGED && mapped[10] == 6);
+    request[10] = 0;
+    CHECK(cbl_uim_request(&esim_on, request, len, mapped, sizeof mapped) == CBL_UNCHANGED);
+    request[10] = 6;
+    CHECK(cbl_uim_request(&esim_on, request, len, mapped, sizeof mapped) == CBL_INACTIVE);
+    request[10] = 10;
+    CHECK(cbl_uim_request(&esim_on, request, len, mapped, sizeof mapped) == CBL_INACTIVE);
+
+    /* Change Provisioning Session: the primary GW session stays, its application's slot two becomes slot one. */
+    const uint8_t change[2] = { 0, 1 }, app[3] = { 2, 1, 0xa0 };
+    len = 7; cbd_wr16(request + 3, 0x38);
+    len += cbd_tlv(request + len, sizeof request - len, 0x01, change, 2);
+    len += cbd_tlv(request + len, sizeof request - len, 0x10, app, 3);
+    cbd_wr16(request + 5, len - 7);
+    CHECK(cbl_uim_request(&esim_on, request, len, mapped, sizeof mapped) == CBL_CHANGED);
+    const uint8_t *app_out = cbd_find(mapped, len, 0x10, &got);
+    selector = cbd_find(mapped, len, 0x01, &got);
+    CHECK(app_out && app_out[0] == 1 && selector && selector[0] == 0);
+    request[len - 3] = 1;   /* the application on slot one, while the eUICC is the active card */
+    CHECK(cbl_uim_request(&esim_on, request, len, mapped, sizeof mapped) == CBL_INACTIVE);
+
+    /* Messages without a slot or session selector are left alone. */
+    len = 7; cbd_wr16(request + 3, 0x2f); cbd_wr16(request + 5, 0);
+    CHECK(cbl_uim_request(&esim_on, request, len, mapped, sizeof mapped) == CBL_UNCHANGED);
+    if (failures == before) printf("PASS endpoint slot mapping\n");
+}
+
 int main(void)
 {
     test_qmux();
@@ -881,5 +1149,8 @@ int main(void)
     test_data();
     test_esim();
     test_esim_cache();
+    test_esim_selection();
+    test_esim_pulled();
+    test_endpoint_slots();
     return failures ? 1 : 0;
 }

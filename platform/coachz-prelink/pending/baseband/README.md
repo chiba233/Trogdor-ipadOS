@@ -4,6 +4,8 @@
 
 ## 文件
 
+- `coachz_bb_esim.h`：VINYL Tape 到真实 eUICC 的 UIM/APDU 桥接。Tape 管理入口固定在槽 2，物理切槽不改变既有配置和排队命令的目标。选卡修订区分管理操作的临时映射与联网选卡，解析 ES10c BF31／BF32 的真实结果后才请求保留 eUICC 或切回实体卡，并在映射复查后查询、发布真实 Card Status。切换时清除旧卡身份缓存，旧映射下排队的 UIM 请求返回忙，避免对另一张卡执行。新增非敏感命令、结果、映射和状态刷新事件。主机模型覆盖两种物理槽位顺序、卡片拒绝、查询保留选卡和刷新失败，界面切换及 eSIM 联网仍待实机验收。
+- `coachz_bb_slots.h`：CommCenter 的两个卡端点和 modem 逻辑槽的对应。eSIM 管理固定在端点二，而这台 modem 把当前用的卡报在逻辑槽一；选中 eUICC 时，Card Status 的卡记录和各应用索引的卡字节换到端点二，另一端点只带物理在位；CommCenter 发往端点二的槽和卡会话（类型 4 到 9）换成 modem 的逻辑槽，发往非活动端点的请求回 DEVICE_NOT_READY。主会话号不改，跟着应用索引走。选中实体卡时不做任何转换，保持实机已通的路径。直接转发和放行被扣住的 UIM 请求两条路径都经过它。格式取自 libqmi 的 UIM Card Status；实机未验收。
 - `coachz_bb_qmux.h`：qmux1/qmux2 上的 QMUX 与 modem 的 QRTR 互转。普通服务只去掉或加回 6 字节 QMUX 头；CTL 在这里应答（GetClientId 按通道和服务分配客户端号，每个客户端占一个本地 QRTR 端口，从 0x4100 起；ReleaseClientId 和 Sync 释放，释放的端口要发 DEL_CLIENT）。苹果私有服务（0xe1 到 0xea）的请求交回调用者，暂时一律回 `QMI_ERR_NOT_SUPPORTED`。
 - `coachz_bb_data.h`：这台 modem 的数据口和激活。CommCenter 绑定数据口时填苹果 PCIe 基带的端点 `{3, 4}` 或只给 mux id，这里换成或补上 IPA 的 `{4, 1}`（WDS 0xa2、QOS 0x2b、WDA 0x20/0x21）。CommCenter 第一次要 WDS 客户端时，桥接层用自己的客户端照 ModemManager 对 IPA 的顺序发 DPM Open Port 和 WDA Set Data Format（QMAPv4，不行再 QMAP）。BSP 的 ActivationRegister（0xb00c）回成功并发 kActivated 指示。
 - `coachz_bb_sahara.h`：sahara 通道上扮演 modem 的设备端。发 HELLO，按 ELF 头、程序头、各段请求列出的镜像，收到的数据丢弃，最后一个镜像的 DONE 应答报完成。 主机回模式 3 时走命令模式（芯片 ID、序列号，再切回模式 0）。`pbl` 通道的方法 5 读 BHI 寄存器（0 序列号、3 MSM ID、4 PK hash），方法 4 `sendImage` 收下即丢。序列号是固定值，不用真实序列号。

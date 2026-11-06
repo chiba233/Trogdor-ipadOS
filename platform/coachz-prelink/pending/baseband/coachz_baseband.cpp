@@ -77,6 +77,7 @@ static int bb_esim_slot = -1;
 static bb_tx bb_uim_held[BB_TX];
 static uint32_t bb_uim_head, bb_uim_count;
 static uint8_t bb_uim_cid[BB_TX];
+static uint32_t bb_uim_generation[BB_TX];
 static uint8_t *bb_esim_in, *bb_esim_resp;
 #define BB_ESIM_BYTES (1024u * 1024u)
 
@@ -318,6 +319,34 @@ static void bb_pdp_note(uint32_t local_port, uint32_t cid, uint32_t channel, con
 
 static void bb_sim_request(const struct cbq_result &r, const uint8_t *sdu);
 
+// A UIM request from CommCenter while the eUICC is the selected card: its endpoint-two slot or card-session selector names the
+// modem's logical slot (coachz_bb_slots.h), and a request for the endpoint whose card is not active is answered as not ready.
+// 1 when it was queued translated or answered here, 0 to send it as it is.
+static uint8_t bb_uim_map[BB_FRAME_MAX];
+static uint32_t bb_uim_mapped, bb_uim_inactive;
+static int bb_uim_endpoint(uint32_t local_port, uint32_t node, uint32_t port, uint32_t channel, uint32_t cid,
+                           const uint8_t *sdu, uint32_t len)
+{
+  struct cbl_view v;
+  if (!cbe_slot_view(&bb_esim, &v)) return 0;
+  const enum cbl_request_result t = cbl_uim_request(&v, sdu, len, bb_uim_map, sizeof bb_uim_map);
+  const uint32_t message = (uint32_t)(sdu[3] | sdu[4] << 8);
+  if (t == CBL_CHANGED) {
+    if (++bb_uim_mapped <= 16 || !(bb_uim_mapped & (bb_uim_mapped - 1)))
+      printf("COACHZ baseband: UIM 0x%x for endpoint %u sent to logical slot %u (%u mapped)\n", message, v.active, v.logical, bb_uim_mapped);
+    bb_queue_tx(local_port, node, port, bb_uim_map, len);
+    return 1;
+  }
+  if (t == CBL_INACTIVE) {
+    if (++bb_uim_inactive <= 16 || !(bb_uim_inactive & (bb_uim_inactive - 1)))
+      printf("COACHZ baseband: UIM 0x%x for the inactive endpoint answered not ready (%u)\n", message, bb_uim_inactive);
+    const uint32_t n = cbq_private_answer(sdu, CBE_SVC_UIM, cid, CBL_ERR_DEVICE_NOT_READY, nullptr, 0, bb_out, sizeof bb_out);
+    if (n) bb_push(channel ? CBH_QMUX2 : CBH_QMUX1, bb_out, n);
+    return 1;
+  }
+  return 0;
+}
+
 // A request for the modem, with the data port named as this modem has it.
 static void bb_to_modem(const struct cbq_result &r, const uint8_t *sdu)
 {
@@ -329,7 +358,6 @@ static void bb_to_modem(const struct cbq_result &r, const uint8_t *sdu)
     return;
   }
   if (r.service == CBD_SVC_WDS) bb_pdp_note(r.local_port, r.cid, r.channel, sdu, r.len);
-  bb_sim_request(r, sdu);
   if (r.service == CBE_SVC_UIM && bb_esim.route_failed) {
     const uint32_t n = cbq_private_answer(sdu, r.service, r.cid, CBE_ERR_INTERNAL, nullptr, 0, bb_out, sizeof bb_out);
     if (n) bb_push(r.channel ? CBH_QMUX2 : CBH_QMUX1, bb_out, n);
@@ -343,12 +371,15 @@ static void bb_to_modem(const struct cbq_result &r, const uint8_t *sdu)
       const uint32_t slot = (bb_uim_head + bb_uim_count++) % BB_TX;
       bb_uim_held[slot] = { r.local_port, r.node, r.port, r.len, copy };
       bb_uim_cid[slot] = r.cid;
+      bb_uim_generation[slot] = bb_esim.route_generation;
     } else {
       const uint32_t n = cbq_private_answer(sdu, r.service, r.cid, CBE_ERR_DEVICE_IN_USE, nullptr, 0, bb_out, sizeof bb_out);
       if (n) bb_push(r.channel ? CBH_QMUX2 : CBH_QMUX1, bb_out, n);
     }
     return;
   }
+  bb_sim_request(r, sdu);
+  if (r.service == CBE_SVC_UIM && bb_uim_endpoint(r.local_port, r.node, r.port, r.channel, r.cid, sdu, r.len)) return;
   const struct cbd_fix f = cbd_endpoint_fix(r.service, sdu, r.len, bb_fix, sizeof bb_fix);
   if (!f.len) {
     bb_queue_tx(r.local_port, r.node, r.port, sdu, r.len);
@@ -362,6 +393,34 @@ static void bb_to_modem(const struct cbq_result &r, const uint8_t *sdu)
 
 // eSIM control runs on the same QRTR owner as the other QMI traffic (bb_lock held).
 // Only explicit VINYL commands may switch slots or send an APDU. Idle discovery reads slot status.
+static void bb_sim_route_changed(void);
+
+static void bb_esim_publish_card(void)
+{
+  static uint32_t generation, next_client;
+  if (generation != bb_esim.route_generation) {
+    generation = bb_esim.route_generation;
+    bb_sim_route_changed();
+  }
+  if (!bb_esim.card_status_len) { next_client = 0; return; }
+  for (; next_client < CBQ_MAX_CLIENTS; next_client++) {
+    const struct cbq_client &client = bb_qmux.client[next_client];
+    if (!client.used || client.channel == CBQ_INTERNAL || client.service != CBE_SVC_UIM) continue;
+    const uint32_t channel = client.channel ? CBH_QMUX2 : CBH_QMUX1;
+    if (bb_ch[channel].count == BB_QUEUE) return;
+    cbq_frame_header(bb_out, bb_esim.card_status_len, CBE_SVC_UIM, client.cid);
+    memcpy(bb_out + CBQ_HDR, bb_esim.card_status, bb_esim.card_status_len);
+    const uint32_t queued = bb_ch[channel].count;
+    bb_push(channel, bb_out, CBQ_HDR + bb_esim.card_status_len);
+    if (bb_ch[channel].count == queued) return;
+  }
+  printf("COACHZ baseband: selected physical slot %u generation %u, fresh card status published\n",
+         bb_esim.selected_phys, generation);
+  next_client = 0;
+  bb_esim.card_status_len = 0;
+  bb_esim.needs_card = bb_esim.freeze = 0;
+}
+
 static void bb_esim_step(void)
 {
   if (!bb_esim_in || !bb_esim_resp) return;
@@ -376,7 +435,26 @@ static void bb_esim_step(void)
     const uint32_t index = held.local_port - CBQ_PORT_BASE;
     if (index < CBQ_MAX_CLIENTS && bb_qmux.client[index].used && bb_qmux.client[index].service == CBE_SVC_UIM &&
         bb_qmux.client[index].cid == bb_uim_cid[bb_uim_head]) {
-      bb_txq[(bb_tx_head + bb_tx_count++) % BB_TX] = held;
+      const struct cbq_client &client = bb_qmux.client[index];
+      if (bb_uim_generation[bb_uim_head] != bb_esim.route_generation) {
+        // A queued operation addressed the old SIM. Make its caller retry after the
+        // fresh status, instead of executing it against a different physical card.
+        const uint32_t channel = client.channel ? CBH_QMUX2 : CBH_QMUX1;
+        if (bb_ch[channel].count == BB_QUEUE) break;
+        const uint32_t n = cbq_private_answer(held.data, CBE_SVC_UIM, client.cid,
+                                             CBE_ERR_DEVICE_IN_USE, nullptr, 0, bb_out, sizeof bb_out);
+        const uint32_t queued = bb_ch[channel].count;
+        if (n) bb_push(channel, bb_out, n);
+        if (bb_ch[channel].count == queued) break;
+        IOFreeData(held.data, held.len);
+      } else {
+        const struct cbq_result request = { CBQ_TO_MODEM, held.len, held.node, held.port,
+                                            held.local_port, client.channel, client.service, client.cid };
+        bb_sim_request(request, held.data);
+        if (bb_uim_endpoint(held.local_port, held.node, held.port, client.channel, client.cid, held.data, held.len))
+          IOFreeData(held.data, held.len);
+        else bb_txq[(bb_tx_head + bb_tx_count++) % BB_TX] = held;
+      }
     } else IOFreeData(held.data, held.len);
     bb_uim_head = (bb_uim_head + 1) % BB_TX; bb_uim_count--;
   }
@@ -391,6 +469,7 @@ static void bb_esim_step(void)
       cbq_client_find(&bb_qmux, bb_esim.session_channel, CBE_SVC_VINYL, bb_esim.session_cid) < 0)
     cbe_session_release(&bb_esim, now, 2);
   cbe_tick(&bb_esim, now);
+  bb_esim_publish_card();
   if (bb_esim.req_len) {
     const uint32_t queued = bb_tx_count;
     bb_queue_tx(CBQ_PORT_BASE + (uint32_t)bb_esim_slot, server->node, server->port, bb_esim.req, bb_esim.req_len);
@@ -431,6 +510,16 @@ static void bb_activation_indicate(void)
 struct bb_sim_read { uint8_t used, channel, cid; uint16_t txn, file; };
 static bb_sim_read bb_sim_reads[8];
 static uint32_t bb_sim_next;
+static void bb_sim_route_changed(void)
+{
+  // A new radio selection must learn its own identity. Late EF replies from the old
+  // route no longer match an outstanding read and cannot repopulate this cache.
+  bzero(bb_sim_reads, sizeof bb_sim_reads);
+  bzero(bb_iccid, sizeof bb_iccid);
+  bzero(bb_imsi, sizeof bb_imsi);
+  bb_iccid_known = bb_imsi_known = 0;
+  bb_activation_indicate();
+}
 static void bb_sim_request(const struct cbq_result &r, const uint8_t *sdu)
 {
   if (r.service != CBD_SVC_UIM) return;
