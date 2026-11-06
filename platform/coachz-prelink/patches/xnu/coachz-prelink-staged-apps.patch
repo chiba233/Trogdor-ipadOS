@@ -99,7 +99,7 @@
  	.vfs_setattr            = NULL,
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -8999,6 +8999,177 @@
+@@ -8999,6 +8999,253 @@
  	return 0;
  }
  
@@ -184,7 +184,11 @@
 +	return error;
 +}
 +
-+static const char coachz_ls_marker[] = "/private/var/db/.coachz-ls-built";
++/* -2 (k197): every plug-in under /Applications reached pkd with no containing bundle (LSPlugInKitProxy containingBundle nil, so
++ * PlugInKitDaemon rejected all 141: "plug-ins outside containing apps must be in /System", and the file providers never loaded). pkd
++ * itself suggests rebuilding the LaunchServices registration; a new marker name makes lsd rebuild once more with the current bindfs. */
++static const char coachz_ls_marker[] = "/private/var/db/.coachz-ls-built-2";
++static const char coachz_apps_reregistered[] = "/private/var/db/.coachz-apps-reregistered-1";
 +
 +/* Called about every ten seconds from the kernel's sampling thread. */
 +void coachz_staged_mark_built(void);
@@ -207,6 +211,64 @@
 +	printf("COACHZ staged apps: LaunchServices database kept from now on: %d\n", error);
 +}
 +
++static int
++coachz_owned_dir(proc_t p, user_addr_t scratch, const char *dir, uid_t uid, gid_t gid)
++{
++	/* An existing directory is only given its owner and mode; a missing one is made first (mkdir, as the audio patch does). */
++	struct vnode_attr attributes;
++	vnode_t vp = NULLVP;
++	int error = vnode_lookup(dir, 0, &vp, vfs_context_kernel());
++
++	if (error) {
++		struct mkdir_args request = {.path = scratch + 0xc00, .mode = 0755};
++		int32_t result = 0;
++		error = copyout(dir, request.path, strlen(dir) + 1);
++		if (!error) {
++			error = mkdir(p, &request, &result);
++		}
++		if (!error) {
++			error = vnode_lookup(dir, 0, &vp, vfs_context_kernel());
++		}
++		if (error) {
++			return error;
++		}
++	}
++	VATTR_INIT(&attributes);
++	VATTR_SET(&attributes, va_uid, uid);
++	VATTR_SET(&attributes, va_gid, gid);
++	VATTR_SET(&attributes, va_mode, 0755);
++	error = vnode_setattr(vp, &attributes, vfs_context_kernel());
++	vnode_put(vp);
++	return error;
++}
++
++static int
++coachz_bundle_dir(proc_t p, user_addr_t scratch)
++{
++	/* The move above takes the directory itself; containermanagerd and app installers (TrollStore lists it first) expect it to exist.
++	 * Recreated empty, with the owner and mode the moved one had (_installd 33:33, 0755). */
++	return coachz_owned_dir(p, scratch, "/private/var/containers/Bundle/Application", 33, 33);
++}
++
++static int
++coachz_jb_mobile_dir(proc_t p, user_addr_t scratch)
++{
++	/* Sileo (uid 501) keeps its database under /var/jb/var/mobile/Library/Caches/Sileo; the environment left /var/jb/var/mobile empty
++	 * and root-owned 0755, so it could not make that path and stopped at DatabaseManager.swift:39 (k195). The home and its Library and
++	 * Caches belong to mobile, as /var/mobile does. Nothing is made unless /var/jb/var already exists. */
++	static const char *const dirs[] = {"/private/var/jb/var/mobile", "/private/var/jb/var/mobile/Library", "/private/var/jb/var/mobile/Library/Caches"};
++	vnode_t vp = NULLVP;
++	int error = vnode_lookup("/private/var/jb/var", 0, &vp, vfs_context_kernel());
++
++	if (error) {
++		return error;
++	}
++	vnode_put(vp);
++	for (unsigned i = 0; i < sizeof(dirs) / sizeof(dirs[0]) && !error; i++) {
++		error = coachz_owned_dir(p, scratch, dirs[i], 501, 501);
++	}
++	return error;
++}
 +static void
 +coachz_staged_apps_prepare(proc_t p, user_addr_t scratch)
 +{
@@ -215,7 +277,7 @@
 +	char (*containers)[64] = kalloc_data(128 * 64, Z_WAITOK), (*files)[64] = kalloc_data(8 * 64, Z_WAITOK);
 +	char *path = kalloc_data(256, Z_WAITOK);
 +	unsigned count = 0, removed = 0, looked = 0;
-+	int semaphore_error, moved = 0, moved_store = 0, rebuilt = 1;
++	int semaphore_error, moved = 0, moved_store = 0, rebuilt = 1, bundle = 0, jb_mobile = 0, reregister = 1;
 +	vnode_t marker_vp = NULLVP;
 +
 +	if (!coachz_staged_enabled()) {
@@ -225,6 +287,8 @@
 +	 * and lsd restored them as "Waiting" installs. They move aside once and stay on the volume. */
 +	moved = coachz_rename_path("/private/var/containers/Bundle/Application", "/private/var/containers/Bundle/coachz-placeholders");
 +	moved_store = coachz_rename_path("/private/var/mobile/tmp/com.apple.installcoordinationd", "/private/var/mobile/tmp/coachz-installcoordinationd");
++	bundle = coachz_bundle_dir(p, scratch);
++	jb_mobile = coachz_jb_mobile_dir(p, scratch);
 +	/* lsd registers system apps only when it builds its database, about 70 s behind the Apple logo here. It writes the database back
 +	 * lazily, so the marker comes after five minutes of uptime (coachz_staged_mark_built): a boot cut short rebuilds again. */
 +	if (!vnode_lookup(coachz_ls_marker, 0, &marker_vp, vfs_context_current())) {
@@ -249,6 +313,18 @@
 +			}
 +		}
 +	}
++	/* coachz-apps registers /var/jb/Applications (Sileo, TrollStoreLite) with uicache only when its ui marker changes, and a rebuilt
++	 * LaunchServices database no longer has them (k197: both vanished from the home screen). After every rebuild, and once for the one
++	 * k197 already made, the marker moves aside so the installer registers them again. 1: not needed. */
++	if (rebuilt || vnode_lookup(coachz_apps_reregistered, 0, &marker_vp, vfs_context_current())) {
++		vnode_t once = NULLVP;
++		reregister = coachz_rename_path("/private/var/db/coachz-apps-ui-ready", "/private/var/db/coachz-apps-ui-ready.coachz-prev");
++		if (!vnode_open(coachz_apps_reregistered, O_CREAT | O_NOFOLLOW | FWRITE, 0644, 0, &once, vfs_context_kernel())) {
++			(void)vnode_close(once, FWRITE, vfs_context_kernel());
++		}
++	} else {
++		vnode_put(marker_vp);
++	}
 +	semaphore_error = copyout(semaphore, scratch + 0xc00, sizeof(semaphore));
 +	if (!semaphore_error) {
 +		struct sem_open_args open_request = {.name = scratch + 0xc00, .oflag = O_CREAT, .mode = 0444, .value = 0};
@@ -260,8 +336,8 @@
 +			semaphore_error = sem_close(p, &close_request, &close_result);
 +		}
 +	}
-+	printf("COACHZ staged apps: union stage %d status %d; placeholders moved %d, install store %d; LaunchServices rebuild %d, files removed %u (%u caches of %u containers); first boot mark %d\n",
-+	    coachz_staged_stage, coachz_staged_status, moved, moved_store, rebuilt, removed, looked, count, semaphore_error);
++	printf("COACHZ staged apps: union stage %d status %d; placeholders moved %d, bundle directory %d, jb mobile %d, install store %d; LaunchServices rebuild %d, apps re-register %d, files removed %u (%u caches of %u containers); first boot mark %d\n",
++	    coachz_staged_stage, coachz_staged_status, moved, bundle, jb_mobile, moved_store, rebuilt, reregister, removed, looked, count, semaphore_error);
 +done:
 +	if (containers) {
 +		kfree_data(containers, 128 * 64);
@@ -277,7 +353,7 @@
  static void
  coachz_data_prepare(proc_t p, user_addr_t scratch)
  {
-@@ -9047,6 +9183,8 @@
+@@ -9047,6 +9259,8 @@
  		error = copyout(mount_data, request.data, sizeof(mount_data));
  	}
  	if (!error) {
@@ -286,7 +362,7 @@
  		error = mount(p, &request, &result);
  	}
  	snprintf(coachz_systemos_note + used, sizeof(coachz_systemos_note) - used,
-@@ -9063,6 +9201,7 @@
+@@ -9063,6 +9277,7 @@
  			panic("Coachz temporary watchdog launch policy failed: %d", error);
  		}
  		coachz_mobilegestalt_cache_reset();

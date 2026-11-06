@@ -13,6 +13,7 @@
 // is unaffected. The DWC3 node has no dma-coherent: the mapper cleans and invalidates a buffer when it maps and when it unmaps it, and
 // the controller allocates its rings write-combined (Normal non-cacheable) instead of cacheable.
 #include <IOKit/IOLib.h>
+#include <string.h>
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IODeviceMemory.h>
@@ -32,6 +33,7 @@
 #include "OriginalAppleUSBABI.h"
 
 extern "C" vm_offset_t ml_io_map(vm_offset_t physical, vm_size_t size);
+extern "C" vm_offset_t phystokv(uint64_t pa);
 extern "C" void dcache_incoherent_io_flush64(addr64_t pa, unsigned int count, unsigned int remaining, unsigned int *res);
 extern "C" int armcpu_spi_attach(uint32_t, bool, void (*)(void *), void *, uint32_t *, uint64_t *);   // ArmCpu.cpp, IOReturn
 extern "C" uint64_t armcpu_spi_count(uint32_t intid);
@@ -521,10 +523,12 @@ void xhci_interrupt(void *context) {
   dispatch_secondary(nub);
   IOSimpleLockUnlock(gIrqLock);
 }
+void trace_state_sample();
 void interrupter_poll(void *context, wait_result_t) {
   CoachzUsbNub *nub = static_cast<CoachzUsbNub *>(context);
   for (;;) {
     IOSleep(1);
+    trace_state_sample();
     bool any = false;
     for (int i = 1; i < CoachzUsbNub::kSources; ++i) any |= interrupter_pending(i);
     if (!any) continue;
@@ -637,6 +641,24 @@ bool add_bridge_personality() {
     personality->setObject(gIOClassKey, cls); personality->setObject(gIOProviderClassKey, provider);
     personality->setObject(gIOPropertyMatchKey, match); personality->setObject(gIOProbeScoreKey, score);
     drivers->setObject(personality);
+    // k197: interface 0 (boot keyboard) matched IOUSBHostHIDDevice's only normal-boot personality, "Generic Keyboard" (class 3,
+    // subclass 1, protocol 1), and the bridge took its IOHIDInterface; the touchpad's interface 2 (class 3, subclass 0) got no driver
+    // at all, so its IOHIDInterface never existed. Apple's own vendor form (IOUSBHostHIDDeviceSafeBoot "SaitekP2500": idVendor,
+    // idProduct, bConfigurationValue, bInterfaceNumber) gives that one interface to the in-kernel IOUSBHostHIDDevice.
+    if (OSDictionary *pad = OSDictionary::withCapacity(9)) {
+      OSString *bundle = OSString::withCString("com.apple.driver.usb.IOUSBHostHIDDevice");
+      OSString *padClass = OSString::withCString("IOUSBHostHIDDevice"), *padProvider = OSString::withCString("IOUSBHostInterface");
+      OSString *behavior = OSString::withCString("");
+      OSNumber *padInterface = OSNumber::withNumber(kZedTouchpadInterface, 32), *configuration = OSNumber::withNumber(1ULL, 32);
+      if (bundle && padClass && padProvider && behavior && padInterface && configuration) {
+        pad->setObject("CFBundleIdentifier", bundle); pad->setObject(gIOClassKey, padClass); pad->setObject(gIOProviderClassKey, padProvider);
+        pad->setObject("HIDDefaultBehavior", behavior); pad->setObject("idVendor", vendor); pad->setObject("idProduct", product);
+        pad->setObject("bConfigurationValue", configuration); pad->setObject("bInterfaceNumber", padInterface);
+        drivers->setObject(pad);
+      }
+      OSSafeReleaseNULL(bundle); OSSafeReleaseNULL(padClass); OSSafeReleaseNULL(padProvider); OSSafeReleaseNULL(behavior);
+      OSSafeReleaseNULL(padInterface); OSSafeReleaseNULL(configuration); pad->release();
+    }
     added = gIOCatalogue->addDrivers(drivers, true);
   }
   OSSafeReleaseNULL(personality); OSSafeReleaseNULL(match); OSSafeReleaseNULL(drivers); OSSafeReleaseNULL(cls);
@@ -694,7 +716,182 @@ bool controller_start(IOService *self, IOService *provider) {
   log("controller start: buffer options 0x%x -> 0x%x", before, *options);
   const bool started = gXhciStart(self, provider);
   log("controller start returned %d", started);
+  // No changePowerStateTo floor: IOUSBHostFamily turns powerOverrideOnPriv on, so only its own changePowerStateToPriv counts (k192
+  // set 3 and the controller still went to 0). The real cause was the flat power tree (ArmDTPlatform.patch).
   return started;
+}
+
+// Read only, k188: every register access the driver makes goes through AppleNubT8011USBXHCI's slots 290 (read32: this, window, offset)
+// and 292 (write32: this, window, offset, value), 103 and 26 call sites in AppleUSBXHCI. k185 and k187 both had the two root ports in
+// U3 (PORTSC PLS 3) while GET_DESCRIPTOR waited, after AppleUSBXHCIPort::powerOn had read PORTSC as 0 for its 10 ms. This logs each
+// write and each read whose value differs from the last read of that register, by offset from the controller base and with the time.
+constexpr unsigned kXhciRead32Slot = 290, kXhciRead64Slot = 291, kXhciWrite32Slot = 292, kXhciWrite64Slot = 293, kTraceLines = 4000;
+extern "C" uint64_t kvtophys(vm_offset_t va);
+extern "C" uint64_t mach_absolute_time(void);
+uint32_t (*gXhciRead32)(IOService *, volatile void *, uint32_t);
+void (*gXhciWrite32)(IOService *, volatile void *, uint32_t, uint32_t);
+uint64_t (*gXhciRead64)(IOService *, volatile void *, uint32_t);
+void (*gXhciWrite64)(IOService *, volatile void *, uint32_t, uint64_t);
+uint32_t gTraceLast[kXhciBytes / 4];
+uint8_t gTraceSeen[kXhciBytes / 4];
+volatile uint32_t gTraceCount;
+int64_t trace_offset(volatile void *window, uint32_t offset) {
+  const uint64_t pa = kvtophys(reinterpret_cast<vm_offset_t>(window) + offset);
+  return pa >= kXhciBase && pa < kXhciBase + kXhciBytes ? static_cast<int64_t>(pa - kXhciBase) : -1;
+}
+// k188 printed only with interrupts on and so saw no PORTSC access at all: the port code runs with them off. Entries now go to a
+// buffer, any context, and the monitor prints them (trace_flush).
+struct TraceEntry { uint64_t ticks; int32_t at; uint32_t offset, value; char kind; volatile bool ready; };
+TraceEntry gTraceRing[kTraceLines];
+uint32_t gTracePrinted;
+void trace(char kind, int64_t at, uint32_t offset, uint32_t value) {
+  const uint32_t i = __atomic_fetch_add(&gTraceCount, 1, __ATOMIC_RELAXED);
+  if (i >= kTraceLines) return;
+  TraceEntry &e = gTraceRing[i];
+  e.ticks = mach_absolute_time(); e.at = static_cast<int32_t>(at); e.offset = offset; e.value = value; e.kind = kind;
+  __atomic_store_n(&e.ready, true, __ATOMIC_RELEASE);
+}
+// The driver's register helpers (AppleUSBXHCI, e.g. at 0xfffffff005ec0ac8) read nothing and return 0 unless the controller's word at
+// +0x250 is 1, which is how powerOn could report PORTSC 0: its changes go into the same trace, sampled every millisecond.
+constexpr size_t kDriverState = 0x250;
+IOService *volatile gTraceController;
+void trace_state_sample() {
+  static uint32_t last = ~0u;
+  IOService *controller = gTraceController;
+  if (!controller) return;
+  const uint32_t v = *reinterpret_cast<volatile uint32_t *>(reinterpret_cast<uint8_t *>(controller) + kDriverState);
+  if (v != last) { last = v; trace('S', -2, kDriverState, v); }
+}
+void trace_flush() {
+  const uint32_t end = __atomic_load_n(&gTraceCount, __ATOMIC_RELAXED);
+  for (; gTracePrinted < end && gTracePrinted < kTraceLines; ++gTracePrinted) {
+    const TraceEntry &e = gTraceRing[gTracePrinted];
+    if (!__atomic_load_n(&e.ready, __ATOMIC_ACQUIRE)) break;
+    const uint64_t us = e.ticks * 10 / 192;   // the SC7180 generic timer runs at 19.2 MHz
+    if (e.kind == 'S') log("rw %llu.%03llu ms driver state +0x%x = %u", us / 1000, us % 1000, e.offset, e.value);
+    else if (e.kind == 'P' || e.kind == 'p') log("rw %llu.%03llu ms %c port %u PORTSC 0x%08x", us / 1000, us % 1000, e.kind, e.offset, e.value);
+    else if (e.at >= 0) log("rw %llu.%03llu ms %c +0x%x 0x%08x", us / 1000, us % 1000, e.kind, static_cast<unsigned>(e.at), e.value);
+    else log("rw %llu.%03llu ms %c window offset 0x%x 0x%08x (outside the controller)", us / 1000, us % 1000, e.kind, e.offset, e.value);
+  }
+  if (end > kTraceLines && gTracePrinted == kTraceLines) { log("rw trace full: %u more accesses not kept", end - kTraceLines); ++gTracePrinted; }
+}
+uint32_t controller_read32(IOService *self, volatile void *window, uint32_t offset) {
+  const uint32_t value = gXhciRead32(self, window, offset);
+  const int64_t at = trace_offset(window, offset);
+  if (at < 0 || (at & 3)) { trace('R', at, offset, value); return value; }
+  const size_t i = static_cast<size_t>(at) / 4;
+  if (!gTraceSeen[i] || gTraceLast[i] != value) { gTraceSeen[i] = 1; gTraceLast[i] = value; trace('r', at, offset, value); }
+  return value;
+}
+void controller_write32(IOService *self, volatile void *window, uint32_t offset, uint32_t value) {
+  trace('w', trace_offset(window, offset), offset, value);
+  gXhciWrite32(self, window, offset, value);
+}
+// 64-bit registers (CRCR, DCBAAP, ERSTBA, ERDP): the low word as 'Q'/'q', the high word as 'H' at offset + 4. Reads are kept only when
+// either half changed, as for 32-bit reads.
+uint64_t controller_read64(IOService *self, volatile void *window, uint32_t offset) {
+  const uint64_t value = gXhciRead64(self, window, offset);
+  const int64_t at = trace_offset(window, offset);
+  const size_t i = at >= 0 && !(at & 7) ? static_cast<size_t>(at) / 4 : 0;
+  if (!i || !gTraceSeen[i] || gTraceLast[i] != static_cast<uint32_t>(value) || gTraceLast[i + 1] != static_cast<uint32_t>(value >> 32)) {
+    if (i) { gTraceSeen[i] = 1; gTraceLast[i] = static_cast<uint32_t>(value); gTraceLast[i + 1] = static_cast<uint32_t>(value >> 32); }
+    trace('q', at, offset, static_cast<uint32_t>(value)); trace('H', at >= 0 ? at + 4 : at, offset + 4, static_cast<uint32_t>(value >> 32));
+  }
+  return value;
+}
+void controller_write64(IOService *self, volatile void *window, uint32_t offset, uint64_t value) {
+  const int64_t at = trace_offset(window, offset);
+  trace('Q', at, offset, static_cast<uint32_t>(value)); trace('H', at >= 0 ? at + 4 : at, offset + 4, static_cast<uint32_t>(value >> 32));
+  gXhciWrite64(self, window, offset, value);
+}
+
+// Read only, k191: AppleUSBXHCIPort reads and writes its PORTSC itself, through a pointer at +0x3a8 and only while the controller's
+// +0x598 check passes (port vtable +0x770 read at 0xfffffff005ee0c80, +0x780 write at 0xfffffff005ee0cf0), so k189's slot trace saw no
+// PORTSC access at all while both root ports went to U3 before GET_DESCRIPTOR. Each port gets a copy of its vtable with these two
+// wrapped: writes always, reads when the value changes, in the same buffer as the controller's accesses ('P' port write, 'p' read).
+constexpr unsigned kPortRead = 0x770 / 8, kPortWrite = 0x780 / 8, kPortTableSlots = 512, kPortsTraced = 4;
+struct TracedPort { void *port; uint32_t (*read)(void *); void (*write)(void *, uint32_t); uint32_t last; bool seen; };
+TracedPort gPorts[kPortsTraced];
+int traced_port(void *port) { for (int i = 0; i < static_cast<int>(kPortsTraced); ++i) if (gPorts[i].port == port) return i; return -1; }
+uint32_t port_read(void *port) {
+  const int i = traced_port(port);
+  if (i < 0) return 0;
+  const uint32_t value = gPorts[i].read(port);
+  if (!gPorts[i].seen || gPorts[i].last != value) { gPorts[i].seen = true; gPorts[i].last = value; trace('p', -3, static_cast<uint32_t>(i), value); }
+  return value;
+}
+void port_write(void *port, uint32_t value) {
+  const int i = traced_port(port);
+  if (i < 0) return;
+  trace('P', -3, static_cast<uint32_t>(i), value);
+  gPorts[i].write(port, value);
+}
+void trace_ports(IOService *controller) {
+  OSIterator *children = controller->getChildIterator(gIOServicePlane);
+  if (!children) return;
+  int count = 0;
+  while (OSObject *child = children->getNextObject()) {
+    IOService *port = OSDynamicCast(IOService, child);
+    if (!port || !strnstr(port->getMetaClass()->getClassName(), "XHCI", 64) || !strnstr(port->getMetaClass()->getClassName(), "Port", 64) || count >= static_cast<int>(kPortsTraced)) continue;
+    void **own = *reinterpret_cast<void ***>(port);
+    void **table = static_cast<void **>(IOMalloc(kPortTableSlots * sizeof(void *)));
+    if (!table) break;
+    memcpy(table, own, kPortTableSlots * sizeof(void *));
+    gPorts[count] = {port, reinterpret_cast<uint32_t (*)(void *)>(own[kPortRead]), reinterpret_cast<void (*)(void *, uint32_t)>(own[kPortWrite]), 0, false};
+    table[kPortRead] = reinterpret_cast<void *>(port_read);
+    table[kPortWrite] = reinterpret_cast<void *>(port_write);
+    __atomic_store_n(reinterpret_cast<void ***>(port), table, __ATOMIC_RELEASE);
+    log("port %d traced: %s %s", count, port->getMetaClass()->getClassName(), port->getName());
+    ++count;
+  }
+  children->release();
+}
+
+// k192/k195 (PORTSC traced): about 2 ms after each port reset AppleUSBXHCIPort::suspend wrote PORTSC | 0x10060 (LWS, PLS U3) on the root
+// ports with the controller running; the hub's resume (PLS 15) was never driven to U0, and every later transfer hung. The ports sat at
+// power state 2 under the root domain: ArmDTPlatform's PMRegisterDevice (patches/drivers/ArmDTPlatform.patch) now builds the tree as
+// AppleARMPE does, and UsbForcePower (tried in k195, before the tree was right) is no longer set.
+// Every service under the controller with its power-plane parent and state: with ArmDTPlatform's AppleARMPE-style PMRegisterDevice the
+// ports should sit under the controller and each IOUSBHostDevice under its port (before: all under the root domain).
+void log_power_tree(IOService *controller) {
+  IORegistryIterator *it = IORegistryIterator::iterateOver(controller, gIOServicePlane, kIORegistryIterateRecursively);
+  if (!it) return;
+  unsigned shown = 0;
+  while (IORegistryEntry *entry = it->getNextObject()) {
+    IOService *service = OSDynamicCast(IOService, entry);
+    if (!service || !service->inPlane(gIOPowerPlane) || shown++ >= 40) continue;
+    const char *parent = "none";
+    if (IORegistryEntry *connection = service->getParentEntry(gIOPowerPlane))
+      if (IORegistryEntry *above = connection->getParentEntry(gIOPowerPlane)) parent = above->getName();
+    log("power tree: %s (%s) under %s, power %ld", service->getName(), service->getMetaClass()->getClassName(), parent,
+        static_cast<long>(service->getPowerState()));
+  }
+  it->release();
+}
+// k196: both hubs and the base (18d1:504c, AppleUSBHostCompositeDevice configuration 1) enumerated, yet the bridge was never probed in
+// 26 s and IOUSBHostHIDDevice left nothing in the unified log. Every service under the controller in the service plane, depth by
+// indentation, with its class, name, inactive state, busy count and (in the power plane) power state: where the interfaces and their
+// drivers stop.
+void log_service_tree(IOService *controller, unsigned tick) {
+  IORegistryIterator *it = IORegistryIterator::iterateOver(controller, gIOServicePlane, kIORegistryIterateRecursively);
+  if (!it) return;
+  unsigned shown = 0;
+  const unsigned base = controller->getDepth(gIOServicePlane);
+  while (IORegistryEntry *entry = it->getNextObject()) {
+    if (shown++ >= 80) { log("tree %u: more entries not shown", tick); break; }
+    IOService *service = OSDynamicCast(IOService, entry);
+    const unsigned depth = entry->getDepth(gIOServicePlane) - base;
+    log("tree %u: %.*s%s (%s)%s busy %u power %ld", tick, static_cast<int>(depth > 12 ? 12 : depth) * 2, "                        ",
+        entry->getName(), entry->getMetaClass()->getClassName(), service && service->isInactive() ? " inactive" : "",
+        service ? static_cast<unsigned>(service->getBusyState()) : 0u,
+        service && service->inPlane(gIOPowerPlane) ? static_cast<long>(service->getPowerState()) : -1L);
+  }
+  it->release();
+}
+void log_port_power(const char *when) {
+  for (int i = 0; i < static_cast<int>(kPortsTraced); ++i)
+    if (IOService *port = static_cast<IOService *>(gPorts[i].port)) log("%s: port %d power %ld PORTSC 0x%08x", when, i,
+                                                                         static_cast<long>(port->getPowerState()), gPorts[i].last);
 }
 
 IOService *make_controller(CoachzUsbNub *nub) {
@@ -708,6 +905,15 @@ IOService *make_controller(CoachzUsbNub *nub) {
   for (unsigned slot : kAppleNubT8011USBXHCIReplaced) table[slot] = coachz_original_xhci_table[slot];
   gXhciStart = reinterpret_cast<bool (*)(IOService *, IOService *)>(coachz_original_xhci_table[kAppleUSBXHCIStartSlot]);
   table[kAppleUSBXHCIStartSlot] = reinterpret_cast<void *>(controller_start);
+  gXhciRead32 = reinterpret_cast<uint32_t (*)(IOService *, volatile void *, uint32_t)>(table[kXhciRead32Slot]);
+  gXhciWrite32 = reinterpret_cast<void (*)(IOService *, volatile void *, uint32_t, uint32_t)>(table[kXhciWrite32Slot]);
+  table[kXhciRead32Slot] = reinterpret_cast<void *>(controller_read32);
+  table[kXhciWrite32Slot] = reinterpret_cast<void *>(controller_write32);
+  gXhciRead64 = reinterpret_cast<uint64_t (*)(IOService *, volatile void *, uint32_t)>(table[kXhciRead64Slot]);
+  gXhciWrite64 = reinterpret_cast<void (*)(IOService *, volatile void *, uint32_t, uint64_t)>(table[kXhciWrite64Slot]);
+  table[kXhciRead64Slot] = reinterpret_cast<void *>(controller_read64);
+  gTraceController = controller;
+  table[kXhciWrite64Slot] = reinterpret_cast<void *>(controller_write64);
   *reinterpret_cast<void ***>(controller) = table;
 
   // The controller's properties are the original personality's (stream, LPM and request policies among them).
@@ -776,6 +982,75 @@ void log_controller(IOService *controller) {
       xhci32(rt + 0x44), xhci32(rt + 0x64));
 }
 
+// Read only, k186: what the controller and the driver hold in memory around the first EP0 transfer. k185 enumerated both root ports
+// (Enable Slot and Address Device completed, 17 events on interrupter 0), then GET_DESCRIPTOR timed out on both devices, the next
+// Stop Endpoint got no completion and the ports went to U3, with no SMMU fault, no HSE/HCE and every interrupter's IP clear.
+// Interrupters (xHCI 5.5.2), their first event ring segment table entry and the event TRBs at ERDP, then for slots 1 and 2 the
+// output slot and EP0 contexts (6.2) and the EP0 transfer ring at its dequeue pointer. Memory is read through the physical aperture:
+// the driver's buffer pages are already write-combined there (pmap_set_cache_attributes changes it too), and a second Device
+// mapping of RAM (ml_io_map) is a mismatched alias, which hung eMMC CMD25 in k181.
+uint64_t iova_to_pa(uint64_t iova) {
+  if (iova < kIovaBase || iova >= kIovaBase + kIovaPages * kPage) return 0;
+  const uint32_t ppn = __atomic_load_n(&gShadow[(iova - kIovaBase) / kPage], __ATOMIC_ACQUIRE);
+  return ppn ? (static_cast<uint64_t>(ppn) * kPage) | (iova & (kPage - 1)) : 0;
+}
+// One 32-bit word at a device address, or false when it is not mapped.
+bool dma32(uint64_t iova, uint32_t *value) {
+  const uint64_t pa = iova_to_pa(iova);
+  if (!pa || (iova & 3)) return false;
+  *value = *reinterpret_cast<volatile uint32_t *>(phystokv(pa));
+  return true;
+}
+uint64_t dma64(uint64_t iova) {
+  uint32_t lo = 0, hi = 0;
+  if (!dma32(iova, &lo) || !dma32(iova + 4, &hi)) return ~0ull;
+  return (static_cast<uint64_t>(hi) << 32) | lo;
+}
+void dump_trbs(const char *what, uint64_t iova, int before, int after) {
+  for (int i = -before; i <= after; ++i) {
+    const uint64_t at = (iova & ~0xfull) + static_cast<int64_t>(i) * 16;
+    uint32_t w[4] = {};
+    bool ok = true;
+    for (int j = 0; j < 4 && ok; ++j) ok = dma32(at + 4u * static_cast<unsigned>(j), &w[j]);
+    if (!ok) { log("%s %+d at 0x%llx: not mapped", what, i, at); continue; }
+    // TRB type in dword 3 bits 15:10, cycle bit 0; for transfer TRBs the interrupter target is dword 2 bits 31:22.
+    log("%s %+d at 0x%llx: %08x %08x %08x %08x type %u c%u", what, i, at, w[0], w[1], w[2], w[3], (w[3] >> 10) & 0x3f, w[3] & 1);
+  }
+}
+void dump_rings(const char *when) {
+  if (!gXhci) return;
+  const uint32_t op = xhci32(0) & 0xff, rt = xhci32(0x18) & ~0x1fu, hcc1 = xhci32(0x10);
+  const unsigned ctx = (hcc1 & 4) ? 64 : 32;
+  log("dump %s: USBSTS 0x%x CRCR 0x%x HCCPARAMS1 0x%x context %u bytes, PORTSC 0x%x 0x%x", when, xhci32(op + 4), xhci32(op + 0x18),
+      hcc1, ctx, xhci32(op + 0x400), xhci32(op + 0x410));
+  for (uint32_t i = 0; i < 3; ++i) {
+    const uint32_t ir = rt + 0x20 + 0x20 * i;
+    const uint64_t erstba = (static_cast<uint64_t>(xhci32(ir + 0x14)) << 32) | xhci32(ir + 0x10);
+    const uint64_t erdp = (static_cast<uint64_t>(xhci32(ir + 0x1c)) << 32) | xhci32(ir + 0x18);
+    const uint64_t segment = dma64(erstba);
+    uint32_t size = 0; dma32(erstba + 8, &size);
+    log("dump %s: interrupter %u IMAN 0x%x IMOD 0x%x ERSTSZ %u ERSTBA 0x%llx ERDP 0x%llx; segment 0x%llx size %u", when, i,
+        xhci32(ir), xhci32(ir + 4), xhci32(ir + 8), erstba, erdp, segment, size & 0xffff);
+    char label[32]; snprintf(label, sizeof label, "dump %s ev%u", when, i);
+    if (segment != ~0ull) dump_trbs(label, erdp & ~0xfull, 2, 4);
+  }
+  const uint64_t dcbaap = (static_cast<uint64_t>(xhci32(op + 0x34)) << 32) | xhci32(op + 0x30);
+  for (uint32_t slot = 1; slot <= 2; ++slot) {
+    const uint64_t out = dma64(dcbaap + 8 * slot);
+    if (out == ~0ull || !out) { log("dump %s: slot %u no output context (0x%llx)", when, slot, out); continue; }
+    uint32_t s[4] = {}, e[5] = {};
+    for (int j = 0; j < 4; ++j) dma32(out + 4u * static_cast<unsigned>(j), &s[j]);
+    for (int j = 0; j < 5; ++j) dma32(out + ctx + 4u * static_cast<unsigned>(j), &e[j]);
+    const uint64_t deq = ((static_cast<uint64_t>(e[3]) << 32) | e[2]) & ~0xfull;
+    // Slot state dword 3 bits 31:27 (0 disabled, 1 default, 2 addressed, 3 configured); EP state dword 0 bits 2:0 (1 running,
+    // 2 halted, 3 stopped, 4 error); dequeue cycle state dword 2 bit 0.
+    log("dump %s: slot %u context 0x%llx slot %08x %08x %08x %08x state %u; ep0 %08x %08x %08x %08x %08x state %u dcs %u", when, slot,
+        out, s[0], s[1], s[2], s[3], s[3] >> 27, e[0], e[1], e[2], e[3], e[4], e[0] & 7, e[2] & 1);
+    char label[32]; snprintf(label, sizeof label, "dump %s ep0.%u", when, slot);
+    dump_trbs(label, deq, 4, 3);
+  }
+}
+
 // The PM state as ioreg shows it ("IOPowerManagement": current, desired, the driver's, the device's and the children's requests,
 // the machine state) and the power-plane parent: k176 had the nub in the plane and on, the controller at state 0 with its registers
 // initialized and run/stop clear, and the hub connected on both ports.
@@ -796,8 +1071,16 @@ void log_pm(IOService *service, const char *label) {
 void monitor(IOService *controller) {
   for (unsigned tick = 0;; ++tick) {
     IOSleep(tick < 30 ? 2000 : 10000);
+    trace_flush();
+    // k185 timing: monitor starts about a second after makeUsable, GET_DESCRIPTOR timed out about 4.3 s after it and the Stop
+    // Endpoint 2 s later: ticks 0 and 1 see the transfer pending, tick 3 the state after both timeouts.
+    if (tick == 0) dump_rings("pending");
+    if (tick == 1) dump_rings("late");
+    if (tick == 3) dump_rings("after");
     uint32_t fsr = 0, fsynr = 0; uint64_t far = 0;
     smmu_read32(&gSmmu, gCbOffset + kCbFsr, &fsr);
+    // FSR[10:9] is FORMAT (0b10, AArch64), not a fault and not write-1-to-clear: only TF..UUT, SS and MULTI are faults.
+    fsr &= 0xc00001feu;
     if (fsr) {
       smmu_read64(&gSmmu, gCbOffset + kCbFar, &far); smmu_read32(&gSmmu, gCbOffset + kCbFsynr0, &fsynr);
       smmu_write32(&gSmmu, gCbOffset + kCbFsr, fsr);
@@ -810,7 +1093,13 @@ void monitor(IOService *controller) {
           gLivePages, gRangeCount, gUncachedCount, gUncachedPages, gUncachedFull, armcpu_spi_count(kXhciIntid), gIrqLine, gIrqSecondary[1],
           gIrqSecondary[2], gIrqShared, fsr, far, fsynr, gfsr, gfsynr);
       if (tick < 5 || tick % 6 == 0) log_controller(controller);
-      if (tick == 1 || tick == 10) { log_pm(controller, "controller"); log_pm(controller ? controller->getProvider() : nullptr, "nub"); }
+      log_port_power("monitor");
+      if (controller && (tick == 3 || tick == 10 || tick == 20 || tick == 29 || tick % 6 == 0)) log_service_tree(controller, tick);
+      if (tick == 1 || tick == 10) {
+        log_pm(controller, "controller"); log_pm(controller ? controller->getProvider() : nullptr, "nub");
+        for (const TracedPort &t : gPorts) if (t.port) log_pm(static_cast<IOService *>(t.port), "port");
+        if (controller) log_power_tree(controller);
+      }
     }
   }
 }
@@ -863,6 +1152,7 @@ void host_thread(void *, wait_result_t) {
   if (controller) {
     log_pm(controller, "controller at start");
     IOSleep(5000);
+    trace_ports(controller);
     if (controller->getPowerState() == 0) {
       // Still off with the nub on (k176): ask for the controller's usable state as a client would, once, and show what PM did.
       log_pm(controller, "controller still off");

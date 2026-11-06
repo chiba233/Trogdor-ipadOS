@@ -1,0 +1,32 @@
+--- a/ArmDTPlatform.cpp	2026-11-05 16:21:54
++++ b/ArmDTPlatform.cpp	2026-11-05 16:21:54
+@@ -36,6 +36,7 @@
+   bool configure (IOService *provider) override;
+   const char *deleteList (void) override;
+   const char *excludeList (void) override;
++  void PMRegisterDevice (IOService *nub, IOService *device) override;
+ private:
+   bool hasNVRAMProxy (IOService *provider);
+   bool createDeviceNubs (IOService *provider);
+@@ -56,6 +57,21 @@
+   return "()";
+ }
+ 
++// Coachz: the power parent of a driver joining the power tree, as Apple's ARM platform expert chooses it (AppleARMPE::PMRegisterDevice,
++// AppleARMPlatform 21H461 at 0xfffffff005990128): the first service in the nub's provider chain that is already in the power plane,
++// else the root domain. IOPlatformExpert's version puts every driver directly under the root domain, so an IOUSBHostDevice's need for
++// power never reached its AppleUSBHostPort, and the root ports suspended (PORTSC PLS U3) right after each port reset (k185-k195).
++void ArmDTPlatform::PMRegisterDevice (IOService *nub, IOService *device)
++{
++  for (IOService *parent = nub; parent; parent = parent->getProvider ())
++    if (parent->inPlane (gIOPowerPlane))
++      {
++        parent->addPowerChild (device);
++        return;
++      }
++  IODTPlatformExpert::PMRegisterDevice (nub, device);
++}
++
+ bool ArmDTPlatform::hasNVRAMProxy (IOService *provider)
+ {
+   IORegistryEntry *chosen = provider->childFromPath ("chosen", gIODTPlane);

@@ -1,0 +1,127 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -3222,14 +3222,95 @@
+ #endif
+ 
+ #if CONFIG_PERSONAS
++#if defined(BCM2837)
++/*
++ * TrollStore Lite starts its own root helper from the mobile application with a uid/gid 0 persona (TrollStore TSUtil.m spawnRoot:
++ * persona 99 with POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE, uid 0, gid 0); the check below refuses that to every non-root caller, so its
++ * installs ended with "posix_spawn error 1". Only that caller binary spawning the trollstorehelper of its own bundle passes, both
++ * delivered and trust-cached by coachz-apps; every other caller keeps the original rule. Denials print once per pid.
++ */
++static const char *const coachz_trollstore_callers[] = {
++	"/private/var/jb/Applications/TrollStoreLite.app/TrollStoreLite",
++	"/var/jb/Applications/TrollStoreLite.app/TrollStoreLite",
++};
++static const char *const coachz_trollstore_helpers[] = {
++	"/private/var/jb/Applications/TrollStoreLite.app/trollstorehelper",
++	"/var/jb/Applications/TrollStoreLite.app/trollstorehelper",
++};
++
++/* posix_spawn's frame is large already: the paths live on the heap. */
++static __attribute__((noinline)) bool
++coachz_trollstore_root_helper(user_addr_t path, int *which)
++{
++	char *target = kalloc_data(MAXPATHLEN, Z_WAITOK), *caller = kalloc_data(MAXPATHLEN, Z_WAITOK);
++	size_t copied = 0;
++	int length = MAXPATHLEN;
++	vnode_t vp = NULLVP;
++	*which = 0;
++	if (target && caller && path != USER_ADDR_NULL && copyinstr(path, target, MAXPATHLEN, &copied) == 0) {
++		for (unsigned i = 0; i < 2; i++) {
++			if (strcmp(target, coachz_trollstore_helpers[i]) == 0) {
++				*which |= 1;
++			}
++		}
++		vp = proc_getexecutablevnode(current_proc());
++	}
++	if (vp != NULLVP) {
++		const int got = vn_getpath(vp, caller, &length);
++		vnode_put(vp);
++		for (unsigned i = 0; !got && i < 2; i++) {
++			if (strcmp(caller, coachz_trollstore_callers[i]) == 0) {
++				*which |= 2;
++			}
++		}
++	}
++	if (target) {
++		kfree_data(target, MAXPATHLEN);
++	}
++	if (caller) {
++		kfree_data(caller, MAXPATHLEN);
++	}
++	return *which == 3;
++}
++
++static __attribute__((noinline)) void
++coachz_persona_denied(const char *rule, user_addr_t path, int which)
++{
++	static int last_pid = -1;
++	const int pid = proc_selfpid();
++	if (__atomic_exchange_n(&last_pid, pid, __ATOMIC_RELAXED) == pid) {
++		return;
++	}
++	char *target = kalloc_data(MAXPATHLEN, Z_WAITOK);
++	size_t copied = 0;
++	if (target && (path == USER_ADDR_NULL || copyinstr(path, target, MAXPATHLEN, &copied) != 0)) {
++		strlcpy(target, "?", MAXPATHLEN);
++	}
++	printf("COACHZ persona: pid %d %s denied %s, TrollStore helper %d caller %d, target %s\n", pid, proc_best_name(current_proc()), rule,
++	    which & 1, (which >> 1) & 1, target ? target : "?");
++	if (target) {
++		kfree_data(target, MAXPATHLEN);
++	}
++}
++#endif
++
+ static int
+-spawn_validate_persona(struct _posix_spawn_persona_info *px_persona)
++spawn_validate_persona(struct _posix_spawn_persona_info *px_persona, user_addr_t path)
+ {
+ 	int error = 0;
+ 	struct persona *persona = NULL;
+ 	kauth_cred_t mycred = kauth_cred_get();
++#if defined(BCM2837)
++	int which = 0;
++	const bool trollstore = coachz_trollstore_root_helper(path, &which);
++#else
++	(void)path;
++#endif
+ 
+ 	if (!IOCurrentTaskHasEntitlement( PERSONA_MGMT_ENTITLEMENT)) {
++#if defined(BCM2837)
++		coachz_persona_denied("entitlement", path, which);
++#endif
+ 		return EPERM;
+ 	}
+ 
+@@ -3247,6 +3328,18 @@
+ 	// non-root process should not be allowed to set persona with uid/gid 0
+ 	if (!kauth_cred_issuser(mycred) &&
+ 	    (px_persona->pspi_uid == 0 || px_persona->pspi_gid == 0)) {
++#if defined(BCM2837)
++		if (trollstore) {
++			static unsigned allowed;
++			const unsigned n = __atomic_add_fetch(&allowed, 1, __ATOMIC_RELAXED);
++			if (n <= 4 || !(n & (n - 1))) {
++				printf("COACHZ persona: TrollStore root helper allowed %u\n", n);
++			}
++			persona_put(persona);
++			return 0;
++		}
++		coachz_persona_denied("uid 0", path, which);
++#endif
+ 		return EPERM;
+ 	}
+ 
+@@ -3749,7 +3842,7 @@
+ 			    px_args.persona_info_size)) != 0) {
+ 				goto bad;
+ 			}
+-			if ((error = spawn_validate_persona(px_persona)) != 0) {
++			if ((error = spawn_validate_persona(px_persona, uap->path)) != 0) {
+ 				goto bad;
+ 			}
+ 		}

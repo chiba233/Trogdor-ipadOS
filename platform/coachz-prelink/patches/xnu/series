@@ -142,5 +142,8 @@ coachz-prelink-apps.patch
 # LaunchServices/lsd/kill traces (LS, LSD, K39) and the memcpy line. Everything above stays as it was accepted.
 coachz-prelink-probe-cleanup.patch
 
+# TrollStore Lite's spawnRoot: only its own binary may start its own trollstorehelper with a uid/gid 0 persona.
+coachz-prelink-trollstore-persona.patch
+
 # /chosen/coachz-baseband: the cellular bridge (pending/baseband): QRTR hooks in the Wi-Fi thread, its firmware on the Data volume, CommCenter running.
 coachz-prelink-baseband.patch
