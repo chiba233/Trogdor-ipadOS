@@ -23,14 +23,13 @@ mainline function it follows. Runtime data from Linux on this machine is not a r
 | apps SMMU bank, firmware load, ARM9 release (`venus_boot_no_tz`, `venus_reset_cpu`) | Runs on hardware |
 | HFI queues, SYS_INIT, image version | Runs on hardware: SYS_INIT_DONE, `VIDEO.VE.5.4-00059-PROD-1` |
 | vcodec0 power-on | Runs on hardware |
-| Session init, buffer requirements, load resources, start, sequence-change event | Runs on hardware (k206, the earlier fixed-region self-test) |
-| Decoder engine: `vdec_start_output`, `vdec_event_change` (incl. resolution change), `vdec_start_capture`, `vdec_decoder_cmd`, flush, `vdec_session_release` | Written, not run on hardware |
-| Per-buffer memory: contiguous, write-combined, mapped into the bank at a first-fit IOVA below the shared queues, unmapped on free | Written, not run on hardware |
-| Interrupts (SPI 174, `venus_isr` / `venus_isr_thread`, 10 ms poll fallback) | Written, not run on hardware |
-| Clock scaling (`load_scale_v4`, the five OPPs with their CX corners, Fabia rate change and the RCG divider) and the bandwidth table | Written, not run on hardware |
-| Boot self-test through the engine (one I_PCM IDR picture, compared sample by sample) | Written, not run on hardware |
-| IOKit service `CoachzVenus` and user client, ABI `CoachzVideoAbi.h` | Written, not run on hardware |
-| VideoToolbox decoder `AVD.videodecoder` (`avc1`, `hvc1`, `hev1`, `vp09`) and its delivery (bindfs union, trust cache, kobject map grant) | Written, not run on hardware |
+| Decoder engine: `vdec_start_output`, `vdec_event_change`, `vdec_start_capture`, `vdec_decoder_cmd`, flush, `vdec_session_release` | Runs on hardware: the boot self-test decodes its I_PCM picture exactly; a resolution change mid-stream and flush are not exercised |
+| Per-buffer memory: contiguous, write-combined, mapped into the bank at a first-fit IOVA below the shared queues, unmapped on free | Runs on hardware (up to 66 ranges, 31 table pages with two sessions) |
+| Interrupts (SPI 174, `venus_isr` / `venus_isr_thread`, 10 ms poll fallback) | Runs on hardware |
+| Clock scaling (`load_scale_v4`, the five OPPs with their CX corners, Fabia rate change and the RCG divider) and the bandwidth table | Bandwidth votes run on hardware; no session has needed more than 150 MHz yet, so the PLL rate change is not exercised |
+| Boot self-test through the engine (one I_PCM IDR picture, compared sample by sample) | Runs on hardware: 0 of 16384 luma and 0 of 8192 chroma samples differ |
+| IOKit service `CoachzVenus` and user client, ABI `CoachzVideoAbi.h` | Runs on hardware |
+| VideoToolbox decoder `AVD.videodecoder` (`avc1`, `hvc1`, `hev1`, `vp09`) and its delivery (bindfs union, trust cache, kobject map grant) | Runs on hardware: Safari's HEVC 640x360 video decodes in mediaplaybackd ("hvc1 (HW decoder), 420v"), about 30 frames a second, none dropped; green bars flash in the picture (below); H.264, VP9 and larger sizes not tried |
 | Power collapse (`venus_suspend_3xx`/4xx), `cpu-cfg` vote, system-error recovery (`venus_sys_error_handler`) | Not written: the core stays powered at its OPP; a SYS_ERROR or watchdog fails every session until reboot |
 | 10-bit output (P010) | Not written: a 10-bit sequence fails its session |
 
@@ -97,3 +96,13 @@ H264H8 registers `avc1` and `drmi` with its H.264 create function and `hvc1` and
   over `/System/Library/VideoDecoders` before launchd; `build-coachz-venus.py` signs it and writes its trust cache module (passed with
   `--root-trust-cache`); `coachz-prelink-gpu-map-grant.patch` lets `CoachzVenusUserClient` mappings past the sandbox's kobject filter, and
   the service grants every process (`NativeSandboxGrantProcess` `*`).
+
+## Open: green bars in HEVC playback
+
+Seen on hardware with Safari's 640x360 HEVC video. The firmware logs, per session: `DMAConfigDec(245): Error on LCU size: 3` right
+after the sequence change, and `h265Dec_Continue(241): Downscale is not supported: Invalid frame dimensions for output2!` (answered as
+the non-fatal 0x1008) after CONTINUE. OUTPUT2's frame size is the capture height aligned to 32 (640x384), as `vdec_try_fmt_common` and
+`vdec_output_conf` set it, against a 640x360 sequence. Not yet separated: whether the firmware then leaves some OPBs unconverted (zero
+NV12 shows green), whether the LCU size error leaves part of the picture undecoded, or whether the decoder's copy is at fault. Decode
+latency is 30-100 ms a frame with 400-800 ms spikes.
+
