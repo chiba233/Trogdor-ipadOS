@@ -13,12 +13,68 @@
 #include <spawn.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <dlfcn.h>
 #include <archive.h>
 #include <archive_entry.h>
 
 extern char **environ;
 static NSString *const base = @"/private/var/ngpu/owner-apps";
 static NSMutableSet<NSData *> *records;
+
+@interface LSApplicationProxy : NSObject
++ (instancetype)applicationProxyForIdentifier:(NSString *)identifier;
+@property(nonatomic,readonly) NSURL *bundleURL;
+@property(nonatomic,readonly,getter=isInstalled) BOOL installed;
+@property(nonatomic,readonly,getter=isPlaceholder) BOOL placeholder;
+@property(nonatomic,readonly,getter=isRestricted) BOOL restricted;
+@end
+
+/* These CFPreferences entry points are also used by TrollStore's root helper. */
+static int enableSystemAppVisibility(BOOL *changed)
+{
+    typedef CFPropertyListRef (*CopyPreference)(CFStringRef,CFStringRef,CFStringRef,CFStringRef,CFStringRef);
+    typedef void (*SetPreference)(CFStringRef,CFPropertyListRef,CFStringRef,CFStringRef,CFStringRef,CFStringRef);
+    typedef Boolean (*SyncPreferences)(CFStringRef,CFStringRef,CFStringRef,CFStringRef);
+    CopyPreference copy=dlsym(RTLD_DEFAULT,"_CFPreferencesCopyValueWithContainer");
+    SetPreference set=dlsym(RTLD_DEFAULT,"_CFPreferencesSetValueWithContainer");
+    SyncPreferences sync=dlsym(RTLD_DEFAULT,"_CFPreferencesSynchronizeWithContainer");
+    if(!copy || !set || !sync)return ENOSYS;
+    CFStringRef key=CFSTR("SBShowNonDefaultSystemApps"),domain=CFSTR("com.apple.springboard");
+    CFStringRef account=CFSTR("mobile"),container=CFSTR("kCFPreferencesNoContainer");
+    CFPropertyListRef value=copy(key,domain,account,kCFPreferencesAnyHost,container);
+    BOOL before=value && CFEqual(value,kCFBooleanTrue);
+    if(value)CFRelease(value);
+    *changed=!before;
+    Boolean synced=true;
+    if(!before) {
+        set(key,kCFBooleanTrue,domain,account,kCFPreferencesAnyHost,container);
+        synced=sync(domain,account,kCFPreferencesAnyHost,container);
+    }
+    value=copy(key,domain,account,kCFPreferencesAnyHost,container);
+    BOOL after=value && CFEqual(value,kCFBooleanTrue);
+    if(value)CFRelease(value);
+    fprintf(stderr,"COACHZ apps: nondefault system visibility before %d sync %d after %d\n",before,synced,after);
+    return synced && after?0:EIO;
+}
+
+static BOOL applicationRegistered(NSString *identifier,NSString *path)
+{
+    static void *services;
+    if(!services)services=dlopen("/System/Library/Frameworks/MobileCoreServices.framework/MobileCoreServices",RTLD_NOW|RTLD_LOCAL);
+    Class cls=NSClassFromString(@"LSApplicationProxy");
+    if(!cls || ![cls respondsToSelector:@selector(applicationProxyForIdentifier:)]) {
+        fprintf(stderr,"COACHZ apps: application proxy API unavailable\n");return NO;
+    }
+    LSApplicationProxy *proxy=[cls applicationProxyForIdentifier:identifier];
+    BOOL api=[proxy respondsToSelector:@selector(isInstalled)] && [proxy respondsToSelector:@selector(isPlaceholder)] &&
+        [proxy respondsToSelector:@selector(isRestricted)] && [proxy respondsToSelector:@selector(bundleURL)];
+    BOOL installed=api && proxy.isInstalled,placeholder=api && proxy.isPlaceholder,restricted=api && proxy.isRestricted;
+    BOOL samePath=api && [proxy.bundleURL.path.stringByResolvingSymlinksInPath isEqualToString:path.stringByResolvingSymlinksInPath];
+    fprintf(stderr,"COACHZ apps: proxy %s api %d installed %d placeholder %d restricted %d path-match %d\n",
+        identifier.UTF8String,api,installed,placeholder,restricted,samePath);
+    return installed && !placeholder && !restricted && samePath;
+}
 
 static uint32_t be32(const void *p) { uint32_t x; memcpy(&x,p,4); return OSSwapBigToHostInt32(x); }
 static uint32_t le32(const void *p) { uint32_t x; memcpy(&x,p,4); return OSSwapLittleToHostInt32(x); }
@@ -80,8 +136,17 @@ static void trustTree(NSString *root)
     if (lstat(root.fileSystemRepresentation,&st)) return;
     if (S_ISREG(st.st_mode)) {
         if (st.st_size>=32 && st.st_size<512*1024*1024) {
-            NSData *d=[NSData dataWithContentsOfFile:root options:NSDataReadingMappedIfSafe error:nil];
-            if (d) (void)hashes(d,0);
+            /* Resource files need no mapping or signature scan. Release each image promptly. */
+            uint32_t magic=0;
+            int fd=open(root.fileSystemRepresentation,O_RDONLY|O_CLOEXEC);
+            ssize_t n=fd<0?-1:pread(fd,&magic,sizeof(magic),0);
+            if(fd>=0)close(fd);
+            if(n!=sizeof(magic) || (le32(&magic)!=MH_MAGIC_64 &&
+               be32(&magic)!=FAT_MAGIC && be32(&magic)!=FAT_MAGIC_64))return;
+            @autoreleasepool {
+                NSData *d=[NSData dataWithContentsOfFile:root options:NSDataReadingMappedIfSafe error:nil];
+                if (d) (void)hashes(d,0);
+            }
         }
         return;
     }
@@ -133,9 +198,12 @@ static int run(NSString *path, NSArray<NSString *> *args)
 {
     char **av=calloc(args.count+2,sizeof(char *)); av[0]=(char *)path.fileSystemRepresentation;
     for(NSUInteger i=0;i<args.count;i++) av[i+1]=(char *)args[i].UTF8String;
+    fprintf(stderr,"COACHZ apps: starting %s\n",path.lastPathComponent.UTF8String);
     pid_t pid; int status=0,r=posix_spawn(&pid,av[0],NULL,NULL,av,environ); free(av);
+    fprintf(stderr,"COACHZ apps: spawn %s status %d pid %d\n",path.lastPathComponent.UTF8String,r,r?-1:pid);
     if(r) return r;
     while(waitpid(pid,&status,0)<0) if(errno!=EINTR) return errno;
+    fprintf(stderr,"COACHZ apps: finished %s wait status 0x%x\n",path.lastPathComponent.UTF8String,status);
     return WIFEXITED(status)?WEXITSTATUS(status):128+WTERMSIG(status);
 }
 
@@ -173,6 +241,16 @@ static int unpack(NSString *file)
 
 static int bootstrap(void)
 {
+    /* Keep child diagnostics on a regular append-only file, independent of launchd's stdio transport. */
+    struct stat old_stderr={0};
+    int old_status=fstat(STDERR_FILENO,&old_stderr)?errno:0;
+    int log=open("/private/var/log/coachz-apps.log",O_WRONLY|O_CREAT|O_APPEND|O_CLOEXEC,0600);
+    if(log<0)return errno;
+    if(dup2(log,STDOUT_FILENO)<0 || dup2(log,STDERR_FILENO)<0){int r=errno;close(log);return r;}
+    if(log>STDERR_FILENO)close(log);
+    if(fcntl(STDOUT_FILENO,F_SETFD,0)<0 || fcntl(STDERR_FILENO,F_SETFD,0)<0)return errno;
+    setvbuf(stderr,NULL,_IONBF,0);
+    fprintf(stderr,"COACHZ apps: stdio previous type 0%o status %d\n",old_stderr.st_mode&S_IFMT,old_status);
     fprintf(stderr,"COACHZ apps: installer entered pid %d uid %u\n",getpid(),getuid());
     NSString *revision=[NSString stringWithContentsOfFile:[base stringByAppendingPathComponent:@"revision"] encoding:NSUTF8StringEncoding error:nil];
     if(!revision.length)return EINVAL;
@@ -190,26 +268,43 @@ static int bootstrap(void)
         fprintf(stderr,"COACHZ apps: extraction finished status %d\n",r);if(r)return r;
         if(![revision writeToFile:extracted atomically:YES encoding:NSUTF8StringEncoding error:nil])return EIO;
     }
-    fprintf(stderr,"COACHZ apps: installed code scan starting\n");
-    trustTree(@"/var/jb"); trustTree(@"/var/containers/Bundle/Application");
-    int r=loadRecords();if(r)return r;
+    BOOL visibilityChanged=NO;
+    int r=enableSystemAppVisibility(&visibilityChanged);if(r)return r;
+    NSString *uiMarker=@"/private/var/db/coachz-apps-ui-ready";
+    NSString *uiRevision=[@"2\n" stringByAppendingString:revision];
+    BOOL registerApps=fresh || visibilityChanged ||
+        ![uiRevision isEqual:[NSString stringWithContentsOfFile:uiMarker encoding:NSUTF8StringEncoding error:nil]];
+    /* The delivered static cache covers the two applications and all bootstrap tools. */
     setenv("PATH","/var/jb/usr/bin:/var/jb/usr/sbin:/var/jb/bin:/var/jb/sbin:/usr/bin:/bin:/usr/sbin:/sbin",1);
     setenv("HOME","/var/root",1);setenv("NO_PASSWORD_PROMPT","1",1);
     if(fresh) {
+        fprintf(stderr,"COACHZ apps: initial configuration uses delivered static trust cache\n");
         r=run(@"/var/jb/usr/libexec/firmware",@[]);fprintf(stderr,"COACHZ apps: firmware metadata %d\n",r);if(r)return r;
         r=run(@"/var/jb/usr/sbin/pwd_mkdb",@[@"-p",@"/var/jb/etc/master.passwd"]);if(r)return r;
         r=run(@"/var/jb/usr/bin/dpkg",@[@"--configure",@"-a"]);fprintf(stderr,"COACHZ apps: package configuration %d\n",r);if(r)return r;
+        if(![revision writeToFile:marker atomically:YES encoding:NSUTF8StringEncoding error:nil])return EIO;
     }
-    /* lsd may appear late. Retry registration without restarting the system shell. */
-    for(NSString *app in @[@"Sileo.app",@"TrollStoreLite.app"]) {
-        int status=EAGAIN;
-        for(unsigned i=0;i<12 && status;i++) {
-            status=run(@"/var/jb/usr/bin/uicache",@[@"-p",[@"/var/jb/Applications" stringByAppendingPathComponent:app]]);
-            if(status)sleep(5);
+    if(registerApps) {
+        /* lsd may appear late. Retry registration without restarting the system shell. */
+        for(NSString *app in @[@"Sileo.app",@"TrollStoreLite.app"]) {
+            NSString *path=[@"/var/jb/Applications" stringByAppendingPathComponent:app];
+            NSString *identifier=[app isEqualToString:@"Sileo.app"]?@"org.coolstar.SileoStore":@"com.opa334.TrollStoreLite";
+            int status=EAGAIN;
+            for(unsigned i=0;i<12 && status;i++) {
+                status=run(@"/var/jb/usr/bin/uicache",@[@"-v",@"-p",path]);
+                if(!status && !applicationRegistered(identifier,path))status=EAGAIN;
+                if(status)sleep(5);
+            }
+            fprintf(stderr,"COACHZ apps: registration %s status %d\n",app.UTF8String,status);if(status)return status;
         }
-        fprintf(stderr,"COACHZ apps: registration %s status %d\n",app.UTF8String,status);if(status)return status;
+        if(![uiRevision writeToFile:uiMarker atomically:YES encoding:NSUTF8StringEncoding error:nil])return EIO;
     }
-    if(fresh && ![revision writeToFile:marker atomically:YES encoding:NSUTF8StringEncoding error:nil])return EIO;
+    /* Restore additional installed code after the statically trusted UI repair. */
+    if(!fresh) {
+        fprintf(stderr,"COACHZ apps: installed code scan starting\n");
+        trustTree(@"/var/jb"); trustTree(@"/var/containers/Bundle/Application");
+        r=loadRecords();if(r)return r;
+    }
     fprintf(stderr,"COACHZ apps: bootstrap ready\n");
     return 0;
 }

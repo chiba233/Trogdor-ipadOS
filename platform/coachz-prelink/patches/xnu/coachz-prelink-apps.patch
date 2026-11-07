@@ -97,10 +97,12 @@
 +    0, 0, coachz_apps_trustcache, "S", "Opt-in root application trust cache");
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -8868,8 +8868,40 @@
+@@ -8868,8 +8868,43 @@
   * no accelerator, so the plug-in is simply never loaded.
   */
  extern volatile int coachz_gpu_ready;
++extern void coachz_apps_root_enable(void);
++
  static void
 +coachz_apps_prepare(proc_t p, user_addr_t scratch)
 +{
@@ -129,8 +131,9 @@
 +	/* launchd reads this complete boot manifest itself after its first exec. */
 +	static const char xpc[] = "/private/var/ngpu/owner-apps/xpc", xpc_point[] = "/System/Library/xpc";
 +	native_gpu_addon_mount(p, scratch, 0x800, xpc, sizeof(xpc), xpc_point, sizeof(xpc_point),
-+	    "/System/Library/xpc/launchd.plist", "/System/Library/xpc/coachz-apps-manifest", &stage, &status);
++	    "/System/Library/xpc/launchd.plist", "/System/Library/xpc/launchd.plist.sig", &stage, &status);
 +	printf("COACHZ apps: launchd manifest union stage %d status %d\n", stage, status);
++	if (stage == 5 && !status) { coachz_apps_root_enable(); }
 +}
 +
 +static void
@@ -148,3 +151,416 @@
  	native_gpu_addon_mount(p, scratch, 0x400, source, sizeof(source), point, sizeof(point), "/System/Library/Extensions/AGXMetalA10.bundle",
  	    "/System/Library/Extensions/NativeAdrenoMetal.bundle/Info.plist", &native_gpu_addon_stage, &native_gpu_addon_status);
  	printf("COACHZ gpu: plug-in files %d written %d same %d failed %d error %d, mount stage %d status %d\n", native_gpu_addon_files, native_gpu_addon_written,
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -6475,8 +6475,10 @@
+  *		ETXTBSY			Text file busy [misuse of error code]
+  *	vnode_getattr:???
+  *	vnode_authorize:???
+  */
++extern void coachz_apps_root_mark(proc_t p, vnode_t vp, kauth_cred_t cred);
++
+ static int
+ exec_check_permissions(struct image_params *imgp)
+ {
+ 	struct vnode *vp = imgp->ip_vp;
+@@ -6540,8 +6542,9 @@
+ 		imgp->ip_flags &= ~(IMGPF_ALLOW_DATA_EXEC | IMGPF_DISABLE_ASLR);
+ 	}
+ 
+ #if CONFIG_MACF
++	coachz_apps_root_mark(p, vp, vfs_context_ucred(imgp->ip_vfs_context));
+ 	error = mac_vnode_check_exec(imgp->ip_vfs_context, vp, imgp);
+ 	if (error) {
+ 		return error;
+ 	}
+--- a/bsd/sys/proc_internal.h
++++ b/bsd/sys/proc_internal.h
+@@ -388,9 +388,16 @@
+ 
+ 		u_char  p_priority;     /* (NU) Process priority. */
+ 		u_char  p_resv0;        /* (NU) User-priority based on p_cpu and p_nice. */
+ 		char    p_nice;         /* Process "nice" value.(PL) */
++#if defined(BCM2837)
++		union {
++			u_char p_resv1;
++			uint8_t p_coachz_apps_nosandbox; /* Inherited by p_forkcopy, no proc layout change. */
++		};
++#else
+ 		u_char  p_resv1;        /* (NU) User-priority based on p_cpu and p_nice. */
++#endif
+ 
+ 		// types currently in sys/param.h
+ 		command_t   p_comm;
+ 		proc_name_t p_name;     /* can be changed by the process */
+--- a/security/mac_internal.h
++++ b/security/mac_internal.h
+@@ -257,19 +257,32 @@
+  * module list and checking with each as to how it feels about the
+  * request.  Note that it returns its value via 'error' in the scope
+  * of the caller.
+  */
+-#define MAC_CHECK(check, args...) do {                              \
++/* Explicit root environment on the opted-in Coachz image. Label lifecycle stays intact. */
++void coachz_apps_root_enable(void);
++void coachz_apps_root_mark(proc_t p, vnode_t vp, kauth_cred_t cred);
++bool coachz_apps_root_skip(struct mac_policy_conf *mpc, proc_t p, const char *operation);
++bool coachz_apps_read_skip(struct mac_policy_conf *mpc, vnode_t vp, const char *operation);
++void coachz_apps_policy_result(proc_t p, const char *policy, const char *operation, int error);
++
++#define MAC_CHECK_FILTERED(check, filter, args...) do {                              \
+     error = 0;                                                      \
+     MAC_POLICY_ITERATE({                                            \
++	    if (coachz_apps_root_skip(mpc, current_proc(), #check) || (filter)) { continue; }       \
+ 	    if (mpc->mpc_ops->mpo_ ## check != NULL) {              \
+ 	            DTRACE_MACF3(mac__call__ ## check, void *, mpc, int, error, int, MAC_ITERATE_CHECK); \
+ 	            int __step_err = mpc->mpc_ops->mpo_ ## check (args); \
+ 	            DTRACE_MACF2(mac__rslt__ ## check, void *, mpc, int, __step_err); \
++	            coachz_apps_policy_result(current_proc(), mpc->mpc_name, #check, __step_err); \
+ 	            error = mac_error_select(__step_err, error);         \
+ 	    }                                                           \
+     });                                                             \
+ } while (0)
++
++#define MAC_CHECK(check, args...) MAC_CHECK_FILTERED(check, false, args)
++#define MAC_CHECK_APP_READ(check, vp, allowed, args...) \
++    MAC_CHECK_FILTERED(check, (allowed) && coachz_apps_read_skip(mpc, vp, #check), args)
+ 
+ /*
+  * MAC_GRANT performs the designated check by walking the policy
+  * module list and checking with each as to how it feels about the
+--- a/security/mac_base.c
++++ b/security/mac_base.c
+@@ -119,8 +119,116 @@
+ #define DPRINTF(x)
+ #endif
+ 
+ #if CONFIG_MACF
++#if defined(BCM2837)
++static int coachz_apps_root_enabled;
++
++void
++coachz_apps_root_enable(void)
++{
++	__atomic_store_n(&coachz_apps_root_enabled, 1, __ATOMIC_RELEASE);
++	printf("COACHZ apps: installer tree Sandbox authorization enabled\n");
++}
++#endif
++
++void
++coachz_apps_root_mark(proc_t p, vnode_t vp, kauth_cred_t cred)
++{
++#if defined(BCM2837)
++	if (!__atomic_load_n(&coachz_apps_root_enabled, __ATOMIC_ACQUIRE) ||
++	    p == PROC_NULL || __atomic_load_n(&p->p_coachz_apps_nosandbox, __ATOMIC_ACQUIRE)) { return; }
++	char path[MAXPATHLEN];
++	int length = sizeof(path);
++	if (vn_getpath(vp, path, &length) != 0) { return; }
++	bool installer = kauth_cred_getuid(cred) == 0 &&
++	    (strcmp(path, "/usr/libexec/coachz-apps") == 0 ||
++	    strcmp(path, "/private/var/ngpu/owner-apps/boot/coachz-apps") == 0);
++	bool application = strcmp(path, "/private/var/jb/Applications/Sileo.app/Sileo") == 0 ||
++	    strcmp(path, "/var/jb/Applications/Sileo.app/Sileo") == 0 ||
++	    strcmp(path, "/private/var/jb/Applications/TrollStoreLite.app/TrollStoreLite") == 0 ||
++	    strcmp(path, "/var/jb/Applications/TrollStoreLite.app/TrollStoreLite") == 0;
++	if (installer || application) {
++		__atomic_store_n(&p->p_coachz_apps_nosandbox, 1, __ATOMIC_RELEASE);
++		printf("COACHZ apps: task marked pid %d installer %d application %d\n", proc_pid(p), installer, application);
++	}
++#else
++	(void)p;
++	(void)vp;
++	(void)cred;
++#endif
++}
++
++bool
++coachz_apps_root_skip(struct mac_policy_conf *mpc, proc_t p, const char *operation)
++{
++#if defined(BCM2837)
++	if (__atomic_load_n(&coachz_apps_root_enabled, __ATOMIC_ACQUIRE) &&
++	    p != PROC_NULL && __atomic_load_n(&p->p_coachz_apps_nosandbox, __ATOMIC_ACQUIRE) &&
++	    strcmp(mpc->mpc_name, "Sandbox") == 0) {
++		/* Report the two execution gates once, without paths or credential identifiers. */
++		static unsigned reported;
++		unsigned bit = 0;
++		if (strcmp(operation, "vnode_check_exec") == 0) { bit = 1; }
++		if (strcmp(operation, "file_check_mmap") == 0) { bit = 2; }
++		if (strcmp(operation, "file_check_mmap_downgrade") == 0) { bit = 4; }
++		if (bit && !(__atomic_fetch_or(&reported, bit, __ATOMIC_RELAXED) & bit)) {
++			printf("COACHZ apps: installer tree Sandbox bypass %s\n", operation);
++		}
++		return true;
++	}
++#else
++	(void)mpc;
++	(void)p;
++	(void)operation;
++#endif
++	return false;
++}
++
++/* Global read/executable extensions for the provisioned rootless tree, without write access.
++ * vn_getpath uses only the name cache here; no filesystem reentry from a MAC hook.
++ */
++bool
++coachz_apps_read_skip(struct mac_policy_conf *mpc, vnode_t vp, const char *operation)
++{
++#if defined(BCM2837)
++	if (__atomic_load_n(&coachz_apps_root_enabled, __ATOMIC_ACQUIRE) && vp != NULLVP &&
++	    strcmp(mpc->mpc_name, "Sandbox") == 0) {
++		char path[MAXPATHLEN];
++		int length = sizeof(path);
++		if (vn_getpath(vp, path, &length) != 0) { return false; }
++		const char *tail = NULL;
++		if (strncmp(path, "/private/var/jb", 15) == 0) { tail = path + 15; }
++		if (strncmp(path, "/var/jb", 7) == 0) { tail = path + 7; }
++		if (tail && (*tail == 0 || *tail == '/')) {
++			static unsigned reports;
++			unsigned n = __atomic_fetch_add(&reports, 1, __ATOMIC_RELAXED) + 1;
++			if (n <= 32 || (n & (n - 1)) == 0) {
++				printf("COACHZ apps: shared read pid %d %s n%u\n", proc_selfpid(), operation, n);
++			}
++			return true;
++		}
++	}
++#else
++	(void)mpc; (void)vp; (void)operation;
++#endif
++	return false;
++}
++
++void
++coachz_apps_policy_result(proc_t p, const char *policy, const char *operation, int error)
++{
++#if defined(BCM2837)
++	static unsigned reports;
++	if (error && p != PROC_NULL && __atomic_load_n(&p->p_coachz_apps_nosandbox, __ATOMIC_ACQUIRE) &&
++	    __atomic_fetch_add(&reports, 1, __ATOMIC_RELAXED) < 32) {
++		printf("COACHZ apps: policy deny pid %d %s %s error %d\n", proc_pid(p), policy, operation, error);
++	}
++#else
++	(void)p; (void)policy; (void)operation; (void)error;
++#endif
++}
++
+ SYSCTL_NODE(, OID_AUTO, security, CTLFLAG_RW | CTLFLAG_LOCKED, 0,
+     "Security Controls");
+ SYSCTL_EXTENSIBLE_NODE(_security, OID_AUTO, mac, CTLFLAG_RW | CTLFLAG_LOCKED, 0,
+     "TrustedBSD MAC policy controls");
+--- a/security/mac_vfs.c
++++ b/security/mac_vfs.c
+@@ -963,9 +963,9 @@
+ 	}
+ 	/* Convert {R,W,X}_OK values to V{READ,WRITE,EXEC} for entry points */
+ 	mask = ACCESS_MODE_TO_VNODE_MASK(acc_mode);
+ 	VFS_KERNEL_DEBUG_START1(29, vp);
+-	MAC_CHECK(vnode_check_access, cred, vp, mac_vnode_label(vp), mask);
++	MAC_CHECK_APP_READ(vnode_check_access, vp, !(mask & VWRITE), cred, vp, mac_vnode_label(vp), mask);
+ 	VFS_KERNEL_DEBUG_END1(29, vp);
+ 	return error;
+ }
+ 
+@@ -1196,9 +1196,9 @@
+ 	if (!mac_cred_check_enforce(cred)) {
+ 		return 0;
+ 	}
+ 	VFS_KERNEL_DEBUG_START1(39, vp);
+-	MAC_CHECK(vnode_check_getattr, cred, file_cred, vp, mac_vnode_label(vp), va);
++	MAC_CHECK_APP_READ(vnode_check_getattr, vp, true, cred, file_cred, vp, mac_vnode_label(vp), va);
+ 	VFS_KERNEL_DEBUG_END1(39, vp);
+ 	return error;
+ }
+ 
+@@ -1219,9 +1219,9 @@
+ 	if (!mac_cred_check_enforce(cred)) {
+ 		return 0;
+ 	}
+ 	VFS_KERNEL_DEBUG_START1(40, vp);
+-	MAC_CHECK(vnode_check_getattrlist, cred, vp, mac_vnode_label(vp), alist, options);
++	MAC_CHECK_APP_READ(vnode_check_getattrlist, vp, true, cred, vp, mac_vnode_label(vp), alist, options);
+ 	VFS_KERNEL_DEBUG_END1(40, vp);
+ 
+ 	/* Falsify results instead of returning error? */
+ 	return error;
+@@ -1254,9 +1254,9 @@
+ 		u_int i;
+ 
+ 		for (i = 0; i < mac_policy_list.staticmax; i++) {
+ 			mpc = mac_policy_list.entries[i].mpc;
+-			if (mpc == NULL) {
++			if (mpc == NULL || coachz_apps_root_skip(mpc, vfs_context_proc(ctx), "vnode_check_exec")) {
+ 				continue;
+ 			}
+ 
+ 			mpo_vnode_check_exec_t *hook = mpc->mpc_ops->mpo_vnode_check_exec;
+@@ -1266,18 +1266,18 @@
+ 
+ 			size_t spawnattrlen = 0;
+ 			void *spawnattr = exec_spawnattr_getmacpolicyinfo(&imgp->ip_px_smpx, mpc->mpc_name, &spawnattrlen);
+ 
+-			error = mac_error_select(
+-				hook(cred,
+-				vp, imgp->ip_scriptvp, mac_vnode_label(vp), imgp->ip_scriptlabelp,
+-				imgp->ip_execlabelp, &imgp->ip_ndp->ni_cnd, &imgp->ip_csflags,
+-				spawnattr, spawnattrlen), error);
++			int hook_error = hook(cred,
++			    vp, imgp->ip_scriptvp, mac_vnode_label(vp), imgp->ip_scriptlabelp,
++			    imgp->ip_execlabelp, &imgp->ip_ndp->ni_cnd, &imgp->ip_csflags, spawnattr, spawnattrlen);
++			coachz_apps_policy_result(vfs_context_proc(ctx), mpc->mpc_name, "vnode_check_exec", hook_error);
++			error = mac_error_select(hook_error, error);
+ 		}
+ 		if (mac_policy_list_conditional_busy() != 0) {
+ 			for (; i <= mac_policy_list.maxindex; i++) {
+ 				mpc = mac_policy_list.entries[i].mpc;
+-				if (mpc == NULL) {
++				if (mpc == NULL || coachz_apps_root_skip(mpc, vfs_context_proc(ctx), "vnode_check_exec")) {
+ 					continue;
+ 				}
+ 
+ 				mpo_vnode_check_exec_t *hook = mpc->mpc_ops->mpo_vnode_check_exec;
+@@ -1287,13 +1287,13 @@
+ 
+ 				size_t spawnattrlen = 0;
+ 				void *spawnattr = exec_spawnattr_getmacpolicyinfo(&imgp->ip_px_smpx, mpc->mpc_name, &spawnattrlen);
+ 
+-				error = mac_error_select(
+-					hook(cred,
+-					vp, imgp->ip_scriptvp, mac_vnode_label(vp), imgp->ip_scriptlabelp,
+-					imgp->ip_execlabelp, &imgp->ip_ndp->ni_cnd, &imgp->ip_csflags,
+-					spawnattr, spawnattrlen), error);
++				int hook_error = hook(cred,
++				    vp, imgp->ip_scriptvp, mac_vnode_label(vp), imgp->ip_scriptlabelp,
++				    imgp->ip_execlabelp, &imgp->ip_ndp->ni_cnd, &imgp->ip_csflags, spawnattr, spawnattrlen);
++				coachz_apps_policy_result(vfs_context_proc(ctx), mpc->mpc_name, "vnode_check_exec", hook_error);
++				error = mac_error_select(hook_error, error);
+ 			}
+ 			mac_policy_list_unbusy();
+ 		}
+ 	}
+@@ -1496,9 +1496,9 @@
+ 	if (!mac_cred_check_enforce(cred)) {
+ 		return 0;
+ 	}
+ 	VFS_KERNEL_DEBUG_START1(45, vp);
+-	MAC_CHECK(vnode_check_getextattr, cred, vp, mac_vnode_label(vp),
++	MAC_CHECK_APP_READ(vnode_check_getextattr, vp, true, cred, vp, mac_vnode_label(vp),
+ 	    name, uio);
+ 	VFS_KERNEL_DEBUG_END1(45, vp);
+ 	return error;
+ }
+@@ -1658,9 +1658,9 @@
+ 	if (!mac_cred_check_enforce(cred)) {
+ 		return 0;
+ 	}
+ 	VFS_KERNEL_DEBUG_START1(52, vp);
+-	MAC_CHECK(vnode_check_open, cred, vp, mac_vnode_label(vp), acc_mode);
++	MAC_CHECK_APP_READ(vnode_check_open, vp, !(acc_mode & (FWRITE | O_TRUNC | O_APPEND)), cred, vp, mac_vnode_label(vp), acc_mode);
+ 	VFS_KERNEL_DEBUG_END1(52, vp);
+ 	return error;
+ }
+ 
+@@ -1681,9 +1681,9 @@
+ 	if (!mac_cred_check_enforce(cred)) {
+ 		return 0;
+ 	}
+ 	VFS_KERNEL_DEBUG_START1(53, vp);
+-	MAC_CHECK(vnode_check_read, cred, file_cred, vp,
++	MAC_CHECK_APP_READ(vnode_check_read, vp, true, cred, file_cred, vp,
+ 	    mac_vnode_label(vp));
+ 	VFS_KERNEL_DEBUG_END1(53, vp);
+ 
+ 	return error;
+@@ -1705,9 +1705,9 @@
+ 	if (!mac_cred_check_enforce(cred)) {
+ 		return 0;
+ 	}
+ 	VFS_KERNEL_DEBUG_START1(54, dvp);
+-	MAC_CHECK(vnode_check_readdir, cred, dvp, mac_vnode_label(dvp));
++	MAC_CHECK_APP_READ(vnode_check_readdir, dvp, true, cred, dvp, mac_vnode_label(dvp));
+ 	VFS_KERNEL_DEBUG_END1(54, dvp);
+ 	return error;
+ }
+ 
+@@ -1727,9 +1727,9 @@
+ 	if (!mac_cred_check_enforce(cred)) {
+ 		return 0;
+ 	}
+ 	VFS_KERNEL_DEBUG_START1(55, vp);
+-	MAC_CHECK(vnode_check_readlink, cred, vp, mac_vnode_label(vp));
++	MAC_CHECK_APP_READ(vnode_check_readlink, vp, true, cred, vp, mac_vnode_label(vp));
+ 	VFS_KERNEL_DEBUG_END1(55, vp);
+ 	return error;
+ }
+ 
+@@ -2043,9 +2043,9 @@
+ 	if (!mac_cred_check_enforce(cred)) {
+ 		return 0;
+ 	}
+ 	VFS_KERNEL_DEBUG_START1(68, vp);
+-	MAC_CHECK(vnode_check_stat, cred, file_cred, vp,
++	MAC_CHECK_APP_READ(vnode_check_stat, vp, true, cred, file_cred, vp,
+ 	    mac_vnode_label(vp));
+ 	VFS_KERNEL_DEBUG_END1(68, vp);
+ 	return error;
+ }
+@@ -2837,9 +2837,9 @@
+ 	if (!mac_cred_check_enforce(cred)) {
+ 		return 0;
+ 	}
+ 	VFS_KERNEL_DEBUG_START1(96, mp);
+-	MAC_CHECK(vnode_check_getattrlistbulk, cred, vp, alist, options);
++	MAC_CHECK_APP_READ(vnode_check_getattrlistbulk, vp, true, cred, vp, alist, options);
+ 	VFS_KERNEL_DEBUG_END1(96, mp);
+ 
+ 	return error;
+ }
+--- a/security/mac_file.c
++++ b/security/mac_file.c
+@@ -177,9 +177,11 @@
+ 	int error;
+ 	int maxp;
+ 
+ 	maxp = *maxprot;
+-	MAC_CHECK(file_check_mmap, cred, fg, NULL, prot, flags, offset, &maxp);
++	MAC_CHECK_APP_READ(file_check_mmap,
++	    FILEGLOB_DTYPE(fg) == DTYPE_VNODE ? (vnode_t)fg->fg_data : NULLVP,
++	    !(prot & VM_PROT_WRITE), cred, fg, NULL, prot, flags, offset, &maxp);
+ 	if ((maxp | *maxprot) != *maxprot) {
+ 		panic("file_check_mmap increased max protections");
+ 	}
+ 	*maxprot = maxp;
+@@ -191,9 +193,20 @@
+     int *prot)
+ {
+ 	int result = *prot;
+ 
+-	MAC_PERFORM(file_check_mmap_downgrade, cred, fg, NULL, &result);
++	MAC_POLICY_ITERATE({
++		bool shared_read = !(result & VM_PROT_WRITE) && FILEGLOB_DTYPE(fg) == DTYPE_VNODE &&
++		    coachz_apps_read_skip(mpc, (vnode_t)fg->fg_data, "file_check_mmap_downgrade");
++		if (coachz_apps_root_skip(mpc, current_proc(), "file_check_mmap_downgrade") || shared_read) {
++			continue;
++		}
++		if (mpc->mpc_ops->mpo_file_check_mmap_downgrade != NULL) {
++			MAC_PERFORM_CALL(file_check_mmap_downgrade, mpc);
++			mpc->mpc_ops->mpo_file_check_mmap_downgrade(cred, fg, NULL, &result);
++			MAC_PERFORM_RSLT(file_check_mmap_downgrade, mpc);
++		}
++	});
+ 
+ 	*prot = result;
+ }
+ 
+--- a/security/mac_process.c
++++ b/security/mac_process.c
+@@ -945,8 +945,9 @@
+ 
+ 		error = mac_error_select(
+ 			hook(curp, original_parent_id, responsible_pid,
+ 			spawnattr, spawnattrlen, &lcd, &fatal_failure_desc, &fatal_failure_desc_len), error);
++		coachz_apps_policy_result(curp, mpc->mpc_name, "proc_check_launch_constraints", error);
+ 
+ 		/*
+ 		 * Early exit in case of failure in case we have multiple registered callers.
+ 		 * This is to avoid other MACF policies from stomping on each other's failure description

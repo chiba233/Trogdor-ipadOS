@@ -21,7 +21,94 @@ import tarfile
 import zlib
 
 ROOT = Path(__file__).resolve().parent.parent
-BOOT_ENTRY_TARGET = '/private/var/ngpu/owner-apps/coachz-apps'
+BOOT_ENTRY_TARGET = '/usr/libexec/coachz-apps'
+
+
+def append_launchd_job(stock, path, job):
+    """Keep the native cache's original objects and reference identities intact."""
+    assert stock.startswith(b'bplist00') and len(stock) >= 40
+    _, offset_size, reference_size, count, root, table = struct.unpack('>6sBBQQQ', stock[-32:])
+    assert offset_size in (1, 2, 4, 8) and reference_size in (1, 2, 4, 8)
+    assert count > root and 8 <= table and table + count * offset_size == len(stock) - 32
+    offsets = [int.from_bytes(stock[table + i * offset_size:table + (i + 1) * offset_size], 'big')
+               for i in range(count)]
+    assert all(8 <= offset < table for offset in offsets)
+    body = bytearray(stock[:table])
+
+    def read_count(offset, kind):
+        marker = stock[offset]
+        assert marker >> 4 == kind
+        length = marker & 15
+        offset += 1
+        if length == 15:
+            assert stock[offset] >> 4 == 1 and stock[offset] & 15 <= 3
+            size = 1 << (stock[offset] & 15)
+            offset += 1
+            length = int.from_bytes(stock[offset:offset + size], 'big')
+            offset += size
+        assert offset <= table
+        return length, offset
+
+    def dictionary_refs(index):
+        length, offset = read_count(offsets[index], 13)
+        assert offset + 2 * length * reference_size <= table
+        refs = [int.from_bytes(stock[offset + i * reference_size:offset + (i + 1) * reference_size], 'big')
+                for i in range(2 * length)]
+        assert all(ref < count for ref in refs)
+        return refs[:length], refs[length:]
+
+    keys, values = dictionary_refs(root)
+    jobs_index = None
+    for key, value in zip(keys, values):
+        length, offset = read_count(offsets[key], 5)
+        if stock[offset:offset + length] == b'LaunchDaemons':
+            jobs_index = value
+    assert jobs_index is not None
+    keys, values = dictionary_refs(jobs_index)
+
+    def marker(kind, length):
+        if length < 15:
+            return bytes((kind | length,))
+        width = next(width for width in (1, 2, 4, 8) if length < 1 << (8 * width))
+        return bytes((kind | 15, 16 | (width.bit_length() - 1))) + length.to_bytes(width, 'big')
+
+    def references(indices):
+        return b''.join(index.to_bytes(reference_size, 'big') for index in indices)
+
+    def append(value):
+        if isinstance(value, bool):
+            encoded = b'\x09' if value else b'\x08'
+        elif isinstance(value, str):
+            encoded = value.encode('ascii')
+            encoded = marker(80, len(encoded)) + encoded
+        elif isinstance(value, int):
+            assert value >= 0
+            width = next(width for width in (1, 2, 4, 8) if value < 1 << (8 * width))
+            encoded = bytes((16 | (width.bit_length() - 1),)) + value.to_bytes(width, 'big')
+        elif isinstance(value, list):
+            encoded = marker(160, len(value)) + references([append(item) for item in value])
+        elif isinstance(value, dict):
+            key_refs = [append(key) for key in value]
+            value_refs = [append(item) for item in value.values()]
+            encoded = marker(208, len(value)) + references(key_refs + value_refs)
+        else:
+            raise TypeError('unsupported new launchd job value')
+        index = len(offsets)
+        assert index < 1 << (8 * reference_size), 'native object-reference width exhausted'
+        offsets.append(len(body))
+        body.extend(encoded)
+        return index
+
+    keys.append(append(path))
+    values.append(append(job))
+    offsets[jobs_index] = len(body)
+    body.extend(marker(208, len(keys)) + references(keys + values))
+    new_table = len(body)
+    assert new_table < 1 << (8 * offset_size), 'native offset width exhausted'
+    assert body[:table] == stock[:table], 'native object data changed'
+    body.extend(b''.join(offset.to_bytes(offset_size, 'big') for offset in offsets))
+    body.extend(struct.pack('>6sBBQQQ', bytes(6), offset_size, reference_size, len(offsets), root, new_table))
+    return bytes(body)
 
 
 def launchd_manifest(stock):
@@ -37,12 +124,62 @@ def launchd_manifest(stock):
     assert result['LaunchDaemons']['/System/Library/LaunchDaemons/com.apple.replayd.plist']['com.apple.private.security.no-sandbox'] is True
     path = '/System/Library/LaunchDaemons/com.coachz.apps.plist'
     assert path not in result['LaunchDaemons']
-    result['LaunchDaemons'][path] = job
-    packed = plistlib.dumps(result, fmt=plistlib.FMT_BINARY, sort_keys=False)
+    packed = append_launchd_job(stock, path, job)
     check = plistlib.loads(packed)
     assert check['LaunchDaemons'].pop(path) == job
     assert check == plistlib.loads(stock), 'an original launchd entry changed'
     return packed, plistlib.dumps(job)
+
+
+def signature_directories(blob):
+    """Bounded embedded/detached signature parser, shared by code and data files."""
+    assert len(blob) >= 12
+    magic, total, count = struct.unpack_from('>III', blob)
+    assert magic == 0xfade0cc0 and 12 <= total <= len(blob) and count <= (total - 12) // 8
+    out = []
+    for i in range(count):
+        _, cd = struct.unpack_from('>II', blob, 12 + 8 * i)
+        assert 12 + 8 * count <= cd <= total - 8
+        magic, length = struct.unpack_from('>II', blob, cd)
+        assert 8 <= length <= total - cd
+        if magic == 0xfade0c02:
+            assert length >= 44
+            out.append(blob[cd:cd + length])
+    assert out, 'signature has no CodeDirectory'
+    return out
+
+
+def signature_cdhashes(blob):
+    return {(hashlib.new({1: 'sha1', 2: 'sha256', 3: 'sha256', 4: 'sha384'}[cd[37]], cd).digest()[:20], cd[37])
+            for cd in signature_directories(blob)}
+
+
+def verify_detached_pages(data, blob):
+    """Check the exact bytes the kernel will validate after SecCodeMapMemory."""
+    for cd in signature_directories(blob):
+        offset = struct.unpack_from('>I', cd, 16)[0]
+        slots, limit = struct.unpack_from('>II', cd, 28)
+        size, typ, _, bits = cd[36:40]
+        algorithm = {1: 'sha1', 2: 'sha256', 3: 'sha256', 4: 'sha384'}[typ]
+        assert bits == 12 and limit == len(data), 'detached signature has wrong page size or file length'
+        assert slots == (len(data) + 4095) // 4096 and size <= hashlib.new(algorithm).digest_size
+        assert offset + slots * size <= len(cd), 'page hashes exceed CodeDirectory'
+        for i in range(slots):
+            expected = hashlib.new(algorithm, data[i * 4096:(i + 1) * 4096]).digest()[:size]
+            assert cd[offset + i * size:offset + (i + 1) * size] == expected, 'detached signature page mismatch'
+    return signature_cdhashes(blob)
+
+
+def sign_manifest(path):
+    signature = path.with_name(path.name + '.sig')
+    # Generic files default to one unpaged hash. SecCodeMapMemory needs the same
+    # 4 KiB page coverage used by this OS's original launchd.plist signature.
+    subprocess.run(['codesign', '--force', '--sign', '-', '--identifier', 'com.coachz.launchd.manifest',
+                    '--digest-algorithm', 'sha256', '--pagesize', '4096', '--detached', str(signature), str(path)], check=True)
+    blob = signature.read_bytes()
+    verify_detached_pages(path.read_bytes(), blob)
+    subprocess.run(['codesign', '--verify', '--strict', '--detached', str(signature), str(path)], check=True)
+    return blob
 
 
 def cdhashes(data):
@@ -74,22 +211,7 @@ def cdhashes(data):
         if cmd == 0x1d:
             off, size = struct.unpack_from('<II', data, at + 8)
             assert off + size <= len(data)
-            blob = data[off:off + size]
-            magic, total, count = struct.unpack_from('>III', blob)
-            assert magic == 0xfade0cc0 and total <= size and count <= (total - 12) // 8
-            out = set()
-            for i in range(count):
-                _, cd = struct.unpack_from('>II', blob, 12 + 8 * i)
-                assert cd + 8 <= total
-                magic, length = struct.unpack_from('>II', blob, cd)
-                if magic != 0xfade0c02:
-                    continue
-                assert 44 <= length <= total - cd
-                typ = blob[cd + 37]
-                algo = {1: 'sha1', 2: 'sha256', 3: 'sha256', 4: 'sha384'}[typ]
-                out.add((hashlib.new(algo, blob[cd:cd + length]).digest()[:20], typ))
-            assert out, 'unsigned ARM64 Mach-O'
-            return out
+            return signature_cdhashes(data[off:off + size])
         at += length
     raise ValueError('unsigned ARM64 Mach-O')
 
@@ -118,13 +240,17 @@ def main():
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--reuse-environment', type=Path,
                    help='retain an already extracted environment and its exact revision; change only the boot entry')
+    p.add_argument('--rebuild-helper', action='store_true',
+                   help='rebuild the installer while preserving the reused archive and its deployed revision')
     a = p.parse_args()
     out = a.output.resolve(); out.mkdir(parents=True, exist_ok=True)
     helper = out / 'coachz-apps'
     sdk = subprocess.check_output(['xcrun', '--sdk', 'iphoneos', '--show-sdk-path'], text=True).strip()
-    if a.reuse_environment:
-        if a.reuse_environment.resolve() == out:
-            raise ValueError('reuse source and output must be separate directories')
+    if a.rebuild_helper and not a.reuse_environment:
+        raise ValueError('--rebuild-helper requires --reuse-environment')
+    if a.reuse_environment and a.reuse_environment.resolve() == out:
+        raise ValueError('reuse source and output must be separate directories')
+    if a.reuse_environment and not a.rebuild_helper:
         shutil.copyfile(a.reuse_environment / 'coachz-apps', helper)
         helper.chmod(0o755)
     else:
@@ -137,6 +263,7 @@ def main():
     stock = (a.assets / 'launchd-stock.plist').read_bytes()
     manifest, job = launchd_manifest(stock)
     (out / 'launchd.plist').write_bytes(manifest)
+    manifest_signature = sign_manifest(out / 'launchd.plist')
     original_daemon = (a.assets / 'mtmergeprops').read_bytes()
     original_identity = subprocess.run(['codesign', '--display', '--verbose=4', str(a.assets / 'mtmergeprops')],
                                        capture_output=True, text=True, check=True).stderr
@@ -148,8 +275,9 @@ def main():
         payload = out / 'environment.tar.gz'
         shutil.copyfile(a.reuse_environment / 'environment.tar.gz', payload)
         expected = (a.reuse_environment / 'revision').read_text()
-        actual = hashlib.sha256(payload.read_bytes() + helper.read_bytes()).hexdigest() + '\n'
-        assert expected == actual, 'existing environment revision does not match its files'
+        previous = json.loads((a.reuse_environment / 'manifest.json').read_text())
+        assert previous['archive_sha256'] == hashlib.sha256(payload.read_bytes()).hexdigest(), 'reused archive differs'
+        assert previous['revision'] == expected.strip(), 'reused revision differs'
     else:
         # Preserve tar metadata, symlinks and package database entries without writing through links on the host.
         members = {}
@@ -219,7 +347,7 @@ def main():
                     info.size = len(data)
                 tar.addfile(info, io.BytesIO(data) if data is not None else None)
 
-    hashes = cdhashes(helper.read_bytes()) | cdhashes(original_check) | cdhashes(original_daemon)
+    hashes = cdhashes(helper.read_bytes()) | cdhashes(original_check) | cdhashes(original_daemon) | signature_cdhashes(manifest_signature)
     with tarfile.open(payload) as environment:
         for info in environment:
             if info.isfile():
@@ -227,15 +355,17 @@ def main():
     assert 0 < len(hashes) <= 32768
     tc_entries = b''.join(cdhash + bytes((typ, 0, 0, 0)) for cdhash, typ in sorted(hashes))
     (out / 'trustcache.bin').write_bytes(struct.pack('<I16sI', 2, hashlib.sha256(tc_entries).digest()[:16], len(hashes)) + tc_entries)
-    revision = hashlib.sha256(payload.read_bytes() + helper.read_bytes()).hexdigest() + '\n'
+    revision = expected if a.reuse_environment else hashlib.sha256(payload.read_bytes() + helper.read_bytes()).hexdigest() + '\n'
     (out / 'revision').write_text(revision)
     files = [('owner-apps/coachz-apps', 0o755, helper.read_bytes()),
              ('owner-apps/environment.tar.gz', 0o644, payload.read_bytes()),
              ('owner-apps/revision', 0o644, revision.encode()),
              ('owner-apps/boot/sysstatuscheck', 0o755, original_check),
              ('owner-apps/boot/mtmergeprops', 0o755, original_daemon),
+             ('owner-apps/boot/coachz-apps', 0o755, helper.read_bytes()),
              ('owner-apps/LaunchDaemons/com.coachz.apps.plist', 0o644, job),
              ('owner-apps/xpc/launchd.plist', 0o644, manifest),
+             ('owner-apps/xpc/launchd.plist.sig', 0o644, manifest_signature),
              ('owner-apps/xpc/coachz-apps-manifest', 0o644, b'direct launchd job\n')]
     gpu = a.gpu_addon.read_bytes()
     magic, count, total = struct.unpack_from('<8sI4xQ', gpu)
@@ -268,25 +398,32 @@ def main():
         assert entries[name] == (mode, data), 'delivered app entry differs: ' + name
     assert entries['owner-apps/boot/sysstatuscheck'][1] == original_check, 'old boot-task wrapper not restored'
     assert entries['owner-apps/boot/mtmergeprops'][1] == original_daemon, 'old daemon wrapper not restored'
+    assert entries['owner-apps/boot/coachz-apps'] == (0o755, helper.read_bytes()), 'system installer entry differs'
     assert entries['owner-apps/xpc/launchd.plist'][1] == manifest, 'launchd manifest differs'
     tc = (out / 'trustcache.bin').read_bytes()
     trusted = {(tc[i:i + 20], tc[i + 20]) for i in range(24, len(tc), 24)}
-    for name in ('owner-apps/boot/sysstatuscheck', 'owner-apps/boot/mtmergeprops', 'owner-apps/coachz-apps'):
+    assert verify_detached_pages(entries['owner-apps/xpc/launchd.plist'][1],
+                                 entries['owner-apps/xpc/launchd.plist.sig'][1]) <= trusted, 'manifest signature missing from trust cache'
+    for name in ('owner-apps/boot/sysstatuscheck', 'owner-apps/boot/mtmergeprops',
+                 'owner-apps/boot/coachz-apps', 'owner-apps/coachz-apps'):
         assert cdhashes(entries[name][1]) <= trusted, 'delivered executable missing from trust cache'
     evidence = {'gpu_addon_sha256': hashlib.sha256(gpu).hexdigest(), 'addon_sha256': hashlib.sha256(result).hexdigest(),
                 'archive_sha256': hashlib.sha256(payload.read_bytes()).hexdigest(), 'trusted_code_directories': len(hashes),
                 'bootstrap_bytes': payload.stat().st_size, 'addon_bytes': len(result), 'runtime_accepted': False,
                 'environment_reused': bool(a.reuse_environment), 'revision': revision.strip(),
+                'helper_rebuilt': a.rebuild_helper,
                 'bootstrap_method': 'direct job in launchd boot manifest',
                 'boot_entry_target': BOOT_ENTRY_TARGET,
                 'launchd_manifest_sha256': hashlib.sha256(manifest).hexdigest(),
+                'launchd_signature_sha256': hashlib.sha256(manifest_signature).hexdigest(),
+                'launchd_signature_cdhashes': [h.hex() for h, _ in sorted(signature_cdhashes(manifest_signature))],
                 'original_launchd_manifest_sha256': hashlib.sha256(stock).hexdigest(),
                 'original_jobs_preserved': len(plistlib.loads(stock)['LaunchDaemons']),
                 'installer_job': 'com.coachz.apps',
                 'sandbox_declaration': 'com.apple.private.security.no-sandbox',
                 'original_daemon_sha256': hashlib.sha256(original_daemon).hexdigest(),
                 'sysstatuscheck_restored': True, 'mtmergeprops_restored': True,
-                'requires_kernel_rebuild': True}
+                'required_kernel_feature': 'apps launchd manifest union'}
     (out / 'manifest.json').write_text(json.dumps(evidence, indent=2) + '\n')
     print(json.dumps(evidence, indent=2))
 
