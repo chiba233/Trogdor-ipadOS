@@ -4,7 +4,7 @@
  	return iokit_lookup_io_object(port, IKOT_IOKIT_CONNECT);
  }
  
-+/* io_connect_map_memory_into_task (2863) and io_connect_unmap_memory_from_task (2864) on the GPU driver's own user
++/* io_connect_map_memory_into_task (2863) and io_connect_unmap_memory_from_task (2864) on the GPU driver's and the video codec's user
 + * clients pass the sandbox's kobject filter (ipc_kobject_server_internal), adapted from Droid-VM's bring-up patch
 + * (BSD-2-Clause-Patent): the original profiles never let a sandboxed Metal client reach them. Anything else: false. */
 +extern boolean_t coachz_gpu_connect_granted(io_object_t obj);
@@ -61,7 +61,7 @@
 +		return false;
 +	}
 +	const char * cls = client->getMetaClass()->getClassName();
-+	if (strcmp(cls, "AGXDeviceUserClient") && strcmp(cls, "NativeAdrenoGpuClient")) {
++	if (strcmp(cls, "AGXDeviceUserClient") && strcmp(cls, "NativeAdrenoGpuClient") && strcmp(cls, "CoachzVenusUserClient")) {
 +		return false;
 +	}
 +	if (reported < 12) {

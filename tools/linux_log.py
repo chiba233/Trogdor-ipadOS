@@ -200,7 +200,10 @@ def modem_blob(kpart, directory, baseband=None):
     efs = [directory / 'rmtfs' / name for name in ('modem_fs1', 'modem_fs2', 'modem_fsc', 'modem_fsg')]
     # WLFW's board data (linux-firmware ath10k/WCN3990/hw1.0/board-2.bin) likewise when it is there.
     board = [directory / 'board-2.bin'] if (directory / 'board-2.bin').is_file() else []
-    files = [directory / 'mba.mbn', *(efs if all(path.is_file() for path in efs) else []), *board, directory / 'qdsp6sw.mbn']
+    # The video codec's firmware (linux-firmware qcom/venus-5.4/venus.mbn) likewise; with it the kernel brings the codec up
+    # (CoachzVenus.cpp), without it the codec stays off.
+    venus = [directory / 'venus.mbn'] if (directory / 'venus.mbn').is_file() else []
+    files = [directory / 'mba.mbn', *(efs if all(path.is_file() for path in efs) else []), *board, *venus, directory / 'qdsp6sw.mbn']
     named = [(path.name, path.read_bytes()) for path in files] + ([('baseband.arc', baseband)] if baseband else [])
     header = bytearray(4096)
     header[:16] = b'COACHZMODEMFW1\0\0'

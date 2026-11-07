@@ -1,0 +1,77 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -9700,8 +9700,66 @@
+ 		kfree_data(path, 256);
+ 	}
+ }
++
++/*
++ * The VideoToolbox decoder for the video codec (package/CoachzVideoDecoder.c, served by package/CoachzVenus.cpp), which the kernel
++ * carries: written to the Data volume each boot and shown in /System/Library/VideoDecoders through a read-only bindfs union, where
++ * VideoToolbox's VTLoadVideoDecoders dlopens AVD.videodecoder (the shared cache has no image of that name). Its CDHash is in the
++ * trust cache module build-coachz-venus.py writes. A kernel built without it leaves the directory alone.
++ */
++extern const unsigned char coachz_video_decoder[] __attribute__((weak));
++extern const uint64_t coachz_video_decoder_size __attribute__((weak));
+ 
+ static void
++coachz_video_prepare(proc_t p, user_addr_t scratch)
++{
++	static const char *const directories[] = {"/private/var/coachz", "/private/var/coachz/video"};
++	static const char source[] = "/private/var/coachz/video", point[] = "/System/Library/VideoDecoders";
++	int error = 0, stage = 0;
++
++	if (!coachz_video_decoder || !coachz_video_decoder_size) {
++		return;
++	}
++	for (unsigned index = 0; index < sizeof(directories) / sizeof(directories[0]) && !error; index++) {
++		struct mkdir_args request = {.path = scratch + 0x100, .mode = 0755};
++		int32_t result = 0;
++		error = copyout(directories[index], request.path, strlen(directories[index]) + 1);
++		if (!error) {
++			error = mkdir(p, &request, &result);
++			error = error == EEXIST ? 0 : error;
++		}
++	}
++	if (!error) {
++		error = coachz_audio_write("/private/var/coachz/video/AVD.videodecoder", coachz_video_decoder, coachz_video_decoder_size, 0755);
++	}
++	if (!error) {
++		const user_addr_t offset = 0xa00;
++		struct mount_args request = {.type = scratch + offset, .path = scratch + offset + 0x20,
++			                     .flags = MNT_RDONLY | MNT_UNION, .data = scratch + offset + 0x100};
++		int32_t result = 0;
++		vnode_t probe = NULLVP;
++
++		stage = 1;
++		if (!(error = copyout("bindfs", request.type, 7)) && !(error = copyout(point, request.path, sizeof(point))) &&
++		    !(error = copyout(source, request.data, sizeof(source)))) {
++			native_bindfs_boot_mount = 1;
++			error = mount(p, &request, &result);
++			native_bindfs_boot_mount = 0;
++			if (!error) {
++				stage = 2;
++				/* The union must show the decoder beside the system's own files there. */
++				error = vnode_lookup("/System/Library/VideoDecoders/AVD.videodecoder", 0, &probe, vfs_context_kernel());
++				if (!error) {
++					vnode_put(probe);
++					stage = 3;
++				}
++			}
++		}
++	}
++	printf("COACHZ video: decoder %llu bytes, mount stage %d status %d\n", coachz_video_decoder_size, stage, error);
++}
++
++static void
+ coachz_data_prepare(proc_t p, user_addr_t scratch)
+ {
+ 	char device_path[64] = {0};
+@@ -9772,6 +9830,7 @@
+ 		coachz_audio_prepare(p, scratch);
+ 		coachz_gpu_prepare(p, scratch);
+ 		coachz_baseband_prepare(p, scratch);
++		coachz_video_prepare(p, scratch);
+ 	}
+ }
+ 

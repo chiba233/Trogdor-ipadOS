@@ -145,5 +145,10 @@ coachz-prelink-probe-cleanup.patch
 # TrollStore Lite's spawnRoot: only its own binary may start its own trollstorehelper with a uid/gid 0 persona.
 coachz-prelink-trollstore-persona.patch
 
+# The video codec's firmware from the blob, its cx consumer and its MM1/MM2 bus vote (package/CoachzVenus.cpp).
+coachz-prelink-venus.patch
+
 # /chosen/coachz-baseband: the cellular bridge (pending/baseband): QRTR hooks in the Wi-Fi thread, its firmware on the Data volume, CommCenter running.
 coachz-prelink-baseband.patch
+# The VideoToolbox decoder for the video codec (package/CoachzVideoDecoder.c) on the Data volume, shown in /System/Library/VideoDecoders through a bindfs union.
+coachz-prelink-video-decoder.patch

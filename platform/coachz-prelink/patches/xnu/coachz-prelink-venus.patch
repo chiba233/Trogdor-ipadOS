@@ -1,0 +1,62 @@
+--- a/bsd/dev/coachz_wifi.c
++++ b/bsd/dev/coachz_wifi.c
+@@ -360,7 +360,7 @@
+  * others): cmd-db lookups, active-only writes through the TCS above, and cx.lvl as rpmhpd aggregates it, the highest corner any
+  * consumer asks for (a plain write by one would drop another's level). The modem's proxy vote is one such consumer.
+  */
+-enum { COACHZ_CX_MSS_PROXY = 3, COACHZ_CX_CONSUMERS = 5 };   /* 1, 2 SDCC; 4 usb_1 */
++enum { COACHZ_CX_MSS_PROXY = 3, COACHZ_CX_CONSUMERS = 6 };   /* 1, 2 SDCC; 4 usb_1; 5 venus (CoachzVenus.cpp) */
+ static uint32_t coachz_cx_corner[COACHZ_CX_CONSUMERS], coachz_cx_written = 0xffffffffu;
+ static volatile uint32_t coachz_cx_busy;
+ static uint8_t coachz_aux[4][64];
+@@ -540,6 +540,31 @@
+ }
+ 
+ /* The commands ordered by VCD (stable) with the commit bit on the last BCM of each VCD, sent through the active TCS in one go. */
++static int wifi_bcm_send(vm_offset_t db, const char *tag, const struct wifi_bcm *bcms, unsigned count);
++
++/* venus.mbn from the firmware blob (below), for CoachzVenus.cpp; null until it was read and its SHA-256 matched. */
++uint8_t *volatile coachz_venus_fw;
++size_t coachz_venus_fw_bytes;
++
++/*
++ * The video codec's path to memory, as venus_runtime_resume and load_scale_v4 ask for it (icc_set_bw on "video-mem": qxm_venus0 in
++ * MM1, qns_mem_noc_sf in MM2; qns_llcc and ebi already carry the DDR vote's top level; "cpu-cfg" is CN0, kept on). MM1 also carries
++ * the display's qxm_mdp0, which Debian's interconnect summary reads as 920678 kB/s average and 1600000 peak: nobody else votes MM1
++ * here, so that share is added and the peak never drops below it. kB/s in, as icc_set_bw takes them. Returns wifi_bcm_send's result.
++ */
++int coachz_venus_bus_vote(uint64_t avg_kbps, uint64_t peak_kbps);
++int
++coachz_venus_bus_vote(uint64_t avg_kbps, uint64_t peak_kbps)
++{
++    const uint64_t display_avg = 920678, display_peak = 1600000;
++    const struct wifi_bcm bcms[] = {
++        {"MM1", 32, 1, 0, avg_kbps + display_avg, peak_kbps > display_peak ? peak_kbps : display_peak},
++        {"MM2", 32, 1, 0, avg_kbps, peak_kbps},
++    };
++    const vm_offset_t db = wifi_cmd_db();
++    return db ? wifi_bcm_send(db, "venus bus", bcms, 2) : -1;
++}
++
+ static int
+ wifi_bcm_send(vm_offset_t db, const char *tag, const struct wifi_bcm *bcms, unsigned count)
+ {
+@@ -839,6 +864,18 @@
+                 kfree_data(copy, (size_t)size);
+             }
+         }
++        /* The video firmware (linux-firmware qcom/venus-5.4/venus.mbn, at most VENUS_FW_MEM_SIZE as venus_load_fw allows), kept for
++         * CoachzVenus.cpp, which copies its segments into the venus region itself. */
++        if (!error && !memcmp(digest, entry + 32, 32) && !strcmp(name, "venus.mbn") && size >= 4096 && size <= (6u << 20) &&
++            !coachz_venus_fw) {
++            uint8_t *copy = kalloc_data((size_t)((size + 511) & ~511ull), Z_WAITOK);
++            if (copy && !wifi_fw_read(disk, context, copy, (size_t)((size + 511) & ~511ull), wifi_fw_blob + offset)) {
++                coachz_venus_fw_bytes = (size_t)size;
++                __atomic_store_n(&coachz_venus_fw, copy, __ATOMIC_RELEASE);
++            } else if (copy) {
++                kfree_data(copy, (size_t)((size + 511) & ~511ull));
++            }
++        }
+         if (!error && !memcmp(digest, entry + 32, 32) && !strcmp(name, "qdsp6sw.mbn") && size >= 4096) {
+             wifi_mpss_at = wifi_fw_blob + offset;
+             wifi_mpss_bytes = size;

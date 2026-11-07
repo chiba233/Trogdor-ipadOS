@@ -232,6 +232,9 @@ def main():
             if (ROOT / 'platform' / a.platform / 'scripts/build-coachz-usb-host.py').is_file():
                 # The Apple USB host stack's platform side; it calls the SMMU kit that libCoachzGpu.a carries.
                 os.environ['XNU_EXTRA_LD_ARCHIVES'] += ' -Wl,-force_load,' + str(ctx.tree / 'build/coachz-usb-host/libCoachzUsbHost.a')
+            if (ROOT / 'platform' / a.platform / 'scripts/build-coachz-venus.py').is_file():
+                # The video codec's bring-up (CoachzVenus.cpp); like the USB host side it calls the SMMU kit in libCoachzGpu.a.
+                os.environ['XNU_EXTRA_LD_ARCHIVES'] += ' -Wl,-force_load,' + str(ctx.tree / 'build/coachz-venus/libCoachzVenus.a')
         kernel.build(ctx, modules)
         candidate = ctx.tree / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf'
         if not candidate.is_file():

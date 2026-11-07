@@ -71,9 +71,10 @@ class UsbHostTests(unittest.TestCase):
         self.assertIn('build/coachz-usb-host/libCoachzUsbHost.a', (ROOT / 'tools/kernel_source.py').read_text())
 
     def test_default_boot_is_unchanged(self):
-        series = (ROOT / 'platform/coachz-prelink/patches/xnu/series').read_text().split()
+        series = [line for line in (ROOT / 'platform/coachz-prelink/patches/xnu/series').read_text().splitlines()
+                  if line and not line.startswith('#')]
         self.assertIn('coachz-prelink-usb-host.patch', series)
-        self.assertEqual(series[-1], 'coachz-prelink-baseband.patch')
+        self.assertEqual(series[-2:], ['coachz-prelink-baseband.patch', 'coachz-prelink-video-decoder.patch'])
         patch = (ROOT / 'platform/coachz-prelink/patches/xnu/coachz-prelink-usb-host.patch').read_text()
         self.assertIn('+++ b/iokit/Kernel/IOCatalogue.cpp', patch)
         self.assertIn('PE_parse_boot_argn("coachz-usb-host"', patch)
