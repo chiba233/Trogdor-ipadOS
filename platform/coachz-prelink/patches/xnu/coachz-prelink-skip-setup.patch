@@ -1,6 +1,6 @@
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -8513,7 +8513,146 @@
+@@ -8513,7 +8513,158 @@
  	printf("COACHZ MobileGestalt cache removed: %d\n", error);
  }
  
@@ -24,6 +24,12 @@
 +	return false;
 +}
 +
++/* This helper enters APFS and corecrypto from the init thread; keep its path/plist buffers off the 16 KiB kernel stack. */
++struct coachz_setup_scratch {
++	char path[MAXPATHLEN], saved[MAXPATHLEN], plist[1024];
++	struct vnode_attr attributes;
++};
++
  static int
 +coachz_setup_pref(const char *name, const char *marker, const char *body)
 +{
@@ -32,28 +38,32 @@
 +	    "<plist version=\"1.0\"><dict>";
 +	static const char tail[] = "</dict></plist>\n";
 +	vfs_context_t context = vfs_context_kernel();
-+	char path[MAXPATHLEN], saved[MAXPATHLEN], plist[1024];
-+	struct vnode_attr attributes;
++	struct coachz_setup_scratch *work = kalloc_type(struct coachz_setup_scratch, Z_WAITOK | Z_ZERO);
 +	vnode_t vnode = NULLVP, target = NULLVP;
 +	int length, error, close_error, residual = 0;
 +
-+	snprintf(path, sizeof(path), "/private/var/mobile/Library/Preferences/%s.plist", name);
-+	snprintf(saved, sizeof(saved), "%s.coachz-prev", path);
-+	length = snprintf(plist, sizeof(plist), "%s%s%s", head, body, tail);
-+	if (length <= 0 || length >= (int)sizeof(plist)) {
-+		return EINVAL;
++	if (!work) {
++		return ENOMEM;
 +	}
-+	error = vnode_open(path, O_NOFOLLOW | FREAD, 0, 0, &vnode, context);
++
++	snprintf(work->path, sizeof(work->path), "/private/var/mobile/Library/Preferences/%s.plist", name);
++	snprintf(work->saved, sizeof(work->saved), "%s.coachz-prev", work->path);
++	length = snprintf(work->plist, sizeof(work->plist), "%s%s%s", head, body, tail);
++	if (length <= 0 || length >= (int)sizeof(work->plist)) {
++		error = EINVAL;
++		goto done;
++	}
++	error = vnode_open(work->path, O_NOFOLLOW | FREAD, 0, 0, &vnode, context);
 +	if (!error) {
 +		bool present = false;
-+		VATTR_INIT(&attributes);
-+		VATTR_WANTED(&attributes, va_data_size);
-+		error = vnode_getattr(vnode, &attributes, context);
-+		if (!error && (vnode_vtype(vnode) != VREG || attributes.va_data_size > (1 << 20))) {
++		VATTR_INIT(&work->attributes);
++		VATTR_WANTED(&work->attributes, va_data_size);
++		error = vnode_getattr(vnode, &work->attributes, context);
++		if (!error && (vnode_vtype(vnode) != VREG || work->attributes.va_data_size > (1 << 20))) {
 +			error = EFTYPE;
 +		}
 +		if (!error) {
-+			size_t size = (size_t)attributes.va_data_size, allocated = size ? size : 1;
++			size_t size = (size_t)work->attributes.va_data_size, allocated = size ? size : 1;
 +			char *data = kalloc_data(allocated, Z_WAITOK | Z_NOFAIL);
 +			error = size ? vn_rdwr(UIO_READ, vnode, data, (int)size, 0, UIO_SYSSPACE, 0,
 +			    vfs_context_ucred(context), &residual, vfs_context_proc(context)) : 0;
@@ -62,7 +72,7 @@
 +			}
 +			present = !error && coachz_bytes_contain(data, size, marker);
 +			if (!error && !present) {
-+				error = vnode_open(saved, O_CREAT | O_TRUNC | O_NOFOLLOW | FWRITE, 0600, 0, &target, context);
++				error = vnode_open(work->saved, O_CREAT | O_TRUNC | O_NOFOLLOW | FWRITE, 0600, 0, &target, context);
 +				if (!error) {
 +					if (size) {
 +						error = vn_rdwr(UIO_WRITE, target, data, (int)size, 0, UIO_SYSSPACE, IO_UNIT | IO_SYNC,
@@ -78,31 +88,33 @@
 +		error = error ? error : close_error;
 +		if (error || present) {
 +			printf("COACHZ setup: %s %s: %d\n", name, present ? "already has its keys" : "not read", error);
-+			return error;
++			goto done;
 +		}
 +	} else if (error != ENOENT) {
 +		printf("COACHZ setup: %s open: %d\n", name, error);
-+		return error;
++		goto done;
 +	}
-+	error = vnode_open(path, O_CREAT | O_TRUNC | O_NOFOLLOW | FWRITE, 0600, 0, &target, context);
++	error = vnode_open(work->path, O_CREAT | O_TRUNC | O_NOFOLLOW | FWRITE, 0600, 0, &target, context);
 +	if (error) {
 +		printf("COACHZ setup: %s create: %d\n", name, error);
-+		return error;
++		goto done;
 +	}
-+	error = vn_rdwr(UIO_WRITE, target, plist, length, 0, UIO_SYSSPACE, IO_UNIT | IO_SYNC,
++	error = vn_rdwr(UIO_WRITE, target, work->plist, length, 0, UIO_SYSSPACE, IO_UNIT | IO_SYNC,
 +	    vfs_context_ucred(context), NULL, vfs_context_proc(context));
 +	if (!error) {
-+		VATTR_INIT(&attributes);
-+		VATTR_SET(&attributes, va_uid, 501);
-+		VATTR_SET(&attributes, va_gid, 501);
-+		VATTR_SET(&attributes, va_mode, 0600);
++		VATTR_INIT(&work->attributes);
++		VATTR_SET(&work->attributes, va_uid, 501);
++		VATTR_SET(&work->attributes, va_gid, 501);
++		VATTR_SET(&work->attributes, va_mode, 0600);
 +		/* vnode_open leaves O_TRUNC to its caller: set the length explicitly. */
-+		VATTR_SET(&attributes, va_data_size, (uint64_t)length);
-+		error = vnode_setattr(target, &attributes, context);
++		VATTR_SET(&work->attributes, va_data_size, (uint64_t)length);
++		error = vnode_setattr(target, &work->attributes, context);
 +	}
 +	close_error = vnode_close(target, FWRITE, context);
 +	error = error ? error : close_error;
 +	printf("COACHZ setup: wrote %s (%d bytes): %d\n", name, length, error);
++done:
++	kfree_type(struct coachz_setup_scratch, work);
 +	return error;
 +}
 +
@@ -147,7 +159,7 @@
  coachz_watchdog_policy_prepare(void)
  {
  	const char policy[] = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-@@ -8658,6 +8797,7 @@
+@@ -8658,6 +8809,7 @@
  			panic("Coachz temporary watchdog launch policy failed: %d", error);
  		}
  		coachz_mobilegestalt_cache_reset();

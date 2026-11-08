@@ -1711,3 +1711,18 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 - **k168**：`COACHZ net: ... removed 1`，但用户客户端用了自己的类名，`IOUC CoachzNetworkStackUserClient failed MACF in process pid 37, configd`，InterfaceNamer 没有完成，wifid 停在 `WiFiManagerCreate`，Wi-Fi 开关灰掉。
 - **k169、k170**：用户客户端改成原版 `IONetworkStackUserClient` 实例换 vtable。没有 `failed MACF`；开机后自动加入已保存网络，认证、关联、四次握手完成，DHCP 发布 IPv4 和路由，IPv6 也拿到，DNS 可达。`the network stack was opened` 没有出现。
 - 之后一次开机始终没有加入：上一次开机时控制中心发起了断开（wifid 记 `user-initiated disconnect ... reason=Control Center`），iPadOS 把自动加入关到第二天早上，这是系统行为，不是驱动问题。
+
+## k209 启动偏好处理时的内核栈溢出
+
+日志环记录 CPU 1 在原版 launchd 执行前 panic：`Invalid kernel stack pointer (probable overflow)`。最后一条偏好记录为
+`com.apple.springboard already has its keys: 0`，接下来是 `com.apple.migration` 的准备。PC 位于同步异常入口保存寄存器的指令，
+写地址落入栈下方的 guard page；LR 位于预链接 corecrypto 的 CTR 初始化回调。完整父调用栈未保留下来。
+
+主机反汇编显示内核栈为 16 KiB，`coachz_setup_pref` 栈帧 3696 字节，连同外层 `coachz_data_prepare` 和 `load_init_program`
+已占 6608 字节，之后还进入 vnode、文件系统和加密调用。源码将路径、备份路径、plist 和 vnode 属性移到类型化堆分配，所有已分配
+出口共用释放路径；路径、XML、标记键和偏好值保持字节一致。编译对象的栈预算回归检查在原对象上按 3696 字节失败，修订后的统一
+内核构建通过，同一函数栈帧降至 144 字节，回归检查通过。
+
+修订从 k210 起随内核交付。后续 k211、k212 真机日志均越过原先停止的 `com.apple.migration` 偏好处理，完成其余偏好准备、
+原版 launchd 启动和 Venus 逐样点自检，并进入实际视频解码；两份日志均未出现该栈溢出 panic。此项验收仅覆盖启动偏好处理的
+栈占用修复，不代表 GPU 恢复、SpringBoard 稳定性或视频绿线已经修好。

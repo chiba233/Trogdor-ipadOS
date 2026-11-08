@@ -1,7 +1,9 @@
 """The ADT the SMP route gives XNU: SC7180 cores in MPIDR Affinity1, PSCI by SMC."""
 from pathlib import Path
 import re
+import shutil
 import struct
+import subprocess
 import sys
 import unittest
 
@@ -78,8 +80,22 @@ class SmpTreeTests(unittest.TestCase):
         for key in ('BKNoWatchdogs', 'DMUserDataDisposition', 'LastSystemVersion</key><string>21H461', 'SetupDone',
                     'SBDisableIdleSleep', 'LockdownActivationIndicatesCloudConfigurationAvailable'):
             self.assertIn(key, patch)
-        self.assertIn('+		VATTR_SET(&attributes, va_uid, 501);', patch)
+        self.assertIn('+		VATTR_SET(&work->attributes, va_uid, 501);', patch)
         self.assertIn('+		coachz_setup_prepare();', patch)
+
+    def test_compiled_setup_helper_leaves_stack_for_apfs_and_crypto(self):
+        root = Path(__file__).resolve().parents[1]
+        obj = root / 'build/xnu-source-prelink/coachz/ipados-17.7.11-21H461/coachz/tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT/kern_exec.o'
+        if not obj.is_file() or not shutil.which('xcrun'):
+            self.skipTest('needs the locally compiled kernel object and Xcode')
+        disassembly = subprocess.check_output(['xcrun', 'llvm-objdump', '-d',
+            '--disassemble-symbols=_coachz_setup_pref', str(obj)], text=True)
+        prologue = '\n'.join(disassembly.split('<_coachz_setup_pref>:', 1)[1].splitlines()[:24])
+        # Include callee saves and local storage. The observed 3696-byte frame exhausted the 16 KiB init-thread stack in crypto.
+        decrements = re.findall(r'sub\s+sp, sp, #(0x[0-9a-f]+)|\[sp, #-(0x[0-9a-f]+)\]!', prologue)
+        frame = sum(int(a or b, 16) for a, b in decrements)
+        self.assertGreater(frame, 0)
+        self.assertLessEqual(frame, 1024, 'setup helper must leave room for vnode/APFS/corecrypto calls')
 
     def test_main_os_tree_has_the_ids_for_a_platform_uuid(self):
         source = (Path(__file__).resolve().parents[1] / 'tools/xnu_screen.py').read_text()
