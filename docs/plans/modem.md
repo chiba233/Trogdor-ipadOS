@@ -172,6 +172,12 @@ b9 用 drivers/RamBlock/coachz_modem.c 按上面的顺序接入，在 Wi-Fi 线�
 - BSP 0xb001（`queryActivationStatus`）的应答是 TLV 0x01 ChipInformation {u32 芯片 ID，u32 序列号}，CommCenter 放进激活附带信息（`kCTPostponementInfoBasebandChipID`、`...BasebandSerialNumber`），ABM 也发布这两项。桥接层回 BHI 和 sahara 阶段报过的同一组值（固定序列号，不是真实的）；上机后 `Unable to get chip id and serial number` 不再出现。eSIM 的 `Could not get cellular plan device Info` 仍在，跟这两项无关。
 - 数据上下文仍然没有分配，CommCenter 记 `kDataNotSupported{context is not assigned}`。
 
+### 第十次上机（eSIM 选卡）
+
+开机时 eUICC 里的配置已启用，modem 却在实体卡上，CommCenter 的 sub.eval 在两个端点里找不到这张 eSIM 的 ICCID（“SIM … not found, leaving with no assignment”），不分配订阅，也就不会请求切卡。原因是卡信息列表里只有实体卡一项，而 CommCenter 按下标把列表对到端点上。另外，CommCenter 读这张列表时，Get Card Status 应答用 TLV 0x17，Card Status Change 指示用 TLV 0x14（指示里的 0x12、0x15 分别当作扩展卡状态和“卡短暂断电”）；这台 modem 两处都用 0x17，0x15 是 SIM busy。
+
+桥接层现在在实体卡在用时给端点二补上 eUICC 一项（ICCID 取自卡槽状态，再加 EID），指示里把列表放到 0x14，并去掉 modem 的 0x12、0x14、0x15。CommCenter 选中 eSIM 后发苹果私有的 SelectUIMForSingleSubCfg（UIM 0x5557，TLV 0x01：0 槽一、1 槽二；另一种驱动发 MapProvisioningSessionToSlot 0x6e，TLV 0x10 为槽号），这台 modem 不认识，由桥接层执行：切槽、等 6 秒、重读卡槽、提交选卡、发布新卡状态，然后回应。实机上 eSIM 激活和两个方向的切换都成功，日志里每次请求都在新卡状态之后回应成功。切换耗时长，从 eSIM 切回实体卡时较长时间显示无 SIM，设置里的 EID 缺失，三者待查。
+
 ### eSIM Tape 实现（待实机）
 
 补齐的 `coachz_bb_esim.h` 已接入现有 QMUX 收发，不改数据口和激活实现，不增编译参数：

@@ -42,6 +42,12 @@
 #define CBE_UIM_CLOSE_LOGICAL_CHANNEL 0x003fu
 #define CBE_UIM_SWITCH_SLOT 0x0046u
 #define CBE_UIM_GET_SLOT_STATUS 0x0047u
+/* Apple's single-standby subscription selection (libCommCenterMCommandDrivers, DataSubscriptionCommandDriver's
+ * handleConfigureSubscription_sync): QMILegacyDataSubscriptionCommandDriver sends SelectUIMForSingleSubCfg, TLV 0x01 u8 (0 slot
+ * one, 1 slot two); QMIDataSubscriptionCommandDriver sends MapProvisioningSessionToSlot, TLV 0x10 u8 primary slot from 1 (0x11 the
+ * secondary). This modem knows neither: the bridge carries the selection out itself (cbe_route_request). */
+#define CBE_UIM_SELECT_SINGLE_SUB 0x5557u
+#define CBE_UIM_MAP_PROVISIONING 0x006eu
 #define CBE_UIM_CAPABILITY_TLV 0x21u
 #define CBE_ERR_NO_MEMORY 2u
 #define CBE_ERR_INTERNAL 3u
@@ -108,6 +114,7 @@ struct cbe_slots {
     uint8_t known, count, euicc, active, logical, eid_len;   /* euicc, active: physical slot from 1, 0 none; logical: the active one's */
     uint8_t present[CBE_SLOTS], is_euicc[CBE_SLOTS], is_active[CBE_SLOTS], logical_of[CBE_SLOTS];
     uint8_t eid[16];
+    uint8_t iccid_len[CBE_SLOTS], iccid[CBE_SLOTS][10];   /* the slot status' ICCID bytes per physical slot; never logged */
 };
 
 /* UIM Get Slot Status response: 1 when parsed. TLV 0x10 {n, {u32 card, u32 state, u8 logical, u8 iccid[len]}}, 0x11 {n, {u32 protocol,
@@ -126,6 +133,7 @@ static inline int cbe_parse_slots(struct cbe_slots *s, const uint8_t *sdu, uint3
             t.present[i] = cbd_rd32(st + at) == 2u;
             t.is_active[i] = cbd_rd32(st + at + 4) == 1u;
             t.logical_of[i] = st[at + 8];
+            if (st[at + 9] && st[at + 9] <= 10u) { t.iccid_len[i] = st[at + 9]; __builtin_memcpy(t.iccid[i], st + at + 10, st[at + 9]); }
         }
         at += 10u + st[at + 9];
     }
@@ -174,6 +182,26 @@ static inline uint32_t cbe_der(const uint8_t *p, uint32_t n, uint32_t *tag, uint
     return at && *len <= n - at ? at : 0;
 }
 
+/* SGP.22 EnableProfileRequest [49] / DisableProfileRequest [50]: { profileIdentifier [0], refreshFlag BOOLEAN [1] }. With the flag
+ * set the eUICC raises the REFRESH that re-initialises the card, which the modem carries out itself: Hermes, ChromeOS's LPA on this
+ * modem, only waits kSimRefreshDelay after an enable ("The card triggers a refresh after profile enable", modem_qrtr.cc). Apple's
+ * basebands reset the card themselves, so CommCenter's request may leave the flag clear and the enabled profile's USIM never comes
+ * up here. The flag is set; the result is CommCenter's value (0, 1) or 2 when the request has none. */
+static inline uint32_t cbe_refresh_flag(uint8_t *p, uint32_t n)
+{
+    uint32_t tag = 0, len = 0;
+    const uint32_t h = cbe_der(p, n, &tag, &len);
+    if (!h || (tag != 0xbf31u && tag != 0xbf32u)) return 2;
+    for (uint32_t at = h; at < h + len;) {
+        uint32_t t = 0, l = 0;
+        const uint32_t hh = cbe_der(p + at, h + len - at, &t, &l);
+        if (!hh) return 2;
+        if (t == 0x81u && l == 1u) { const uint32_t old = p[at + hh] ? 1u : 0u; p[at + hh] = 0xff; return old; }
+        at += hh + l;
+    }
+    return 2;
+}
+
 struct cbe_seg { uint32_t off, len; };
 /* The STORE DATA segments of a command: a Bound Profile Package split as SGP.22 says, anything else whole. 0 when a BF36 is malformed. */
 static inline uint32_t cbe_segments(const uint8_t *in, uint32_t n, struct cbe_seg *seg, uint32_t max)
@@ -213,7 +241,7 @@ static inline uint32_t cbe_segments(const uint8_t *in, uint32_t n, struct cbe_se
 enum cbe_step { CBE_S_IDLE, CBE_S_SLOTS, CBE_S_SWITCH, CBE_S_SETTLE, CBE_S_RESLOT, CBE_S_OPEN, CBE_S_APDU, CBE_S_CLOSE, CBE_S_RESTORE, CBE_S_RESTORE_SETTLE, CBE_S_CARD_STATUS };
 enum cbe_job_state { CBE_J_FREE, CBE_J_RECEIVING, CBE_J_READY };
 enum cbe_event_kind {
-    CBE_EV_SLOTS,        /* a: count, b: eUICC physical slot, c: active physical slot, d: EID length */
+    CBE_EV_SLOTS,        /* a: count, b: eUICC physical slot, c: active physical slot, d: EID length, e: the eUICC slot's ICCID length */
     CBE_EV_SLOTS_FAILED, /* a: QMI error (0xffff none) */
     CBE_EV_REQUEST,      /* a: command, b: transaction, c: CommCenter slot, d: bytes */
     CBE_EV_SWITCH,       /* a: physical slot, b: logical slot, c: QMI error */
@@ -229,6 +257,8 @@ enum cbe_event_kind {
     CBE_EV_ROUTE,        /* a: old selected physical slot, b: confirmed slot, c: generation */
     CBE_EV_CARD,         /* a: QMI error, b: indication bytes, c: selected physical slot */
     CBE_EV_CARD_STATE,   /* a: UIM message, b: GW primary app index, c: card count, d/e: first two card states | first app state << 8 */
+    CBE_EV_REFRESH,      /* a: Tape command, b: CommCenter's refreshFlag (0, 1; 2 absent) */
+    CBE_EV_SUBSCRIPTION, /* a: UIM message, b: CommCenter endpoint, c: target physical slot, d: 1 taken, 2 switching, 3 answered; e: QMI error */
 };
 enum cbe_reason { CBE_R_NO_SLOTS = 1, CBE_R_NO_EUICC, CBE_R_SWITCH_LIMIT, CBE_R_QMI, CBE_R_SW, CBE_R_TIMEOUT, CBE_R_ROOM, CBE_R_INACTIVE, CBE_R_SEGMENTS };
 struct cbe_event { uint32_t kind, a, b, c, d, e; };
@@ -250,9 +280,17 @@ enum cbe_step step;
 int active;                       /* job index, -1 none */
 uint8_t channel_id, channel_open, switched, restore_phys, get_more, sw1, sw2, route_failed;
 uint8_t selected_phys, physical_phys, route_commit, needs_card;
+/* CommCenter's subscription selection (cbe_route_request): 1 waiting, 3 being carried out, 2 to be answered */
+uint8_t route_req, route_req_channel, route_req_cid, route_req_endpoint, route_req_target;
+uint16_t route_req_txn, route_req_msg;
+uint32_t route_req_error;
 uint32_t route_generation, card_status_len;
 uint8_t card_status[CBE_CARD_BYTES]; /* fresh UIM indication, retained until all external clients have received it */
 uint8_t card_map[CBE_CARD_BYTES];    /* TLV 0x10 moved to CommCenter's endpoints (cbe_card_tlv) */
+/* Each physical slot's last entry of the per-card arrays (0x11, 0x12, 0x15, 0x16, 0x17), taken while its card was the modem's: the
+ * endpoint whose card is not active gets it (cbe_array_tlv). Identities stay in memory, never in events or logs. */
+uint8_t array_entry[CBE_SLOTS][5][CBL_ENTRY_MAX];
+uint8_t array_len[CBE_SLOTS][5];
 uint32_t deadline, wait_txn, wait_msg, txn, switches;
 uint8_t session, session_channel, session_cid, session_slot;
 uint32_t session_deadline, session_limit;
@@ -300,7 +338,10 @@ static inline void cbe_caps(const struct cbe *e, uint8_t caps[2])
 {
 caps[0] = caps[1] = CBE_CAP_NONE;
 if (e->freeze) { caps[0] = e->frozen[0]; caps[1] = e->frozen[1]; return; }
-if (!e->slots.known || !e->slots.euicc) return;
+/* While the slots are re-read after a restore the last published vector stands: without TLV 0x21 CommCenter drops the Tape endpoint
+ * and Settings loses the EID. */
+if (!e->slots.known) { caps[0] = e->caps[0]; caps[1] = e->caps[1]; return; }
+if (!e->slots.euicc) return;
 caps[CBE_TAPE_SLOT - 1] = CBE_CAP_TAPE;
 }
 static inline void cbe_caps_note(struct cbe *e)
@@ -337,6 +378,87 @@ static inline uint32_t cbe_card_tlv(struct cbe *e, const uint8_t *value, uint32_
     return cbd_tlv(out, room, 0x10, value, len);
 }
 
+static inline uint32_t cbe_array_index(uint32_t type)
+{
+    return type == 0x11u ? 0u : type == 0x12u ? 1u : type == 0x15u ? 2u : type == 0x16u ? 3u : 4u;
+}
+/* The modem's own entries, by the physical slot whose card sits in that logical slot: kept for when that card is not active. */
+static inline void cbe_array_note(struct cbe *e, const uint8_t *sdu, uint32_t n)
+{
+    if (!e->slots.known || !cbd_sdu_ok(sdu, n)) return;
+    const uint32_t end = 7u + cbd_rd16(sdu + 5);
+    for (uint32_t at = 7u; at + 3u <= end; at += 3u + cbd_rd16(sdu + at + 1)) {
+        const uint32_t type = sdu[at], size = cbd_rd16(sdu + at + 1);
+        const uint8_t *v = sdu + at + 3;
+        if (!cbl_is_card_array(type) || size < 1u || size > end - at - 3u) continue;
+        for (uint32_t i = 0, off = 1; i < v[0] && off < size; i++) {
+            const uint32_t bytes = cbl_entry_bytes(type, v + off, size - off);
+            if (!bytes) break;
+            for (uint32_t phys = 0; phys < e->slots.count && phys < CBE_SLOTS; phys++) {
+                if (!e->slots.is_active[phys] || (e->slots.logical_of[phys] ? e->slots.logical_of[phys] : 1u) != i + 1u) continue;
+                __builtin_memcpy(e->array_entry[phys][cbe_array_index(type)], v + off, bytes);
+                e->array_len[phys][cbe_array_index(type)] = (uint8_t)bytes;
+            }
+            off += bytes;
+        }
+    }
+}
+/* Endpoint e's entry when the modem reports no card for it: its card's last entry, else one from the slot status (the eUICC's EID
+ * and the slot's ICCID; hot swap "not supported" for the eUICC, present or not present for the tray). For the card info list a
+ * slot status that names an ICCID wins over the cached entry: it is re-read at every eSIM operation, so it follows a profile
+ * enabled since the card was last active. */
+static inline uint32_t cbe_array_fill(struct cbe *e, uint32_t type, uint32_t endpoint, const struct cbl_view *v, uint8_t *out)
+{
+    const uint32_t phys = endpoint ? e->slots.euicc : e->physical_phys;
+    if (!phys || phys > CBE_SLOTS) return 0;
+    const uint32_t k = cbe_array_index(type), cached = e->array_len[phys - 1][k];
+    if (cached && !(type == 0x17u && e->slots.iccid_len[phys - 1])) {
+        __builtin_memcpy(out, e->array_entry[phys - 1][k], cached); return cached;
+    }
+    if (type == 0x11u) { out[0] = endpoint ? 0u : (v->present[endpoint] ? 2u : 3u); return 1; }
+    if (type == 0x12u || type == 0x15u) { out[0] = type == 0x12u; return 1; }
+    if (type == 0x16u) { __builtin_memset(out, 0, 4); return 4; }
+    uint32_t w = 0;
+    out[w++] = e->slots.iccid_len[phys - 1];
+    __builtin_memcpy(out + w, e->slots.iccid[phys - 1], e->slots.iccid_len[phys - 1]); w += e->slots.iccid_len[phys - 1];
+    out[w++] = 0;
+    const uint32_t eid = endpoint && e->slots.eid_len == 16u ? 16u : 0u;
+    out[w++] = (uint8_t)eid;
+    __builtin_memcpy(out + w, e->slots.eid, eid); w += eid;
+    return w;
+}
+/* A per-card array TLV written to out as TLV `to`, mapped to endpoints with cbe_card_tlv's view; otherwise as the modem sent it.
+ * With the physical card selected the arrays stay as they are, except the card info list (0x17), which gains endpoint two's entry:
+ * sub.eval looks the user's eSIM plan up by ICCID among the endpoints, and with the eUICC's ICCID nowhere it logs "SIM ... not
+ * found, leaving with no assignment" and never selects endpoint two (seen on hardware with the eSIM profile enabled on the card). */
+static inline uint32_t cbe_array_tlv(struct cbe *e, uint32_t type, uint32_t to, const uint8_t *value, uint32_t len,
+                                     uint8_t *out, uint32_t room)
+{
+    struct cbl_view v;
+    const int swapped = cbe_slot_view(e, &v);
+    if (cbl_valid(&v) && (swapped || type == 0x17u)) {
+        uint8_t fill0[CBL_ENTRY_MAX], fill1[CBL_ENTRY_MAX], mapped[1u + 2u * CBL_ENTRY_MAX];
+        const uint8_t *const fill[2] = { fill0, fill1 };
+        const uint32_t fill_len[2] = { cbe_array_fill(e, type, 0, &v, fill0), cbe_array_fill(e, type, 1, &v, fill1) };
+        const uint32_t n = cbl_card_array(&v, type, value, len, fill, fill_len, mapped, sizeof mapped);
+        if (n) return cbd_tlv(out, room, (uint8_t)to, mapped, n);
+    }
+    return cbd_tlv(out, room, (uint8_t)to, value, len);
+}
+
+/* CommCenter numbers the Apple card-status TLVs of the Card Status Change indication differently from the Get Card Status response
+ * (libCommCenterMCommandDrivers, EURSimCommandDriver: the indication handler registered in init_sync reads ExtendedCardStatus at
+ * 0x12, ExtendedCardInfoList at 0x14 and IsMomentaryPowerDown at 0x15; queryStatus's response handler reads them at 0x13, 0x17 and
+ * 0x18). This modem uses one numbering for both: its card info list {ICCID, ATR, EID} is 0x17 and 0x15 is SIM busy. In an
+ * indication the list moves to 0x14, and the modem's 0x12, 0x14 and 0x15 stay out, so validity is not read as extended card status
+ * nor SIM busy as momentary power down. The TLV type to write for an indication, 0 to leave it out. */
+static inline uint32_t cbe_indication_type(uint32_t type)
+{
+    if (type == 0x17u) return 0x14u;
+    if (type == 0x12u || type == 0x14u || type == 0x15u) return 0;
+    return type;
+}
+
 /* libqmi UIM Card Status schema. Only state enums and application indexes reach the log,
  * never AIDs or card identities. Malformed status is left to the native parser. */
 static inline void cbe_card_note(struct cbe *e, const uint8_t *sdu, uint32_t n)
@@ -367,20 +489,26 @@ static inline void cbe_card_note(struct cbe *e, const uint8_t *sdu, uint32_t n)
  * records move to CommCenter's endpoints (cbe_card_tlv). */
 static inline uint32_t cbe_card_status_fix(struct cbe *e, uint32_t service, const uint8_t *sdu, uint32_t n, uint8_t *out, uint32_t room)
 {
-if (service != CBE_SVC_UIM || n < 7u || !cbd_sdu_ok(sdu, n) || !e->slots.known) return 0;
+if (service != CBE_SVC_UIM || n < 7u || !cbd_sdu_ok(sdu, n)) return 0;
 const uint32_t message = cbd_rd16(sdu + 3);
 if (!((sdu[0] == CBQ_QMI_RESPONSE && message == CBE_UIM_GET_CARD_STATUS && !cbd_error(sdu, n)) ||
       (sdu[0] == CBQ_QMI_INDICATION && message == CBE_UIM_CARD_STATUS_CHANGE))) return 0;
 cbe_card_note(e, sdu, n);
+cbe_array_note(e, sdu, n);
 uint8_t caps[2];
 cbe_caps(e, caps);
 const uint32_t end = 7u + cbd_rd16(sdu + 5);
-if (room < end + 11u) return 0;   /* the capability TLV, and a 6-byte presence record for the endpoint without a card */
+/* the capability TLV, a 6-byte presence record and one more entry of each per-card array for the endpoint without a card */
+if (room < end + 11u + 5u * CBL_ENTRY_MAX) return 0;
 uint32_t w = 7u;
 for (uint32_t i = 0; i < 7u; i++) out[i] = sdu[i];
+const int indication = sdu[0] == CBQ_QMI_INDICATION;
 for (uint32_t at = 7u; at < end; at += 3u + cbd_rd16(sdu + at + 1)) {
-if (sdu[at] == 0x10u) w += cbe_card_tlv(e, sdu + at + 3, cbd_rd16(sdu + at + 1), out + w, room - w);
-else if (sdu[at] != CBE_UIM_CAPABILITY_TLV) w += cbd_tlv(out + w, room - w, sdu[at], sdu + at + 3, cbd_rd16(sdu + at + 1));
+const uint32_t type = sdu[at], to = indication ? cbe_indication_type(type) : type;
+if (!to) continue;
+if (type == 0x10u) w += cbe_card_tlv(e, sdu + at + 3, cbd_rd16(sdu + at + 1), out + w, room - w);
+else if (cbl_is_card_array(type)) w += cbe_array_tlv(e, type, to, sdu + at + 3, cbd_rd16(sdu + at + 1), out + w, room - w);
+else if (type != CBE_UIM_CAPABILITY_TLV) w += cbd_tlv(out + w, room - w, (uint8_t)to, sdu + at + 3, cbd_rd16(sdu + at + 1));
 }
 w += cbd_tlv(out + w, room - w, CBE_UIM_CAPABILITY_TLV, caps, 2);
 cbd_wr16(out + 5, w - 7u);
@@ -649,6 +777,8 @@ static inline void cbe_begin(struct cbe *e, uint32_t now)
         cbe_finish(e, 1, CBE_R_INACTIVE, j->slot, now); return;
     }
     j->deadline = now + 180000u;
+    if (j->cmd == CBE_TAPE_ENABLE || j->cmd == CBE_TAPE_DISABLE)
+        cbe_event(e, CBE_EV_REFRESH, j->cmd, cbe_refresh_flag(e->in + j->off, j->len), 0, 0, 0);
     e->resp_len = e->seg_index = e->frag_pos = e->block = 0;
     e->get_more = e->sw1 = e->sw2 = 0;
     /* No BB recovery records are stored here. Match the driver's explicit empty-session result,
@@ -819,6 +949,76 @@ static inline uint32_t cbe_host(struct cbe *e, uint32_t channel, uint32_t cid,
     return cbq_private_answer(sdu, CBE_SVC_VINYL, cid, error, extra, error ? 0 : w, out, room);
 }
 
+/* CommCenter's subscription selection (CBE_UIM_SELECT_SINGLE_SUB, CBE_UIM_MAP_PROVISIONING). On this single-standby radio the
+ * endpoint it names is the card the modem must serve: endpoint two the eUICC, endpoint one the tray. The bridge takes the request and
+ * answers it once the route is settled: the same switch, six-second settle, slot re-read and fresh card status as a successful
+ * EnableProfile (cbe_restore with route_commit), so queued UIM traffic and data starts stay held meanwhile and the old route's
+ * requests are retried. Returns a QMUX response in out (a malformed or concurrent request), CBE_DEFERRED when taken, 0 when the
+ * message is not one of these. Only message numbers, endpoints, slots and errors reach the events. */
+static inline uint32_t cbe_route_request(struct cbe *e, uint32_t channel, uint32_t cid, const uint8_t *sdu, uint32_t n,
+                                         uint8_t *out, uint32_t room)
+{
+    if (!cbd_sdu_ok(sdu, n) || sdu[0] != CBQ_QMI_REQUEST) return 0;
+    const uint32_t message = cbd_rd16(sdu + 3);
+    if (message != CBE_UIM_SELECT_SINGLE_SUB && message != CBE_UIM_MAP_PROVISIONING) return 0;
+    uint32_t len = 0, endpoint = 0, error = 0;
+    const uint8_t *v = cbd_find(sdu, n, message == CBE_UIM_SELECT_SINGLE_SUB ? 0x01 : 0x10, &len);
+    if (v && len == 1u) {
+        if (message == CBE_UIM_SELECT_SINGLE_SUB && v[0] <= 1u) endpoint = v[0] + 1u;
+        else if (message == CBE_UIM_MAP_PROVISIONING && v[0] >= 1u && v[0] <= 2u) endpoint = v[0];
+    }
+    if (!endpoint) error = CBE_ERR_INVALID_ARG;
+    else if (e->route_req) error = CBE_ERR_DEVICE_IN_USE;
+    if (error) {
+        cbe_event(e, CBE_EV_SUBSCRIPTION, message, endpoint, 0, 3, error);
+        return cbq_private_answer(sdu, CBE_SVC_UIM, cid, error, 0, 0, out, room);
+    }
+    e->route_req = 1; e->route_req_channel = (uint8_t)channel; e->route_req_cid = (uint8_t)cid;
+    e->route_req_endpoint = (uint8_t)endpoint; e->route_req_target = 0;
+    e->route_req_txn = (uint16_t)cbd_rd16(sdu + 1); e->route_req_msg = (uint16_t)message; e->route_req_error = 0;
+    cbe_event(e, CBE_EV_SUBSCRIPTION, message, endpoint, 0, 1, 0);
+    return CBE_DEFERRED;
+}
+/* With the engine idle and the slots known: start the selection, or settle it at once when the modem already serves that card. */
+static inline void cbe_route_start(struct cbe *e, uint32_t now)
+{
+    const uint8_t target = e->route_req_endpoint == CBE_TAPE_SLOT ? e->slots.euicc : e->physical_phys;
+    e->route_req_target = target;
+    if (!target || target > CBE_SLOTS) { e->route_req_error = CBE_ERR_INVALID_ARG; e->route_req = 2; return; }
+    if (target == e->slots.active && target == e->selected_phys) { e->route_req = 2; return; }
+    uint8_t caps[2]; cbe_caps(e, caps);
+    e->frozen[0] = caps[0]; e->frozen[1] = caps[1]; e->freeze = 1;
+    e->restore_phys = target;
+    e->switched = e->route_commit = e->needs_card = 1;
+    e->route_req = 3;
+    cbe_event(e, CBE_EV_SUBSCRIPTION, e->route_req_msg, e->route_req_endpoint, target, 2, 0);
+    cbe_restore(e, now);
+}
+/* The selection's outcome once the engine is idle again and its card status is out. A failed route goes back to the card the modem
+ * served, as a failed restore does: route_failed clears when the slot status shows it again. */
+static inline void cbe_route_settle(struct cbe *e)
+{
+    if (e->route_failed || e->selected_phys != e->route_req_target) {
+        e->route_req_error = CBE_ERR_INTERNAL;
+        e->restore_phys = e->selected_phys; e->route_commit = 0;
+    }
+    e->route_req = 2;
+}
+/* The answer to CommCenter's selection, when one is due: its length in out and its QMUX channel; the caller clears route_req once
+ * the frame is queued. */
+static inline uint32_t cbe_route_output(struct cbe *e, uint8_t *channel, uint8_t *out, uint32_t room)
+{
+    if (e->route_req != 2) return 0;
+    *channel = e->route_req_channel;
+    return cbq_private_message(CBQ_QMI_RESPONSE, e->route_req_txn, e->route_req_msg, CBE_SVC_UIM, e->route_req_cid,
+                               e->route_req_error, 0, 0, out, room);
+}
+static inline void cbe_route_sent(struct cbe *e)
+{
+    cbe_event(e, CBE_EV_SUBSCRIPTION, e->route_req_msg, e->route_req_endpoint, e->route_req_target, 3, e->route_req_error);
+    e->route_req = 0;
+}
+
 static inline void cbe_tick(struct cbe *e, uint32_t now)
 {
     if (e->active >= 0 && (int32_t)(now - e->job[e->active].deadline) >= 0) {
@@ -846,6 +1046,8 @@ static inline void cbe_tick(struct cbe *e, uint32_t now)
         cbe_session_release(e, now, 1); return;
     }
     if (e->done_pending || e->card_status_len) return;
+    if (e->route_req == 3) { cbe_route_settle(e); return; }
+    if (e->route_req == 1 && e->active < 0 && !e->session && e->slots.known) { cbe_route_start(e, now); return; }
     int next = -1;
     for (uint32_t i = 0; i < CBE_JOBS; i++)
         if (e->job[i].state == CBE_J_READY && (!e->session || cbe_session_owner(e, &e->job[i])) && (next < 0 || (int32_t)(e->job[i].seq - e->job[next].seq) < 0)) next = (int)i;
@@ -869,7 +1071,7 @@ static inline int cbe_answer(struct cbe *e, const uint8_t *sdu, uint32_t n, uint
         uint32_t card_len = 0;
         const uint8_t *card = cbd_find(sdu, n, 0x10, &card_len);
         const uint32_t end = 7u + cbd_rd16(sdu + 5);
-        if (error || !card || card_len < 9u || end > CBE_CARD_BYTES - 11u) {
+        if (error || !card || card_len < 9u || end > CBE_CARD_BYTES - 11u - 5u * CBL_ENTRY_MAX) {
             cbe_event(e, CBE_EV_CARD, error ? error : CBE_ERR_INTERNAL, 0, e->selected_phys, 0, 0);
             e->done_status = e->route_failed = e->needs_card = 1;
             e->slots.known = 0; e->freeze = 0; e->step = CBE_S_IDLE; e->deadline = now + 5000u;
@@ -882,12 +1084,16 @@ static inline int cbe_answer(struct cbe *e, const uint8_t *sdu, uint32_t n, uint
         cbd_wr16(e->card_status + 1, 0);
         cbd_wr16(e->card_status + 3, CBE_UIM_CARD_STATUS_CHANGE);
         uint32_t written = 7;
+        cbe_array_note(e, sdu, n);
         for (uint32_t at = 7; at < end; at += 3u + cbd_rd16(sdu + at + 1)) {
-            if (sdu[at] == 0x02u || sdu[at] == CBE_UIM_CAPABILITY_TLV) continue;
-            if (sdu[at] == 0x10u) written += cbe_card_tlv(e, sdu + at + 3, cbd_rd16(sdu + at + 1),
-                                                          e->card_status + written, CBE_CARD_BYTES - written);
+            const uint32_t type = sdu[at], to = cbe_indication_type(type);
+            if (type == 0x02u || type == CBE_UIM_CAPABILITY_TLV || !to) continue;
+            if (type == 0x10u) written += cbe_card_tlv(e, sdu + at + 3, cbd_rd16(sdu + at + 1),
+                                                       e->card_status + written, CBE_CARD_BYTES - written);
+            else if (cbl_is_card_array(type)) written += cbe_array_tlv(e, type, to, sdu + at + 3, cbd_rd16(sdu + at + 1),
+                                                       e->card_status + written, CBE_CARD_BYTES - written);
             else written += cbd_tlv(e->card_status + written, CBE_CARD_BYTES - written,
-                                    sdu[at], sdu + at + 3, cbd_rd16(sdu + at + 1));
+                                    (uint8_t)to, sdu + at + 3, cbd_rd16(sdu + at + 1));
         }
         uint8_t caps[2]; cbe_caps(e, caps);
         written += cbd_tlv(e->card_status + written, CBE_CARD_BYTES - written, CBE_UIM_CAPABILITY_TLV, caps, 2);
@@ -931,7 +1137,8 @@ static inline int cbe_answer(struct cbe *e, const uint8_t *sdu, uint32_t n, uint
             }
             return 1;
         }
-        cbe_event(e, CBE_EV_SLOTS, e->slots.count, e->slots.euicc, e->slots.active, e->slots.eid_len, 0);
+        cbe_event(e, CBE_EV_SLOTS, e->slots.count, e->slots.euicc, e->slots.active, e->slots.eid_len,
+                  e->slots.euicc ? e->slots.iccid_len[e->slots.euicc - 1] : 0);
         if (!e->selected_phys) e->selected_phys = e->slots.active;
         if (!e->physical_phys) {
             for (uint32_t i = 0; i < e->slots.count; i++)

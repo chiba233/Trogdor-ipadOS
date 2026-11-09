@@ -491,6 +491,13 @@ static void bb_esim_step(void)
     if (bb_ch[channel].count == queued) { bb_esim.done_chunk = chunk; bb_esim.done_pending = (uint8_t)pending; break; }
   }
   struct cbe_event event;
+  if (bb_esim.route_req == 2 && !bb_esim.card_status_len) {
+    uint8_t qmux = 0;
+    const uint32_t n = cbe_route_output(&bb_esim, &qmux, bb_out, sizeof bb_out);
+    const uint32_t channel = qmux ? CBH_QMUX2 : CBH_QMUX1, queued = bb_ch[channel].count;
+    if (n && queued < BB_QUEUE) bb_push(channel, bb_out, n);
+    if (!n || bb_ch[channel].count != queued) cbe_route_sent(&bb_esim);
+  }
   while (cbe_take_event(&bb_esim, &event))
     printf("COACHZ baseband: esim event %u a%u b%u c%u d%u e%u\n", event.kind, event.a, event.b, event.c, event.d, event.e);
 }
@@ -648,6 +655,15 @@ static void bb_host_write(uint32_t channel, const uint8_t *data, uint32_t len)
       const uint32_t n = cbq_private_answer(data + CBQ_HDR, r.service, r.cid, 0, nullptr, 0, bb_out, sizeof bb_out);
       if (n) bb_push(channel, bb_out, n);
       break;
+    }
+    // CommCenter's subscription selection, which this modem does not know (coachz_bb_esim.h): carried out by the bridge.
+    if (r.service == CBE_SVC_UIM) {
+      const uint32_t n = bb_esim_in && bb_esim_resp ?
+        cbe_route_request(&bb_esim, r.channel, r.cid, data + CBQ_HDR, r.len, bb_out, sizeof bb_out) : 0;
+      if (n) {
+        if (n != CBE_DEFERRED) bb_push(channel, bb_out, n);
+        break;
+      }
     }
     bb_to_modem(r, data + CBQ_HDR);
     break;

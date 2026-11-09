@@ -89,6 +89,59 @@ static inline uint32_t cbl_card_status(const struct cbl_view *v, const uint8_t *
     return at;
 }
 
+/* The other card-status TLVs are counted arrays with one entry per card, in TLV 0x10's card order, and CommCenter takes them by
+ * position as well: libCommCenterMCommandDrivers' sHandleIccids keys TLV 0x17's ICCIDs by the entry's index, so an array left in the
+ * modem's order gives the active eUICC's ICCID to endpoint one and none to endpoint two (EURSimCommandDriver then finds no SIM for
+ * the eSIM plan, never switches its subscription, and instance kOne stays with the physical card). Entry sizes, read from this
+ * modem's own responses: 0x11 hot swap (1 byte: 0 not supported, 2 present, 3 not present), 0x12 validity (1), 0x15 SIM busy (1),
+ * 0x16 (4), 0x17 {ICCID length, ICCID, ATR length, ATR, EID length, EID}. */
+#define CBL_ENTRY_MAX 72u
+static inline int cbl_is_card_array(uint32_t type)
+{
+    return type == 0x11u || type == 0x12u || type == 0x15u || type == 0x16u || type == 0x17u;
+}
+static inline uint32_t cbl_entry_bytes(uint32_t type, const uint8_t *p, uint32_t size)
+{
+    if (type == 0x11u || type == 0x12u || type == 0x15u) return size >= 1u ? 1u : 0u;
+    if (type == 0x16u) return size >= 4u ? 4u : 0u;
+    if (type != 0x17u) return 0;
+    uint32_t at = 0;
+    for (uint32_t field = 0; field < 3; field++) {
+        if (at >= size || p[at] > size - at - 1u) return 0;
+        at += 1u + p[at];
+    }
+    return at <= CBL_ENTRY_MAX ? at : 0;
+}
+/* One such array mapped to endpoints as cbl_card_status maps the cards; fill[e] is endpoint e's entry when the modem has no card
+ * for it. The value's new length, 0 for malformed input or a missing fill (then left as it is). */
+static inline uint32_t cbl_card_array(const struct cbl_view *v, uint32_t type, const uint8_t *in, uint32_t size,
+    const uint8_t *const fill[2], const uint32_t fill_len[2], uint8_t *out, uint32_t room)
+{
+    if (!cbl_valid(v) || !cbl_is_card_array(type) || size < 1u) return 0;
+    const uint32_t n = in[0];
+    if (!n || n > 2u || v->logical > n) return 0;
+    uint32_t offset[2] = { 0, 0 }, bytes[2] = { 0, 0 }, at = 1;
+    for (uint32_t i = 0; i < n; i++) {
+        offset[i] = at;
+        bytes[i] = cbl_entry_bytes(type, in + at, size - at);
+        if (!bytes[i]) return 0;
+        at += bytes[i];
+    }
+    if (at != size || room < 1u) return 0;
+    const uint32_t swap = (v->active - 1u) ^ (v->logical - 1u);
+    uint32_t w = 1;
+    out[0] = 2;
+    for (uint32_t endpoint = 0; endpoint < 2; endpoint++) {
+        const uint32_t logical = endpoint ^ swap;
+        const uint8_t *src = logical < n ? in + offset[logical] : fill[endpoint];
+        const uint32_t len = logical < n ? bytes[logical] : fill_len[endpoint];
+        if (!src || !len || len > room - w) return 0;
+        __builtin_memcpy(out + w, src, len);
+        w += len;
+    }
+    return w;
+}
+
 enum cbl_request_result { CBL_UNCHANGED, CBL_CHANGED, CBL_INACTIVE, CBL_MALFORMED };
 
 /* A UIM request from CommCenter: only its slot or card-session selector (and Change Provisioning Session's application slot)

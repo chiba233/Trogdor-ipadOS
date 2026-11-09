@@ -1035,6 +1035,165 @@ static void test_esim_selection(void)
     CHECK(observed == 1);
 }
 
+/* SGP.22 refreshFlag: set on enable and disable so the eUICC re-initialises the card (cbe_refresh_flag), and the Vinyl capability vector
+ * kept while the slots are re-read (cbe_caps). */
+static void test_esim_refresh(void)
+{
+    uint8_t enable[] = { 0xbf, 0x31, 0x0f, 0xa0, 0x0a, 0x5a, 0x08, 1, 2, 3, 4, 5, 6, 7, 8, 0x81, 0x01, 0x00 };
+    uint8_t disable[] = { 0xbf, 0x32, 0x0f, 0xa0, 0x0a, 0x5a, 0x08, 1, 2, 3, 4, 5, 6, 7, 8, 0x81, 0x01, 0xff };
+    uint8_t none[] = { 0xbf, 0x31, 0x0c, 0xa0, 0x0a, 0x5a, 0x08, 1, 2, 3, 4, 5, 6, 7, 8 };
+    uint8_t other[] = { 0xbf, 0x2d, 0x03, 0x81, 0x01, 0x00 };
+    CHECK(cbe_refresh_flag(enable, sizeof enable) == 0 && enable[sizeof enable - 1] == 0xff);
+    CHECK(cbe_refresh_flag(disable, sizeof disable) == 1 && disable[sizeof disable - 1] == 0xff);
+    CHECK(cbe_refresh_flag(none, sizeof none) == 2);
+    CHECK(cbe_refresh_flag(other, sizeof other) == 2 && other[5] == 0x00);
+    CHECK(cbe_refresh_flag(enable, 3) == 2);
+    uint8_t caps[2];
+    esim_reset();
+    cbe_caps(&esim, caps); CHECK(caps[0] == CBE_CAP_NONE && caps[1] == CBE_CAP_TAPE);
+    esim.slots.known = 0;
+    cbe_caps(&esim, caps); CHECK(caps[0] == CBE_CAP_NONE && caps[1] == CBE_CAP_TAPE);
+}
+
+/* One card status from the modem, as an indication or a Get Card Status response: one card with a Ready USIM (0x10), its hot-swap
+ * byte (0x11), its SIM busy byte (0x15) and its ICCID, ATR and EID entry (0x17), in this modem's numbering. */
+static uint32_t esim_card_message(uint8_t *s, uint32_t room, int response, uint8_t iccid_seed, uint8_t hot_swap, uint32_t eid)
+{
+    uint8_t card[9 + 6 + 14 + 2] = { 0 }, swap[2] = { 1, hot_swap }, busy[2] = { 1, 0 }, info[1 + 11 + 3 + 17] = { 1, 10 };
+    const uint8_t result[4] = { 0 };
+    cbd_wr16(card, 0x0000); cbd_wr16(card + 2, 0xffff); cbd_wr16(card + 4, 0xffff); cbd_wr16(card + 6, 0xffff);
+    card[8] = 1; card[9] = 1; card[14] = 1;            /* present, one application */
+    card[15] = 2; card[16] = 7; card[21] = 2;          /* USIM, Ready, a 2-byte AID */
+    uint32_t w = 2;
+    for (unsigned i = 0; i < 10; i++) info[w++] = (uint8_t)(iccid_seed + i);
+    info[w++] = 2; info[w++] = 0x3b; info[w++] = 0x9f;
+    info[w++] = (uint8_t)eid;
+    for (unsigned i = 0; i < eid; i++) info[w++] = (uint8_t)(0xa0 + i);
+    s[0] = response ? CBQ_QMI_RESPONSE : CBQ_QMI_INDICATION; cbd_wr16(s + 1, response ? 7 : 0);
+    cbd_wr16(s + 3, response ? CBE_UIM_GET_CARD_STATUS : CBE_UIM_CARD_STATUS_CHANGE);
+    uint32_t n = 7;
+    if (response) n += cbd_tlv(s + n, room - n, 0x02, result, sizeof result);
+    n += cbd_tlv(s + n, room - n, 0x17, info, w);
+    n += cbd_tlv(s + n, room - n, 0x16, (const uint8_t[]){ 1, 0, 0, 0, 0 }, 5);
+    n += cbd_tlv(s + n, room - n, 0x15, busy, 2);
+    n += cbd_tlv(s + n, room - n, 0x11, swap, 2);
+    n += cbd_tlv(s + n, room - n, 0x10, card, sizeof card);
+    cbd_wr16(s + 5, n - 7);
+    return n;
+}
+/* The card info list in CommCenter's numbering: 0x17 in a response, 0x14 in an indication (cbe_indication_type), where SIM busy
+ * (0x15, CommCenter's IsMomentaryPowerDown there) stays out. With the physical card selected only that list gains endpoint two's
+ * entry, the eUICC's ICCID from the slot status and its EID; with the eUICC selected endpoint two carries the eUICC's own entry
+ * and endpoint one its card's last entry. */
+static void test_esim_card_arrays(void)
+{
+    uint8_t raw[256], out[2048];
+    esim_reset();
+    CHECK(esim.physical_phys == 1 && esim.selected_phys == 1);
+    esim.slots.iccid_len[1] = 10;
+    for (unsigned i = 0; i < 10; i++) esim.slots.iccid[1][i] = (uint8_t)(0x70 + i);
+    uint32_t n = esim_card_message(raw, sizeof raw, 0, 0x10, 2, 0);
+    uint32_t m = cbe_card_status_fix(&esim, CBE_SVC_UIM, raw, n, out, sizeof out);
+    uint32_t l = 0;
+    CHECK(m && !cbd_find(out, m, 0x17, &l) && !cbd_find(out, m, 0x15, &l));
+    const uint8_t *v = cbd_find(out, m, 0x14, &l);
+    CHECK(v && l == 1u + 15u + 29u && v[0] == 2 && v[1] == 10 && v[2] == 0x10);
+    CHECK(v && v[16] == 10 && v[17] == 0x70 && v[26] == 0x79 && v[27] == 0 && v[28] == 16 && v[29] == 0xa0);
+    CHECK(esim.array_len[0][4] == 15);
+    v = cbd_find(out, m, 0x11, &l);
+    CHECK(v && l == 2 && v[0] == 1);             /* the other arrays stay as the modem sent them */
+    v = cbd_find(out, m, 0x10, &l);
+    CHECK(v && v[8] == 1);
+    n = esim_card_message(raw, sizeof raw, 1, 0x10, 2, 0);
+    m = cbe_card_status_fix(&esim, CBE_SVC_UIM, raw, n, out, sizeof out);
+    v = cbd_find(out, m, 0x17, &l);
+    CHECK(m && v && v[0] == 2 && l == 1u + 15u + 29u && cbd_find(out, m, 0x15, &l) && !cbd_find(out, m, 0x14, &l));
+    /* The route moved to the eUICC (physical slot two, the modem's logical slot one). */
+    esim.slots.is_active[0] = 0; esim.slots.is_active[1] = 1; esim.slots.logical_of[1] = 1;
+    esim.slots.active = 2; esim.slots.logical = 1; esim.selected_phys = 2;
+    n = esim_card_message(raw, sizeof raw, 0, 0x40, 0, 16);
+    m = cbe_card_status_fix(&esim, CBE_SVC_UIM, raw, n, out, sizeof out);
+    v = cbd_find(out, m, 0x14, &l);
+    CHECK(m && v && v[0] == 2);
+    const uint32_t len = 15;                    /* {10, ICCID, 2, ATR, 0}: the physical card's cached entry */
+    CHECK(l == 1u + len + len + 16);
+    CHECK(v[1] == 10 && v[2] == 0x10 && v[1 + len] == 10 && v[2 + len] == 0x40 && v[1 + len + 14] == 16);
+    v = cbd_find(out, m, 0x11, &l);
+    CHECK(v && l == 3 && v[0] == 2 && v[1] == 2 && v[2] == 0);
+    v = cbd_find(out, m, 0x10, &l);
+    CHECK(v && v[8] == 2 && cbd_rd16(v) == 0x0100);
+    if (!failures) printf("PASS esim card arrays\n");
+}
+
+/* CommCenter's subscription selection (cbe_route_request): taken and answered after the route to the named card is settled, at once
+ * when the modem already serves it, refused when malformed or while another is open, and failed back when the switch did not land. */
+static void esim_route_answer(uint16_t txn, uint16_t message, uint32_t error)
+{
+    uint8_t out[64], channel = 9;
+    CHECK(esim.route_req == 2);
+    const uint32_t n = cbe_route_output(&esim, &channel, out, sizeof out);
+    CHECK(n && channel == 1 && out[4] == CBE_SVC_UIM && out[5] == 7);
+    CHECK(cbd_rd16(out + CBQ_HDR + 1) == txn && cbd_rd16(out + CBQ_HDR + 3) == message);
+    CHECK(cbd_error(out + CBQ_HDR, n - CBQ_HDR) == error);
+    cbe_route_sent(&esim);
+    CHECK(!esim.route_req);
+}
+static uint32_t esim_route_request(uint16_t txn, uint16_t message, uint8_t tlv, uint8_t value, uint8_t *out, uint32_t room)
+{
+    uint8_t s[32];
+    const uint32_t w = cbd_tlv(s + 7, sizeof s - 7, tlv, &value, 1);
+    cbd_request(s, txn, message, w);
+    return cbe_route_request(&esim, 1, 7, s, 7 + w, out, room);
+}
+static void test_esim_route(void)
+{
+    uint8_t out[64];
+    esim_reset();
+    /* Not a selection: left alone. Malformed: answered at once. */
+    CHECK(esim_route_request(1, CBE_UIM_GET_CARD_STATUS, 0x01, 0, out, sizeof out) == 0);
+    uint32_t n = esim_route_request(2, CBE_UIM_SELECT_SINGLE_SUB, 0x01, 2, out, sizeof out);
+    CHECK(n && n != CBE_DEFERRED && cbd_error(out + CBQ_HDR, n - CBQ_HDR) == CBE_ERR_INVALID_ARG && !esim.route_req);
+    /* Endpoint one while the tray card is served: answered without a switch. */
+    CHECK(esim_route_request(3, CBE_UIM_MAP_PROVISIONING, 0x10, 1, out, sizeof out) == CBE_DEFERRED);
+    n = esim_route_request(4, CBE_UIM_SELECT_SINGLE_SUB, 0x01, 1, out, sizeof out);
+    CHECK(n && n != CBE_DEFERRED && cbd_error(out + CBQ_HDR, n - CBQ_HDR) == CBE_ERR_DEVICE_IN_USE);
+    cbe_tick(&esim, 10);
+    CHECK(esim.step == CBE_S_IDLE && !esim.switches);
+    esim_route_answer(3, CBE_UIM_MAP_PROVISIONING, 0);
+    /* SelectUIMForSingleSubCfg 1 (slot two): switch to the eUICC, settle, re-read, publish its card, then answer. */
+    CHECK(esim_route_request(5, CBE_UIM_SELECT_SINGLE_SUB, 0x01, 1, out, sizeof out) == CBE_DEFERRED);
+    cbe_tick(&esim, 20);
+    CHECK(esim.step == CBE_S_RESTORE && esim.wait_msg == CBE_UIM_SWITCH_SLOT && esim.freeze && esim.switches == 1);
+    CHECK(esim.route_req == 3 && esim.route_req_target == 2);
+    esim_answer(21, NULL, 0, 0);
+    CHECK(esim.step == CBE_S_RESTORE_SETTLE);
+    cbe_tick(&esim, 6021); CHECK(esim.step == CBE_S_RESLOT);
+    esim_slots(6022, 1);
+    CHECK(esim.selected_phys == 2 && esim.route_generation == 1);
+    esim_card_publish(6023, 1);
+    CHECK(esim.route_req == 3);
+    cbe_tick(&esim, 6024);
+    esim_route_answer(5, CBE_UIM_SELECT_SINGLE_SUB, 0);
+    struct cbl_view view;
+    CHECK(cbe_slot_view(&esim, &view) && view.active == 2 && view.logical == 1);
+    /* Back to slot one, but the modem stays on the eUICC: the selection fails and the route stays where the modem is. */
+    CHECK(esim_route_request(6, CBE_UIM_MAP_PROVISIONING, 0x10, 1, out, sizeof out) == CBE_DEFERRED);
+    cbe_tick(&esim, 7000);
+    CHECK(esim.step == CBE_S_RESTORE && esim.route_req_target == 1);
+    esim_answer(7001, NULL, 0, 0);
+    cbe_tick(&esim, 13001);
+    esim_slots(13002, 1);
+    CHECK(esim.route_failed && esim.step == CBE_S_IDLE);
+    cbe_tick(&esim, 13003);
+    esim_route_answer(6, CBE_UIM_MAP_PROVISIONING, CBE_ERR_INTERNAL);
+    CHECK(esim.selected_phys == 2 && esim.restore_phys == 2 && !esim.route_commit);
+    cbe_tick(&esim, 18003);
+    CHECK(esim.step == CBE_S_SLOTS);
+    esim_slots(18004, 1);
+    CHECK(!esim.route_failed);
+    if (!failures) printf("PASS esim route\n");
+}
+
 /* A SIM card pulled while an eSIM query had the eUICC mapped: the modem finds the empty slot only when the restore powers it up, and
  * the indication it raises then falls inside the dropped window, so the restore publishes the real status (cbe_restore). */
 static void test_esim_pulled(void)
@@ -1151,6 +1310,9 @@ int main(void)
     test_esim_cache();
     test_esim_selection();
     test_esim_pulled();
+    test_esim_card_arrays();
+    test_esim_route();
+    test_esim_refresh();
     test_endpoint_slots();
     return failures ? 1 : 0;
 }
