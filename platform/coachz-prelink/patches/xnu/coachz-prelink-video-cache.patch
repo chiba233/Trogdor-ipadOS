@@ -1,0 +1,53 @@
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -10684,6 +10684,9 @@
+ 	uint64_t state = states.state;
+ 	bool tlb_flush_pass_needed = !!(states.tlb_flush_pass_needed);
+ 	bool rt_cache_flush_pass_needed = !!(states.rt_cache_flush_pass_needed);
++#if defined(ARM64_BOARD_CONFIG_BCM2837)
++	unsigned int coachz_cleaned_pages = 0;
++#endif
+ 
+ 	/* For verifying progress. */
+ 	__assert_only const uint64_t page_index_old = page_index;
+@@ -10728,6 +10731,22 @@
+ 			if (pp_attr_template & PP_ATTR_WIMG_MASK) {
+ 				wimg_bits_new = pp_attr_template & PP_ATTR_WIMG_MASK;
+ 			}
++
++#if defined(ARM64_BOARD_CONFIG_BCM2837)
++			/*
++			 * vm_object_iopl_wire_empty zero-fills through the cached aperture before this batch.
++			 * On Coachz an uncached/write-combined IOSurface must not retain dirty zero lines that
++			 * can later overwrite CPU-written video pixels. Drain the old cached mapping before
++			 * changing its attributes, as the noncoherent DMA allocation boundary requires.
++			 * The existing final RT-only clean pass does not cover IO/WCOMB pages.
++			 */
++			if (wimg_bits_new != wimg_bits_prev &&
++			    !(wimg_bits_prev & VM_MEM_NOT_CACHEABLE) &&
++			    (wimg_bits_new & VM_MEM_NOT_CACHEABLE)) {
++				FlushPoC_DcacheRegion(phystokv(paddr), PAGE_SIZE);
++				++coachz_cleaned_pages;
++			}
++#endif
+ 
+ 			/* Update the cache attributes in PTE and PP_ATTR table. */
+ 			if (wimg_bits_new != wimg_bits_prev) {
+@@ -10902,6 +10921,17 @@
+ 	states_new.page_index = page_index;
+ 	states_new.state = state;
+ 	states_new.tlb_flush_pass_needed = tlb_flush_pass_needed ? 1 : 0;
++#if defined(ARM64_BOARD_CONFIG_BCM2837) && !XNU_MONITOR
++	if (coachz_cleaned_pages) {
++		static uint64_t coachz_batches, coachz_pages;
++		uint64_t n = __atomic_add_fetch(&coachz_batches, 1, __ATOMIC_RELAXED);
++		uint64_t pages = __atomic_add_fetch(&coachz_pages, coachz_cleaned_pages, __ATOMIC_RELAXED);
++		if (n <= 8 || !(n & (n - 1))) {
++			kprintf("COACHZ surface cache: batch %llu attr 0x%x cleaned %u pages before mapping, total %llu\n",
++			    n, cacheattr, coachz_cleaned_pages, pages);
++		}
++	}
++#endif
+ 	states_new.rt_cache_flush_pass_needed = rt_cache_flush_pass_needed ? 1 : 0;
+ 	return states_new;
+ }

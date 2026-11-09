@@ -106,3 +106,28 @@ the non-fatal 0x1008) after CONTINUE. OUTPUT2's frame size is the capture height
 NV12 shows green), whether the LCU size error leaves part of the picture undecoded, or whether the decoder's copy is at fault. Decode
 latency is 30-100 ms a frame with 400-800 ms spikes.
 
+
+## k213 hardware observation (2026-11-10)
+
+Actual playback no longer showed horizontal green lines, while the displayed frame rate became much worse.
+The returned kernel ring contains no panic. This is a picture-integrity milestone with an open performance regression, not complete
+video acceptance. The image included both `coachz-prelink-video-cache.patch`, the cached-to-uncached page-transition drain, and the expanded boundary observations;
+this run does not isolate the drain from the additional observation and synchronization effects.
+
+Of eighteen selected playback pictures, seventeen have complete FBD, private pre-copy snapshot, three locked source/destination
+comparisons, page-metadata queries, return and pre-emit observations. All captured differences are zero, compressed-input hashes
+agree, and the four plane mappings report cache metadata 0x6 without missing or changed pages. The eighteenth picture's persistent
+log ends before its final query/unlock/emission records. The separate fixed-frame self-test is not included in the playback count.
+Unobserved frames and intervals remain outside these comparisons.
+
+The packed ADT supplies the 19.2 MHz timebase used to interpret the recorded ticks. On those seventeen pictures, the kernel full-plane
+digest takes a median 10.23 ms; the private snapshot takes 1.47 ms; the actual copy interval, including the sparse pre-copy probe,
+takes 1.37 ms (maximum 11.28 ms). Snapshot through the final locked comparison takes a median 12.49 ms. FBD-to-return is a median
+96.88 ms, including scheduling, queueing, pool work and observations; it is not a measured hardware decode time.
+
+During the stable playback window the native decoder statistics record 189, 178 and 181 decoded pictures in roughly six-second
+windows, with zero decoder drops. The display queue records 111 and 109 displayed pictures and 67 and 68 dropped pictures in two
+roughly six-second windows. Thus steady decoded throughput is close to 30 fps while displayed throughput is about 18 fps. Startup
+also contains much longer queued decode latencies; those are not explained by the steady-state counts. GPU/presentation traces
+are retained for the display-side investigation; decoder startup, copy and observation cost also remain open. Preserve the accepted
+picture behavior while investigating both boundaries.

@@ -148,6 +148,9 @@ coachz-prelink-trollstore-persona.patch
 # The video codec's firmware from the blob, its cx consumer and its MM1/MM2 bus vote (package/CoachzVenus.cpp).
 coachz-prelink-venus.patch
 
+# Drain cached zero-fill before batch-mapping managed IOSurface pages as uncached on Coachz.
+coachz-prelink-video-cache.patch
+
 # /chosen/coachz-baseband: the cellular bridge (pending/baseband): QRTR hooks in the Wi-Fi thread, its firmware on the Data volume, CommCenter running.
 coachz-prelink-baseband.patch
 # The VideoToolbox decoder for the video codec (package/CoachzVideoDecoder.c) on the Data volume, shown in /System/Library/VideoDecoders through a bindfs union.
