@@ -1,0 +1,435 @@
+--- a/bsd/vfs/vfs_vnops.c
++++ b/bsd/vfs/vfs_vnops.c
+@@ -371,6 +371,112 @@
+  * XXX:		We should enummerate the possible errno values here, and where
+  *		in the code they originated.
+  */
++/* Bounded FSEvents startup evidence. Labels name only the three system log directories, never file names or UUID contents.
++ * Copy the pathname in this leaf helper so its small buffer is gone before the open enters APFS or crypto. */
++/* Labels: 1 root journal, 2 fallback journal, 3 Data journal, 4 unavailable,
++ * 5 temporary directory, 6 root mount, 7 Data mount, 8 another resolved path, 9 known relative journal leaf. */
++unsigned coachz_files_kernel_label(const char *path);
++unsigned coachz_files_path_label(user_addr_t address, int segment, vfs_context_t ctx);
++void coachz_files_operation_result(unsigned label, const char *operation, int fd, int error, vnode_t vp, uint64_t detail);
++
++unsigned
++coachz_files_kernel_label(const char *path)
++{
++	static const char *const directories[] = {"/.fseventsd", "/private/var/db/fseventsd", "/private/var/.fseventsd"};
++	if (!path) {
++		return 4;
++	}
++	for (unsigned i = 0; i < sizeof(directories) / sizeof(directories[0]); ++i) {
++		size_t n = strlen(directories[i]);
++		if (!strncmp(path, directories[i], n) && (path[n] == 0 || path[n] == '/')) {
++			return i + 1;
++		}
++	}
++	if (!strcmp(path, "/tmp") || !strcmp(path, "/private/var/tmp")) {
++		return 5;
++	}
++	if (!strcmp(path, "/")) {
++		return 6;
++	}
++	if (!strcmp(path, "/private/var")) {
++		return 7;
++	}
++	if (!strcmp(path, "fseventsd-uuid") || !strcmp(path, "no_log") || !strcmp(path, "ignore")) {
++		return 9;
++	}
++	return 0;
++}
++
++__attribute__((noinline)) unsigned
++coachz_files_path_label(user_addr_t address, int segment, vfs_context_t ctx)
++{
++	proc_t p = vfs_context_proc(ctx);
++	char path[128];
++	size_t copied;
++	if (!p || strcmp(p->p_comm, "fseventsd")) {
++		return 0;
++	}
++	if (!address) {
++		return 4;
++	}
++	if (segment == UIO_SYSSPACE) {
++		strlcpy(path, (const char *)(uintptr_t)address, sizeof(path));
++	} else if (copyinstr(address, path, sizeof(path), &copied)) {
++		return 4;
++	}
++	return coachz_files_kernel_label(path);
++}
++
++static unsigned
++coachz_files_open_label(struct nameidata *ndp, vfs_context_t ctx)
++{
++	return coachz_files_path_label(ndp->ni_dirp, ndp->ni_segflg, ctx);
++}
++
++void
++coachz_files_operation_result(unsigned label, const char *operation, int fd, int error, vnode_t vp, uint64_t detail)
++{
++	proc_t p = current_proc();
++	static unsigned records;
++	if (!label || !p || strcmp(p->p_comm, "fseventsd")) {
++		return;
++	}
++	unsigned seq = __atomic_fetch_add(&records, 1, __ATOMIC_RELAXED);
++	if (seq > 256) {
++		return;
++	}
++	if (seq == 256) {
++		printf("COACHZ files: operation diagnostic budget exhausted\n");
++		return;
++	}
++	mount_t mp = vp ? vnode_mount(vp) : NULL;
++	printf("COACHZ files: operation seq %u pid %d op %s path-label %u fd %d error %d vnode %u fsid 0x%x flags 0x%llx detail 0x%llx\n",
++	    seq, proc_selfpid(), operation, label, fd, error, (unsigned)(vp != NULLVP),
++	    mp ? (unsigned)vfs_statfs(mp)->f_fsid.val[0] : 0,
++	    mp ? (unsigned long long)vfs_flags(mp) : 0, (unsigned long long)detail);
++}
++
++static void
++coachz_files_open_result(unsigned label, int requested, int final, int error, vnode_t vp)
++{
++	static unsigned records;
++	if (!label) {
++		return;
++	}
++	unsigned seq = __atomic_fetch_add(&records, 1, __ATOMIC_RELAXED);
++	if (seq > 256) {
++		return;
++	}
++	if (seq == 256) {
++		printf("COACHZ files: open diagnostic budget exhausted\n");
++		return;
++	}
++	mount_t mp = vp ? vnode_mount(vp) : NULL;
++	printf("COACHZ files: open seq %u pid %d directory %u requested 0x%x final 0x%x error %d type %u vid %u fsid 0x%x flags 0x%llx\n",
++	    seq, proc_selfpid(), label, (unsigned)requested, (unsigned)final, error, vp ? vnode_vtype(vp) : 0, vp ? vnode_vid(vp) : 0,
++	    mp ? (unsigned)vfs_statfs(mp)->f_fsid.val[0] : 0, mp ? (unsigned long long)vfs_flags(mp) : 0);
++}
++
+ int
+ vn_open_auth(struct nameidata *ndp, int *fmodep, struct vnode_attr *vap, vnode_t authvp)
+ {
+@@ -386,6 +492,8 @@
+ 	boolean_t batched;
+ 	boolean_t ref_failed;
+ 	int nretries = 0;
++	const unsigned coachz_directory = coachz_files_open_label(ndp, ctx);
++	const int coachz_requested = *fmodep;
+ 
+ again:
+ 	vp = NULL;
+@@ -400,6 +508,7 @@
+ 	if (VATTR_IS_ACTIVE(vap, va_dataprotect_flags)) {
+ 		if ((authvp != NULLVP)
+ 		    && !ISSET(vap->va_dataprotect_flags, VA_DP_AUTHENTICATE)) {
++			coachz_files_open_result(coachz_directory, coachz_requested, *fmodep, EINVAL, NULLVP);
+ 			return EINVAL;
+ 		}
+ 		// If raw encrypted mode is requested, handle that here
+@@ -702,6 +811,7 @@
+ 	}
+ 
+ 	*fmodep = fmode;
++	coachz_files_open_result(coachz_directory, coachz_requested, fmode, 0, ndp->ni_vp);
+ 	return 0;
+ 
+ bad:
+@@ -755,6 +865,7 @@
+ 	}
+ 
+ out:
++	coachz_files_open_result(coachz_directory, coachz_requested, *fmodep, error, NULLVP);
+ 	return error;
+ }
+ 
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -3463,6 +3463,35 @@
+ }
+ #endif /* QUOTA */
+ 
++extern unsigned coachz_files_path_label(user_addr_t, int, vfs_context_t);
++extern void coachz_files_operation_result(unsigned, const char *, int, int, vnode_t, uint64_t);
++
++/* Original fseventsd selects its global logger by the returned ROOTFS flag and checks the opened directory's fsid.
++ * Trace the API results without changing the mount view, return codes, files or UUIDs. */
++static void
++coachz_files_stat_result(mount_t mp, const char *operation, int fd, unsigned returned_flags, int error)
++{
++	proc_t p = current_proc();
++	static unsigned records;
++	if (!p || strcmp(p->p_comm, "fseventsd")) {
++		return;
++	}
++	unsigned seq = __atomic_fetch_add(&records, 1, __ATOMIC_RELAXED);
++	if (seq > 256) {
++		return;
++	}
++	if (seq == 256) {
++		printf("COACHZ files: stat diagnostic budget exhausted\n");
++		return;
++	}
++	mount_t root_mp = rootvnode ? vnode_mount(rootvnode) : NULL;
++	printf("COACHZ files: stat seq %u pid %d op %s fd %d error %d fsid 0x%x flags 0x%llx returned 0x%x root-fsid 0x%x root-flags 0x%llx iopolicy 0x%x\n",
++	    seq, proc_selfpid(), operation, fd, error, mp ? (unsigned)vfs_statfs(mp)->f_fsid.val[0] : 0,
++	    mp ? (unsigned long long)vfs_flags(mp) : 0, returned_flags,
++	    root_mp ? (unsigned)vfs_statfs(root_mp)->f_fsid.val[0] : 0, root_mp ? (unsigned long long)vfs_flags(root_mp) : 0,
++	    (unsigned)p->p_vfs_iopolicy);
++}
++
+ static int
+ statfs_internal(proc_t p, struct mount *mp, user_addr_t bufp)
+ {
+@@ -3472,16 +3501,20 @@
+ #if CONFIG_MACF
+ 	error = mac_mount_check_stat(ctx, mp);
+ 	if (error != 0) {
++		coachz_files_stat_result(mp, "stat-legacy", -1, 0, error);
+ 		return error;
+ 	}
+ #endif
+ 
+ 	error = vfs_update_vfsstat(mp, ctx, VFS_USER_EVENT);
+ 	if (error != 0) {
++		coachz_files_stat_result(mp, "stat-legacy", -1, 0, error);
+ 		return error;
+ 	}
+ 
+-	return munge_statfs(mp, &mp->mnt_vfsstat, bufp, NULL, IS_64BIT_PROCESS(p), TRUE);
++	error = munge_statfs(mp, &mp->mnt_vfsstat, bufp, NULL, IS_64BIT_PROCESS(p), TRUE);
++	coachz_files_stat_result(mp, "stat-legacy", -1, mp->mnt_flag & MNT_VISFLAGMASK, error);
++	return error;
+ }
+ 
+ /*
+@@ -3613,6 +3646,7 @@
+ 	    UIO_USERSPACE, uap->path, ctxp);
+ 	error = namei(ndp);
+ 	if (error != 0) {
++		coachz_files_stat_result(NULL, "path64-lookup", -1, 0, error);
+ 		goto out;
+ 	}
+ 	vp = ndp->ni_vp;
+@@ -3622,6 +3656,7 @@
+ #if CONFIG_MACF
+ 	error = mac_mount_check_stat(ctxp, mp);
+ 	if (error != 0) {
++		coachz_files_stat_result(mp, "path64", -1, 0, error);
+ 		vnode_put(vp);
+ 		goto out;
+ 	}
+@@ -3629,6 +3664,7 @@
+ 
+ 	error = vfs_update_vfsstat(mp, ctxp, VFS_USER_EVENT);
+ 	if (error != 0) {
++		coachz_files_stat_result(mp, "path64", -1, 0, error);
+ 		vnode_put(vp);
+ 		goto out;
+ 	}
+@@ -3641,6 +3677,7 @@
+ 		strlcpy(&sfsp->f_mntonname[0], "/", sizeof("/"));
+ 	}
+ 	error = copyout(sfsp, uap->buf, sizeof(*sfsp));
++	coachz_files_stat_result(mp, "path64", -1, sfsp->f_flags, error);
+ 	vnode_put(vp);
+ 
+ out:
+@@ -3658,17 +3695,20 @@
+ 	struct vnode *vp;
+ 	struct mount *mp;
+ 	struct statfs64 sfs;
++	unsigned coachz_returned_flags = 0;
+ 	int error;
+ 
+ 	AUDIT_ARG(fd, uap->fd);
+ 
+ 	if ((error = file_vnode(uap->fd, &vp))) {
++		coachz_files_stat_result(NULL, "fd64-file", uap->fd, 0, error);
+ 		return error;
+ 	}
+ 
+ 	error = vnode_getwithref(vp);
+ 	if (error) {
+ 		file_drop(uap->fd);
++		coachz_files_stat_result(NULL, "fd64-vnode", uap->fd, 0, error);
+ 		return error;
+ 	}
+ 
+@@ -3692,6 +3732,7 @@
+ 	}
+ 
+ 	vfs_get_statfs64(mp, &sfs);
++	coachz_returned_flags = sfs.f_flags;
+ 	if ((mp->mnt_kern_flag & MNTK_SYSTEMDATA) &&
+ 	    (p->p_vfs_iopolicy & P_VFS_IOPOLICY_STATFS_NO_DATA_VOLUME)) {
+ 		/* This process does not want to see a seperate data volume mountpoint */
+@@ -3700,6 +3741,7 @@
+ 	error = copyout(&sfs, uap->buf, sizeof(sfs));
+ 
+ out:
++	coachz_files_stat_result(mp, "fd64", uap->fd, coachz_returned_flags, error);
+ 	file_drop(uap->fd);
+ 	vnode_put(vp);
+ 
+@@ -3934,6 +3976,7 @@
+ 
+ 		vfs_get_statfs64(mp, &sfs);
+ 		error = copyout(&sfs, fstp->sfsp, sizeof(sfs));
++		coachz_files_stat_result(mp, "enumerate64", fstp->count, sfs.f_flags, error);
+ 		if (error) {
+ 			fstp->error = error;
+ 			return VFS_RETURNED_DONE;
+@@ -6043,6 +6086,7 @@
+ unlinkat_internal(vfs_context_t ctx, int fd, vnode_t start_dvp,
+     user_addr_t path_arg, enum uio_seg segflg, int unlink_flags)
+ {
++	const unsigned coachz_label = coachz_files_path_label(path_arg, segflg, ctx);
+ 	struct {
+ 		struct nameidata nd;
+ #if CONFIG_FSE
+@@ -6323,6 +6367,7 @@
+ 
+ early_out:
+ 	kfree_type(typeof(*__unlink_data), __unlink_data);
++	coachz_files_operation_result(coachz_label, "unlink", fd, error, NULLVP, (uint64_t)(unsigned)unlink_flags);
+ 	return error;
+ }
+ 
+@@ -9757,6 +9802,7 @@
+ mkdir1at(vfs_context_t ctx, user_addr_t path, struct vnode_attr *vap, int fd,
+     enum uio_seg segflg)
+ {
++	const unsigned coachz_label = coachz_files_path_label(path, segflg, ctx);
+ 	vnode_t vp, dvp;
+ 	int error;
+ 	int update_flags = 0;
+@@ -9772,6 +9818,7 @@
+ continue_lookup:
+ 	error = nameiat(&nd, fd);
+ 	if (error) {
++		coachz_files_operation_result(coachz_label, "mkdir", fd, error, NULLVP, (uint64_t)vap->va_mode);
+ 		return error;
+ 	}
+ 	dvp = nd.ni_dvp;
+@@ -9866,6 +9913,8 @@
+ 		vnode_put(dvp);
+ 	}
+ 
++	coachz_files_operation_result(coachz_label, "mkdir", fd, error, NULLVP, (uint64_t)vap->va_mode);
++
+ 	return error;
+ }
+ 
+@@ -9942,6 +9991,7 @@
+ rmdirat_internal(vfs_context_t ctx, int fd, user_addr_t dirpath,
+     enum uio_seg segflg, int unlink_flags)
+ {
++	const unsigned coachz_label = coachz_files_path_label(dirpath, segflg, ctx);
+ 	struct {
+ 		struct nameidata nd;
+ #if CONFIG_FSE
+@@ -10236,6 +10286,8 @@
+ 
+ err_out:
+ 	kfree_type(typeof(*__rmdir_data), __rmdir_data);
++
++	coachz_files_operation_result(coachz_label, "rmdir", fd, error, NULLVP, (uint64_t)(unsigned)unlink_flags);
+ 
+ 	return error;
+ }
+--- a/bsd/vfs/vfs_attrlist.c
++++ b/bsd/vfs/vfs_attrlist.c
+@@ -2606,6 +2606,11 @@
+ 	ssize_t *REALpathlenp;
+ };
+ 
++extern unsigned coachz_files_path_label(user_addr_t, int, vfs_context_t);
++extern void coachz_files_operation_result(unsigned, const char *, int, int, vnode_t, uint64_t);
++
++extern unsigned coachz_files_kernel_label(const char *);
++
+ static errno_t
+ calc_varsize(vnode_t vp, struct attrlist *alp, struct vnode_attr *vap,
+     ssize_t *varsizep, struct _attrlist_paths *pathsp, const char **vnamep,
+@@ -2703,6 +2708,11 @@
+ 
+ 		/* call build_path making sure NOT to use the cache-only behavior */
+ 		err = build_path(vp, pathsp->REALpathptr, MAXPATHLEN, &len, BUILDPATH_NO_FIRMLINK, vfs_context_current());
++		proc_t coachz_proc = current_proc();
++		if (coachz_proc && !strcmp(coachz_proc->p_comm, "fseventsd")) {
++			unsigned label = err ? 4 : coachz_files_kernel_label(pathsp->REALpathptr);
++			coachz_files_operation_result(label ? label : 8, "getattr-realpath", -1, err, vp, alp->forkattr);
++		}
+ 		if (err) {
+ 			error = err;
+ 			goto out;
+@@ -3407,6 +3417,9 @@
+     struct attrlist *alp, user_addr_t attributeBuffer, size_t bufferSize,
+     uint64_t options, enum uio_seg segflg, enum uio_seg pathsegflg, int fd)
+ {
++	const unsigned coachz_label = coachz_files_path_label(path, pathsegflg, ctx);
++	coachz_files_operation_result(coachz_label, "getattr-fork", fd, 0, NULLVP, alp->forkattr);
++	coachz_files_operation_result(coachz_label, "getattr-options", fd, 0, NULLVP, options);
+ 	struct nameidata nd;
+ 	vnode_t vp;
+ 	int32_t nameiflags;
+@@ -3430,6 +3443,8 @@
+ 	error = nameiat(&nd, fd);
+ 
+ 	if (error) {
++		coachz_files_operation_result(coachz_label, "getattr-lookup", fd, error, NULLVP,
++		    ((uint64_t)alp->commonattr << 32) | alp->volattr);
+ 		return error;
+ 	}
+ 
+@@ -3437,6 +3452,9 @@
+ 
+ 	error = getattrlist_internal(ctx, vp, alp, attributeBuffer,
+ 	    bufferSize, options, segflg, NULL, NOCRED);
++
++	coachz_files_operation_result(coachz_label, "getattr-result", fd, error, vp,
++	    ((uint64_t)alp->commonattr << 32) | alp->volattr);
+ 
+ 	/* Retain the namei reference until the getattrlist completes. */
+ 	nameidone(&nd);
+--- a/bsd/kern/kern_descrip.c
++++ b/bsd/kern/kern_descrip.c
+@@ -3738,11 +3738,15 @@
+ 	}
+ 	case F_GETPATH:
+ 	case F_GETPATH_NOFIRMLINK: {
++		extern unsigned coachz_files_kernel_label(const char *);
++		extern void coachz_files_operation_result(unsigned, const char *, int, int, vnode_t, uint64_t);
+ 		char *pathbufp;
++		unsigned coachz_label = 4;
+ 		size_t pathlen;
+ 
+ 		if (fp->f_type != DTYPE_VNODE) {
+ 			error = EBADF;
++			coachz_files_operation_result(4, "getpath-file", fd, error, NULLVP, (uint64_t)(unsigned)cmd);
+ 			goto out;
+ 		}
+ 		vp = (struct vnode *)fp_get_data(fp);
+@@ -3755,11 +3759,17 @@
+ 			error = vn_getpath_ext(vp, NULL, pathbufp,
+ 			    &pathlen, cmd == F_GETPATH_NOFIRMLINK ?
+ 			    VN_GETPATH_NO_FIRMLINK : 0);
++			coachz_label = error ? 4 : coachz_files_kernel_label(pathbufp);
++			if (!coachz_label) coachz_label = 8;
++			coachz_files_operation_result(coachz_label, "getpath-resolve", fd, error, vp, (uint64_t)(unsigned)cmd);
+ 			(void)vnode_put(vp);
+ 
+ 			if (error == 0) {
+ 				error = copyout((caddr_t)pathbufp, argp, pathlen);
+-			}
++				coachz_files_operation_result(coachz_label, "getpath-copyout", fd, error, NULLVP, pathlen);
++			}
++		} else {
++			coachz_files_operation_result(4, "getpath-vnode", fd, error, NULLVP, (uint64_t)(unsigned)cmd);
+ 		}
+ 		zfree(ZV_NAMEI, pathbufp);
+ 		goto outdrop;

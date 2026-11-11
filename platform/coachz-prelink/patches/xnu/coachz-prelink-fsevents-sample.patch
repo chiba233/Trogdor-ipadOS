@@ -1,0 +1,26 @@
+--- a/osfmk/arm64/coachz_thread.c
++++ b/osfmk/arm64/coachz_thread.c
+@@ -148,3 +148,4 @@
+ 	{
+ 		extern int coachz_preferences_pid, coachz_poster_pid, coachz_wifid_pid;
++		extern int coachz_fseventsd_pid;
+ 		if (!strcmp(name, "Preferences")) {
+@@ -156,4 +157,7 @@
+ 		if (!strcmp(name, "wifid")) {
+ 			coachz_wifid_pid = exited ? 0 : pid;
+ 		}
++		if (!strcmp(name, "fseventsd")) {
++			coachz_fseventsd_pid = exited ? 0 : pid;
++		}
+ 	}
+@@ -862,3 +866,6 @@
+ /* Each report, where the main threads of the tapped app and of SpringBoard are, for the disk log. */
+ int coachz_preferences_pid, coachz_poster_pid, coachz_wifid_pid;
++/* The Files app reads nothing because no client reaches com.apple.FSEvents (FSEventStreamStart: invalid destination port) while
++ * fseventsd's main thread sleeps in __semwait_signal: where it waits, symbolized. */
++int coachz_fseventsd_pid;
+ void coachz_sample_main_threads(void);
+@@ -1010,2 +1017,3 @@
+ 	coachz_sample_threads(coachz_wifid_pid, "wifid", 16);
++	coachz_sample_threads(coachz_fseventsd_pid, "fseventsd", 8);
+ 	unsigned threads = 0;

@@ -145,8 +145,18 @@ coachz-prelink-probe-cleanup.patch
 # TrollStore Lite's spawnRoot: only its own binary may start its own trollstorehelper with a uid/gid 0 persona.
 coachz-prelink-trollstore-persona.patch
 
+# Private-data logging for the file provider, document, plug-in, LaunchServices and download subsystems (Files and Safari downloads).
+coachz-prelink-staged-logging.patch
+
 # The video codec's firmware from the blob, its cx consumer and its MM1/MM2 bus vote (package/CoachzVenus.cpp).
 coachz-prelink-venus.patch
+
+# fseventsd main-thread samples (the Files app: no client reaches com.apple.FSEvents).
+coachz-prelink-fsevents-sample.patch
+# FSEvents startup: actual log-directory opens and per-call filesystem identity/flag results, without changing the filesystem view.
+coachz-prelink-file-services.patch
+# Userspace sees one volume on "/": the SystemOS union is reported as the root volume it covers (getfsstat, statfs, stat, getattrlist).
+coachz-prelink-root-view.patch
 
 # Drain cached zero-fill before batch-mapping managed IOSurface pages as uncached on Coachz.
 coachz-prelink-video-cache.patch

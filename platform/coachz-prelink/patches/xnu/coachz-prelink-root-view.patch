@@ -1,0 +1,226 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8411,6 +8411,13 @@
+ 		if (library) {
+ 			vnode_put(library);
+ 		}
++	}
++	if (!error && use_union) {
++		/* Userspace sees one volume on "/" (coachz_union_identity in vfs_subr.c). */
++		extern mount_t coachz_union_identity(mount_t mp);
++		printf("COACHZ root view: union fsid 0x%x reported as root fsid 0x%x\n",
++		    (unsigned)vfs_statfs(coachz_systemos_mount)->f_fsid.val[0],
++		    (unsigned)vfs_statfs(coachz_union_identity(coachz_systemos_mount))->f_fsid.val[0]);
+ 	}
+ 	if (!error && !use_union) {
+ 		error = copyout(environment, environment_vector[0], strlen(environment) + 1);
+@@ -9504,8 +9511,11 @@
+ 
+ /* -2 (k197): every plug-in under /Applications reached pkd with no containing bundle (LSPlugInKitProxy containingBundle nil, so
+  * PlugInKitDaemon rejected all 141: "plug-ins outside containing apps must be in /System", and the file providers never loaded). pkd
+- * itself suggests rebuilding the LaunchServices registration; a new marker name makes lsd rebuild once more with the current bindfs. */
+-static const char coachz_ls_marker[] = "/private/var/db/.coachz-ls-built-2";
++ * itself suggests rebuilding the LaunchServices registration; a new marker name makes lsd rebuild once more with the current bindfs.
++ * -3: that rebuild left them the same, every extension of the boot filesystem with no parent unit: LaunchServices finds a bundle's
++ * container by its device id, and the SystemOS union and the root volume gave different ones. Userspace now sees one volume on "/"
++ * (coachz_union_identity in vfs_subr.c); the extensions register only when the database is built, so it is built once more. */
++static const char coachz_ls_marker[] = "/private/var/db/.coachz-ls-built-3";
+ static const char coachz_apps_reregistered[] = "/private/var/db/.coachz-apps-reregistered-1";
+ 
+ /* fseventsd never finishes starting ("Could not open logging directory <1> ... dev[16777231]", then "No global disk logger state?!"),
+--- a/bsd/vfs/vfs_subr.c
++++ b/bsd/vfs/vfs_subr.c
+@@ -13153,3 +13153,54 @@
+ }
+ 
+ #endif /* CONFIG_FILE_LEASES */
++
++/*
++ * Coachz: the SystemOS volume is a native union over the root volume's "/" (kern_exec.c), so files under "/" come from two APFS
++ * volumes and getfsstat listed two mounts on "/". Userspace identifies a volume by its device id: LaunchServices, CoreServices'
++ * FileIDTree, launchd's feature flag store and fseventsd compare the number of a file with the one of the volume they enumerated.
++ * The union is reported as the root volume it covers, as UniXNU's macos-union-one-volume.patch does: getfsstat leaves it out and
++ * stat, statfs and getattrlist give the root volume's device id and fsid. MNT_ROOTFS, the mounts and the kernel's own view stay.
++ */
++mount_t coachz_union_identity(mount_t mp);
++int32_t coachz_union_devid(int32_t dev);
++fsid_t coachz_union_fsid(fsid_t fsid);
++
++mount_t
++coachz_union_identity(mount_t mp)
++{
++	if (mp != NULL && (mp->mnt_flag & MNT_UNION) && mp->mnt_vnodecovered != NULLVP &&
++	    (mp->mnt_vnodecovered->v_flag & VROOT) && (mp->mnt_vnodecovered->v_mount->mnt_flag & MNT_ROOTFS)) {
++		return mp->mnt_vnodecovered->v_mount;
++	}
++	return mp;
++}
++
++/* The same for a bare device id or fsid (getattrlistbulk packs entries without a vnode): the union's becomes the root volume's.
++ * rootvnode is the union's root once kern_exec.c has mounted it and does not change afterwards. */
++static mount_t
++coachz_union_on_root(void)
++{
++	vnode_t root = rootvnode;
++	mount_t mp = root ? root->v_mount : NULL;
++	return coachz_union_identity(mp) != mp ? mp : NULL;
++}
++
++int32_t
++coachz_union_devid(int32_t dev)
++{
++	mount_t mp = coachz_union_on_root();
++	if (mp && dev == mp->mnt_vfsstat.f_fsid.val[0]) {
++		return coachz_union_identity(mp)->mnt_vfsstat.f_fsid.val[0];
++	}
++	return dev;
++}
++
++fsid_t
++coachz_union_fsid(fsid_t fsid)
++{
++	mount_t mp = coachz_union_on_root();
++	if (mp && fsid.val[0] == mp->mnt_vfsstat.f_fsid.val[0] && fsid.val[1] == mp->mnt_vfsstat.f_fsid.val[1]) {
++		return coachz_union_identity(mp)->mnt_vfsstat.f_fsid;
++	}
++	return fsid;
++}
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -3525,6 +3525,8 @@
+  *	vfs_update_vfsstat:???
+  *	munge_statfs:EFAULT
+  */
++extern mount_t coachz_union_identity(mount_t mp);
++
+ /* ARGSUSED */
+ int
+ statfs(proc_t p, struct statfs_args *uap, __unused int32_t *retval)
+@@ -3542,7 +3544,7 @@
+ 		return error;
+ 	}
+ 	vp = nd.ni_vp;
+-	mp = vp->v_mount;
++	mp = coachz_union_identity(vp->v_mount);
+ 	nameidone(&nd);
+ 
+ 	error = statfs_internal(p, mp, uap->buf);
+@@ -3571,7 +3573,7 @@
+ 
+ 	AUDIT_ARG(vnpath_withref, vp, ARG_VNODE1);
+ 
+-	mp = vp->v_mount;
++	mp = coachz_union_identity(vp->v_mount);
+ 	if (!mp) {
+ 		error = EBADF;
+ 		goto out_vnode;
+@@ -3650,7 +3652,7 @@
+ 		goto out;
+ 	}
+ 	vp = ndp->ni_vp;
+-	mp = vp->v_mount;
++	mp = coachz_union_identity(vp->v_mount);
+ 	nameidone(ndp);
+ 
+ #if CONFIG_MACF
+@@ -3714,7 +3716,7 @@
+ 
+ 	AUDIT_ARG(vnpath_withref, vp, ARG_VNODE1);
+ 
+-	mp = vp->v_mount;
++	mp = coachz_union_identity(vp->v_mount);
+ 	if (!mp) {
+ 		error = EBADF;
+ 		goto out;
+@@ -3766,6 +3768,10 @@
+ 	int error, my_size;
+ 	vfs_context_t ctx = vfs_context_current();
+ 
++	/* The SystemOS union on "/" is the root volume (coachz_union_identity). */
++	if (coachz_union_identity(mp) != mp) {
++		return VFS_RETURNED;
++	}
+ 	if (fstp->sfsp && fstp->count < fstp->maxcount) {
+ #if CONFIG_MACF
+ 		error = mac_mount_check_stat(ctx, mp);
+@@ -3949,6 +3955,10 @@
+ 	struct statfs64 sfs;
+ 	int error;
+ 
++	/* The SystemOS union on "/" is the root volume (coachz_union_identity). */
++	if (coachz_union_identity(mp) != mp) {
++		return VFS_RETURNED;
++	}
+ 	if (fstp->sfsp && fstp->count < fstp->maxcount) {
+ #if CONFIG_MACF
+ 		error = mac_mount_check_stat(vfs_context_current(), mp);
+--- a/bsd/vfs/vfs_vnops.c
++++ b/bsd/vfs/vfs_vnops.c
+@@ -110,6 +110,8 @@
+ 
+ #include <IOKit/IOBSD.h>
+ #include <libkern/section_keywords.h>
++
++extern mount_t coachz_union_identity(mount_t mp);
+ 
+ static int vn_closefile(struct fileglob *fp, vfs_context_t ctx);
+ static int vn_ioctl(struct fileproc *fp, u_long com, caddr_t data,
+@@ -1625,6 +1627,15 @@
+ 		sb->st_dev = va.va_fsid;
+ 		sb->st_ino = (ino_t)va.va_fileid;
+ 	}
++	/* A file of the SystemOS union on "/" is on the root volume (coachz_union_identity in vfs_subr.c). */
++	if (coachz_union_identity(vp->v_mount) != vp->v_mount) {
++		dev_t root_dev = coachz_union_identity(vp->v_mount)->mnt_vfsstat.f_fsid.val[0];
++		if (isstat64 != 0) {
++			sb64->st_dev = root_dev;
++		} else {
++			sb->st_dev = root_dev;
++		}
++	}
+ 	mode = va.va_mode;
+ 	switch (vp->v_type) {
+ 	case VREG:
+--- a/bsd/vfs/vfs_attrlist.c
++++ b/bsd/vfs/vfs_attrlist.c
+@@ -190,6 +190,9 @@
+ {
+ 	attrlist_pack_variable2(ab, source, count, NULL, 0);
+ }
++
++extern int32_t coachz_union_devid(int32_t dev);
++extern fsid_t coachz_union_fsid(fsid_t fsid);
+ 
+ /*
+  * Attempt to pack a string. This is a special case of a variable width attribute.
+@@ -1670,11 +1673,12 @@
+ 			    mp->mnt_vfsstat.f_fsid.val[0]);
+ 			abp->actual.commonattr |= ATTR_CMN_DEVID;
+ 		} else if (VATTR_IS_ACTIVE(vap, va_fsid) && VATTR_IS_SUPPORTED(vap, va_fsid)) {
+-			ATTR_PACK4((*abp), vap->va_fsid);
++			/* Coachz: a file of the SystemOS union on "/" is on the root volume (coachz_union_identity in vfs_subr.c). */
++			ATTR_PACK4((*abp), coachz_union_devid((int32_t)vap->va_fsid));
+ 			abp->actual.commonattr |= ATTR_CMN_DEVID;
+ 		} else if (vp) {
+ 			ATTR_PACK4((*abp),
+-			    vp->v_mount->mnt_vfsstat.f_fsid.val[0]);
++			    coachz_union_devid(vp->v_mount->mnt_vfsstat.f_fsid.val[0]));
+ 			abp->actual.commonattr |= ATTR_CMN_DEVID;
+ 		} else if (VATTR_IS_SUPPORTED(vap, va_devid)) {
+ 			ATTR_PACK4((*abp), vap->va_devid);
+@@ -1689,11 +1693,12 @@
+ 			    mp->mnt_vfsstat.f_fsid);
+ 			abp->actual.commonattr |= ATTR_CMN_FSID;
+ 		} else if (VATTR_IS_SUPPORTED(vap, va_fsid64)) {
+-			ATTR_PACK8((*abp), vap->va_fsid64);
++			fsid_t shown = coachz_union_fsid(vap->va_fsid64);
++			ATTR_PACK8((*abp), shown);
+ 			abp->actual.commonattr |= ATTR_CMN_FSID;
+ 		} else if (vp) {
+-			ATTR_PACK8((*abp),
+-			    vp->v_mount->mnt_vfsstat.f_fsid);
++			fsid_t shown = coachz_union_fsid(vp->v_mount->mnt_vfsstat.f_fsid);
++			ATTR_PACK8((*abp), shown);
+ 			abp->actual.commonattr |= ATTR_CMN_FSID;
+ 		} else if (!return_valid || pack_invalid) {
+ 			fsid_t fsid = {{0}};

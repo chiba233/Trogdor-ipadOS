@@ -1,0 +1,74 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -9494,17 +9494,36 @@
+  * itself suggests rebuilding the LaunchServices registration; a new marker name makes lsd rebuild once more with the current bindfs. */
+ static const char coachz_ls_marker[] = "/private/var/db/.coachz-ls-built-2";
+ static const char coachz_apps_reregistered[] = "/private/var/db/.coachz-apps-reregistered-1";
++
++/* fseventsd never finishes starting ("Could not open logging directory <1> ... dev[16777231]", then "No global disk logger state?!"),
++ * so FSEventsCopyUUIDForDevice fails and LocalStorageFileProvider has no volume UUID for the Data volume: the Files app lists nothing.
++ * fseventsd refuses a mount whose <mount>/.fseventsd opens on another file system, or a mount on / that is neither read-only nor the
++ * root file system. Which mount that is needs the mount table as the system sees it: printed once, a minute after boot. */
++static int
++coachz_print_mount(mount_t mp, void *arg)
++{
++	struct vfsstatfs *sp = vfs_statfs(mp);
++	unsigned *n = arg;
++	printf("COACHZ mounts: %u %s on %s type %s fsid 0x%x flags 0x%llx\n", (*n)++, sp->f_mntfromname, sp->f_mntonname, sp->f_fstypename,
++	    (unsigned)sp->f_fsid.val[0], (unsigned long long)vfs_flags(mp));
++	return VFS_RETURNED;
++}
+ 
+ /* Called about every ten seconds from the kernel's sampling thread. */
+ void coachz_staged_mark_built(void);
+ void
+ coachz_staged_mark_built(void)
+ {
+-	static bool done;
++	static bool done, mounts_printed;
+ 	uint64_t now;
+ 	vnode_t vp = NULLVP;
+ 
+ 	absolutetime_to_nanoseconds(mach_absolute_time(), &now);
++	if (!mounts_printed && now >= 60 * NSEC_PER_SEC) {
++		unsigned n = 0;
++		mounts_printed = true;
++		(void)vfs_iterate(0, coachz_print_mount, &n);
++	}
+ 	if (done || now < 300 * NSEC_PER_SEC || !coachz_staged_enabled()) {
+ 		return;
+ 	}
+@@ -9629,6 +9648,33 @@
+ 		}
+ 	} else {
+ 		vnode_put(marker_vp);
++	}
++	/* The Files app shows nothing and Safari downloads never land, and fileproviderd, LocalStorageFileProvider, pkd and lsd say why only
++	 * in private arguments. As the baseband patch does for its subsystems, logd is told to keep those in the clear; the files stay on this
++	 * Data volume and their logs can hold file names, so nothing from them is published. */
++	{
++		static const char *const subsystems[] = {"com.apple.FileProvider", "com.apple.DocumentManager", "com.apple.DocumentsApp",
++		    "com.apple.PlugInKit", "com.apple.launchservices", "com.apple.extensionkit", "com.apple.WebKit", "com.apple.mobilesafari",
++		    "com.apple.Safari", "com.apple.containermanager", "com.apple.fsevents"};
++		static const char logging[] = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict><key>DEFAULT-OPTIONS</key><dict>"
++		    "<key>Enable-Private-Data</key><true/><key>Privacy-Enable-Level</key><string>Private</string></dict></dict></plist>\n";
++		char logging_path[160];
++		unsigned written_ok = 0;
++		int logging_error = 0;
++		for (unsigned i = 0; i < sizeof(subsystems) / sizeof(subsystems[0]); i++) {
++			snprintf(logging_path, sizeof(logging_path), "/private/var/preferences/Logging/Subsystems/%s.plist", subsystems[i]);
++			int written = native_gpu_addon_write(logging_path, (const uint8_t *)logging, sizeof(logging) - 1, 0644, vfs_context_current());
++			if (written == ENOENT && !(written = native_gpu_addon_parents(p, scratch, logging_path))) {
++				written = native_gpu_addon_write(logging_path, (const uint8_t *)logging, sizeof(logging) - 1, 0644, vfs_context_current());
++			}
++			if (written > 0 && !logging_error) {
++				logging_error = written;
++			} else if (written <= 0) {
++				written_ok++;
++			}
++		}
++		printf("COACHZ staged apps: private logging for %u of %u file and download subsystems, first error %d\n", written_ok,
++		    (unsigned)(sizeof(subsystems) / sizeof(subsystems[0])), logging_error);
+ 	}
+ 	semaphore_error = copyout(semaphore, scratch + 0xc00, sizeof(semaphore));
+ 	if (!semaphore_error) {

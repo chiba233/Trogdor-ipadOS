@@ -1739,3 +1739,15 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 抽样帧的复制区间（含复制前稀疏探针）中位数为 1.37 ms，最大 11.28 ms；内核整帧摘要中位数 10.23 ms。
 FBD 到 return 的中位数 96.88 ms 包含排队、调度、池操作和探针，不是硬件解码耗时。全部 pid／epoch 的 GPU trace
 及过滤后的性能日志已保存，用于继续定位呈现端的丢帧；解码启动、复制与探针开销仍需继续调查。
+
+## k214 卷标识互相矛盾，k215 统一为根卷
+
+k214 带了两处卷标识修改：statfs 把 `MNT_ROOTFS` 报给 SystemOS 联合挂载，getattrlist 把根卷文件报成联合挂载的 fsid，`stat` 仍报根卷。
+真机上 launchd 对 `CoreAudioServices/audiomxd` 特性开关给出两个相反的结果，mediaserverd 和 audiomxd 都去注册
+`com.apple.audio.AudioQueueServer`，mediaserverd 每次都 abort；backboardd 在“start window server...”之后再无进展，
+没有打开显示驱动和 GPU，SpringBoard 在 `BKSDisplayGetMainScreenInfo` 里等它，界面没有出来。
+
+k215 照 UniXNU 的 `macos-union-one-volume.patch` 改为把联合挂载报成它覆盖的根卷（getfsstat、statfs、stat、getattrlist 一致）。
+真机上界面正常出来，mediaserverd 不再崩溃；fseventsd 不再报 `<1>`，“文件”App 能正常浏览；pkd 不再以
+“plug-ins outside containing apps”拒绝 `/Applications` 下的扩展（k213 是 141 条，k215 为 0），这些 App 的扩展重新出现。
+同一次启动 backboardd 的内存涨到 4.4 GB 被 jetsam 结束，界面很卡，原因在 GPU 用户态，单独追查。
