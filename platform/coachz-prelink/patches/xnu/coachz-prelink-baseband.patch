@@ -191,7 +191,7 @@
  		}
  	}
  	kfree_data(data, (size_t)size + 1);
-@@ -8887,9 +8899,228 @@
+@@ -8887,9 +8899,229 @@
  	native_gpu_addon_mount(p, scratch, 0xa00, small_source, sizeof(small_source), small_point, sizeof(small_point), COACHZ_SMALL "/assets/Background Light.HEIC",
  	    COACHZ_SMALL "/Background-Light.jpg", &small_stage, &small_status);
  	printf("COACHZ gpu: wallpaper overlays: flat stage %d status %d, 834 stage %d status %d\n", native_gpu_addon3_stage, native_gpu_addon3_status, small_stage, small_status);
@@ -353,9 +353,10 @@
 +	int error;
 +	/* ABM and BBUpdater say why a boot failed only in %s messages, and CommCenter's QMUX trace (com.apple.telephony.bb, category qmux) prints
 +	 * every QMI message as private bytes; both stay private unless logd is told otherwise for the subsystem. With this those logs can hold
-+	 * device identifiers: they stay on this machine. CommCenter's own subsystem too: its carrier bundle matching input is private. */
++	 * device identifiers: they stay on this machine. CommCenter's own subsystem too: its carrier bundle matching input is private. Settings'
++	 * cellular subsystem prints the MobileEquipmentInfo it shows in About (with the EID, which is missing there) only as private data. */
 +	static const char *const logging_paths[] = {"/private/var/preferences/Logging/Subsystems/com.apple.telephony.abm.plist",
-+	                                            "/private/var/preferences/Logging/Subsystems/com.apple.telephony.bb.plist", "/private/var/preferences/Logging/Subsystems/com.apple.CommCenter.plist"};
++	                                            "/private/var/preferences/Logging/Subsystems/com.apple.telephony.bb.plist", "/private/var/preferences/Logging/Subsystems/com.apple.CommCenter.plist", "/private/var/preferences/Logging/Subsystems/com.apple.cellularsettings.plist"};
 +	static const char logging[] = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict><key>DEFAULT-OPTIONS</key><dict>"
 +	    "<key>Enable-Private-Data</key><true/><key>Privacy-Enable-Level</key><string>Private</string></dict></dict></plist>\n";
 +	int logging_error = 0;
@@ -420,7 +421,7 @@
  coachz_audio_prepare(proc_t p, user_addr_t scratch)
  {
  	static const char *const directories[] = {"/private/var/coachz", "/private/var/coachz/audio", "/private/var/coachz/audio/CoachzAudio.driver",
-@@ -8965,6 +9196,10 @@
+@@ -8965,6 +9197,10 @@
  	     * registered, so its first caller waits forever; identityservicesd and CommCenter are UniXNU's first-boot XPC wait
  	     * cycle; accessoryupdaterd keeps trustd checking certificates. A disabled job's clients get no answer at once. */
  	    "<plist version=\"1.0\"><dict><key>com.apple.watchdogd</key><true/><key>com.apple.fairplayd.A2</key><true/><key>com.apple.accessoryupdaterd</key><true/><key>com.apple.identityservicesd</key><true/><key>com.apple.CommCenter</key><true/></dict></plist>\n";
@@ -431,7 +432,7 @@
  	int disable = 0;
  	int error;
  
-@@ -8972,7 +9207,7 @@
+@@ -8972,7 +9208,7 @@
  		return 0;
  	}
  	error = coachz_watchdog_policy_file("/private/var/db/com.apple.xpc.launchd/disabled.plist",
@@ -440,7 +441,7 @@
  	if (!error) {
  		/* Prevent first-boot migration from replacing the deliberately installed override. */
  		error = coachz_watchdog_policy_file("/private/var/db/com.apple.xpc.launchd/disabled.migrated", "", 0);
-@@ -9282,6 +9517,7 @@
+@@ -9282,6 +9518,7 @@
  		coachz_setup_prepare();
  		coachz_audio_prepare(p, scratch);
  		coachz_gpu_prepare(p, scratch);

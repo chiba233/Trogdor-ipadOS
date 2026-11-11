@@ -1751,3 +1751,6 @@ k215 照 UniXNU 的 `macos-union-one-volume.patch` 改为把联合挂载报成�
 真机上界面正常出来，mediaserverd 不再崩溃；fseventsd 不再报 `<1>`，“文件”App 能正常浏览；pkd 不再以
 “plug-ins outside containing apps”拒绝 `/Applications` 下的扩展（k213 是 141 条，k215 为 0），这些 App 的扩展重新出现。
 同一次启动 backboardd 的内存涨到 4.4 GB 被 jetsam 结束，界面很卡，原因在 GPU 用户态，单独追查。
+
+同一次启动，eSIM 在实体卡和 eUICC 之间来回切了 6 次，每次桥都切到选中的物理槽并发布新卡状态，从 eSIM 切回实体卡时只短暂显示无 SIM。
+“关于本机”仍不显示 EID：设置收到的 `CTMobileEquipmentInfo` 带 CSN，但挂在槽一上，设置去槽二找（docs/plans/modem.md）。

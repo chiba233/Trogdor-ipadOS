@@ -891,9 +891,80 @@ static void test_esim_cache(void)
     esim_drain();
     esim_tape_command(CBE_TAPE_DELETE, 9, del, sizeof del, 1, 0, 20002); esim_open();
     esim_apdu_response(6007, NULL, 0, 0x90, 0);
-    esim_restore(6008);
+    /* Both answers are stale now and none is served; they are read again on the open channel, in entry order, before the
+     * physical SIM is switched back, and the delete's own answer survives in resp. */
+    for (unsigned i = 0; i < CBE_CACHE_ENTRIES; i++) CHECK(esim.cached[i].used != 1);
+    CHECK(esim.refresh == 1 && esim.step == CBE_S_APDU && esim.done_pending && !esim.done_status);
+    uint32_t len = 0;
+    const uint8_t *apdu = cbd_find(esim.req, esim.req_len, 0x02, &len);
+    CHECK(apdu && len == 2u + 5u + sizeof query + 1u && !memcmp(apdu + 7, query, sizeof query));
+    const uint8_t profiles_now[] = { 0xbf, 0x2d, 3, 0xa0, 1, 0 }, notifications_now[] = { 0xbf, 0x28, 3, 0xa0, 1, 0 };
+    esim_apdu_response(6008, profiles_now, sizeof profiles_now, 0x90, 0);
+    CHECK(esim.refresh == 2 && esim.step == CBE_S_APDU && esim.cached[0].used == 1);
+    esim_apdu_response(6009, notifications_now, sizeof notifications_now, 0x90, 0);
+    CHECK(!esim.refresh && esim.step == CBE_S_CLOSE && esim.cached[1].used == 1 && esim.resp_len == 0);
+    esim_restore(6010); esim_drain();
+    const uint32_t after_refresh = esim.switches;
+    esim_tape_command(13, 13, query, sizeof query, 1, 0, 60000);
+    cbe_tick(&esim, 60001);
+    CHECK(esim.step == CBE_S_IDLE && !esim.req_len && esim.switches == after_refresh);
+    CHECK(esim.done_pending && esim.done_len == sizeof profiles_now && !memcmp(esim.resp, profiles_now, sizeof profiles_now));
+    esim_drain();
+    /* A refresh the card refuses drops every stale answer and closes as before. */
+    esim_tape_command(CBE_TAPE_DELETE, 9, del, sizeof del, 1, 0, 60002); esim_open();
+    esim_apdu_response(6007, NULL, 0, 0x90, 0);
+    CHECK(esim.refresh == 1);
+    esim_apdu_response(6008, NULL, 0, 0x6a, 0x88);
+    CHECK(!esim.refresh && esim.step == CBE_S_CLOSE && !esim.done_status);
+    esim_restore(6009);
     for (unsigned i = 0; i < CBE_CACHE_ENTRIES; i++) CHECK(!esim.cached[i].used);
     if (!failures) printf("PASS esim read-only query cache\n");
+}
+
+/* Closing the ISD-R channel is cleanup: a failed close after a successful EnableProfile keeps the result (Hermes never closes it, the
+ * eUICC's REFRESH ends it). With the eUICC kept selected there is no switch to protect, so stale answers are not read again. */
+static void test_esim_close(void)
+{
+    const uint8_t enable[] = { 0xbf, 0x31, 0 }, enabled[] = { 0xbf, 0x31, 3, 0x80, 1, 0 };
+    const uint8_t query[] = { 0xbf, 0x2d, 0 }, answer[] = { 0xbf, 0x2d, 2, 0xa0, 0 };
+    esim_reset(); cbe_set_cache(&esim, esim_cache, sizeof esim_cache);
+    esim_tape_command(13, 9, query, sizeof query, 1, 0, 2); esim_open();
+    esim_apdu_response(6007, answer, sizeof answer, 0x90, 0);
+    esim_restore(6008); esim_drain();
+    CHECK(esim.cached[0].used == 1);
+    esim_tape_command(CBE_TAPE_ENABLE, 9, enable, sizeof enable, 1, 0, 20000);
+    cbe_tick(&esim, 20001); CHECK(esim.step == CBE_S_SWITCH);
+    esim_answer(20002, NULL, 0, 0); cbe_tick(&esim, 26002); esim_slots(26003, 1);
+    const uint8_t ch[] = { 0x10, 1, 0, 1 };
+    esim_answer(26004, ch, sizeof ch, 0);
+    esim_apdu_response(26005, enabled, sizeof enabled, 0x90, 0);
+    CHECK(esim.route_commit && esim.restore_phys == 2 && !esim.refresh && esim.step == CBE_S_CLOSE && esim.cached[0].used == 2);
+    esim_answer(26006, NULL, 0, CBE_ERR_INTERNAL);
+    CHECK(!esim.done_status && esim.done_pending && !esim.channel_open && esim.step == CBE_S_RESTORE_SETTLE);
+    CHECK(esim.done_len == sizeof enabled && !memcmp(esim.resp, enabled, sizeof enabled));
+    cbe_tick(&esim, 32006); esim_slots(32007, 1);
+    CHECK(esim.selected_phys == 2 && esim.route_generation == 1);
+    esim_card_publish(32008, 1);
+    uint8_t out[2048], channel = 0;
+    const uint32_t n = cbe_output(&esim, &channel, out, sizeof out);
+    uint32_t len = 0;
+    const uint8_t *info = n ? cbd_find(out + CBQ_HDR, n - CBQ_HDR, 0x01, &len) : NULL;
+    CHECK(info && len == 11 && info[0] == CBE_TAPE_ENABLE && !cbd_rd16(info + 1));
+    /* A batch hold keeps the eUICC through short gaps, but a waiting selection ends it at once. */
+    esim_reset();
+    esim_tape_command(13, 9, query, sizeof query, 1, 0, 2); esim_open();
+    esim_apdu_response(6007, answer, sizeof answer, 0x90, 0);
+    CHECK(esim.session == CBE_SESSION_BATCH && esim.session_deadline == 6007u + CBE_BATCH_IDLE_MS && esim.step == CBE_S_IDLE);
+    esim_drain();
+    cbe_tick(&esim, 9000); CHECK(esim.session && esim.step == CBE_S_IDLE);
+    uint8_t route[64], select[16];
+    const uint8_t endpoint = 0;
+    const uint32_t w = cbd_tlv(select + 7, sizeof select - 7, 0x01, &endpoint, 1);
+    cbd_request(select, 50, CBE_UIM_SELECT_SINGLE_SUB, w);
+    CHECK(cbe_route_request(&esim, 1, 7, select, 7 + w, route, sizeof route) == CBE_DEFERRED);
+    cbe_tick(&esim, 9001);
+    CHECK(!esim.session && esim.step == CBE_S_CLOSE);
+    if (!failures) printf("PASS esim channel close is cleanup\n");
 }
 
 static void test_esim_selection(void)
@@ -1308,6 +1379,7 @@ int main(void)
     test_data();
     test_esim();
     test_esim_cache();
+    test_esim_close();
     test_esim_selection();
     test_esim_pulled();
     test_esim_card_arrays();

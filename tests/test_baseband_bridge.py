@@ -41,7 +41,7 @@ class BasebandBridgeTests(unittest.TestCase):
                             str(ROOT / 'tests/coachz_bb_model_test.c'), '-o', str(binary)], check=True)
             result = subprocess.run([str(binary)], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(result.stdout.count('PASS '), 10, result.stdout)
+            self.assertEqual(result.stdout.count('PASS '), 11, result.stdout)
 
     def test_headers_compile_as_cpp(self):
         """coachz_baseband.cpp includes the portable headers as C++."""

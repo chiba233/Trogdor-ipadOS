@@ -178,6 +178,24 @@ b9 用 drivers/RamBlock/coachz_modem.c 按上面的顺序接入，在 Wi-Fi 线�
 
 桥接层现在在实体卡在用时给端点二补上 eUICC 一项（ICCID 取自卡槽状态，再加 EID），指示里把列表放到 0x14，并去掉 modem 的 0x12、0x14、0x15。CommCenter 选中 eSIM 后发苹果私有的 SelectUIMForSingleSubCfg（UIM 0x5557，TLV 0x01：0 槽一、1 槽二；另一种驱动发 MapProvisioningSessionToSlot 0x6e，TLV 0x10 为槽号），这台 modem 不认识，由桥接层执行：切槽、等 6 秒、重读卡槽、提交选卡、发布新卡状态，然后回应。实机上 eSIM 激活和两个方向的切换都成功，日志里每次请求都在新卡状态之后回应成功。切换耗时长，从 eSIM 切回实体卡时较长时间显示无 SIM，设置里的 EID 缺失，三者待查。
 
+### eSIM 回切实体卡与切卡耗时
+
+这台 modem 只有一个逻辑槽，访问 eUICC 就要把它切过去，每次切槽后按 Hermes 的 `kSimRefreshDelay` 等 6 秒（Hermes 的注释说，切槽后马上发 QMI 会出错）。所以切一次至少 6 秒，6 秒本身不缩短。上次上机慢，是因为切槽次数太多。从 eSIM 切回实体卡时，内核事件和 CommCenter 日志对得上的过程是：
+
+- CommCenter 先 DisableProfile，再用 0x5557 选实体卡。桥切回实体卡、发布新卡状态，5 ms 后 CommCenter 再查 GetProfilesInfo（日志里的“Updating EID”）。这条查询的缓存已被 DisableProfile 清掉，桥只好又把槽切去 eUICC，实体卡随即消失。CommCenter 连续 12 秒报“SIM … not found”，退回去再 EnableProfile 一次。
+- 那次 EnableProfile 在卡上成功（ES10 结果 0），之后关逻辑通道却失败了（QMI 错误 3）。原因是桥让 Enable/Disable 都带 refreshFlag，eUICC 做 REFRESH 时通道随之失效。桥把整条命令判成失败，CommCenter 又补发一次 DisableProfile。
+- 之后每次取回和删除通知都要再切一次。批处理的空闲保持只有 3 秒，而取回通知、上传服务器、删除通知之间各隔约 4 秒，于是每条通知都要切走再切回。
+
+改动：
+
+- 关逻辑通道只算收尾。关闭失败或超时都不再改写已经由卡给出的结果；Hermes 也从不主动关 ISD-R 通道，下次重新打开即可。
+- 改变卡片的命令只把缓存的查询标成过期，不再直接清掉。马上要从 eUICC 切去另一张卡时，先在仍然打开的通道上把过期查询重读一遍，再关通道、切槽。之后 CommCenter 的查询直接从缓存回答，不必再切走。重读失败就丢掉该条目，退回原来的行为。待发的应答先暂存，重读完再放回。
+- 批处理空闲保持改为 12 秒（上限 30 秒）。放开 eUICC 再拿回来要付两次 6 秒，空闲短于 12 秒时不放手反而更省。
+
+上机：在实体卡和 eSIM 之间来回切了 6 次，每次桥都切到选中的物理槽并发布新卡状态；从 eSIM 切回实体卡时只短暂显示无 SIM。
+
+EID：MobileEquipmentInfo 的 CSN 取哪个槽，由 `capabilities::ct::defaultMobileEquipmentInfoCSNSlotID()` 按 radio 查表决定。radio 3（J121）对应槽二，正是 eUICC 所在的端点，所以槽号没选错。设置页确实拿到了 MobileEquipmentInfo，但内容在日志里是私有数据。`--baseband` 给 `com.apple.cellularsettings` 打开私有日志后，上机看到：设置的 SubscriberCache 收到的 `CTMobileEquipmentInfo` 带着 CSN（eSIM 为当前卡时），但这一条的 `slotID` 是 `CTSubscriptionSlotOne`。这台 modem 按单待配置工作，CommCenter 只给出槽一的条目，没有槽二；设置按 radio 3 去槽二找 CSN，所以“关于本机”不显示 EID。实体卡为当前卡时，槽一那条的 CSN 也是空的。CommCenter 同时报“No local cellular plan signup support”，支持的 eSIM 流程为 0，设置因此也不显示添加 eSIM 的入口。设置按槽二取 CSN 的具体代码路径还没反汇编。
+
 ### eSIM Tape 实现（待实机）
 
 补齐的 `coachz_bb_esim.h` 已接入现有 QMUX 收发，不改数据口和激活实现，不增编译参数：

@@ -91,8 +91,11 @@
 #define CBE_TIMEOUT_MS 10000u
 #define CBE_SETTLE_MS 6000u
 #define CBE_SESSION_IDLE_MS 180000u
-#define CBE_BATCH_IDLE_MS 3000u
-#define CBE_BATCH_LIMIT_MS 15000u
+/* Giving the eUICC back and taking it again costs two of Hermes' 6 s SIM refresh delays (CBE_SETTLE_MS), during which the physical
+ * SIM is not usable either: hold through any shorter gap. On hardware ListNotification, RetrieveNotification, the upload to the
+ * server and RemoveNotification came about 4 s apart, and a 3 s hold switched away and back for each notification. */
+#define CBE_BATCH_IDLE_MS 12000u
+#define CBE_BATCH_LIMIT_MS 30000u
 #define CBE_SESSION_INSTALL 1u
 #define CBE_SESSION_BATCH 2u
 #define CBE_EVENTS 32u
@@ -250,8 +253,9 @@ enum cbe_event_kind {
     CBE_EV_FAILED,       /* a: command, b: step, c: QMI error or SW, d: reason (cbe_reason) */
     CBE_EV_CAPS,         /* a: slot one, b: slot two: the capability bytes changed */
     CBE_EV_LEGACY_CSN,   /* a: command, b: CommCenter slot, c: QMI result; no card identifier */
-    CBE_EV_SESSION,      /* a: 1 held, 2 released; b: slot, c: trigger command, d: reason (0 explicit, 1 idle, 2 disconnect, 3 error) */
-    CBE_EV_CACHE,        /* a: command, b: 1 answered from the cache, 2 stored, 3 cleared; c: bytes (stored, answered) or entries (cleared) */
+    CBE_EV_SESSION,      /* a: 1 held, 2 released; b: slot, c: trigger command, d: reason (0 explicit, 1 idle, 2 disconnect, 3 error, 4 a selection waits) */
+    CBE_EV_CACHE,        /* a: command, b: 1 answered from the cache, 2 stored, 3 marked stale, 4 refreshed before leaving the eUICC,
+                          * 5 stale entries dropped; c: bytes (stored, answered, refreshed) or entries (stale, dropped) */
     CBE_EV_COMMAND,      /* a: legacy command, b: transaction, c: slot, d: QMI error, e: header length */
     CBE_EV_PROFILE,      /* a: Tape command, b: ES10c result (UINT32_MAX malformed), c: selected physical slot, d: requested physical slot */
     CBE_EV_ROUTE,        /* a: old selected physical slot, b: confirmed slot, c: generation */
@@ -305,9 +309,12 @@ uint8_t done_pending, done_status, done_sw1, done_sw2;
 uint32_t done_chunk, done_len;
 struct cbe_event ev[CBE_EVENTS];
 uint32_t ev_count, ev_lost, card_status_fixed; uint32_t card_mapped;
-/* read-only query answers; each entry's bytes at cache + index * (cache_cap / CBE_CACHE_ENTRIES) */
+/* read-only query answers; each entry's bytes at cache + index * (cache_cap / CBE_CACHE_ENTRIES); used 1 valid, 2 stale */
 uint8_t *cache;
 uint32_t cache_cap, cache_next;
+/* the stale entry being read again before the channel closes (index + 1, 0 none), and the pending answer it displaces from resp */
+uint8_t refresh, keep[64];
+uint32_t keep_len;
 struct { uint8_t used, cmd, sw1, sw2; uint32_t req_len, resp_len; uint8_t req[CBE_CACHE_REQ]; } cached[CBE_CACHE_ENTRIES];
 };
 
@@ -581,10 +588,10 @@ static inline void cbe_send_block(struct cbe *e, uint32_t now)
         cbe_send_apdu(e, apdu, e->sw2 ? 5u : 4u, now);
         return;
     }
-    const struct cbe_job *j = &e->job[e->active];
     const struct cbe_seg *s = &e->seg[e->seg_index];
     const uint32_t left = s->len - e->frag_pos, take = left < CBE_APDU_DATA ? left : CBE_APDU_DATA;
-    const uint8_t *bytes = j->cmd == CBE_TAPE_EID ? cbe_get_eid : e->in + j->off;
+    const uint8_t *bytes = e->refresh ? e->cached[e->refresh - 1].req :
+        e->job[e->active].cmd == CBE_TAPE_EID ? cbe_get_eid : e->in + e->job[e->active].off;
     apdu[0] = 0x80; apdu[1] = 0xe2; apdu[2] = take == left ? 0x91 : 0x11;
     apdu[3] = (uint8_t)e->block++; apdu[4] = (uint8_t)take;
     __builtin_memcpy(apdu + 5, bytes + s->off + e->frag_pos, take);
@@ -652,13 +659,73 @@ static inline void cbe_profile_route(struct cbe *e, uint32_t cmd)
     e->restore_phys = target;
     e->switched = e->route_commit = e->needs_card = 1;
 }
+/* ------------------------------------------------------------------ stale cache entries, read again before the eUICC is given back
+ * A command that may change the card's answers only marks the cached ones stale (cbe_cache_note). When the eUICC is about to be
+ * switched away for the physical SIM, each stale query runs once more on the still open channel: on hardware CommCenter asked
+ * GetProfilesInfo again 5 ms after DisableProfile's route to the physical SIM, the miss switched the slot away from that SIM, and
+ * CommCenter, finding no SIM, enabled the eSIM again. A query that fails is dropped, as before. */
+static inline int cbe_stale_from(const struct cbe *e, uint32_t from)
+{
+    for (uint32_t i = from; i < CBE_CACHE_ENTRIES; i++)
+        if (e->cached[i].used == 2) return (int)i;
+    return -1;
+}
+static inline void cbe_stale_drop(struct cbe *e)
+{
+    uint32_t dropped = 0;
+    for (uint32_t i = 0; i < CBE_CACHE_ENTRIES; i++)
+        if (e->cached[i].used == 2) { e->cached[i].used = 0; dropped++; }
+    if (dropped) cbe_event(e, CBE_EV_CACHE, 0, 5, dropped, 0, 0);
+}
+static inline void cbe_refresh_start(struct cbe *e, uint32_t i, uint32_t now)
+{
+    e->refresh = (uint8_t)(i + 1);
+    e->seg[0] = (struct cbe_seg){ 0, e->cached[i].req_len }; e->seg_count = 1;
+    e->seg_index = e->frag_pos = e->block = e->resp_len = 0;
+    e->get_more = e->sw1 = e->sw2 = 0;
+    e->step = CBE_S_APDU; cbe_send_block(e, now);
+}
+/* The refresh is over: the answer still to be sent goes back into resp, then the channel closes as it would have. */
+static inline void cbe_refresh_end(struct cbe *e, uint32_t now, int failed)
+{
+    if (failed) cbe_stale_drop(e);
+    if (e->done_pending) { __builtin_memcpy(e->resp, e->keep, e->keep_len); e->resp_len = e->keep_len; }
+    e->refresh = 0; e->req_len = e->wait_msg = 0; e->get_more = 0;
+    cbe_send_close(e, now);
+}
+static inline void cbe_refresh_store(struct cbe *e, uint32_t now)
+{
+    const uint32_t i = e->refresh - 1u, room = e->cache_cap / CBE_CACHE_ENTRIES;
+    if (e->sw1 != 0x90u || e->sw2 || !e->resp_len || e->resp_len > room) { cbe_refresh_end(e, now, 1); return; }
+    __builtin_memcpy(e->cache + i * room, e->resp, e->resp_len);
+    e->cached[i].used = 1; e->cached[i].sw1 = e->sw1; e->cached[i].sw2 = e->sw2; e->cached[i].resp_len = e->resp_len;
+    cbe_event(e, CBE_EV_CACHE, e->cached[i].cmd, 4, e->resp_len, 0, 0);
+    const int next = cbe_stale_from(e, i + 1u);
+    if (next >= 0) cbe_refresh_start(e, (uint32_t)next, now);
+    else cbe_refresh_end(e, now, 0);
+}
+/* Close the logical channel, first reading stale queries again when the restore will switch to another card. */
+static inline void cbe_leave(struct cbe *e, uint32_t now)
+{
+    const int stale = e->cache ? cbe_stale_from(e, 0) : -1;
+    if (stale >= 0 && e->switched && e->restore_phys && e->restore_phys != e->slots.euicc) {
+        if (!e->done_pending || e->done_len <= sizeof e->keep) {
+            e->keep_len = e->done_pending ? e->done_len : 0;
+            if (e->keep_len) __builtin_memcpy(e->keep, e->resp, e->keep_len);
+            cbe_refresh_start(e, (uint32_t)stale, now);
+            return;
+        }
+        cbe_stale_drop(e);
+    }
+    cbe_send_close(e, now);
+}
 /* Drop the channel lease only when no APDU is executing. Cleanup still finishes before queued SIM traffic resumes. */
 static inline void cbe_session_release(struct cbe *e, uint32_t now, uint32_t reason)
 {
     if (!e->session || e->active >= 0 || e->step != CBE_S_IDLE) return;
     cbe_event(e, CBE_EV_SESSION, 2, e->session_slot, 0, reason, 0);
     e->session = 0;
-    if (e->channel_open) cbe_send_close(e, now);
+    if (e->channel_open) cbe_leave(e, now);
     else cbe_restore(e, now);
 }
 static inline int cbe_session_owner(const struct cbe *e, const struct cbe_job *j)
@@ -685,7 +752,7 @@ static inline int cbe_cacheable(const uint8_t *req, uint32_t n)
 static inline int cbe_cache_find(const struct cbe *e, uint32_t cmd, const uint8_t *req, uint32_t n)
 {
     for (uint32_t i = 0; i < CBE_CACHE_ENTRIES; i++)
-        if (e->cached[i].used && e->cached[i].cmd == cmd && e->cached[i].req_len == n && !__builtin_memcmp(e->cached[i].req, req, n))
+        if (e->cached[i].used == 1 && e->cached[i].cmd == cmd && e->cached[i].req_len == n && !__builtin_memcmp(e->cached[i].req, req, n))
             return (int)i;
     return -1;
 }
@@ -701,21 +768,25 @@ static inline int cbe_cache_take(struct cbe *e, const struct cbe_job *j)
     cbe_event(e, CBE_EV_CACHE, j->cmd, 1, e->resp_len, 0, 0);
     return 1;
 }
-/* After a command reached the card: keep a clean read-only answer; anything else may change the answers, so drop them all. */
+/* After a command reached the card: keep a clean read-only answer; anything else may change the answers, so none of them is served
+ * again until it has been read again (cbe_leave) or replaced. */
 static inline void cbe_cache_note(struct cbe *e, const struct cbe_job *j, uint32_t status)
 {
     if (!e->cache || j->cmd == CBE_TAPE_EID || j->cmd == CBE_TAPE_GET_SESSION || j->cmd == CBE_TAPE_CLEAR_SESSION) return;
     const uint8_t *req = e->in + j->off;
     if (!cbe_cacheable(req, j->len)) {
         uint32_t had = 0;
-        for (uint32_t i = 0; i < CBE_CACHE_ENTRIES; i++) { had += e->cached[i].used; e->cached[i].used = 0; }
+        for (uint32_t i = 0; i < CBE_CACHE_ENTRIES; i++) if (e->cached[i].used) { had++; e->cached[i].used = 2; }
         if (had) cbe_event(e, CBE_EV_CACHE, j->cmd, 3, had, 0, 0);
         return;
     }
     const uint32_t room = e->cache_cap / CBE_CACHE_ENTRIES;
     if (status || e->sw1 != 0x90u || e->sw2 || !e->resp_len || e->resp_len > room || cbe_cache_find(e, j->cmd, req, j->len) >= 0) return;
+    /* the stale entry of the same query first, then a free one, then the oldest */
     uint32_t i = 0;
-    while (i < CBE_CACHE_ENTRIES && e->cached[i].used) i++;
+    while (i < CBE_CACHE_ENTRIES && !(e->cached[i].used == 2 && e->cached[i].cmd == j->cmd && e->cached[i].req_len == j->len &&
+                                      !__builtin_memcmp(e->cached[i].req, req, j->len))) i++;
+    if (i == CBE_CACHE_ENTRIES) { i = 0; while (i < CBE_CACHE_ENTRIES && e->cached[i].used) i++; }
     if (i == CBE_CACHE_ENTRIES) i = e->cache_next++ % CBE_CACHE_ENTRIES;
     __builtin_memcpy(e->cache + i * room, e->resp, e->resp_len);
     __builtin_memcpy(e->cached[i].req, req, j->len);
@@ -761,7 +832,7 @@ static inline void cbe_finish(struct cbe *e, uint32_t status, uint32_t reason, u
     }
     if (e->session) cbe_event(e, CBE_EV_SESSION, 2, e->session_slot, cmd, status ? 3 : 0, 0);
     e->session = 0;
-    if (e->channel_open) cbe_send_close(e, now);
+    if (e->channel_open) cbe_leave(e, now);
     else cbe_restore(e, now);
 }
 
@@ -1034,16 +1105,22 @@ static inline void cbe_tick(struct cbe *e, uint32_t now)
     } else if (e->step != CBE_S_IDLE && e->step != CBE_S_SETTLE && e->step != CBE_S_RESTORE_SETTLE &&
                (int32_t)(now - e->deadline) >= 0) {
         e->req_len = e->wait_msg = 0;
+        /* Closing the channel is cleanup after the answer is settled; see the CLOSE answer in cbe_answer. */
         if (e->step == CBE_S_CLOSE) {
-            e->done_status = 1; cbe_event(e, CBE_EV_FAILED, e->done.cmd, e->step, 0, CBE_R_TIMEOUT, 0);
+            cbe_event(e, CBE_EV_FAILED, e->done.cmd, e->step, 0, CBE_R_TIMEOUT, 0);
             e->channel_open = 0; cbe_restore(e, now);
         }
+        else if (e->refresh) cbe_refresh_end(e, now, 1);
         else if (e->active >= 0) cbe_finish(e, 1, CBE_R_TIMEOUT, 0, now);
         else { if (e->switched || e->needs_card) e->route_failed = 1; e->done_status = 1; e->slots.known = 0; e->freeze = 0; e->switched = 0; e->step = CBE_S_IDLE; e->deadline = now + 5000u; }
     }
     if (e->step != CBE_S_IDLE) return;
+    /* A waiting selection ends a batch hold at once: the hold exists to save switches, not to delay CommCenter's own choice. */
     if (e->session && (int32_t)(now - e->session_deadline) >= 0) {
         cbe_session_release(e, now, 1); return;
+    }
+    if (e->session == CBE_SESSION_BATCH && e->route_req == 1) {
+        cbe_session_release(e, now, 4); return;
     }
     if (e->done_pending || e->card_status_len) return;
     if (e->route_req == 3) { cbe_route_settle(e); return; }
@@ -1105,10 +1182,14 @@ static inline int cbe_answer(struct cbe *e, const uint8_t *sdu, uint32_t n, uint
         /* Keep UIM and data starts frozen until the bridge publishes this indication. */
         return 1;
     }
+    /* The answer was settled by the card before the close. Hermes never closes the ISD-R channel at all: a slot switch or the eUICC's
+     * own REFRESH ends it, and it opens a new one next time. On hardware the close after a successful EnableProfile (refreshFlag set,
+     * cbe_refresh_flag) failed with internal error 3, the enable was reported as failed, and CommCenter disabled the profile again. */
     if (step == CBE_S_CLOSE) {
-        if (error) { e->done_status = 1; cbe_event(e, CBE_EV_FAILED, e->done.cmd, step, error, CBE_R_QMI, 0); }
+        if (error) cbe_event(e, CBE_EV_FAILED, e->done.cmd, step, error, CBE_R_QMI, 0);
         e->channel_open = 0; cbe_restore(e, now); return 1;
     }
+    if (e->refresh && step == CBE_S_APDU && error) { cbe_refresh_end(e, now, 1); return 1; }
     if (step == CBE_S_RESTORE) {
         if (error && error != CBE_ERR_NO_EFFECT) {
             cbe_event(e, CBE_EV_FAILED, e->done.cmd, step, error, CBE_R_QMI, 0);
@@ -1180,18 +1261,28 @@ static inline int cbe_answer(struct cbe *e, const uint8_t *sdu, uint32_t n, uint
         e->step = CBE_S_APDU; cbe_send_block(e, now);
     } else if (step == CBE_S_APDU) {
         uint32_t l = 0; const uint8_t *a = cbd_find(sdu, n, 0x10, &l);
-        if (!a || l < 4 || cbd_rd16(a) + 2u != l) { cbe_finish(e, 1, CBE_R_QMI, 0, now); return 1; }
+        if (!a || l < 4 || cbd_rd16(a) + 2u != l) {
+            if (e->refresh) cbe_refresh_end(e, now, 1); else cbe_finish(e, 1, CBE_R_QMI, 0, now);
+            return 1;
+        }
         const uint32_t bytes = cbd_rd16(a) - 2u;
         e->sw1 = a[2 + bytes]; e->sw2 = a[3 + bytes];
-        if (bytes > e->resp_cap - e->resp_len) { cbe_finish(e, 1, CBE_R_ROOM, bytes, now); return 1; }
+        if (bytes > e->resp_cap - e->resp_len) {
+            if (e->refresh) cbe_refresh_end(e, now, 1); else cbe_finish(e, 1, CBE_R_ROOM, bytes, now);
+            return 1;
+        }
         __builtin_memcpy(e->resp + e->resp_len, a + 2, bytes); e->resp_len += bytes;
         if (e->sw1 == 0x61) { e->get_more = 1; cbe_send_block(e, now); return 1; }
-        if (e->sw1 != 0x90 || e->sw2) { cbe_finish(e, 1, CBE_R_SW, (uint32_t)e->sw1 << 8 | e->sw2, now); return 1; }
+        if (e->sw1 != 0x90 || e->sw2) {
+            if (e->refresh) cbe_refresh_end(e, now, 1); else cbe_finish(e, 1, CBE_R_SW, (uint32_t)e->sw1 << 8 | e->sw2, now);
+            return 1;
+        }
         e->get_more = 0;
         if (e->frag_pos < e->seg[e->seg_index].len) { cbe_send_block(e, now); return 1; }
         if (++e->seg_index < e->seg_count) {
             e->frag_pos = e->block = e->resp_len = 0; cbe_send_block(e, now); return 1;
         }
+        if (e->refresh) { cbe_refresh_store(e, now); return 1; }
         if (e->job[e->active].cmd == CBE_TAPE_EID) {
             uint32_t tag = 0, len = 0, h = cbe_der(e->resp, e->resp_len, &tag, &len);
             uint32_t at = tag == 0xbf3eu ? h : 0;
