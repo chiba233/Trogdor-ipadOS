@@ -343,7 +343,9 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
             raise ValueError('the native display route needs the prelinked main OS')
         command_line += ' coachz-display=1 offline-legacy-register=1 offline-legacy-gop=1 offline-legacy-phase=4'
         command_line += ' offline-legacy-pm=1 offline-legacy-validate=1 offline-legacy-transfer=1 offline-legacy-cpu-present=1'
-        command_line += ' sheng-vsync=60 sheng-early-retire=0 coachz-reset-mgcache=1'
+        # sheng-early-retire stays at its default 1: the presenter hands the compositor's buffer back as soon as it takes the frame; the GPU
+        # presenter holds its own reference until the copy and flip are done.
+        command_line += ' sheng-vsync=60 coachz-reset-mgcache=1'
         # The first frame silences the screen console until a panic (CoachzDisplay.cpp); the disk log keeps its output.
         command_line += ' coachz-console-band=0'
         if diagnostics:
@@ -351,6 +353,9 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
             # (coachz-dump-mgcache=1) and the IOKit query log (coachz-match-log=1) answered their questions (docs/hardware-tests.md) and
             # stay available by hand: the command line holds 1023 bytes.
             command_line += ' sheng-diag=1'
+            # Every backboardd and SpringBoard thread at each report (coachz-prelink-thread-sample.patch): a boot whose window server
+            # never became ready left only SpringBoard's main thread, waiting on backboardd.
+            command_line += ' coachz-sample-bbd=1'
         # The GT7375P touchscreen on SE4 as an IOHIDDevice digitizer (coachz-prelink-touch.patch, build-sheng-hid-input.py).
         command_line += ' coachz-touch=1'
         # UniXNU's AppleKeyStoreState: no keybag, no passcode, nothing locked (package/CoachzKeyStore.cpp).

@@ -32,6 +32,35 @@ def load_screen():
 
 
 class BasebandBridgeTests(unittest.TestCase):
+    def test_firmware_blob_entries_all_read(self):
+        """Every kernel loop over the modem firmware blob header reads all the entries the header holds: with venus.mbn the blob has
+        nine files, baseband.arc is the ninth, and a bound of eight left it, and with it the CommCenter compatibility copy, uninstalled."""
+        sys.path.insert(0, str(ROOT / 'tools'))
+        try:
+            spec = importlib.util.spec_from_file_location('linux_log_blob', ROOT / 'tools/linux_log.py')
+            linux_log = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(linux_log)
+        finally:
+            sys.path.remove(str(ROOT / 'tools'))
+        with tempfile.TemporaryDirectory(prefix='coachz-blob-') as directory:
+            directory = Path(directory)
+            (directory / 'rmtfs').mkdir()
+            for name in ('mba.mbn', 'board-2.bin', 'venus.mbn', 'qdsp6sw.mbn', 'rmtfs/modem_fs1', 'rmtfs/modem_fs2', 'rmtfs/modem_fsc',
+                         'rmtfs/modem_fsg', 'kpart'):
+                (directory / name).write_bytes(name.encode())
+            pieces, _ = linux_log.modem_blob(directory / 'kpart', directory, baseband=b'archive')
+        header = pieces[0][1]
+        count = struct.unpack_from('<I', header, 16)[0]
+        names = [header[32 + 64 * i:48 + 64 * i].rstrip(b'\0') for i in range(count)]
+        self.assertEqual(names[-1], b'baseband.arc')
+        self.assertGreater(count, 8)
+        sources = (PATCHES / 'coachz-prelink-wifi.patch').read_text() + (PATCHES / 'coachz-prelink-baseband.patch').read_text()
+        self.assertIn('#define WIFI_FW_ENTRIES ((4096u - 32u) / 64u)', sources)
+        bounds = re.findall(r'for \(uint32_t i = 0; i < count && i < ([A-Za-z0-9_]+)', sources)
+        self.assertGreaterEqual(len(bounds), 2)
+        self.assertEqual(set(bounds), {'WIFI_FW_ENTRIES'})
+        self.assertLessEqual(count, (4096 - 32) // 64)
+
     def test_portable_model(self):
         cc = shutil.which('cc')
         self.assertIsNotNone(cc)
@@ -194,8 +223,8 @@ class BasebandBridgeTests(unittest.TestCase):
         self.assertEqual((name.rstrip(b'\0'), size, digest), (b'baseband.arc', 15, hashlib.sha256(b'CZBBFW01archive').digest()))
         self.assertEqual(pieces[-1], (linux_log.MODEM_BLOB + offset, b'CZBBFW01archive'))
         self.assertEqual((plain_end, end), (linux_log.MODEM_BLOB + offset, linux_log.MODEM_BLOB + offset + 4096))
-        # The kernel's loop looks at eight entries, and the qdsp6sw.mbn loader comes before the archive.
-        self.assertIn('i < count && i < 8', (PATCHES / 'coachz-prelink-baseband.patch').read_text())
+        # The kernel's loop looks at every entry the header holds (test_firmware_blob_entries_all_read).
+        self.assertIn('i < count && i < WIFI_FW_ENTRIES', (PATCHES / 'coachz-prelink-baseband.patch').read_text())
 
     def test_firmware_archive(self):
         screen = load_screen()

@@ -205,6 +205,9 @@ def modem_blob(kpart, directory, baseband=None):
     venus = [directory / 'venus.mbn'] if (directory / 'venus.mbn').is_file() else []
     files = [directory / 'mba.mbn', *(efs if all(path.is_file() for path in efs) else []), *board, *venus, directory / 'qdsp6sw.mbn']
     named = [(path.name, path.read_bytes()) for path in files] + ([('baseband.arc', baseband)] if baseband else [])
+    # The kernel reads every entry the 4 KiB header holds (WIFI_FW_ENTRIES in coachz_wifi.c).
+    if len(named) > (4096 - 32) // 64:
+        raise ValueError('the modem firmware blob header holds at most 63 files')
     header = bytearray(4096)
     header[:16] = b'COACHZMODEMFW1\0\0'
     struct.pack_into('<I', header, 16, len(named))

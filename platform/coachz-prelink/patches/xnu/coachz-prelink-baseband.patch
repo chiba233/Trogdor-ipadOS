@@ -1,7 +1,7 @@
 --- a/bsd/dev/coachz_wifi.c
 +++ b/bsd/dev/coachz_wifi.c
-@@ -784,6 +784,8 @@
-     for (uint32_t i = 0; i < count && i < 8; i++) {
+@@ -786,6 +786,8 @@
+     for (uint32_t i = 0; i < count && i < WIFI_FW_ENTRIES; i++) {
          const uint8_t *entry = wifi_fw_header + 32 + 64 * i;
          char name[17] = {0};
 +        /* The cellular bridge's firmware: coachz_baseband_archive reads it, the modem never does. */
@@ -9,7 +9,7 @@
          uint8_t first[64] = {0}, digest[32];
          uint64_t done = 0;
          int error = 0;
-@@ -848,6 +850,59 @@
+@@ -850,6 +852,59 @@
  }
  
  /*
@@ -33,7 +33,7 @@
 +        if (vnode_open(wifi_fw_disks[which], FREAD, 0, 0, &disk, context)) continue;
 +        if (!wifi_fw_read(disk, context, header, 4096, blob) && !memcmp(header, "COACHZMODEMFW1", 14)) {
 +            const uint32_t count = cw_u32(header + 16);
-+            for (uint32_t i = 0; i < count && i < 8 && error == ENOENT; i++) {
++            for (uint32_t i = 0; i < count && i < WIFI_FW_ENTRIES && error == ENOENT; i++) {
 +                const uint8_t *entry = header + 32 + 64 * i;
 +                if (strncmp((const char *)entry, "baseband.arc", 16)) continue;
 +                const uint64_t offset = cw_u64(entry + 16), size = cw_u64(entry + 24);
@@ -69,7 +69,7 @@
   * coachz-wifi=4: q6v5_mba_load for sc7180 (qcom_q6v5_mss.c with sc7180-trogdor.dtsi's qcom,sc7180-mss-pil node and the LTE SKU's
   * 140 MiB mpss_mem), as soon as the MBA has been read and only when neither modem region touches XNU's memory or the framebuffer. The
   * AOP is told the modem loads, cx/mx/mss go to their top level, the reset clocks (iface, bus, snoc_axi) are enabled, the AOSS
-@@ -1149,6 +1204,13 @@
+@@ -1151,6 +1206,13 @@
  extern void coachz_modem_qmi(int, uint32_t, uint32_t, const void *, uint32_t);
  extern void coachz_modem_poll(void);
  extern void coachz_modem_report(unsigned);
@@ -83,7 +83,7 @@
  
  static void
  wifi_smp2p_kick(void)
-@@ -1936,6 +1998,20 @@
+@@ -1938,6 +2000,20 @@
      wq_send(cmd, WQ_CTRL, dst_node, WQ_CTRL, pkt, sizeof(pkt));
  }
  
@@ -104,7 +104,7 @@
  /* QMI over QRTR (soc/qcom/qmi_interface.c): a 7-byte header (type, transaction, message, length) and TLVs (type, u16 length). */
  static int
  wr_tlv(const uint8_t *body, uint32_t n, uint8_t want, const uint8_t **value, uint16_t *len)
-@@ -5308,6 +5384,7 @@
+@@ -5310,6 +5386,7 @@
          if (dst_port == WQ_RMTFS_PORT) wr_request(src_node, src_port, body, size);
          else if (dst_port == WL_PORT) wl_rx(body, size);
          else if (dst_port == WM_SERVER_PORT || dst_port == WM_CLIENT_PORT) coachz_modem_qmi(dst_port == WM_CLIENT_PORT, src_node, src_port, body, size);
@@ -112,7 +112,7 @@
          else printf("COACHZ qrtr: data for port 0x%x from %u:0x%x\n", dst_port, src_node, src_port);
          if (confirm) wq_send(7, dst_port, src_node, src_port, (const uint32_t[]){7, WQ_NODE, dst_port, 0, 0}, 20);
          break;
-@@ -5328,9 +5405,11 @@
+@@ -5330,9 +5407,11 @@
              wl.known = 1;
          }
          coachz_modem_new_server(ctrl[1], ctrl[2], ctrl[3], ctrl[4]);
@@ -124,7 +124,7 @@
          break;
      case 10:
          printf("COACHZ qrtr: lookup for %u from %u:0x%x (remote lookups are ns.c's to refuse)\n", ctrl[1], src_node, src_port);
-@@ -5620,6 +5699,8 @@
+@@ -5622,6 +5701,8 @@
      if (wifi_smem_now(&now_layout)) wifi_glink_state(&wifi_smem_reader, &now_layout);
      const int link = wg_start();
      if (link) printf("COACHZ glink: not started (%d)\n", link);
@@ -133,7 +133,7 @@
      for (unsigned second = 1;; second++) {
          for (unsigned ms = 0; ms < 1000; ms++) {
              if (!link) {
-@@ -5635,12 +5716,14 @@
+@@ -5637,12 +5718,14 @@
                  }
              }
              coachz_modem_poll();

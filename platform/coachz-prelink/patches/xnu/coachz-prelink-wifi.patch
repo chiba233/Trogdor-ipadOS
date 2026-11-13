@@ -13,7 +13,7 @@
  	extern void coachz_battery_start(void);
 --- /dev/null
 +++ b/bsd/dev/coachz_wifi.c
-@@ -0,0 +1,5767 @@
+@@ -0,0 +1,5769 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/* WCN3990 / SC7180: the modem that hosts the WLAN firmware, started as mainline's qcom_q6v5_mss does (coachz-wifi=4), and the SMEM
 + * inventory (coachz-wifi=1 plus an explicit /arm-io/coachz-wifi ADT node). With the modem up: SMP2P, GLINK over SMEM, QRTR and
@@ -730,6 +730,8 @@
 + * disk for wifi_mpss_boot.
 + */
 +#define WIFI_FW_BLOB_USB (144ull << 20)
++/* Every entry the 4 KiB blob header holds (32-byte head, 64-byte entries; tools/linux_log.py refuses more). */
++#define WIFI_FW_ENTRIES ((4096u - 32u) / 64u)
 +/* With the system on the eMMC the kernel partition is coachz-kernel (GPT entry 6, 512 MiB at block 241123328): the blob is 143 MiB into it, as on the USB disk. */
 +#define WIFI_FW_BLOB_EMMC ((241123328ull << 9) + (143ull << 20))
 +static uint64_t wifi_fw_blob = WIFI_FW_BLOB_USB;
@@ -797,7 +799,7 @@
 +    }
 +    const uint32_t count = cw_u32(wifi_fw_header + 16);
 +    printf("COACHZ modem fw: blob on %s with %u files\n", disks[which], count);
-+    for (uint32_t i = 0; i < count && i < 8; i++) {
++    for (uint32_t i = 0; i < count && i < WIFI_FW_ENTRIES; i++) {
 +        const uint8_t *entry = wifi_fw_header + 32 + 64 * i;
 +        char name[17] = {0};
 +        uint8_t first[64] = {0}, digest[32];

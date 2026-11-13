@@ -1775,4 +1775,6 @@ k215 照 UniXNU 的 `macos-union-one-volume.patch` 改为把联合挂载报成�
 同一次启动 backboardd 的内存涨到 4.4 GB 被 jetsam 结束，界面很卡，原因在 GPU 用户态，单独追查。
 
 同一次启动，eSIM 在实体卡和 eUICC 之间来回切了 6 次，每次桥都切到选中的物理槽并发布新卡状态，从 eSIM 切回实体卡时只短暂显示无 SIM。
-“关于本机”仍不显示 EID：设置收到的 `CTMobileEquipmentInfo` 带 CSN，但挂在槽一上，设置去槽二找（docs/plans/modem.md）。
+“关于本机”仍不显示 EID：基带固件包没有读到（`firmware files -1 ... error 2`），CommCenter 兼容副本没有装上，原版 CommCenter 报不支持 eSIM 激活码流程，设置因此不加 EID 这一行（docs/plans/modem.md）。
+
+k216 起内核遍历固件包表头的全部条目：18 个固件文件全部读到，兼容副本挂上，CommCenter 报的 eSIM 流程从 0x0 变为 0x22。
