@@ -10,7 +10,7 @@
  bsd/dev/coachz_wifi.c		standard
 --- a/bsd/dev/coachz_bridge.c
 +++ b/bsd/dev/coachz_bridge.c
-@@ -0,0 +1,472 @@
+@@ -0,0 +1,499 @@
 +/*
 + * The SN65DSI86 eDP bridge's output depth. Coreboot's sn65dsi86_bridge_configure writes SN_DATA_FORMAT_REG 1 (18 bpp) whatever
 + * the panel says, and XNU keeps the firmware's display, so every channel reached the panel with 6 bits: white scenes and
@@ -298,8 +298,9 @@
 +static vm_offset_t flip_mdp;
 +static uint32_t flip_ctl, flip_home_pa, flip_buffers[2];
 +static volatile int flip_away;
-+static uint32_t flip_count, flip_timeouts, flip_max_us;
-+static uint64_t flip_total_us;
++static uint32_t flip_count, flip_timeouts, flip_max_us, flip_late;
++static uint64_t flip_total_us, flip_latch_us, flip_requested;
++static volatile int flip_pending;
 +extern void IOSleep(unsigned int);
 +
 +bool
@@ -332,25 +333,35 @@
 +	return true;
 +}
 +
++/*
++ * The commit-done half of a flip: the pipe latched the last address once the hardware cleared the flush bit at a vsync. Mainline runs it
++ * after the kickoff in the commit worker (msm_atomic_commit_tail: flush_commit, then wait_flush, dpu_encoder_wait_for_commit_done), not in the
++ * caller's ioctl, and the next commit waits for it before it kicks off. Here it runs before the presenter draws into the other buffer, the
++ * one the pipe scanned until that latch, and before the next flush. The presenter's GPU copy and the swap's release no longer wait for a vsync.
++ */
 +void
-+coachz_scanout_flip(uint32_t buffer)
++coachz_scanout_flip_wait(void)
 +{
-+	if (!flip_ctl || buffer > 1) {
++	if (!flip_ctl || !flip_pending) {
 +		return;
 +	}
 +	const uint64_t began = mach_absolute_time();
-+	flip_away = 1;
-+	wr(flip_mdp, FLIP_SSPP_SRC0, flip_buffers[buffer]);
-+	wr(flip_mdp, flip_ctl + FLIP_CTL_FLUSH, 1u);
 +	unsigned waited = 0;
++	if (rd(flip_mdp, flip_ctl + FLIP_CTL_FLUSH) & 1u) {
++		++flip_late;   /* the next frame came before the last flip latched */
++	}
 +	while ((rd(flip_mdp, flip_ctl + FLIP_CTL_FLUSH) & 1u) && waited < 34) {
 +		IOSleep(1);
 +		++waited;
 +	}
-+	uint64_t ns = 0;
-+	absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
++	const uint64_t now = mach_absolute_time();
++	uint64_t ns = 0, latch = 0;
++	absolutetime_to_nanoseconds(now - began, &ns);
++	absolutetime_to_nanoseconds(now - flip_requested, &latch);
 +	const uint32_t us = (uint32_t)(ns / 1000);
++	flip_pending = 0;
 +	flip_total_us += us;
++	flip_latch_us += latch / 1000;
 +	if (us > flip_max_us) {
 +		flip_max_us = us;
 +	}
@@ -358,9 +369,25 @@
 +		++flip_timeouts;
 +	}
 +	if (++flip_count % 600 == 1) {
-+		printf("COACHZ flip: %u flips, %u timeouts, wait mean %llu max %u us\n", flip_count, flip_timeouts, flip_total_us / flip_count, flip_max_us);
++		printf("COACHZ flip: %u flips, %u timeouts, %u still pending at the next frame, wait mean %llu max %u us, request to seen latched mean %llu us\n",
++		    flip_count, flip_timeouts, flip_late, flip_total_us / flip_count, flip_max_us, flip_latch_us / flip_count);
 +		flip_max_us = 0;
 +	}
++}
++
++/* The kickoff half (dpu_encoder_kickoff): the plane address and the pipe's flush bit, then return. One flip is in flight at a time. */
++void
++coachz_scanout_flip(uint32_t buffer)
++{
++	if (!flip_ctl || buffer > 1) {
++		return;
++	}
++	coachz_scanout_flip_wait();
++	flip_away = 1;
++	wr(flip_mdp, FLIP_SSPP_SRC0, flip_buffers[buffer]);
++	wr(flip_mdp, flip_ctl + FLIP_CTL_FLUSH, 1u);
++	flip_requested = mach_absolute_time();
++	flip_pending = 1;
 +}
 +
 +/* Also from the panic path: registers only, no lock and no wait. */

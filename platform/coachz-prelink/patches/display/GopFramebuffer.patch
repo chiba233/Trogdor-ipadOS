@@ -136,18 +136,19 @@
  IOService *native_legacy_display_allocate(void) {return new NativeLegacyDisplay;}
 --- a/NativeGOPPresenter.cpp
 +++ b/NativeGOPPresenter.cpp
-@@ -17,6 +17,10 @@
+@@ -17,6 +17,11 @@
   * and [5] the longest such wait (ns), [6] total ns waited in timed-out calls. A timed wait that returns long before its deadline shows here. */
  volatile uint64_t native_gop_wait_stats[7];
  IOService *native_gop_presenter_create(void);
 +// Coachz: the display pipe's scanout address (bsd/dev/coachz_bridge.c).
 +bool coachz_scanout_prepare(uint64_t firmware,uint64_t oneBuffer,uint64_t *base);
 +void coachz_scanout_flip(uint32_t buffer);
++void coachz_scanout_flip_wait(void);
 +void coachz_scanout_home(void);
  bool native_gop_gpu_offer(IOService *,void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height);
  void native_gop_presenter_set_source(IOService *presenter,IOService *nub);
  // Provided by the display driver: finishes (status 0) or fails the swap that was offered.
-@@ -29,6 +33,7 @@
+@@ -29,6 +34,7 @@
      OSDeclareDefaultStructors(NativeGOPPresenter)
      friend class NativeGOPClient;
      IOMemoryMap *mapping=nullptr;
@@ -155,7 +156,7 @@
      IOLock *gate=nullptr;
      IOService *owner=nullptr;
      NGPMode mode={};
-@@ -94,6 +99,12 @@
+@@ -94,6 +100,12 @@
      {unsigned v=0;PE_parse_boot_argn("sheng-fb-gpu",&v,sizeof v);gpuMode=(v==1);}
      mode={NGP_VERSION,NGP_BGRX8888,video.v_width,video.v_height,video.v_rowBytes,mapping->getLength()};
      native_gop_physical=mapping->getPhysicalAddress();native_gop_virtual=mapping->getVirtualAddress();
@@ -168,7 +169,17 @@
      online=true;native_gop_ready=1;if(gpuMode)gHandoff=this;registerService();return true;
  }
  void NativeGOPPresenter::stop(IOService *provider) {
-@@ -193,6 +204,7 @@
+@@ -164,6 +176,9 @@
+     IOMemoryDescriptor *memory=swap.memory;memory->retain();
+     const uint64_t sequence=swap.sequence,stride=swap.stride;const uint32_t width=swap.width,height=swap.height;
+     IOLockUnlock(gate);
++    // Coachz: the client draws this frame into the buffer the pipe scanned until the last flip latched; wait for that latch here, outside the
++    // gate, instead of in COMPLETE_SWAP, so the render server got its buffer back while the flip was pending.
++    if(flipMemory)coachz_scanout_flip_wait();
+     // The frame's pages go into the client's task here, writable like any import (the GPU maps them for reading; the kernel pins and maintains them).
+     IOMemoryMap *map=memory->createMappingInTask(task,0,kIOMapAnywhere);
+     memory->release();
+@@ -193,6 +208,7 @@
      gpuClient=false;
      auto done=swap;swap={};
      IOLockUnlock(gate);
@@ -176,16 +187,17 @@
      if(!done.offered)return;
      OSSafeReleaseNULL(done.map);if(done.memory)done.memory->release();
      __atomic_fetch_add(&native_gop_gpu_abandoned,1,__ATOMIC_RELAXED);
-@@ -224,6 +236,8 @@
+@@ -224,6 +240,9 @@
      case NGP_METHOD_COMPLETE_SWAP: {
          if(!in || inSize!=sizeof(NGPComplete) || outSize)return kIOReturnBadArgument;
          NGPComplete q={};memcpy(&q,in,sizeof(q));
-+        // Coachz: the frame is finished (the GPU's fence), so it goes on screen before the swap retires; this returns at the vsync that latched it.
++        // Coachz: the frame is finished (the GPU's fence) and copied into the scanout buffer, so the render server's buffer is free: the flip is
++        // kicked off and the swap retires at once. The pipe latches it at the next vsync; waitSwap waits for that before the other buffer is drawn.
 +        if(!q.status && p->flipMemory && (q.reserved==1 || q.reserved==2))coachz_scanout_flip(q.reserved-1);
          return p->completeSwap(q.sequence,(int)q.status);
      }
      default:return kIOReturnUnsupported;
-@@ -233,7 +247,7 @@
+@@ -233,7 +252,7 @@
  IOMemoryDescriptor *NativeGOPPresenter::handoffMemory() {
      NativeGOPPresenter *p=gHandoff;
      if(!p || !p->gpuMode || !p->online || !p->mapping)return nullptr;
