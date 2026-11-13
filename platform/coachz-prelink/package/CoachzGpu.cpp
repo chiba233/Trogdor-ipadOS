@@ -21,6 +21,7 @@
 #include "NativeAdrenoVm.h"
 #include "NativeAdrenoRing.h"
 #include "NativeAdrenoSubmit.h"
+#include "CoachzGpuHang.h"
 #include "NativeAdrenoTimer.h"
 #include "AdrenoPM4.h"
 
@@ -33,6 +34,9 @@ extern "C" unsigned native_adreno_accelerator_instance_size(void);
 extern "C" kern_return_t OSKextLoadKextWithIdentifier(const char *);
 extern "C" void native_adreno_metal_report(void);
 extern "C" void native_adreno_publisher_lock(int locked);
+extern "C" void native_adreno_set_restart(NativeAdrenoRestart restart, void *cookie);
+extern "C" volatile uint32_t native_adreno_recovery[8];
+extern "C" volatile uint32_t native_adreno_unstick[15];
 extern "C" {
 extern volatile uint32_t native_adreno_ring_log[4][4 + 112];
 extern volatile uint32_t native_adreno_ring_log_count;
@@ -126,7 +130,8 @@ uint64_t ringNow(void *) {
     return ns/1000;
 }
 // The GPU's interrupts, as a6xx_irq, a6xx_gmu_irq and a6xx_hfi_irq take them (sc7180.dtsi: SPI 300, 305 and 304, level high). CACHE_FLUSH_TS ends
-// every submission, so it wakes the fence waiters. There is no hang recovery yet: the errors are counted for the report, and masked if they storm.
+// every submission, so it wakes the fence waiters. The errors are counted for the report, and masked if they storm; a hang is recovered by the
+// framework's hangcheck through gpuRestart below.
 extern "C" int armcpu_spi_attach(uint32_t, bool, void (*)(void *), void *, uint32_t *, uint64_t *);
 extern "C" int coachz_gpu_assert_wait_deadline(void *, int, uint64_t) __asm__("_assert_wait_deadline");
 extern "C" int coachz_gpu_thread_wakeup(void *, int, int) __asm__("_thread_wakeup_prim");
@@ -398,6 +403,171 @@ void cpDump(const char *why) {
     for (unsigned i = 0; i < 208 && i < b[3] / 4; ++i) words[i] = b[4 + i];
     wordsPrint("ib", words, b[3] / 4 < 208 ? b[3] / 4 : 208);
 }
+// msm_gpu.c::recover_worker captures the offending submit before reset and BO
+// release. Save bounded data here; reportThread prints it after the publisher
+// lock is released, so diagnostic output cannot delay recovery fence progress.
+struct HangSnapshot {
+    uint32_t state, sequence, fence, owner, asleep, errors, error[4][13];
+    uint64_t table, atUs, elapsedUs, far;
+    uint32_t observed, issued, context, recover[4], pmDropped[2];
+    uint32_t bank[8], gfsr, regs[160], regCount, sqe[0x33], roq[2048], roqCount, roqTotal;
+    uint32_t packets[NativeAdrenoSubmitMaxBuffers * 4], packetTotal, packetCount;
+    uint32_t ring[8192], ringTotal, ringCount, memptrs[1024], memptrTotal, memptrCount;
+    struct Ib {
+        uint64_t address;
+        uint32_t kind, total, requested, offset, flags;
+        CoachzGpuHangRead read;
+    } ib[130];
+    uint32_t ibCount, packetError, packetOffset, captured, words[16384];
+};
+HangSnapshot gHangSnapshot;
+const uint16_t kHangRegisters[] = {
+    RbbmInt0Status, 0x0210, 0x0213, 0x0800, 0x0801, 0x0802, 0x0803, 0x0804, 0x0806, 0x0807, 0x0808,
+    0x0820, 0x0821, 0x0823, 0x0824, 0x0826, 0x0827, 0x0830, 0x0831, 0x0832, 0x0833,
+    0x0840, 0x0841, 0x0842, 0x0843, 0x0844, 0x0845,
+    0x0880, 0x0881, 0x0882, 0x0883, 0x0884, 0x0885, 0x0886, 0x0887, 0x0888, 0x0889, 0x088a,
+    0x08a0, 0x08a1, 0x08a2, 0x08a3, 0x08a4, 0x08a5, 0x08a6, 0x08a7, 0x08a8, 0x08a9, 0x08aa, 0x08ab,
+    0x08c0, 0x08c1, 0x08c2, 0x08c3, 0x08c4,
+    0x08d0, 0x08d1, 0x08d2, 0x08d3, 0x08d4, 0x08d5, 0x08d6, 0x08d7, 0x08d8, 0x08d9, 0x08da, 0x08db, 0x08dc, 0x08dd,
+    0x0928, 0x0929, 0x092a, 0x092b, 0x092c, 0x092d, 0x093e, 0x0942, 0x0943, 0x0949, 0x094a
+};
+static_assert(sizeof(kHangRegisters) / sizeof(kHangRegisters[0]) <= 160, "hang register capacity");
+void gpuHangSnapshot(NativeAdrenoVm *vm, const uint32_t *packets, size_t count, int32_t owner, uint32_t fence) {
+    static unsigned captures;
+    uint32_t empty = 0;
+    if (captures >= 2 || !__atomic_compare_exchange_n(&gHangSnapshot.state, &empty, 1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+    HangSnapshot &out = gHangSnapshot;
+    out.atUs = ringNow(nullptr);
+    out.sequence = ++captures; out.fence = fence; out.owner = uint32_t(owner);
+    out.table = vm ? vm->ttbr0() : 0;
+    out.observed = gRing.completedFence(); out.issued = gRing.lastSubmitted(); out.context = gRing.context();
+    for (unsigned i = 0; i < 4; ++i) out.recover[i] = native_adreno_recover_trace[i];
+    out.pmDropped[0] = gPmDropped;
+    out.asleep = __atomic_load_n(&gPmAsleep, __ATOMIC_ACQUIRE);
+    out.errors = gErrCount < 4 ? gErrCount : 4;
+    for (unsigned i = 0; i < out.errors; ++i) for (unsigned j = 0; j < 13; ++j) out.error[i][j] = gErrLog[i][j];
+    out.regCount = out.roqCount = out.ibCount = out.captured = out.packetError = 0;
+    out.packetOffset = ~0u;
+    out.packetTotal = uint32_t(count);
+    out.packetCount = packets ? uint32_t(count < NativeAdrenoSubmitMaxBuffers * 4 ? count : NativeAdrenoSubmitMaxBuffers * 4) : 0;
+    for (unsigned i = 0; i < out.packetCount; ++i) out.packets[i] = packets[i];
+    // These permanent, CPU-visible ring/memptrs mappings survive a missing job
+    // record. Copy them before restart overwrites the ring and fence page.
+    const auto copyBuffer = [&](unsigned index, uint32_t *words, unsigned limit, uint32_t &total, uint32_t &saved) {
+        total = uint32_t(gBuffers[index].bytes / 4); saved = 0;
+        if (!gMaps[index]) return;
+        const auto source = reinterpret_cast<const volatile uint32_t *>(gMaps[index]->getVirtualAddress());
+        if (!source) return;
+        saved = total < limit ? total : limit;
+        for (unsigned i = 0; i < saved; ++i) words[i] = source[i];
+    };
+    copyBuffer(1, out.ring, 8192, out.ringTotal, out.ringCount);
+    copyBuffer(2, out.memptrs, 1024, out.memptrTotal, out.memptrCount);
+    out.roqTotal = 0;
+    if (!out.asleep) {
+        for (uint16_t reg : kHangRegisters) out.regs[out.regCount++] = coreRead(reg);
+        volatile uint8_t *bank = gSmmu + 0x8000;
+        const uint16_t offsets[] = {0, 0x10, 0x20, 0x24, 0x30, 0x38, 0x58, 0x68};
+        for (unsigned i = 0; i < 8; ++i) out.bank[i] = *reinterpret_cast<volatile uint32_t *>(bank + offsets[i]);
+        out.far = *reinterpret_cast<volatile uint64_t *>(bank + 0x60);
+        out.gfsr = *reinterpret_cast<volatile uint32_t *>(gSmmu + SmmuSgfsr);
+        // Same CP debug banks as the existing a6xx_gpu_state dump; no SP selector reads.
+        coreWrite(0x0908, 0);
+        for (unsigned i = 0; i < 0x33; ++i) out.sqe[i] = coreRead(0x0909);
+        out.roqTotal = out.roqCount = coreRead(0x08c2) >> 14;
+        if (out.roqCount > 2048) out.roqCount = 2048;
+        coreWrite(0x090c, 0);
+        for (unsigned i = 0; i < out.roqCount; ++i) out.roq[i] = coreRead(0x090d);
+    }
+    const auto captureIb = [&](uint32_t kind, uint64_t address, uint32_t total, uint32_t limit) {
+        if (out.ibCount >= 130) return;
+        HangSnapshot::Ib &ib = out.ib[out.ibCount++];
+        ib.kind = kind; ib.address = address; ib.total = total; ib.offset = out.captured;
+        ib.flags = total > limit ? 1 : 0; // per-window limit
+        ib.requested = total < limit ? total : limit;
+        if (ib.requested > 16384 - out.captured) {ib.requested = 16384 - out.captured; ib.flags |= 2;}
+        ib.read = coachzGpuHangRead(vm, address, out.words + ib.offset, ib.requested);
+        if (!ib.requested && total) ib.read.status = kIOReturnNoResources;
+        if (!ib.read.status && ib.read.count < ib.requested) ib.flags |= 4; // mapping end
+        out.captured += uint32_t(ib.read.count);
+    };
+    // Preserve the CP's nested IB windows first, then the actual submitted IBs.
+    // This also covers a child IB that was not itself an execbuf entry.
+    if (!out.asleep) {
+        const auto savedReg = [&](uint16_t wanted) {
+            for (unsigned i = 0; i < out.regCount; ++i) if (kHangRegisters[i] == wanted) return out.regs[i];
+            return uint32_t(0);
+        };
+        captureIb(2, (uint64_t(savedReg(0x0929)) << 32) | savedReg(0x0928), savedReg(0x092a), 2048);
+        captureIb(3, (uint64_t(savedReg(0x092c)) << 32) | savedReg(0x092b), savedReg(0x092d), 2048);
+    }
+    if (packets) for (size_t at = 0; at + 3 < out.packetCount && out.ibCount < 130; at += 4) {
+        if (((packets[at] >> 16) & 0x7f) != 0x3f || (packets[at] & 0x3fff) != 3) {
+            out.packetError = packets[at]; out.packetOffset = uint32_t(at); break;
+        }
+        captureIb(1, (uint64_t(packets[at + 2]) << 32) | packets[at + 1], packets[at + 3] & 0xfffff, 16384);
+    }
+    out.pmDropped[1] = gPmDropped;
+    out.elapsedUs = ringNow(nullptr) - out.atUs;
+    __atomic_store_n(&out.state, 2u, __ATOMIC_RELEASE);
+}
+extern "C" void (*native_adreno_capture_hang)(NativeAdrenoVm *, const uint32_t *, size_t, int32_t, uint32_t);
+// Preserve zeros and every captured word; the older console dumper has a
+// 128-line limit. Pace output outside the publisher lock so the persistent
+// console receiver can flush its buffer while this larger record is printed.
+void hangWordsPrint(const char *name, const uint32_t *words, unsigned count) {
+    for (unsigned at = 0; at < count; at += 16) {
+        printf("COACHZ gpu hang %s +%u:", name, at);
+        for (unsigned i = at; i < at + 16 && i < count; ++i) printf(" %08x", words[i]);
+        printf("\n");
+        IOSleep(20);
+    }
+}
+void hangSnapshotReport() {
+    uint32_t ready = 2;
+    if (!__atomic_compare_exchange_n(&gHangSnapshot.state, &ready, 3, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+    const HangSnapshot &s = gHangSnapshot;
+    printf("COACHZ gpu hang snapshot: n %u fence %u owner %d job %u asleep %u table 0x%llx at %llu us capture %llu us\n",
+        s.sequence, s.fence, int32_t(s.owner), s.packetCount != 0, s.asleep, s.table, s.atUs, s.elapsedUs);
+    printf("COACHZ gpu hang timeline: observed %u issued %u context %u recover %u %x %u %u gate-dropped %u/%u\n",
+        s.observed, s.issued, s.context, s.recover[0], s.recover[1], s.recover[2], s.recover[3], s.pmDropped[0], s.pmDropped[1]);
+    printf("COACHZ gpu hang limits: snapshots 2 IB-words 16384 CP-window-words 2048; packets %u/%u ring %u/%u memptrs %u/%u\n",
+        s.packetCount, s.packetTotal, s.ringCount, s.ringTotal, s.memptrCount, s.memptrTotal);
+    for (unsigned i = 0; i < s.errors; ++i) {
+        printf("COACHZ gpu hang irq %u:", i);
+        for (uint32_t value : s.error[i]) printf(" %08x", value);
+        printf("\n");
+    }
+    for (unsigned i = 0; i < s.regCount; ++i) printf("COACHZ gpu hang reg %04x %08x\n", kHangRegisters[i], s.regs[i]);
+    if (!s.asleep) {
+        printf("COACHZ gpu hang bank:");
+        for (uint32_t value : s.bank) printf(" %08x", value);
+        printf(" far %llx gfsr %x\n", s.far, s.gfsr);
+        hangWordsPrint("sqe", s.sqe, 0x33);
+        printf("COACHZ gpu hang ROQ: saved %u/%u words\n", s.roqCount, s.roqTotal);
+        hangWordsPrint("roq", s.roq, s.roqCount);
+    }
+    if (s.packetOffset != ~0u) printf("COACHZ gpu hang packet: offset %u header %08x unrecognized\n", s.packetOffset, s.packetError);
+    for (unsigned i = 0; i < s.ibCount; ++i) {
+        const HangSnapshot::Ib &ib = s.ib[i];
+        printf("COACHZ gpu hang IB: n %u kind %u address %llx words %u requested %u captured %lu flags %x status 0x%x handle %llx base %llx bytes %lu perms %x\n",
+            i + 1, ib.kind, ib.address, ib.total, ib.requested, (unsigned long)ib.read.count, ib.flags,
+            uint32_t(ib.read.status), ib.read.handle, ib.read.base, (unsigned long)ib.read.bytes, ib.read.permissions);
+        if (ib.read.status) continue;
+        for (unsigned at = 0; at < ib.read.count; at += 16) {
+            printf("COACHZ gpu hang IB%u +%u:", i + 1, at);
+            for (unsigned j = at; j < at + 16 && j < ib.read.count; ++j) printf(" %08x", s.words[ib.offset + j]);
+            printf("\n");
+            IOSleep(20);
+        }
+    }
+    hangWordsPrint("packets", s.packets, s.packetCount);
+    hangWordsPrint("ring", s.ring, s.ringCount);
+    hangWordsPrint("memptrs", s.memptrs, s.memptrCount);
+    printf("COACHZ gpu hang snapshot: end n %u IBs %u captured %u words\n", s.sequence, s.ibCount, s.captured);
+    __atomic_store_n(&gHangSnapshot.state, 0u, __ATOMIC_RELEASE);
+}
+
 void stuckReport() {
     static uint32_t lastFence, printed;
     const uint32_t done = gRing.completedFence(), issued = gRing.lastSubmitted();
@@ -475,6 +645,7 @@ void reportThread(void *, wait_result_t) {
     for (unsigned round = 1;; round++) {
         IOSleep(10000);
         native_adreno_metal_report();
+        hangSnapshotReport();
         stuckReport();
         // Once a minute, which processes have a GPU connection slot (four in this framework) and which were refused.
         if (!(round % 6)) {
@@ -489,6 +660,15 @@ void reportThread(void *, wait_result_t) {
             gRing.lastSubmitted(), static_cast<unsigned long long>(native_gop_gpu_offers), static_cast<unsigned long long>(native_gop_gpu_completions),
             static_cast<unsigned long long>(native_gop_gpu_failures), static_cast<unsigned long long>(native_gop_gpu_abandoned));
         cpState("now");
+        printf("COACHZ gpu recover: hangs %u restarts %u failed %u, last hung fence %u status 0x%x, replayed %u, guilty %u kernel %u; trace %u 0x%x %u %u\n",
+            native_adreno_recovery[0], native_adreno_recovery[1], native_adreno_recovery[2], native_adreno_recovery[3], native_adreno_recovery[4],
+            native_adreno_recovery[5], native_adreno_recovery[6], native_adreno_recovery[7], native_adreno_recover_trace[0], native_adreno_recover_trace[1],
+            native_adreno_recover_trace[2], native_adreno_recover_trace[3]);
+        // The framework's stall handler (NativeAdrenoSubmit::noteStall): [0] write pointer given again, [4] bus drains, [9]/[11] stalls that
+        // ended after those stages, [14] long jobs it found still moving and left alone.
+        printf("COACHZ gpu stall: kicks %u (last fence %u), bus drains %u (last fence %u), ended after kick %u after drain %u, longest %u waits, left alone %u\n",
+            native_adreno_unstick[0], native_adreno_unstick[1], native_adreno_unstick[4], native_adreno_unstick[7], native_adreno_unstick[9],
+            native_adreno_unstick[11], native_adreno_unstick[12], native_adreno_unstick[14]);
         printf("COACHZ gpu irq: %u interrupts, %u fences; waits slept %u, timed out %u; errors ahb %u atb %u cp hw %u (0x%x) hang %u uche %u; gmu %u (0x%x) hfi %u (0x%x)\n",
             gIrqAll, gFlushTs, gIdleBlocks, gIdleTimeouts, gIrqAhb, gIrqAtb, gIrqCpHw, gCpHwStatus, gIrqHang, gIrqOob, gGmuAoIrqs, gGmuAoStatus, gHfiIrqs, gHfiInfo);
         stampReport();
@@ -777,6 +957,54 @@ void pmGet() {
     gPmWakes = gPmWakes + 1;
     printf("COACHZ gpu pm: resume %u status %d ring 0x%x ME_INIT 0x%x wait %d in %llu us, %u core accesses dropped asleep\n", gPmWakes, status, ring, sent,
         int(waited), (mach_absolute_time() - began) / 19, gPmDropped);
+}
+// The board's GPU restart for the framework's hangcheck (NativeAdrenoPublish.cpp, msm's hangcheck timer and recover_worker), called under
+// the publisher lock when the ring's fence stood still for a period and the CP made no progress. As a6xx_recover: the SQE halted first
+// (CP_SQE_CNTL 3), then the power-off a runtime suspend does (a6xx_bus_clear_pending_transactions, the software reset, the GMU slumber,
+// GX collapsed), then the cold start and hw_init of a resume (msm_gpu_hw_init). Between the reset and the CP init the ring restarts at the
+// hung fence (NativeAdrenoRing::restart), and the CP init goes without a fence and is waited for with a6xx_idle, so the submissions the
+// framework replays keep their numbers. Without this hook a hang was only counted and every client waited on the stuck fence forever.
+uint32_t gRestarts, gRestartFailures;
+IOReturn gpuRestart(void *, NativeAdrenoRing *ring, uint32_t completed) {
+    const uint64_t began = mach_absolute_time();
+    const uint32_t rbbm = __atomic_load_n(&gPmAsleep, __ATOMIC_SEQ_CST) ? 0 : coreRead(0x0210);
+    if (!__atomic_load_n(&gPmAsleep, __ATOMIC_SEQ_CST)) {
+        coreWrite(CpSqeCntl, 3);
+        pmSleep();
+    }
+    const int status = coachz_gpu_pm_resume();
+    if (status) {
+        gRestartFailures = gRestartFailures + 1;
+        printf("COACHZ gpu recover: restart %u at fence %u failed: resume %d; GX access remains blocked\n", gRestarts + gRestartFailures,
+            completed, status);
+        return kIOReturnNotResponding;
+    }
+    __atomic_store_n(&gPmAsleep, 0u, __ATOMIC_SEQ_CST);
+    coreWrite(CpSqeInstrBase, uint32_t(gBuffers[0].iova));
+    coreWrite(CpSqeInstrBase + 1, uint32_t(gBuffers[0].iova >> 32));
+    const IOReturn restarted = ring->restart(completed);
+    coreWrite(CpSqeCntl, 1);
+    uint32_t init[9] = {0, 0x2fu, 3u, 0x20000000u, 0, 0, 0, 0, 0};
+    const NativeAdrenoRingClock clock{nullptr, ringNow, ringIdle};
+    const IOReturn sent = restarted ? restarted :
+        AdrenoPM4Type7(Pm4MeInit, 8, &init[0]) == AdrenoPM4Success ? ring->submitUnfenced(init, 9) : kIOReturnError;
+    const IOReturn idle = sent ? sent : ring->idle(&clock, 200000);
+    coreWrite(RbbmSecvidTrustCntl, 0);
+    coreWrite(RbbmIntClearCmd, ~0u);
+    coreWrite(RbbmInt0Mask, IrqMask);
+    *reinterpret_cast<volatile uint32_t *>(gGmu + GmuAoClr) = ~0u;
+    *reinterpret_cast<volatile uint32_t *>(gGmu + GmuHfiClr) = ~0u;
+    *reinterpret_cast<volatile uint32_t *>(gGmu + GmuAoMask) = ~uint32_t(GmuAoErrors);
+    *reinterpret_cast<volatile uint32_t *>(gGmu + GmuHfiMask) = ~uint32_t(GmuHfiFault);
+    profileSetup();
+    const uint64_t now = mach_absolute_time();
+    __atomic_store_n(&gPmLastSubmit, now, __ATOMIC_RELEASE);
+    __atomic_store_n(&gPmLastBusy, now, __ATOMIC_RELEASE);
+    if (idle) gRestartFailures = gRestartFailures + 1;
+    else gRestarts = gRestarts + 1;
+    printf("COACHZ gpu recover: restart %u at fence %u, rbbm before 0x%x, ring 0x%x ME_INIT 0x%x idle 0x%x in %llu us\n",
+        gRestarts + gRestartFailures, completed, rbbm, restarted, sent, idle, (now - began) / 19);
+    return idle;
 }
 void pmThread(void *, wait_result_t) {
     uint32_t retired = 0;
@@ -1199,6 +1427,9 @@ extern "C" int coachz_gpu_driver_start(volatile uint8_t *core, volatile uint8_t 
     cacheSetup();
     if (kernel_thread_start(rateThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
     native_adreno_power_get = pmGet;
+    native_adreno_set_restart(gpuRestart, nullptr);
+    native_adreno_capture_hang = gpuHangSnapshot;
+    printf("COACHZ gpu hang capture: armed, before reset and BO release; 2 snapshots, IB 64 KiB, ring 32 KiB, memptrs 4 KiB\n");
     if (kernel_thread_start(pmThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
     coachz_gpu_trace_start();
     return accelerator;

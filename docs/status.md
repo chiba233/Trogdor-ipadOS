@@ -45,7 +45,7 @@
 | 音量键、电源键 | 真机通过 | 音量 HUD 正常且流畅；电源键先熄屏，再按恢复界面；系统休眠未做 |
 | 背光 | 真机通过（2026-11-01） | 控制中心亮度滑块经 Chrome EC PWM 调亮度，读回一致；熄屏和睡眠联动没做 |
 | 键盘和触控板 | 部分通过 | Zed 底座键盘留在 report protocol（和 Linux 的 usbhid 一样），顶排亮度和音量键、触控板的指针和滚动方向都确认过；其他功能键未逐个确认 |
-| Adreno 618 | 真机通过 | mode 9 常驻驱动：GMU、SMMU、CP、ring／IB／fence 全部执行，界面由 Turnip 和 Metal 合成上屏；单 ring 无抢占；带 memoryless 附件的 pass 在 GMEM 渲染，颜色正常、明显更流畅，其余 pass 仍走系统内存；主帧 UBWC 未生效，卡顿未完全解决，见 [路线](plans/gpu.md) |
+| Adreno 618 | 真机通过，视频合成仍慢 | mode 9 常驻驱动：GMU、SMMU、CP、ring／IB／fence 全部执行，界面由 Turnip 和 Metal 合成上屏；单 ring 无抢占；带 memoryless 附件的 pass 在 GMEM 渲染，颜色正常；全屏合成在物理方向直接渲染，显示器直接采样，旋转转换 pass 已去掉；视频播放时重合成 pass 约 23 ms，渲染服务器同一时间只有一帧在 GPU 上，GPU 忙碌约一半；GPU 复位后的页表重放修正未在真机触发，首次挂起原因未定；见 [性能批次](plans/gpu-performance-batch.md) 和 [路线](plans/gpu.md) |
 | 温度、加速度计、陀螺仪 | 部分通过 | TSENS 25 路和 EC 加速度计、陀螺仪（25 Hz，3 个 SPU HID 服务）读进系统，thermalmonitord 读到 38 个温度服务；限频只有内核 80 °C 规则，没有 CLPC／PMGR 后端 |
 | Wi-Fi | 部分通过 | modem 经主线 `q6v5_mss` 启动，GLINK／QRTR／rmtfs、WLAN 固件握手、copy engine、HTC／WMI、HTT 全通；`en0` 能扫描、加入 WPA2、DHCP 和自动加入，见 [Wi-Fi 计划](plans/wifi.md) |
 | 蜂窝网络 | 部分通过 | 内核扮演苹果的 PCIe 基带接口，BBUpdater 走完启动，CommCenter 经 QMUX 接到 modem；用 eMMC boot 分区里的原厂 FSG 后“关于本机”显示 IMEI 和 ICCID，SIM 就绪。激活指示带上服务已开通和两个卡槽已接受，DPM、WDA 设置和 `BindMuxDataPort` 都成功；有效 SIM 在 LTE 上注册（漫游）并完成 CS、PS 附着，开机后状态栏直接显示运营商名和信号格；ICCID 改成阅读顺序、再带上卡上读到的 IMSI 后，SIM 匹配到运营商设置包，状态栏显示 LTE 标志；CommCenter 推运营商配置文件后会重启基带；桥接层收下文件并回报收完后，配置缓存下来，不再循环重启，LTE 保持注册。数据上下文还没分配，APN 设置还没确认。eSIM 在设置里出现，页面还不对；蜂窝数据未验证，见 [蜂窝计划](plans/modem.md) |

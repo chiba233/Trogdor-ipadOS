@@ -1727,6 +1727,28 @@ k76～k78 都带 `--diagnostics`：插件分帧统计（`sheng-diag=1`），重�
 原版 launchd 启动和 Venus 逐样点自检，并进入实际视频解码；两份日志均未出现该栈溢出 panic。此项验收仅覆盖启动偏好处理的
 栈占用修复，不代表 GPU 恢复、SpringBoard 稳定性或视频绿线已经修好。
 
+## GPU 启动挂起与 CPU 页表恢复重放失败
+
+最新启动的日志环保存 407 秒、无丢失。新编码线程调度记录为参考及实际策略 4、优先级 54，设置返回成功。GPU 最后提交到 fence 27，故障任务为 25，累计显示五帧；冷启动及 ME_INIT 返回成功，后续恢复停在 replay VM 阶段，BadArgument、重放零次。WaitFence 随后返回 DeviceLost，backboardd 因 SIGSEGV 退出；界面停留在 Apple logo，系统日志继续运行。崩溃报告符号化到 Turnip 的 `tu_CmdBindVertexBuffers2`，发生在设备丢失之后。
+
+实际提交代码的主机复现确认：mode 1 恢复时等待了尚未重放、超出重置后 ring 序号的 job fence。源码已改为只等待实际 ring idle 再切表，后续任务的 BO 引用仍保留；增加复位前故障现场缓冲，包含 CP/IRQ、SQE/ROQ、SMMU 和故障提交 IB，由报告线程在恢复锁外打印。首次挂起的具体触发原因仍未确定。针对性软件 SMMU/CP 回归和 GPU 组件编译通过；完整内核未重编，修订尚未取得新的实机结果。
+
+同次帧 trace 保存 1638 条记录：最后完成的 render pass 为序号 24，随后的 1488×2266 pass（序号 25，独立于 fence 编号）没有开始时间戳，尚不能区分中间的收尾、转换或同步命令。spare 补池和 spare placement 没有执行；三次后台物理释放均晚于首次 fence 等待超时约 516 ms。启动未打开管线日志开关，旧管线文件不作为本次证据。
+
+## GPU 恢复修订后的短窗口复验
+
+已写入恢复修订及故障捕获的启动记录中，`gpu hang capture: armed` 标记存在；最终提交和完成均为 7452，帧 offered 3560、shown 3559、failed 0、abandoned 0。hang、restart、恢复失败及列出的 GPU IRQ 错误均为零，没有 DeviceLost 或目标进程崩溃记录。此次没有触发恢复或 snapshot，验证了该版本能运行这段负载，未验收故障恢复路径，也未定位此前首次挂起的原因。
+
+28 次 shader 参考稀疏审核通过、bad 0，8 次表示检查通过、bad/missing/disabled 均为零；私有路径 run 1610。最后一次按阈值打印的版本日志为 writes/rotate 各 1024、merged 0，每个发布边界都只有一个原生 pass，不能宣称本次减少了表示转换。146 次恢复供电及 147 次 slumber 均返回成功；累计 28 次核心寄存器访问被睡眠门控跳过仍需保留在结论中。短窗口与稀疏审核不代替完整像素、截图、切换快照及长期稳定性验收。
+
+28 次周期状态中的 bank FSR 原值为 `0x400`，不应写成寄存器全零。按主线 [arm-smmu.h](https://github.com/torvalds/linux/blob/master/drivers/iommu/arm/arm-smmu/arm-smmu.h#L203)，它位于 FORMAT 字段，不命中 `FSR_FAULT`；日志中的 GFSR 为零。Data 中的帧 trace 尾部存在无效记录和零填充，分析只使用前 311162 条结构有效记录，尾部原因未定。四个 pass 缺少 GPU 结束时间戳，但后续 fence 仍完成，不能据此另报四次挂起。恢复现场的持久传输仍待实际故障触发后验收。
+
+## k215 原生路径整进程关闭与 k216 修复
+
+k215 带上一批 GPU 插件与 Turnip 改动后，backboardd 在原生路径启用几秒内有 7 个命令缓冲被拒：先是没有运行时错误的 `physical private seed:`，然后是 `deferred render encoder: … DefaultRasterSampleCount { count: 0 }`。含原生物理检查的命令随之失败（`valid0 rows0`），此后该进程所有帧都走线性 IOSurface，显示帧数约为 k213 的三分之一，backboardd 中途被 jetsam 杀掉重启。起因是审计标记在拒绝判断之前就已设置：被拒的审计候选照审计流程回放，种子视图为空，选中后附件句柄全空。修订让被拒的候选复位审计和选中标记。
+
+k216 带这个修订和上游 UniXNU 11 月 7–11 日的 Mesa、插件与内核卡死处理移植，日志环保存 320 秒、无丢失。8 次物理检查全部 `rows128`，没有命令缓冲被拒，backboardd 全程是同一进程，`CZ turn try1569 run1096`。卡死处理 `kicks 0`、`left alone 63`。视频播放窗口内，backboardd 采集的 2266×1488 重合成 pass 全部走原生路径，均值 22.6–23.8 ms（k213 原生 27.7 ms、线性 IOSurface 30.8 ms）；1488×2266 旋转转换 pass 没有出现，呈现缩放 pass 2.2 ms。重 pass 每秒 10–14 个，GPU 忙碌 52–62%：呈现器处理上一帧期间渲染服务器平均只有 0.04 次提交，上一帧完成约 12 ms 后才提交下一帧，GPU 上同一时间只有一帧。插件设置三缓冲选项的状态行在通知通道建立之前发出，没有进日志，选项是否生效未确认。约 300 秒起出现内存压力，被杀的是空闲进程和 Safari 的 WebContent；backboardd 的 GPU 地址峰值从 5.0 GiB 涨到 5.75 GiB（k215 为 5.3→8.0 GiB）。
+
 ## k213 视频绿线改善与显示帧率回退
 
 2026-11-10，实际播放的横向绿线消失，同时显示帧率明显变差。返回 Linux 后读取的本次 iPadOS 日志环没有 panic。

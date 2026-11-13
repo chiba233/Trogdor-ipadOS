@@ -64,9 +64,15 @@ def gpu_stack_overlay():
     mesa = UNIXNU / '.cache/mesa-work'
     runtime = UNIXNU / '.cache/gpu-reference/metal2vulkan'
     # The overlay's Mesa patches in the order adreno-compiler-inputs.json records them: UniXNU's transient attachments in GMEM with lazily
-    # allocated memory under TU_DEBUG=sysmem (b95b4c9) and the memory-side colour swap of GMEM transfers (93ad2ce), then the diagnostics.
+    # allocated memory under TU_DEBUG=sysmem (b95b4c9) and the memory-side colour swap of GMEM transfers (93ad2ce), then the diagnostics,
+    # then later UniXNU fixes on the same Mesa commit (85fda3b): 215672b fragment consts that leave the other stages room (no safe_constlen
+    # variant), 97437dc one GPU address allocator per process, c72a8a5 the device kept after a GPU restart, 6061e10 the row pitch for padding,
+    # d76f17d long submissions cut where a command buffer begins.
     mesa_patches = [UNIXNU / 'patches/mesa' / name for name in ('turnip-transient-attachments-in-gmem.patch',
-                                                                 'turnip-gmem-memory-side-swap.patch', 'turnip-coachz-diagnostics.patch')]
+                                                                 'turnip-gmem-memory-side-swap.patch', 'turnip-coachz-diagnostics.patch',
+                                                                 'coachz-port-ir3-fragment-consts.patch', 'coachz-port-turnip-one-va.patch',
+                                                                 'coachz-port-turnip-keep-device.patch', 'coachz-port-turnip-row-pitch.patch',
+                                                                 'coachz-port-turnip-submit-cuts.patch')]
     runtime_patch = UNIXNU / 'drivers/AdrenoMetal/bridge/patches/0026-coachz-copy-profile.patch'
     def apply(tree, patch, reverse=False, check=False):
         command = ['git', '-C', str(tree), 'apply']
@@ -97,7 +103,26 @@ def gpu_stack_overlay():
                 apply(UNIXNU, stack, reverse=True)
 
 
+def require_substantive_batch():
+    """Reject an unfinished active GPU batch before applying or building anything."""
+    manifest = ROOT / '.tools/handoff/gpu-active-batch.json'
+    if not manifest.exists():
+        return
+    batch = json.loads(manifest.read_text())
+    if not batch.get('in_progress'):
+        return
+    changes = batch.get('runtime_changes', [])
+    ids = {item.get('id') for item in changes if isinstance(item, dict) and item.get('id')}
+    minimum = max(8, int(batch.get('minimum_substantive_changes', 8)))
+    count = int(batch.get('implemented_substantive_changes', 0))
+    if count < minimum or len(changes) != count or len(ids) != count:
+        raise SystemExit(f'GPU build refused: active batch has {count}/{minimum} substantive changes; diagnostics and old changes do not count')
+    if batch.get('diagnostics_count_as_improvements') is not False or batch.get('old_changes_count_as_new') is not False:
+        raise SystemExit('GPU build refused: active batch must exclude diagnostics and old changes from its substantive count')
+
+
 def build(prime_list=None):
+    require_substantive_batch()
     with gpu_stack_overlay():
         build_overlaid(prime_list)
 

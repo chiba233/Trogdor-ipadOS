@@ -581,3 +581,151 @@ GPU 电源计时按主线的完成侧语义修订：主线 [msm_gpu.c 的 retire
 G 累计 n822、均值 27,791 us、最大 176 ms；frame-gpu 818 个样本中 557 个不少于 16 ms，约 68.1%。没有固定操作窗口，不能据此认定版本变快或变慢。内核日志未见 panic、KMD fail、DeviceLost、核心界面进程退出或 GPU IRQ 错误；现有统一日志覆盖的界面活动窗口也未筛到相关 GPU 错误，仅为短窗口证据。最后记录一次 slumber，status0；此前 19 次恢复的证据见上一节。
 
 本次保存已构建且已执行的新路径、打包导出、资源保留分离、缓存及诊断、完成侧空闲计时。直渲染覆盖与现有零差异采样成立，长期稳定性、完整像素一致性及性能收益仍保留上述边界；不以构建成功替代实机结果。
+
+### 按表面合并发布和导出矩形边缘，待实机
+
+同步依据为 Linux 主线 [`msm_gem_submit.c`](https://github.com/torvalds/linux/blob/d164c7d754f0e1f020298366ea92430e62476089/drivers/gpu/drm/msm/msm_gem_submit.c) 的 `submit_fence_sync`、`submit_attach_object_fences` 和提交持有引用，以及 [`dma-resv.h`](https://github.com/torvalds/linux/blob/d164c7d754f0e1f020298366ea92430e62476089/include/linux/dma-resv.h) 的对象读写依赖语义。主线按实际访问对象组织依赖，并保留完成 fence；这里将同样的约束接到既有 Metal 表面表示。旋转坐标与原 shader 保持原实现。
+
+- 每个命令缓冲按表面保存独立的不可变写入前缀，并记录原生私有、旋转私有和共享页的编码版本。同一原生目标连续写入只前进原生版本；实际读取旋转/共享表示、未知访问、共享事件或 commit 才转换并发布。无关表面可以穿插，damage 并集保留到该表面的发布边界。审核和表示切换仍先发布旧前缀。
+- 发布记录强持有本次编码实际使用的两个私有表示，核对其队列和 resident 身份；旧命令完成回调对全局缓存提示的失效不会替代本命令的编码回执。资源仍保留至实际 GPU 完成，成功完成后的 coherent 回执才使缓存有效。
+- 合并限于同一命令缓冲。提交前仍完成旋转表示和共享页发布，保持跨进程、CPU 读取及截图的完成边界；没有跨命令缓冲省略发布。每个 pass 本来就在独立命令缓冲的负载不会因此减少旋转次数。
+- `coachz_export4` 将工作组起点向下对齐到四像素；首尾组逐 lane 检查实际矩形，只有完整组才做对齐的 16 字节访问。支持任意列起点和一至三像素窄区域，矩形外像素与行尾 padding/tag 保持。格式、buffer 偏移/行距对齐、容量和范围限制仍生效。没有抽到完整组的窄导出不更新变化率估计。
+
+新增记录：`TR versions writes/rotate/merged/encode` 区分原生写入、实际旋转转换、被合并的更新和转换编码耗时；`encode` 是主机编码耗时，不是 GPU 执行时间。`TR version native/canonical/shared` 是一次发布的编码版本，不是 GPU 完成声明；发布必须取得全部写入的 coherent 回执。`TR publish size` 给出每个边界含 0、1、2、3–4、5+ 个原生 pass 的分布及边界原因，用于区分没有合并机会和合并未生效。`TR export edges` 统计矩形边缘路径，`why b/s/r/l/range` 分别区分 backing、形状/格式、矩形、布局和容量拒绝。
+
+同轮验收：
+
+1. 实际直渲染和内部转换继续零差异，画面方向、颜色/alpha、局部重绘、截图与切换快照正常；缺失或失败的转换报告保持可见。
+2. 在同一操作窗口内关联 `TR versions`、`TR seals`、`CZ mirror/sync` 和有效呈现。存在可合并写入时，应看到 merged 增长且 rotate 少于 writes；全是 commit 边界或 merged 为零时不宣称减少了转换。
+3. 非四像素对齐 damage 命中 edges，矩形/布局拒绝可分别归因；检查窄更新及边缘像素，不能将逻辑覆盖量当 DRAM 节省量。
+4. 结合 `gpu stamps` 的排队/执行、呈现间隔和提交到完成时间评估净收益，保留原有恢复修复并观察实际故障。构建和主机检查不代替实机结果。
+
+交付需要同次构建的 addon 和信任缓存，可沿用当前内核。修改只在插件 overlay 内，使用标准 GPU 构建入口及原输出目录，壁纸和 prime list 同次携带；未实机验收，不提交。
+
+本批前端语法、AIR 组装、补丁适用和隐私检查通过。主机直接执行导出 AIR 函数体的 2810 组矩形检查保留了范围外像素、行尾和前后 guard；纹理读取用坐标桩代替。实际发布函数的主机调用覆盖 A/B/A 合并、选择性读取、事件/提交、表示切换及失败回执，GPU 复制用桩代替。正常 GPU 完整构建退出码为 0，标准 addon 含 20 项文件、配套信任缓存含三个签名哈希；这些检查不建立实机像素、性能或长期稳定性结论。
+
+### 上游差异的接入顺序
+
+核对版本为 UniXNU 主仓库 `5dc00d201496a1e7a72d1f5db23f041eb94ace1c`、AdrenoMetal `6d7f73437087c57ee54a41adceb1735daaea405e` 及 translator `963f0e64f103d2e682cd0cc454a8fe50f52c8cbb`。AdrenoMetal 与当前 pin 的提交历史有分叉，因此按实际源码差异判断，不能把 compare 中的全部提交都算作尚未接入。
+
+| 更新 | 当前源码与接入判断 |
+|---|---|
+| [编码线程继承渲染线程调度策略](https://github.com/UniXNU/AdrenoMetal/commit/241f3557234d) | 已接入；在首个渲染线程自身读取策略快照，由编码线程继承非 timeshare 策略，记录读取、设置及实际策略结果。收益待同窗口测量 |
+| [spare 图像块供 pool 补空间](https://github.com/UniXNU/AdrenoMetal/commit/0f17e741b37c)及后台释放 | 已回移 spare 补空间及 [有界后台释放](https://github.com/UniXNU/AdrenoMetal/commit/59aabad6808b)，接入现有 room worker；保留当前 translator pin、导入所有者、WC 缓存维护和完成顺序。没有整体升级到新运行时的独立 free thread |
+| 共享 shader cache、memoryless→GMEM 与颜色顺序 | 当前源码或 overlay 已包含，不能再次记作新收益 |
+| lowering 线程、commit 直接提交、后台管线预热 | 上游以 `sheng-metal-flow` 实验开关控制，默认关闭。[上游说明](https://unixnu.com/zh/drivers/adreno-metal#缓存和优先级)记录未测出帧率提升及一次停止出帧，不作为默认性能修复启用 |
+| A740 双 ring 调度 | 需要目标代际的上下文和抢占协议。Linux 主线 `d164c7d` 已有 [A6xx 抢占实现](https://github.com/torvalds/linux/blob/d164c7d754f0e1f020298366ea92430e62476089/drivers/gpu/drm/msm/adreno/a6xx_preempt.c)，但 [A618 条目](https://github.com/torvalds/linux/blob/d164c7d754f0e1f020298366ea92430e62476089/drivers/gpu/drm/msm/adreno/a6xx_catalog.c#L847)没有 PREEMPTION quirk；默认门限仍选择单环。强制启用的源码入口不构成 A618 已验证支持 |
+
+### 编码调度、spare 补空间与后台释放，待实机
+
+这批在前述发布/导出修订之上接入两项上游实现，仍通过现有插件及 stack overlay 构建。
+
+- 编码线程保留交互 QoS，另在首次遇到渲染线程时读取该线程自己的调度策略和优先级，以 release/acquire 快照传给编码线程。非 timeshare 策略只尝试继承一次；读取或设置失败不改变原有编码顺序。快照不保留可能退出的线程句柄。`TR encode sched` 一次记录参考策略/优先级、读取结果、设置结果和编码线程实际读取结果；set=-1 表示未尝试设置。帧 trace 的 type 14 记录每批入队、开始、结束、调用数、剩余队列深度和线程 CPU 时间，区分排队与实际执行。
+- 已空出的自有图像块可供 dedicated 或 pooled 图像复用；room keeper 在新分配前先取相同内存类型、尺寸足够的最小 spare。池在锁内已恢复空间时不再添块。spare 仍按十秒老化，并响应内存压力和分配失败；不引入短时间反复分配的字节上限。
+- 已无 placement、无待执行 GPU 使用、无导入页或外部所有者回调的大块自有内存，可交给现有 room worker 在分配器锁外物理释放。排队及正在释放的内存总计最多 128 MiB；小于 256 KiB、队列已满、导入内存或带所有者回调的释放保留原路径。worker 最长每 250 ms 收取一次，也在补空间前收取；所有释放都经过既有进程退出保护。设备由 worker 的强引用保持到本次释放结束，销毁前停止 worker 并释放余下队列。
+- 分配失败重试及内存压力会同步取走尚在队列中的对应 backing，并修正计数，不必等下一次 worker 轮询；已经被 worker 取走的内存仍计入上限，直到真正释放。GPU in-flight parking 分支与导入所有者的释放契约保持原有顺序。
+
+运行时 stage 40–52 记录内存申请、池空间、句柄、复用来源、spare 保留、排队、物理释放及队列满回退；复用来源 1/2/3 分别为池内 placement、spare placement、spare 补池。stage 42/43/48/49 的大小采用向上取整的 64 KiB 单位，饱和于 65535，适配既有 16 位记录参数；不将其误读为 KiB。句柄由 stage 46/58/47/59 按低至高各 16 位拼回，避免记录参数截断。stage 53–57 分开记录完成状态收集、调用方完成回调、保留对象释放与完成门打开。记录仍由既有诊断开关控制。
+
+同轮实机验收需要实际调度结果、type 14 的排队/执行、内存复用与释放阶段，以及同操作窗口的有效呈现和 GPU 排队/执行时间。检查启动、转屏、截图、切换快照、内存压力与长期运行；继承成功、减少分配或主机编译通过均不单独构成帧率收益。回移会改变既有构建入口生成的运行时内容指纹，首次启动包含缓存重建；性能比较需保持相同预热状态。交付仍为标准目录同次生成的 addon 和配套信任缓存，保留壁纸及 prime list。未实机验收，不提交。
+
+本批前端语法、严格记录前缀重放、补丁正反应用字节一致性与隐私检查通过。正常 GPU 完整构建退出码为 0；标准目录 addon 为 12,256,200 字节、20 项文件，配套信任缓存含三个匹配签名哈希。已核对 addon 内二进制、prime list、两组壁纸及新功能标记，插件签名验证通过，临时 overlay 撤回后的上游 checkout 干净。尚未实机验收，未提交。
+
+### 启动挂起、CPU 页表恢复重放与复位前记录
+
+最新实机日志记录新调度路径生效，参考与实际均为策略 4、优先级 54。GPU 随后停在 fence 25，最后发出 27；冷启动、ring restart 和 ME_INIT 返回成功，恢复却停在 replay VM 阶段，状态为 BadArgument，重放数为零。之后 WaitFence 返回 DeviceLost，backboardd 在 Turnip 顶点缓冲绑定路径触发 SIGSEGV；日志仍持续到启动后 407 秒。这批未通过实机验收，不能将构建及主机测试结果当作性能收益。
+
+同次启动的帧 trace 共 1638 条。最后带结束时间戳的是序号 24 的 render pass，随后的 1488×2266 pass（序号 25）连开始时间戳都未写出；pass 序号与 KMD fence 是两个独立编号。当前范围只能收窄至两者之间的收尾、转换或同步命令，不能认定后一 pass 的 shader 是原因；相同 fragment shader 哈希此前已有两次完成记录。runtime 记录没有 spare 补池或 spare placement，三次后台物理释放均发生在第一次 fence 等待超时约 516 ms 后，不能作为首次停住的起因。这不排除其他资源生命周期错误。启动参数未启用 `log-gpu=1`，没有本次按进程生成的管线日志；旧 `pipelines.log` 不参与本次判断。
+
+恢复错误已通过实际 Adreno740 提交代码和软件 SMMU/CP peer 复现。ring 重置到挂起 fence 后，`useVm` 的 `waitAll` 把尚未重放的后续 job 当成 ring 已发出的 fence 等待，超出重置后的序号，触发 BadArgument 并 poison 整个提交器。mode 1 的重放切表现在只等待实际 ring idle，然后写入 TTBR0；原队列中后续 BO 的引用保留到真实完成，正常提交的切表等待逻辑保持。依据为主线 `msm_gpu.c::recover_worker` 的复位、退役故障提交、再重发剩余提交顺序；不以旧队列记录替代复位后实际发出的工作。
+
+首次 GPU 挂起的触发原因尚未定位。新增可选捕获回调在故障 job 仍持有 IB、尚未释放和复位时执行，板级最多保存两份现场：IRQ 原始错误、现有 CP 寄存器及 SQE/ROQ 调试 bank、当前 SMMU 状态、提交进程与 fence、正在执行的 IB1/IB2 窗口及实际提交 IB。IB 总量上限为 64 KiB，其中两个 CP 窗口各最多 8 KiB，截断与读取失败均显式记录；没有增加 SP 选择器读回。捕获写入固定缓冲，慢速打印由报告线程在 publisher 锁外执行，记录捕获耗时，避免日志输出阻塞恢复。静态现场不再依赖恢复十秒后才读到的已清空寄存器，也不再用最初八次提交代替挂起 job。
+
+捕获完整性复核又补齐三个实际缺口：找不到 job 或 fence 读取失败时仍保存硬件、ring 和 fence 页现场；IB 读取先核对 BO 映射范围，只统计真正读取成功的字数，避免 `peekWords` 将映射末尾之外补零却返回成功；新的输出循环保留零值和全部捕获字，不再经过旧 dumper 的 128 行上限。原始提交包最多 128 个，ring 和 memptrs 分别最多保存 32 KiB、4 KiB，打印实际量与总量；IB 分开标记单窗口上限、总容量上限、映射末尾截断和读取状态，并记录映射句柄、基址、大小及权限。还保存同一时刻的队列上下文、完成/提交序号、恢复阶段、电源门控丢弃计数和单调时钟，启动时打印捕获已安装标记。大块输出在锁外限速，便于持久日志接收器持续收取；需要读到 snapshot end 才能认定这一份传输完整。容量有界，不等同于任意深度的间接命令、shader 和全部纹理内容快照。
+
+原 GPU 组件入口已编出包含 26 个对象的 `libCoachzGpu.a`。修订只编译 GPU 驱动组件，未构建完整内核；既有 Metal 插件优化、addon 与配套信任缓存保持。需要后续既有内核组装流程带入该 GPU 修订后，再验收恢复、画面和首次挂起现场；尚未实机确认，不提交。
+
+### 恢复修订的启动复验，尚未触发故障
+
+后续启动使用上述冻结 GPU 库，以及同批 addon 和信任缓存。日志确认捕获已安装；最终提交与完成各 7452，shown 3559，帧失败、挂起、重启及恢复失败均为零，没有 DeviceLost 或目标进程崩溃记录。此次没有进入恢复或 snapshot，因此不能把它当作重放修复的实机故障验收。GPU 的 bank FSR 为 `0x400`，按主线 `arm-smmu.h` 的 FORMAT/FAULT 字段定义不含 fault bits；其他列出的硬件错误位为零。累计 28 次睡眠门控跳过核心寄存器访问，不将其省略为“全部访问正常”。
+
+实际私有路径 run 1610，shader 参考稀疏审核 28/28/0，表示检查 verify 8、bad/missing/disabled 0。末次阈值采样的 writes/rotate 为 1024/1024、merged 0，1024 个发布边界全部只含一个原生 pass；合并规则虽已运行，本次负载没有提供合并机会，不能报告转换次数或帧率收益。该采样早于最终计数，不与最终总量强行对齐；字节计数仍为逻辑覆盖量。
+
+帧 trace 前 311162 条记录可解释，之后出现零填充及无效记录，尾部原因未定。可信前缀中的 23699 个编码批次，排队均值约 7.98 ms、p95 34.59 ms，编码执行均值约 1.49 ms；这些是软件批次时间，不是 GPU 执行时间，也不能相加成每帧成本。5664 个命令缓冲的提交到回调均值约 27.92 ms，仍包含排队与软件开销。没有同操作窗口基线，不建立速度改善结论。GPU 源码和构建产物保持冻结；本轮只补充实机观察与验收边界。
+
+
+### 导出、发布与 MRT 六项优化候选，待实机
+
+本批包含六项独立源码改动；实机性能收益尚未验证。诊断、分析工具和重新构建不计为优化点，既有批次也不重复计数。
+
+1. `coachz_export4` 的每个采样 invocation 写独立报告槽，移除集中在两个计数器上的全局原子加法，成功完成后在 CPU 汇总。采样位置、边缘谓词、像素写入和变化率估计保持。
+2. 导出报告缓冲在成功 GPU 完成且 CPU 读取结束后进入有界 best-fit 复用池。失败、DeviceLost、验证报告和仍在使用的缓冲不进入空闲池，内存压力只回收空闲项。
+3. 原生私有到规范私有的旋转发布使用同表面尚未发布的脏区域并集，并用保留原内容的局部传输更新。旧内容无效、无可靠写入记录、无边界写入或混合表示时保持整帧更新；可靠空区域不发出转换。版本和共享页发布完成边界保持。`TR native partial/empty/saved/rect` 记录命中与逻辑覆盖量，不能解释为 DRAM 流量。
+4. 正常渲染的额外 MRT 保持原 `DontCare` load action，避免主动加入清零；诊断参考与变体仍使用一致的确定清零。Load 和 Store 原有语义保持。
+5. 原生方向的多个 MRT seed 或 store 在同一个 blit encoder 中依次编码，各纹理继续保留到实际完成并记录自己的访问依赖。空集合不开 encoder，创建、复制或结束失败仍使命令失败；旋转路径保持原有传输。
+6. 按源方向与比较策略选择四个专用导出内核，将旋转与比较参数固定在入口，供编译器消除统一参数读取、坐标选择与策略分支；专用管线编译失败则使用原通用内核。一次调度使用同一个比较策略快照。原 BGRA8 读取、打包、纹理创建及 UBWC/tiling 输入保持，`TR export specialized/failed/variant` 记录实际选择，不能以存在函数就断言已运行。
+
+诊断沿用 Mesa 的 A6xx `u_trace` 时间戳机制，覆盖 compute、复制、清除、渲染和缓存刷新，shader 哈希与管线日志对应。Metal 提交、runtime 对象、Vulkan command buffer、实际 kernel fence 和呈现序号独立记录，再按身份关联。主机排队与 GPU 时间保持不同的时钟域，不把嵌套 GPU span 相加为独立成本。缺失时间戳和未完成批次保持可见。
+
+帧记录按进程和 epoch 分文件，v3 每块校验元数据、载荷和结束标记，记录丢失量，处理短写、EINTR 和重试，并周期同步；第一次提交即启动写入器，不等待成功完成。采集需同轮保留 cache 内所有 `frames-*-*.trace`、`gpu-work-*-*.csv`、`pipelines-*-*.log`，使用 `tools/coachz_gpu_profile.py --frames FILE --work FILE --pipelines FILE --output FILE` 验证可信前缀、完整批次、PID/epoch 和实际 fence，缺失关联不补猜。探针对 GPU 和存储的开销未单独测得，固定窗口的性能比较须保持相同诊断配置。
+
+本批需要同次生成的 addon 和配套信任缓存，继续携带 prime list 和两组壁纸；GPU 内核库保持当前恢复候选。使用原 GPU 构建入口和标准输出目录，不构建整颗内核。实机同轮检查六项命中、每种工作耗时、排队与 fence、画面方向/颜色/alpha、局部重绘、截图和切换快照，以及失败、DeviceLost、进程存活和恢复现场；未实机验收，不提交候选。
+
+标准 `tools/xnu_gpu_userland.py --build` 入口现已完成本批编译与打包。addon 的 20 个文件已解包核对，三份实际代码签名与配套信任缓存一致，内嵌 AIR、内嵌与随包 prime list、两组壁纸均匹配；构建覆盖层已清理。GPU 内核库及其 107 个源码输入与当前恢复候选的哈希一致。这只是组件集成交付，六项的实机正确性与性能收益仍待同轮数据验收。
+
+## k213 之后的八项源码修订（尚未实机验收）
+
+本轮以 k213 的六项版本为基线，新增改动独立计数。探针、读取工具、删除单测和旧改动不计入八项。标准 GPU 构建入口在活动批次不足八项时，于应用补丁和启动编译之前拒绝构建；活动批次与构建结果保存在忽略目录。本轮不新增或运行单测，不修改其他子系统。
+
+| 项目 | 新行为 | 必须确认的实机边界 |
+|---|---|---|
+| 1. 自有整屏绘制去掉额外清屏 | 不透明 scanout 和精确 RGBA 旋转传输使用 LOAD，避免运行时将 DontCare 改写成零清屏；局部更新保留范围外像素 | 首帧、两个 scanout 缓冲、旋转与颜色；实际 clear 区间是否消失 |
+| 2. 导出只发一次 dispatch | 自带两轴边界检查的 packed-export 内核使用向上取整的完整工作组，消除精确 dispatchThreads 产生的独立尾部区域 | 右下边缘、不对齐矩形、实际 GPU dispatch 数量 |
+| 3. 呈现读取已完成的原生方向图像 | 成功完成、写入 epoch 仍匹配、没有 plain writer 且几何/格式一致时，直接采样 native MRT 图像；继续保留 canonical 和共享页的发布 | 原生选择次数、GPU 时间与逐像素方向；旧/失败/未完成版本必须回退 |
+| 4. 每个 scanout 缓冲分别维护 damage 历史 | 仅在来源与完整版本链都匹配时，对该缓冲按 damage scissor 绘制；线性采样向外扩边；不变版本可跳过绘制。来源变化、历史缺失或失败走整帧 | 双缓冲交替、跨多次源写入、历史淘汰、边界像素；不能将上一个显示缓冲的历史套给另一个 |
+| 5. 命令内复用 MRT 临时图像 | 前一个 pass 的 render/store/seal 均记录成功后，同一命令中的后续 pass 可复用临时图像；保留 runtime 的资源依赖，命令之间仍只在成功完成后归还 | 多 pass 的读写排序、临时资源数量、颜色一致性；比较用 audit 图像不参与此复用 |
+| 6. 兼容的私有辅助 MRT 直接绑定 | 原生方向下，对独立、非导入、非 view、非旋转、非 buffer、单层单级单采样的私有 RenderTarget，省掉 shadow 分配及前后的 LOAD/STORE 拷贝 | 实际命中、GMEM 选择、辅助附件内容；IOSurface/linear/audit 继续原路径 |
+| 7. 辅助附件按实际区域拷回 | 对 shadow 路径的原生 LOAD/STORE 辅助附件，只拷回原始物理 scissor 并集；incoming seed 仍完整，保证 framebuffer fetch/helper 读取已初始化 | 范围外内容保持、局部矩形和实际字节数；Clear、audit、未知覆盖和非原生方向保留整帧 |
+| 8. 每个目标独立学习导出策略 | 以 backing 的区域、布局和覆盖类别保存独立的 compare/store EWMA；只从成功完成的报告学习，保留原阈值与衰减，单 backing 最多 16 项元数据 | 不同静态/动画目标互不污染、淘汰时在途报告仍有效，以及同窗口实际 GPU 成本 |
+
+这些是源码实现，不能代替实机性能结果。k213 对齐的十二秒窗口中，主合成命令的测得 GPU 区间合计均值为 33.598 ms，其中 2266×1488 双附件 pass 均值 28.89447 ms；present 自身 GPU 区间均值为 3.7588 ms，内含平均 1.4414 ms 的额外清屏，不能重复相加。现有资料不能把这 28.9 ms 归给某一个 shader；记录中的最大指令数并不表示该 shader 独占整个 pass。第八项等策略变化也不能仅凭源码宣称更快。
+
+诊断源码同时补充了完整 present 阶段及空复制回执、native 写入版本回执、实际 scissor、Metal/runtime/Vulkan 命令与 fence 的关联、逐 draw 和多 draw 子绘制、间接批次参数、viewport/scissor 与附件写入/混合状态、实际 Vulkan 管线句柄的创建/销毁生命周期、原函数别名和选中可执行 shader 的完整哈希与统计。驱动与运行时回调采用显式注册和状态回执；不再用空 compute 哈希或 Vulkan 的 `main` 名称猜原函数。采集文件在初始化时预先打开并保留描述符，处理已观察到的延迟打开被 sandbox 拒绝问题。以上新增探针仍须随新组件上机确认，不能称为全进程采集已经通过。
+
+读取工具按完成标记流式处理 Mesa CSV，按真实端点保留有效兄弟区间，把 0/0 条件分支单列为“未执行或未测得”，单端点缺失/倒退仍作为错误。完整回放 k213 的 backboardd 资料得到 58,312 个完成批次、2,650,194 个有效区间、676,064 个 0/0 分支，坏行和坏区间均为零，峰值待处理事件为 1,766。旧资料没有新回调元数据，因此不会补造 shader 名称。旧采集缺失 PID 287 的文件，不能据此声称覆盖所有进程。
+
+## k213 帧时间的拆分与非阻塞翻转（待实机）
+
+k213 播放窗口每帧 52.5 ms，顺序是：合成命令提交并交出帧，呈现器的缩放命令排在它后面，合成跑完再跑 3.8 ms 的缩放（交帧到呈现完成均值 36.5 ms），然后 `COMPLETE_SWAP` 同步等 CTL_FLUSH 在 vsync 清零（均值 9.0 ms），之后才归还渲染服务器的缓冲；再过约 5 ms 下一帧合成才开始。主线 `msm_atomic_commit_tail` 先 `flush_commit` 再 `wait_flush`，非阻塞提交的调用方不等 vsync，下一次提交前才等上一次完成。`coachz_scanout_flip` 照此只写 SSPP_SRC0 和 CTL_FLUSH 就返回，新的 `coachz_scanout_flip_wait` 在 `waitSwap` 交出下一帧之前等锁存（下一帧要画进锁存前还在扫描的那块缓冲），同一时间只有一个翻转在途。日志行 `COACHZ flip: … still pending at the next frame, wait mean …, request to seen latched mean …`。预期等待接近零、帧间隔约降到 42 ms；尚未实机。
+
+更正：重合成 pass 的主目标在原生路径下已经压缩（Turnip `start_render_pass` 记 `ubwc=yy`，bin 256×256 共 54 个）；没走原生路径时主目标是渲染服务器的线性 IOSurface（`ubwc=ny`，bin 192×320 共 60 个）。第二个附件是渲染服务器的 DontCare/DontCare memoryless 输出，每像素多占 4 字节，bin 数因此约翻倍。带 STORAGE、`ubwc0` 的 IMG 记录多数是运行时比较内存需求时生成的临时布局。
+
+逐 tile 的 `draw_ib_gmem` 区间按 Turnip 的蛇形 VSC pipe 顺序还原到屏幕坐标后，k213 里超过 20 ms 的重 pass（两种布局各约 300 次）成本集中在物理坐标约 x 0–1536、y 512–1280 的一块矩形：每个 bin 约 1.0 ms，其余界面约 0.3 ms，最右列约 0.1 ms。这块区域就是播放中的视频画面，约占整个 pass 的六成。全程统计中这种形态的 pass 中位数只有约 4 ms，播放时的 28.9 ms 来自视频图层的合成。着色器身份要等 k214 的管线关联；QuartzCore 中有 `CA_DISABLE_APL_FILTER`、`CA_DISABLE_TONEMAP_PRESCALE`、`CA_BACKDROP_SCALE`、`CA_DISABLE_FILTER_MERGING` 等开关，插件已在 backboardd 设置 CA 环境变量，确定着色器后再选。
+
+同一个十二秒窗口（229 帧）按 GPU 工作分：重合成 pass 走原生路径 152 次、均值 27.8 ms，画进渲染服务器线性 IOSurface 77 次、均值 31.1 ms；整帧共享页导出 compute（`f27c013f`，35×186 组）152 次、均值 3.2 ms，与原生路径次数相同，每帧平均 2.2 ms；呈现缩放 229 次、3.75 ms；旋转转换 76 次、2.0 ms。全程计数 `turn try6051 run2823`，列出的拒绝原因（busy 186、wait 69）只占少数；呈现器 `miss tag1384` 次走共享页读取。下一批候选按收益排：视频图层的合成着色器（约 15 ms/帧，等 k214 的着色器身份）、只在有共享页读者时导出（约 2.2 ms/帧，需要跨进程和 CPU 读取的触发条件，不能简单省掉）、原生路径覆盖率（每次未覆盖约多 3.3 ms，需要 k214 按原因计数）、DPU VIG 缩放替代呈现 pass。
+
+## 上游 UniXNU 11 月 7–11 日修订的移植与帧节奏（待实机）
+
+上游 Mesa 仍钉在 `85fda3b`，与本地同一提交，下面五项以新补丁加到栈 overlay（`patches/mesa/coachz-port-*.patch`），按 `adreno-compiler-inputs.json` 的顺序排在既有三项之后，由 `tools/xnu_gpu_userland.py` 打上：
+
+1. `ir3_shader.h`：片元阶段的 const 上限预留其他阶段在 safe 变体下的份额，避免 `ir3_trim_constlen` 为大片元着色器换上 `safe_constlen` 变体（上游 215672b：CoreAnimation 通用片元着色器在主机编译下 28587→22082 条指令、8369→4243 次停顿）。
+2. `tu_knl_darwin.cc`：同一进程的所有 Turnip 设备共用一个 GPU 地址分配器和锁（上游 97437dc：第二个设备重用已占地址，内核拒绝映射）。
+3. `tu_knl_darwin.cc`：内核故障计数变化（GPU 重启并重放其余提交）不再把 Vulkan 设备判为丢失，只计入 `tu_darwin_restarts`（上游 c72a8a5）。本地该处带有诊断补丁的报错文字，按同一语义手工移植。
+4. `tu_clear_blit.cc`：线性附件按行距而非宽度判断能否用事件 blit 做 GMEM load/store（上游 6061e10）。
+5. `tu_knl*.cc`、`tu_queue.cc`：超过内核 IB 上限的提交在命令缓冲开头处切开，不切开命令流（上游 d76f17d）。
+
+插件在渲染服务器里按名字找到 `CA_FORCE_TRIPLE_BUFFERING`（21H461 的 `CAGetDebugOptionEnvVariableName` 只回答 0–180 号，`CASetDebugOption` 写字节并发出变更），设为 1；`ca-triple-buffer=0` 不设；结果以 `TB triple buffering option` 记入内核日志（上游 AdrenoMetal f8fbee7 的做法，选项名按本系统）。内核侧的卡死处理改为出手前比较 CP 的 IB 状态（上游 Adreno740 95789237），另记 `COACHZ gpu stall` 行。启动参数去掉 `sheng-early-retire=0`：旧版显示驱动在 GPU 呈现器取走帧时归还交换，帧内存由呈现器自己引用，下一帧的拷贝仍等这一帧完成。
+
+不移植的：让 Turnip 逐 pass 自选渲染模式并开启并发分箱（9ddfaf2）。插件注释记录并发分箱曾使 BV 与 BR 在 pass 内互等，A618 没有这两条线程；渲染模式改动以前测得 SP 忙碌减半但提交到完成不降，另做对照。两平面 YCbCr 直接按平面采样（7841a9f）依赖新版翻译器 `555b13d5`，暂不移植。
+
+## k215 原生路径被整进程关闭的原因
+
+k215 的 backboardd（pid 55，被杀后重生为 pid 500）在原生路径启用后几秒内拒绝了 7 个命令缓冲：先是没有运行时错误文本的 `physical private seed:`，然后是 `deferred render encoder: … RenderPass(DefaultRasterSampleCount { count: 0 })`，即一个没有任何附件的 pass。拒绝落在含原生物理检查的命令里，检查读到 `valid0 rows0`，`gCoachzNativeDisabled` 置位后此进程所有候选都按 `prog` 拒绝、所有帧走线性 IOSurface 的 plain 路径，显示帧数约为 k213 的三分之一。八项里的“直接绑定私有辅助附件”把 `encoder->coachzAuditing=audit` 提到 `coachzPrepareMrt` 之前且无条件执行；一个已判为要审计、随后因限速、在途审计、空视图或队列不符被拒的候选仍带着审计标记。`coachzFlushDeferred` 照审计流程回放它：没准备过的视图让种子传输在 `coachzFrameTransfer` 的空指针检查处静默失败，`coachzSelectMrt` 把每个附件写成空句柄。日志里多出的一次原生种子（`seed3 reuse1`，打印出的选中 pass 只有一个）就是这样的回放；原生关掉后不再有审计，拒绝也正好停在 7 次。被拒的候选现在同时复位审计和选中标记，回放走原 pass。k215 里 scratch 复用、直接附件和局部回写三项一次也没有触发（没有 `TR scratch local`、`TR mrt direct`、`TR mrt partial`），它们的效果还没测到；backboardd 的内存增长是否只来自 plain 路径要看修复后的实机。
+
+## k216 实机结果（上游移植八项加审计复位）
+
+原生路径整次启动都开着：物理检查 8 次全部 `rows128`，没有命令缓冲被拒，backboardd 全程是同一进程（k215 里它被 jetsam 杀掉重启过）。`CZ turn try1569 run1096`，k213 是 `try6051 run2823`。翻转 1801 次，0 次超时，下一帧到来时仍未锁存的有 510 次，等待均值 2.1 ms、最大 17 ms（k213 同步等待均值 9.0 ms）。卡死处理没有出手（kicks 0，left alone 63）。
+
+用同一个读取工具解析两次的 backboardd 采集，比较视频播放窗口内的 2266×1488 双附件 pass：k216 全部走原生路径，超过 20 ms 的重 pass 均值 22.6–23.8 ms；k213 原生 27.7 ms、线性 IOSurface 30.8 ms。1488×2266 旋转转换 pass 在 k216 里没有出现，呈现缩放 pass 均值 2.2 ms（k213 为 3.7–4.1 ms）。每帧 GPU 工作因此少了约三分之一，但重 pass 每秒只有 10–14 个（k213 约 19 个），这一时段 GPU 忙碌 52–62%，频率 800 MHz。
+
+帧间隔由两段串联而成：呈现器等渲染服务器交帧（均值 21–40 ms），再等 GPU 跑完（呈现器 `gpu_wait` 35–43 ms，其中自己的缩放只占 2 ms，其余是排在它前面的合成）。呈现器处理上一帧期间，渲染服务器几乎没有提交（平均 0.04 个），要在上一帧完成之后约 12 ms（中位数）才提交下一帧。也就是说 GPU 上同一时间只有一帧，GPU 和编码 CPU 交替空闲。21H461 的 `CA_FORCE_TRIPLE_BUFFERING` 是 176 号调试选项（`CA_FORCE_DOUBLE_BUFFERING` 119 号，`CA_LOG_TRIPLE_BUFFERING` 13 号），`IOMFBDisplay::can_update_` 和 `finish_update` 每次更新都读它。插件的 `TB triple buffering option` 行没有进内核日志：它和同时发出的 `SC route` 行一样，在设备刚打开、通知通道还没建立时就发出了。所以这次无法确认选项是否已设上。`J completed wait`（n1930，均值 23.5 ms）与显示帧数一致，是呈现器自己的等待，不是 CA 在等。

@@ -2,7 +2,7 @@ diff --git a/drivers/AdrenoMetal/bridge/patches/0026-coachz-copy-profile.patch b
 new file mode 100644
 --- /dev/null
 +++ b/drivers/AdrenoMetal/bridge/patches/0026-coachz-copy-profile.patch
-@@ -0,0 +1,970 @@
+@@ -0,0 +1,2021 @@
 +diff --git a/crates/metal2vulkan/src/bind/graphics.rs b/crates/metal2vulkan/src/bind/graphics.rs
 +--- a/crates/metal2vulkan/src/bind/graphics.rs
 ++++ b/crates/metal2vulkan/src/bind/graphics.rs
@@ -85,6 +85,48 @@ new file mode 100644
 +         RuntimeFact::FoldedGroups => Mechanism::Variant,
 +         // A render pipeline compiled under the replay-bindings variant; its plans state it.
 +         RuntimeFact::ReplayBindings => Mechanism::Variant,
++diff --git a/crates/metal2vulkan/src/device/tests/mechanism.rs b/crates/metal2vulkan/src/device/tests/mechanism.rs
++--- a/crates/metal2vulkan/src/device/tests/mechanism.rs
+++++ b/crates/metal2vulkan/src/device/tests/mechanism.rs
++@@ -15,8 +15,9 @@
++         class: SlotClass::Texture,
++         index: 3,
++     };
++     vec![
+++        RuntimeFact::ViewportQuarterTurn,
++         RuntimeFact::ThreadsPerThreadgroup,
++         RuntimeFact::ThreadgroupMemoryLength { index: 0 },
++         RuntimeFact::LocalSizeConstraint { multiple: 32 },
++         RuntimeFact::LocalSizeLimits,
++@@ -354,16 +355,17 @@
++         RuntimeFact::RotatedWeights => 82,
++         RuntimeFact::PrivateList => 86,
++         RuntimeFact::MeshLastFirst => 71,
++         RuntimeFact::YCbCrInPlace { .. } => 65,
+++        RuntimeFact::ViewportQuarterTurn => 89,
++     }
++ }
++
++ #[test]
++ fn mechanism_is_total_over_every_fact_and_profile() {
++     let facts = every_fact();
++     let covered: std::collections::BTreeSet<usize> = facts.iter().map(variant).collect();
++-    assert_eq!(covered, (0..89).collect(), "every_fact misses a variant");
+++    assert_eq!(covered, (0..90).collect(), "every_fact misses a variant");
++     for (stem, _) in super::committed_profiles() {
++         let dev = device(&stem);
++         let p = dev.profile();
++         let f = p.fields();
++@@ -371,8 +373,9 @@
++             let m = mechanism(fact, p);
++             // Deterministic: one mechanism per (fact, profile).
++             assert_eq!(m, mechanism(fact, p));
++             let expected = match fact {
+++                RuntimeFact::ViewportQuarterTurn => Mechanism::Variant,
++                 RuntimeFact::ThreadsPerThreadgroup
++                 | RuntimeFact::ThreadgroupMemoryLength { .. }
++                 | RuntimeFact::ResourcePresence { .. }
++                 | RuntimeFact::SampleCount
 +diff --git a/crates/metal2vulkan/src/lower/stage_io/mod.rs b/crates/metal2vulkan/src/lower/stage_io/mod.rs
 +--- a/crates/metal2vulkan/src/lower/stage_io/mod.rs
 ++++ b/crates/metal2vulkan/src/lower/stage_io/mod.rs
@@ -321,6 +363,101 @@ new file mode 100644
 +                     ..ViewportCompensation::default()
 +                 },
 +                 ..CompensatedViewport::default()
++diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++@@ -1777,8 +1777,13 @@
++     Ok(())
++ }
++
++ impl CommandBuffer {
+++    /// The same stable identity used by the command-buffer stage trace.
+++    pub fn diagnostic_identity(&self) -> u64 {
+++        Arc::as_ptr(&self.0) as usize as u64
+++    }
+++
++     /// A new command buffer of `queue`, holding `slot` of it.
++     pub(super) fn new(queue: &CommandQueue, slot: Slot) -> CommandBuffer {
++         CommandBuffer(Arc::new(CommandBufferShared {
++             device: queue.device().clone(),
++@@ -4402,8 +4407,10 @@
++     /// versions, what it retained and its encoders' logs, then open its gate, which releases its
++     /// waiters once the transition's [`Hold`] (and every other) is gone, and they wait for the
++     /// trails below the mark. Waits from inside these steps answer as [`own`] says.
++     fn complete(self: &Arc<Self>, result: Result<(), CommandBufferError>) {
+++        let trace = Arc::as_ptr(self) as usize;
+++        crate::stage_trace::mark(trace, crate::stage_trace::Stage::CompleteBegin, 0);
++         // A thread sleeps on `changed`, as the state's lock below reads.
++         let parked;
++         // Its command pool, where it settled, whose primary the device's spares begin ahead once
++         // its completed handlers ran (below).
++@@ -4572,8 +4579,9 @@
++             parked = state.parked > 0;
++         }
++         // The holds taken above go here, with no lock of the command buffer's held, before any
++         // handler of its runs: a detach from one of them detaches (`detach.rs`).
+++        crate::stage_trace::mark(trace, crate::stage_trace::Stage::CompleteState, 0);
++         drop(submitted_holds);
++         self.wake_parked(parked);
++         let buffer = CommandBuffer(Arc::clone(self));
++         // Each handler leaves the queue under the lock and runs without it, in the order added
++@@ -4586,8 +4594,9 @@
++                 };
++                 exit_guard::program(|| handler(&buffer));
++             }
++         }
+++        crate::stage_trace::mark(trace, crate::stage_trace::Stage::CompleteHandlers, 0);
++         let handled = Instant::now();
++         drop(buffer);
++         // Its queue's slot comes back as its last completed handler returns, as Metal's does: a
++         // make blocked on its full queue returns then, never while a completed handler runs, nor
++@@ -4666,8 +4675,9 @@
++             }
++         }
++         // The gate notifies its waiters only where it opened here, which this transition's own
++         // hold holds it from: the notify for them is that hold's, as it goes (`gate.rs`).
+++        crate::stage_trace::mark(trace, crate::stage_trace::Stage::CompleteRetained, 0);
++         let notified = self.gate.finish();
++         self.device.shared().counts.command_buffer_wake(notified);
++         // Its pool's primary begun ahead, where no command buffer took the pool since
++         // (`spares.rs`), and no thread waits for the gate, which opens only once this
++@@ -4676,8 +4686,9 @@
++         if let Some(pool) = settled_pool.filter(|_| !self.gate.awaited()) {
++             let shared = self.device.shared();
++             shared.spares.begin_ahead(shared, pool);
++         }
+++        crate::stage_trace::mark(trace, crate::stage_trace::Stage::CompleteEnd, 0);
++     }
++ }
++
++ /// A command buffer's transition, run in its queue's context.
++diff --git a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
++--- a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+++++ b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
++@@ -936,8 +936,23 @@
++             (false, true) => &infos[..1],
++             (false, false) => &infos[..],
++         };
++         let submits = infos;
+++        if crate::stage_trace::diagnostics() {
+++            use ash::vk::Handle as _;
+++            let mut index = 0;
+++            for info in submits {
+++                if info.command_buffer_count == 0 { continue; }
+++                // SAFETY: these infos borrow the live lead/work/finale arrays above.
+++                let commands = unsafe { std::slice::from_raw_parts(
+++                    info.p_command_buffers, info.command_buffer_count as usize) };
+++                for command in commands {
+++                    crate::stage_trace::mark_link(Arc::as_ptr(self) as usize,
+++                        crate::stage_trace::Stage::VulkanCommandBuffer, index, command.as_raw());
+++                    index += 1;
+++                }
+++            }
+++        }
++         let buffers = (submits.iter())
++             .map(|info| info.command_buffer_count as usize)
++             .sum();
++         crate::stage_trace::mark(Arc::as_ptr(self) as usize, crate::stage_trace::Stage::SubmitStep, 2);
 +diff --git a/crates/metal2vulkan-runtime/src/device/adopt.rs b/crates/metal2vulkan-runtime/src/device/adopt.rs
 +--- a/crates/metal2vulkan-runtime/src/device/adopt.rs
 ++++ b/crates/metal2vulkan-runtime/src/device/adopt.rs
@@ -407,6 +544,61 @@ new file mode 100644
 +         };
 +         // The host image copy functions, where the device enabled `hostImageCopy` and copies to
 +         // and from `GENERAL` on the host: by their core names from Vulkan 1.4, else by the
++diff --git a/crates/metal2vulkan-runtime/src/device/room.rs b/crates/metal2vulkan-runtime/src/device/room.rs
++--- a/crates/metal2vulkan-runtime/src/device/room.rs
+++++ b/crates/metal2vulkan-runtime/src/device/room.rs
++@@ -91,31 +91,46 @@
++     let Some(_busy) = exit_guard::enter() else {
++         return;
++     };
++     let shared = device.shared();
+++    crate::memory::reap_retired(&shared.memory, shared.vk());
++     crate::memory::keep_room(&shared.memory, shared.vk(), &shared.counts);
++ }
++
++ /// The thread's loop: a pass for each time room was asked since the last, until stopped.
++ fn run(shared: &Shared, weak: &WeakDevice) {
++     loop {
++-        {
+++        let requested = {
++             let mut state = lock(&shared.state);
++             while !state.asked && !state.stopping {
++-                state = shared
+++                let (next, timeout) = shared
++                     .work
++-                    .wait(state)
+++                    .wait_timeout(state, std::time::Duration::from_millis(250))
++                     .unwrap_or_else(PoisonError::into_inner);
+++                state = next;
+++                if timeout.timed_out() {
+++                    break;
+++                }
++             }
++             if state.stopping {
++                 return;
++             }
+++            let requested = state.asked;
++             state.asked = false;
++-        }
+++            requested
+++        };
++         let Some(device) = weak.upgrade() else {
++             return;
++         };
++-        keep(&device);
+++        if requested {
+++            keep(&device);
+++        } else {
+++            let Some(_busy) = exit_guard::enter() else {
+++                return;
+++            };
+++            let parts = device.shared();
+++            crate::memory::reap_retired(&parts.memory, parts.vk());
+++        }
++         // Outside the state's lock: it may be the device's last handle, whose teardown stops
++         // this thread.
++         drop(device);
++     }
 +diff --git a/crates/metal2vulkan-runtime/src/encoder.rs b/crates/metal2vulkan-runtime/src/encoder.rs
 +--- a/crates/metal2vulkan-runtime/src/encoder.rs
 ++++ b/crates/metal2vulkan-runtime/src/encoder.rs
@@ -500,6 +692,677 @@ new file mode 100644
 ++
 ++/// Most-used large host-image shape successfully bound in place, not copy traffic.
 ++pub fn coachz_host_alias_profile() -> Option<[u64; 8]> { shadow::coachz_host_alias_profile() }
++diff --git a/crates/metal2vulkan-runtime/src/memory.rs b/crates/metal2vulkan-runtime/src/memory.rs
++--- a/crates/metal2vulkan-runtime/src/memory.rs
+++++ b/crates/metal2vulkan-runtime/src/memory.rs
++@@ -99,8 +99,56 @@
++ /// pooled blocks kept empty, the spares go when a block of their type cannot be made
++ /// ([`Memory::release_kept`]) and when the system reports memory pressure
++ /// ([`Memory::release_spare`]).
++ pub(super) const SPARE_FOR: Duration = Duration::from_secs(10);
+++
+++/// Maximum backing waiting for physical release on the room worker.
+++const RETIRED_BYTES: u64 = 128 << 20;
+++/// Small frees do not need another thread handoff.
+++const RETIRE_MIN_BYTES: u64 = 256 << 10;
+++
+++fn trace_memory(pool: (Holds, u32), bytes: u64, available: u64, kind: u32) -> usize {
+++    use crate::stage_trace::{self, Stage};
+++    use std::sync::atomic::{AtomicUsize, Ordering};
+++    if bytes < RETIRE_MIN_BYTES || !stage_trace::diagnostics() {
+++        return 0;
+++    }
+++    static NEXT: AtomicUsize = AtomicUsize::new(1);
+++    let id = (1usize << (usize::BITS - 1)) | NEXT.fetch_add(1, Ordering::Relaxed);
+++    stage_trace::mark(id, Stage::MemoryBegin, kind);
+++    stage_trace::mark(
+++        id,
+++        Stage::MemoryPool,
+++        if kind == 3 {
+++            0x8000 | pool.1
+++        } else {
+++            pool.1 * 2 + u32::from(pool.0 == Holds::Images)
+++        },
+++    );
+++    stage_trace::mark(
+++        id,
+++        Stage::MemoryBytes,
+++        bytes.div_ceil(1 << 16).min(u64::from(u16::MAX)) as u32,
+++    );
+++    stage_trace::mark(
+++        id,
+++        Stage::MemoryAvailable,
+++        available.div_ceil(1 << 16).min(u64::from(u16::MAX)) as u32,
+++    );
+++    id
+++}
+++
+++fn trace_handle(id: usize, memory: vk::DeviceMemory) {
+++    use crate::stage_trace::{self, Stage};
+++    use ash::vk::Handle;
+++    if id != 0 {
+++        let raw = memory.as_raw();
+++        stage_trace::mark(id, Stage::MemoryHandleLow, (raw & 0xffff) as u32);
+++        stage_trace::mark(id, Stage::MemoryHandleMid, ((raw >> 16) & 0xffff) as u32);
+++        stage_trace::mark(id, Stage::MemoryHandleHigh, ((raw >> 32) & 0xffff) as u32);
+++        stage_trace::mark(id, Stage::MemoryHandleTop, (raw >> 48) as u32);
+++    }
+++}
++
++ /// A dedicated block of images whose image went, kept for the next dedicated image of its pool
++ /// ([`SPARE_FOR`]).
++ #[derive(Debug)]
++@@ -647,9 +695,11 @@
++             let bytes = block.ranges.len();
++             let (count, total) = match (imported(&block.payload), block.dedicated) {
++                 (true, _) => (&mut census.imported, &mut census.imported_bytes),
++                 (false, true) => (&mut census.dedicated, &mut census.dedicated_bytes),
++-                (false, false) if block.ranges.is_empty() => (&mut census.empty, &mut census.empty_bytes),
+++                (false, false) if block.ranges.is_empty() => {
+++                    (&mut census.empty, &mut census.empty_bytes)
+++                }
++                 (false, false) => {
++                     census.pooled_used_bytes += block.ranges.used();
++                     (&mut census.pooled, &mut census.pooled_bytes)
++                 }
++@@ -1080,8 +1130,12 @@
++     binds_wait: bool,
++     /// The dedicated blocks of images kept for the next dedicated image of their pool
++     /// ([`SPARE_FOR`]).
++     spare: Vec<Spare>,
+++    /// Owned, unused backing released by the room worker, with no program-owned holds.
+++    retired: std::collections::VecDeque<(usize, Block, FreeCause)>,
+++    retiring_bytes: Arc<std::sync::atomic::AtomicU64>,
+++    retiring_count: Arc<std::sync::atomic::AtomicU64>,
++ }
++
++ impl Memory {
++     /// The memory of a device with `properties`, whose largest allocation is
++@@ -1116,8 +1170,11 @@
++             freed_by: [0; FreeCause::COUNT],
++             log: None,
++             binds_wait: binds_wait(driver),
++             spare: Vec::new(),
+++            retired: std::collections::VecDeque::new(),
+++            retiring_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+++            retiring_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
++         }
++     }
++
++     /// Log each `VkDeviceMemory` allocated, imported or freed from now on to `log`
++@@ -1195,8 +1252,14 @@
++         for spare in &self.spare {
++             census.empty += 1;
++             census.empty_bytes += spare.block.size;
++         }
+++        census.empty += self
+++            .retiring_count
+++            .load(std::sync::atomic::Ordering::Relaxed);
+++        census.empty_bytes += self
+++            .retiring_bytes
+++            .load(std::sync::atomic::Ordering::Relaxed);
++         census
++     }
++
++     /// Whether one of the memory types `allowed` names is of `class`.
++@@ -1463,20 +1526,19 @@
++         let now = Instant::now();
++         let pool = self.pool(holds, type_index);
++         let (freed, stale) = (pool.release(block, offset, size, now), pool.stale(now));
++         if let Some(stale) = stale {
++-            // SAFETY: nothing is placed in a kept empty block, and no command reads it.
++-            drop(unsafe { self.let_go(device, stale, FreeCause::KeptStale, None) });
+++            if holds == Holds::Images && stale.plain() {
+++                self.keep_spare(device, (holds, type_index), stale, now);
+++            } else {
+++                // SAFETY: nothing is placed in a kept empty block, and no command reads it.
+++                drop(unsafe { self.let_go(device, stale, FreeCause::KeptStale, None) });
+++            }
++         }
++         self.age_spare(device, now);
++         match freed {
++-            Some((block, true)) if holds == Holds::Images && block.plain() => {
++-                self.say_block("kept a dedicated block of an image spare", &block);
++-                self.spare.push(Spare {
++-                    pool: (holds, type_index),
++-                    block,
++-                    since: now,
++-                });
+++            Some((block, _)) if holds == Holds::Images && block.plain() => {
+++                self.keep_spare(device, (holds, type_index), block, now);
++                 after
++             }
++             Some((block, dedicated)) => {
++                 let cause = match dedicated {
++@@ -1487,8 +1549,37 @@
++                 unsafe { self.let_go(device, block, cause, after) }
++             }
++             None => after,
++         }
+++    }
+++
+++    /// Physical release requested by pressure or an allocation retry. Work already taken by
+++    /// the room worker stays counted until that worker finishes; queued blocks go here.
+++    fn release_retired(&mut self, device: &ash::Device, type_index: Option<u32>) -> usize {
+++        use std::sync::atomic::Ordering;
+++        let pending = self.retired.len();
+++        let mut count = 0;
+++        for _ in 0..pending {
+++            let (id, block, cause) = self.retired.pop_front().expect("queued retirement");
+++            if type_index.is_some_and(|index| block.type_index != index) {
+++                self.retired.push_back((id, block, cause));
+++                continue;
+++            }
+++            count += 1;
+++            let size = block.size;
+++            if id != 0 {
+++                crate::stage_trace::mark(id, crate::stage_trace::Stage::MemoryFreeBegin, 0);
+++            }
+++            // SAFETY: retirement only accepts unused owned blocks, with no program hold.
+++            unsafe { block.release(device) };
+++            self.freed_by[cause as usize] += 1;
+++            self.retiring_bytes.fetch_sub(size, Ordering::Relaxed);
+++            self.retiring_count.fetch_sub(1, Ordering::Relaxed);
+++            if id != 0 {
+++                crate::stage_trace::mark(id, crate::stage_trace::Stage::MemoryFreeEnd, 0);
+++            }
+++        }
+++        count
++     }
++
++     /// Release every kept empty pooled block of memory type `type_index`, of buffers and of
++     /// images, as a block of that type fails to be made ([`place`]): how many went.
++@@ -1501,20 +1592,44 @@
++             (self.spare)
++                 .extract_if(.., |spare| spare.pool.1 == type_index)
++                 .map(|spare| spare.block),
++         );
++-        let count = blocks.len();
+++        let count = blocks.len() + self.release_retired(device, Some(type_index));
++         for block in blocks {
++             // SAFETY: nothing is placed in a kept empty block, and no command reads it.
++             drop(unsafe { self.let_go(device, block, FreeCause::KeptForRoom, None) });
++         }
++         count
++     }
++
+++    /// Keep unused owned image backing spare ([`SPARE_FOR`]). No byte limit: spares go when they
+++    /// age, when a block of their type cannot be made and on memory pressure. A limit freed spares
+++    /// the render server made again within seconds, each a new allocation wired page by page while
+++    /// the compressor freed pages for it (untagged-102cb4a069: 13-14 us a page).
+++    fn keep_spare(&mut self, _device: &ash::Device, pool: (Holds, u32), block: Block, now: Instant) {
+++        let id = trace_memory(pool, block.size, 0, 3);
+++        trace_handle(id, block.memory);
+++        self.spare.push(Spare {
+++            pool,
+++            block,
+++            since: now,
+++        });
+++        let bytes = self.spare.iter().map(|spare| spare.block.size).sum::<u64>();
+++        if id != 0 {
+++            crate::stage_trace::mark(
+++                id,
+++                crate::stage_trace::Stage::MemoryCached,
+++                bytes.div_ceil(1 << 16).min(u64::from(u16::MAX)) as u32,
+++            );
+++        }
+++    }
+++
++     /// Free the spare blocks that stayed spare for [`SPARE_FOR`] at `now`.
++     fn age_spare(&mut self, device: &ash::Device, now: Instant) {
++         let stale: Vec<Spare> = (self.spare)
++-            .extract_if(.., |spare| now.saturating_duration_since(spare.since) >= SPARE_FOR)
+++            .extract_if(.., |spare| {
+++                now.saturating_duration_since(spare.since) >= SPARE_FOR
+++            })
++             .collect();
++         for spare in stale {
++             // SAFETY: nothing is placed in a spare block, and no command reads it.
++             drop(unsafe { self.let_go(device, spare.block, FreeCause::KeptStale, None) });
++@@ -1534,16 +1649,26 @@
++             .min_by_key(|(_, spare)| spare.block.size)?;
++         Some(self.spare.swap_remove(index).block)
++     }
++
+++    /// The smallest spare block of `pool` of at least `size` bytes, taken out to give the pool
+++    /// room ([`keep_room`]): a spare is memory already made, where a new block is a fresh
+++    /// allocation that may wait for the system to free pages.
+++    fn take_spare_for_room(&mut self, pool: (Holds, u32), size: u64) -> Option<Block> {
+++        let (index, _) = (self.spare.iter().enumerate())
+++            .filter(|(_, spare)| spare.pool == pool && spare.block.size >= size)
+++            .min_by_key(|(_, spare)| spare.block.size)?;
+++        Some(self.spare.swap_remove(index).block)
+++    }
+++
++     /// Free every spare block and every kept empty pooled block: the system reports memory
++     /// pressure, the signal Metal's resource cache gives memory back on. How many went.
++     pub(super) fn release_spare(&mut self, device: &ash::Device) -> usize {
++         let mut blocks: Vec<Block> = self.spare.drain(..).map(|spare| spare.block).collect();
++         for pool in &mut self.pools {
++             blocks.extend(pool.take_kept());
++         }
++-        let count = blocks.len();
+++        let count = blocks.len() + self.release_retired(device, None);
++         for block in blocks {
++             // SAFETY: nothing is placed in a spare or kept empty block, and no command reads it.
++             drop(unsafe { self.let_go(device, block, FreeCause::KeptForRoom, None) });
++         }
++@@ -1585,15 +1710,54 @@
++         block: Block,
++         cause: FreeCause,
++         after: Option<Box<dyn Send>>,
++     ) -> Option<Box<dyn Send>> {
++-        self.freed_by[block.cause(cause) as usize] += 1;
+++        let counted_cause = block.cause(cause);
++         let Some(parking) = &self.parking else {
+++            use std::sync::atomic::Ordering;
+++            let id = trace_memory((Holds::Buffers, block.type_index), block.size, 0, 3);
+++            trace_handle(id, block.memory);
+++            // Imported memory and program-owned keep-alives retain their synchronous release contract.
+++            let can_defer = block.plain()
+++                && after.is_none()
+++                && block.size >= RETIRE_MIN_BYTES
+++                && cause != FreeCause::KeptForRoom;
+++            if can_defer
+++                && self
+++                    .retiring_bytes
+++                    .load(Ordering::Relaxed)
+++                    .saturating_add(block.size)
+++                    <= RETIRED_BYTES
+++            {
+++                let bytes =
+++                    self.retiring_bytes.fetch_add(block.size, Ordering::Relaxed) + block.size;
+++                self.retiring_count.fetch_add(1, Ordering::Relaxed);
+++                self.retired.push_back((id, block, counted_cause));
+++                if id != 0 {
+++                    crate::stage_trace::mark(
+++                        id,
+++                        crate::stage_trace::Stage::MemoryDeferred,
+++                        bytes.div_ceil(1 << 16).min(u64::from(u16::MAX)) as u32,
+++                    );
+++                }
+++                return None;
+++            }
+++            if id != 0 {
+++                if can_defer {
+++                    crate::stage_trace::mark(id, crate::stage_trace::Stage::MemoryQueueFull, 0);
+++                }
+++                crate::stage_trace::mark(id, crate::stage_trace::Stage::MemoryFreeBegin, 0);
+++            }
+++            self.freed_by[counted_cause as usize] += 1;
++             self.say_block("freed a block", &block);
++             // SAFETY: the caller's.
++             unsafe { block.release(device) };
+++            if id != 0 {
+++                crate::stage_trace::mark(id, crate::stage_trace::Stage::MemoryFreeEnd, 0);
+++            }
++             return after;
++         };
+++        self.freed_by[counted_cause as usize] += 1;
++         self.say_block(
++             "a block goes, freed once the batches in flight complete",
++             &block,
++         );
++@@ -1833,8 +1997,13 @@
++         let mut blocks: Vec<Block> = (self.pools.iter_mut())
++             .flat_map(|pool| pool.drain())
++             .collect();
++         blocks.extend(self.spare.drain(..).map(|spare| spare.block));
+++        blocks.extend(self.retired.drain(..).map(|(_, block, _)| block));
+++        self.retiring_bytes
+++            .store(0, std::sync::atomic::Ordering::Relaxed);
+++        self.retiring_count
+++            .store(0, std::sync::atomic::Ordering::Relaxed);
++         for block in blocks {
++             self.say_block("freed a block as the device is destroyed", &block);
++             self.freed_by[block.cause(FreeCause::Teardown) as usize] += 1;
++             // SAFETY: no resource is left, and the device is idle.
++@@ -2205,24 +2374,38 @@
++         let block_size = match dedicated {
++             true => size,
++             false => lock(memory).next_block_bytes(pool, size),
++         };
+++        let available = lock(memory).pool(pool.0, pool.1).room();
+++        let trace = trace_memory(pool, block_size, available, 1);
++         if fit == Fit::Pooled {
++             if let Some(placement) =
++                 lock(memory).place_pooled(device, pool, (size, align), addressed, class)?
++             {
+++                trace_handle(trace, placement.memory);
+++                if trace != 0 {
+++                    crate::stage_trace::mark(trace, crate::stage_trace::Stage::MemoryReused, 1);
+++                }
++                 return Ok(placement);
++             }
++         }
++         // A dedicated image takes a spare block of its pool where one fits ([`SPARE_FOR`]); one
++         // placed apart takes memory no submission has used ([`Fit`]).
++-        if dedicated && fit == Fit::Pooled && holds == Holds::Images && addressed.is_none() {
+++        if fit == Fit::Pooled && holds == Holds::Images && addressed.is_none() {
++             let mut memory = lock(memory);
++-            if let Some(block) = memory.take_spare(device, pool, size) {
+++            if let Some(block) =
+++                memory.take_spare(device, pool, if dedicated { size } else { block_size })
+++            {
++                 let bytes = block.size;
++                 memory.say_block("took a spare dedicated block for an image", &block);
++-                let index = memory.pool(pool.0, pool.1).add(bytes, true, block, size);
+++                let index = memory
+++                    .pool(pool.0, pool.1)
+++                    .add(bytes, dedicated, block, size);
++                 let placement = memory.placement(pool, index, 0, size, false);
+++                trace_handle(trace, placement.memory);
+++                if trace != 0 {
+++                    crate::stage_trace::mark(trace, crate::stage_trace::Stage::MemoryReused, 2);
+++                }
++                 memory.say_placement("placed", &placement, Some(class));
++                 return Ok(placement);
++             }
++         }
++@@ -2234,8 +2417,12 @@
++             made => made,
++         };
++         match made {
++             Ok(block) => {
+++                trace_handle(trace, block.memory);
+++                if trace != 0 {
+++                    crate::stage_trace::mark(trace, crate::stage_trace::Stage::MemoryAllocated, 1);
+++                }
++                 let mut memory = lock(memory);
++                 let index = memory.add_block(pool, block, block_size, dedicated, size);
++                 let placement = memory.placement(pool, index, 0, size, addressed.is_some());
++                 memory.say_placement("placed", &placement, Some(class));
++@@ -2245,8 +2432,37 @@
++             Err(error) => return Err(error),
++         }
++     }
++     Err(failure)
+++}
+++
+++/// Release owned unused backing on the room worker, outside the allocator lock.
+++pub(super) fn reap_retired(memory: &Mutex<Memory>, device: &ash::Device) {
+++    use std::sync::atomic::Ordering;
+++    let (blocks, bytes, count) = {
+++        let mut memory = lock(memory);
+++        memory.age_spare(device, Instant::now());
+++        let blocks: Vec<_> = memory.retired.drain(..).collect();
+++        (
+++            blocks,
+++            Arc::clone(&memory.retiring_bytes),
+++            Arc::clone(&memory.retiring_count),
+++        )
+++    };
+++    for (id, block, cause) in blocks {
+++        let size = block.size;
+++        if id != 0 {
+++            crate::stage_trace::mark(id, crate::stage_trace::Stage::MemoryFreeBegin, 0);
+++        }
+++        // SAFETY: retired blocks contain no placement, pending GPU reader or program-owned keep-alive.
+++        unsafe { block.release(device) };
+++        lock(memory).freed_by[cause as usize] += 1;
+++        bytes.fetch_sub(size, Ordering::Relaxed);
+++        count.fetch_sub(1, Ordering::Relaxed);
+++        if id != 0 {
+++            crate::stage_trace::mark(id, crate::stage_trace::Stage::MemoryFreeEnd, 0);
+++        }
+++    }
++ }
++
++ /// Keep room for any pooled placement (half a block) in each pool the runtime's encodings and
++ /// commits place their own resources in ([`Memory::kept`]), making a block, with `memory`'s lock
++@@ -2273,19 +2489,46 @@
++             .collect();
++         (lacking, memory.maker())
++     };
++     for (pool, bytes) in lacking {
+++        let available = lock(memory).pool(pool.0, pool.1).room();
+++        let trace = trace_memory(pool, bytes, available, 2);
+++        // A spare image block gives the room without a new allocation.
+++        if pool.0 == Holds::Images {
+++            let mut memory = lock(memory);
+++            if memory.pool(pool.0, pool.1).has_room(bytes / 2) {
+++                continue;
+++            }
+++            memory.age_spare(device, Instant::now());
+++            if let Some(block) = memory.take_spare_for_room(pool, bytes / 2) {
+++                trace_handle(trace, block.memory);
+++                if trace != 0 {
+++                    crate::stage_trace::mark(trace, crate::stage_trace::Stage::MemoryReused, 3);
+++                }
+++                memory.say_block("took a spare block of images for room", &block);
+++                let size = block.size;
+++                memory.pool(pool.0, pool.1).add(size, false, block, 0);
+++                continue;
+++            }
+++        }
++         let addressed = (pool.0 == Holds::Buffers).then_some(counts);
++         let Ok(block) = maker.make(device, pool.1, bytes, addressed) else {
++             continue;
++         };
+++        trace_handle(trace, block.memory);
+++        if trace != 0 {
+++            crate::stage_trace::mark(trace, crate::stage_trace::Stage::MemoryAllocated, 1);
+++        }
++         let mut memory = lock(memory);
++         if memory.pool(pool.0, pool.1).has_room(bytes / 2) {
++             let what = "made a pooled block and freed it at once, its pool having room";
++             memory.say_block(what, &block);
++-            drop(memory);
++-            // SAFETY: nothing is placed in the block, which no command reads.
++-            unsafe { block.release(device) };
+++            if pool.0 == Holds::Images && block.plain() {
+++                memory.keep_spare(device, pool, block, Instant::now());
+++            } else {
+++                // SAFETY: nothing is placed in the block, which no command reads.
+++                drop(unsafe { memory.let_go(device, block, FreeCause::KeptForRoom, None) });
+++            }
++             continue;
++         }
++         memory.add_block(pool, block, bytes, false, 0);
++     }
++diff --git a/crates/metal2vulkan-runtime/src/pipeline/creation_log.rs b/crates/metal2vulkan-runtime/src/pipeline/creation_log.rs
++--- a/crates/metal2vulkan-runtime/src/pipeline/creation_log.rs
+++++ b/crates/metal2vulkan-runtime/src/pipeline/creation_log.rs
++@@ -58,8 +58,33 @@
++ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
++ use std::sync::{Mutex, OnceLock};
++ use std::time::{Duration, Instant};
++
+++// Actual Vulkan-object aliases are emitted after creation, regardless of the
+++// driver's compilation thread. The frontend owns one synchronized journal.
+++type ProfileAlias = unsafe extern "C" fn(u64, *const u8, usize);
+++static PROFILE_ALIAS: AtomicUsize = AtomicUsize::new(0);
+++pub(super) fn set_profile_alias(callback: Option<ProfileAlias>) -> u32 {
+++    PROFILE_ALIAS.store(callback.map_or(0, |callback| callback as usize), Ordering::Release);
+++    (PROFILE_ALIAS.load(Ordering::Acquire) != 0) as u32
+++}
+++pub(crate) fn profile_alias(raw: u64, text: &str) {
+++    let address = PROFILE_ALIAS.load(Ordering::Acquire);
+++    if address == 0 { return; }
+++    let emit: ProfileAlias = unsafe { std::mem::transmute(address) };
+++    unsafe { emit(raw, text.as_ptr(), text.len()); }
+++}
+++
+++pub(crate) trait ProfilePipeline {
+++    fn profile_handle(&self) -> u64;
+++}
+++impl ProfilePipeline for super::objects::RawPipeline {
+++    fn profile_handle(&self) -> u64 { ash::vk::Handle::as_raw(self.raw) }
+++}
+++impl ProfilePipeline for std::sync::Arc<super::objects::RawPipeline> {
+++    fn profile_handle(&self) -> u64 { ash::vk::Handle::as_raw(self.raw) }
+++}
+++
++ /// The pipelines a state keeps for its diffs.
++ const HISTORY: usize = 256;
++
++ /// The census name of a fragment function's discards that wait until after its stores.
++@@ -187,8 +212,12 @@
++ /// A key's fields, by name.
++ type Fields = BTreeMap<String, String>;
++
++ impl StateLog {
+++    pub(crate) fn profile_alias(&self, raw: ash::vk::Pipeline) {
+++        profile_alias(ash::vk::Handle::as_raw(raw), &self.name);
+++    }
+++
++     /// The log of a state labelled `label` whose functions are `functions`, numbered now; `None`
++     /// while the log is off.
++     pub(crate) fn new(label: Option<&str>, functions: &[String]) -> Option<StateLog> {
++         if !enabled() {
++@@ -205,9 +234,9 @@
++
++     /// Make the `VkPipeline` of `key` of the variant of `variant` (compiled as `pipeline`, its
++     /// stages' SPIR-V hashed as [`spirv_hashes`] hashes it) on `device` with `make`, and log it:
++     /// [`begin`](Self::begin) and [`Line::made`] on this thread.
++-    pub(crate) fn made<T, E>(
+++    pub(crate) fn made<T: ProfilePipeline, E>(
++         &self,
++         device: &Device,
++         keys: (&VariantKey, &RenderPipeline, &GraphicsKey, &[u64]),
++         make: impl FnOnce() -> Result<T, E>,
++@@ -260,9 +289,9 @@
++         self
++     }
++
++     /// Make the pipeline with `make` on this thread, and deliver the line.
++-    pub(crate) fn made<T, E>(
+++    pub(crate) fn made<T: ProfilePipeline, E>(
++         self,
++         device: &Device,
++         make: impl FnOnce() -> Result<T, E>,
++     ) -> Result<T, E> {
++@@ -279,8 +308,9 @@
++         };
++         let start = Instant::now();
++         // This making's split, the one of a making that encloses it put back after it.
++         let (made, parts) = split_of(make);
+++        if let Ok(ref pipeline) = made { profile_alias(pipeline.profile_handle(), &format!("{} {}", self.head, self.described)); }
++         let turn = super::budget::take_waited();
++         let elapsed = start.elapsed().saturating_sub(turn);
++         let waited = queued + turn;
++         let overlapped = overlapped || BEGUN.load(Ordering::SeqCst) != begun + 1;
++diff --git a/crates/metal2vulkan-runtime/src/pipeline/dispatch_making.rs b/crates/metal2vulkan-runtime/src/pipeline/dispatch_making.rs
++--- a/crates/metal2vulkan-runtime/src/pipeline/dispatch_making.rs
+++++ b/crates/metal2vulkan-runtime/src/pipeline/dispatch_making.rs
++@@ -75,8 +75,9 @@
++ use super::piece_holds::PieceHolds;
++ use super::pool::Place;
++ use super::{ComputePipelineState, RegionKey, Variant};
++ use crate::degradation::{BoundFormats, Occurrence};
+++use crate::device::lock;
++ use crate::error::Error;
++ use crate::Device;
++ use metal2vulkan::bind::{BindState, BoundSampler, Dispatch, DispatchRegion, SamplerDescriptor};
++ use metal2vulkan::device::PipelineWaitPolicy;
++@@ -212,8 +213,13 @@
++     /// A dispatch that binds `formats` takes `made`, its `VkPipeline` of `key`: where `made` was
++     /// made at its state's creation and this is its first dispatch, the notices its making would
++     /// have announced are announced now, naming what the dispatch binds (the module docs).
++     pub(super) fn first_use(&self, made: &RawPipeline, key: &RegionKey, formats: BoundFormats<'_>) {
+++        if std::env::var_os("COACHZ_GPU_WORK_TRACE").is_some() {
+++            for name in lock(&self.coachz_names).iter() {
+++                super::creation_log::profile_alias(ash::vk::Handle::as_raw(made.raw), &format!("compute {name} variant {:?}", self.key));
+++            }
+++        }
++         if made.first_drawn() {
++             self.objects
++                 .device
++                 .shared()
++diff --git a/crates/metal2vulkan-runtime/src/pipeline/mod.rs b/crates/metal2vulkan-runtime/src/pipeline/mod.rs
++--- a/crates/metal2vulkan-runtime/src/pipeline/mod.rs
+++++ b/crates/metal2vulkan-runtime/src/pipeline/mod.rs
++@@ -493,8 +493,9 @@
++
++ /// One compiled variant of a state.
++ pub(super) struct Variant {
++     key: VariantKey,
+++    coachz_names: Mutex<Vec<String>>,
++     /// Shared with the execution records of the dispatches that ran it (`execution.rs`).
++     pipeline: Arc<ComputePipeline>,
++     objects: Arc<VariantObjects>,
++     plans: Mutex<Lru<BindShape, Arc<BindingPlan>>>,
++@@ -626,8 +627,14 @@
++     }
++ }
++
++ impl ComputePipelineState {
+++    /// Optional owner diagnostics, registered before device creation. No symbol
+++    /// lookup or assumptions about the dynamic loader's global namespace.
+++    pub fn coachz_set_profile_alias(callback: Option<unsafe extern "C" fn(u64, *const u8, usize)>) -> u32 {
+++        creation_log::set_profile_alias(callback)
+++    }
+++
++     /// The state `descriptor` describes, made on `device` under `options`; a binary archive's
++     /// add notes what the creation used in `used`. The kernel's dynamic libraries are loaded
++     /// first (`dynamic_library.rs`), and the state keeps the descriptor with them.
++     pub(crate) fn create(
++@@ -734,9 +741,9 @@
++             };
++             indirect_arguments::check_compute(call, uses)?;
++         }
++         let stand_in = !key.storage_images.is_empty();
++-        let base = Variant::of(device, key, found)?;
+++        let base = Variant::of(device, key, found, function.function.info().name)?;
++         // The device's neutrals the base's plan for nothing bound may bind (an unbound texture,
++         // sampler or texel slot's), made here, where the creation may wait, so that no dispatch's
++         // encoding makes one (`neutral.rs`; `RenderPipelineState::make_neutrals`). One that fails
++         // is left to the dispatch that binds it. And room kept in the memory the encodings place
++@@ -1546,9 +1553,9 @@
++     ) -> Result<Arc<Variant>, Error> {
++         let _noted = NoteEntries(device);
++         let (found, _) = Variant::compiled(&Sources::later(device), function, descriptor, &key)
++             .map_err(|error| compile_error(device, error))?;
++-        Variant::of(device, key, found)
+++        Variant::of(device, key, found, function.function.info().name)
++     }
++
++     /// The pipeline of `descriptor` with `function` its kernel or tile function, under `key`:
++     /// the variant of it the memo knows live, or the pipeline `sources` give, each stage found or
++@@ -1592,11 +1599,18 @@
++     fn of(
++         device: &Device,
++         key: VariantKey,
++         found: Remembered<ComputePipeline, Variant>,
+++        coachz_name: &str,
++     ) -> Result<Arc<Variant>, Error> {
++         let pipeline = match found {
++-            Remembered::Live(variant) if variant.key == key => return Ok(variant),
+++            Remembered::Live(variant) if variant.key == key => {
+++                if std::env::var_os("COACHZ_GPU_WORK_TRACE").is_some() {
+++                    let mut names = lock(&variant.coachz_names);
+++                    if !names.iter().any(|name| name == coachz_name) { names.push(coachz_name.to_owned()); }
+++                }
+++                return Ok(variant);
+++            },
++             Remembered::Live(variant) => Arc::clone(&variant.pipeline),
++             Remembered::Compiled(pipeline) => pipeline,
++         };
++         // Before the variant's shader modules, as a render variant's.
++@@ -1609,8 +1623,9 @@
++             CompiledPipeline::Kernel(&pipeline),
++             None,
++         )?;
++         let variant = Arc::new(Variant {
+++            coachz_names: Mutex::new(vec![coachz_name.to_owned()]),
++             key,
++             pipeline,
++             objects: Arc::new(objects),
++             plans: Mutex::new(Lru::counted(PLANS)),
++@@ -1693,8 +1708,13 @@
++                 .objects
++                 .pipeline(&key, graphics::Notices::Now(Some(formats)))?;
++             Ok(made.kept_at(&self.objects, kept::Place::Region(key.clone())))
++         })?;
+++        if std::env::var_os("COACHZ_GPU_WORK_TRACE").is_some() {
+++            for name in lock(&self.coachz_names).iter() {
+++                creation_log::profile_alias(ash::vk::Handle::as_raw(made.raw), &format!("compute {name} variant {:?}", self.key));
+++            }
+++        }
++         self.first_use(&made, &key, formats);
++         Ok(made)
++     }
++
 +diff --git a/crates/metal2vulkan-runtime/src/pipeline/render.rs b/crates/metal2vulkan-runtime/src/pipeline/render.rs
 +--- a/crates/metal2vulkan-runtime/src/pipeline/render.rs
 ++++ b/crates/metal2vulkan-runtime/src/pipeline/render.rs
@@ -603,6 +1466,92 @@ new file mode 100644
 +     pub(super) fn of_tile(state: TileState) -> RenderPipelineState {
 +         RenderPipelineState(Kind::Tile(state))
 +     }
++@@ -2710,9 +2801,11 @@
++             .device
++             .shared()
++             .counts
++             .graphics_pipeline_looked_up();
++-        self.made_or_make(key, render_pass, (state, formats))
+++        let made = self.made_or_make(key, render_pass, (state, formats))?;
+++        if let Some(log) = &state.0.log { log.profile_alias(made.raw); }
+++        Ok(made)
++     }
++
++     /// The `VkPipeline` of `key` for an execution's settle at commit, which records nothing
++     /// (`render/executions.rs`), against `render_pass`: from the memo, the making in flight for
++@@ -2734,9 +2827,12 @@
++                 .map(DrawPipeline::Made);
++         }
++         device.shared().counts.graphics_pipeline_looked_up();
++         Ok(match self.pipelines.begin_at(key) {
++-            (Begun::Made(made), _) => DrawPipeline::Made(made),
+++            (Begun::Made(made), _) => {
+++                if let Some(log) = &state.0.log { log.profile_alias(made.raw); }
+++                DrawPipeline::Made(made)
+++            },
++             (Begun::Pending(pending), _) => DrawPipeline::Making(pending),
++             (Begun::Yours(ticket), _) => {
++                 self.make_drawn(device, key, render_pass, (state, formats), ticket)
++             }
++@@ -2939,14 +3035,16 @@
++         compatible: &Arc<RenderPassObject>,
++         (state, formats): (&GraphicsState, crate::degradation::BoundFormats<'_>),
++     ) -> (DrawPipeline, bool) {
++         if let Some(made) = self.last_made(state, key) {
+++            if let Some(log) = &state.0.log { log.profile_alias(made.raw); }
++             return (DrawPipeline::Made(made), true);
++         }
++         device.shared().counts.graphics_pipeline_looked_up();
++         let key = &key.key();
++         match self.pipelines.begin_at(key) {
++             (Begun::Made(made), at) => {
+++                if let Some(log) = &state.0.log { log.profile_alias(made.raw); }
++                 if let Some(at) = at {
++                     self.keep_last(state, key, at);
++                 }
++                 (DrawPipeline::Made(made), true)
++@@ -2954,8 +3052,9 @@
++             // A draw of a key another caller makes takes the key's residual form where it is made
++             // (`render/residual.rs`).
++             (Begun::Pending(pending), _) => match self.residual_made(key) {
++                 Some(drawn) => {
+++                    if let Some(log) = &state.0.log { log.profile_alias(drawn.raw); }
++                     device.shared().counts.residual_form_drawn();
++                     (DrawPipeline::Made(drawn), false)
++                 }
++                 None => (DrawPipeline::Making(pending), false),
++@@ -2965,8 +3064,9 @@
++                     // Handed to the pool: the draw takes the key's residual form where it is made,
++                     // and nothing waits for the making (`render/residual.rs`).
++                     DrawPipeline::Making(pending) => match self.residual_made(key) {
++                         Some(drawn) => {
+++                    if let Some(log) = &state.0.log { log.profile_alias(drawn.raw); }
++                             device.shared().counts.residual_form_making();
++                             device.shared().counts.residual_form_drawn();
++                             (DrawPipeline::Made(drawn), false)
++                         }
++@@ -2990,17 +3090,20 @@
++         render_pass: &Arc<RenderPassObject>,
++         (state, formats): (&GraphicsState, crate::degradation::BoundFormats<'_>),
++     ) -> Result<Arc<RawPipeline>, Error> {
++         if let Some(made) = self.last_made(state, key) {
+++            if let Some(log) = &state.0.log { log.profile_alias(made.raw); }
++             return Ok(made);
++         }
++         device.shared().counts.graphics_pipeline_looked_up();
++         let key = &key.key();
++         if let Some((made, at)) = self.pipelines.made_with_at(key) {
++             self.keep_last(state, key, at);
++             return Ok(made);
++         }
++-        self.made_or_make(key, render_pass, (state, formats))
+++        let made = self.made_or_make(key, render_pass, (state, formats))?;
+++        if let Some(log) = &state.0.log { log.profile_alias(made.raw); }
+++        Ok(made)
++     }
++
++     /// The `VkPipeline` of a draw of this variant and `key` where `state`'s last draws found it
++     /// made, and its entry stays: the draw uses it as a lookup of the key would, the key compared,
 +diff --git a/crates/metal2vulkan-runtime/src/render/draw_shape.rs b/crates/metal2vulkan-runtime/src/render/draw_shape.rs
 +--- a/crates/metal2vulkan-runtime/src/render/draw_shape.rs
 ++++ b/crates/metal2vulkan-runtime/src/render/draw_shape.rs
@@ -860,6 +1809,130 @@ new file mode 100644
 ++    let rows = COACHZ_HOST_ALIASES.lock().ok()?;
 ++    rows.iter().max_by_key(|r| r[6].saturating_mul(r[4])).copied()
 ++}
++diff --git a/crates/metal2vulkan-runtime/src/stage_trace.rs b/crates/metal2vulkan-runtime/src/stage_trace.rs
++--- a/crates/metal2vulkan-runtime/src/stage_trace.rs
+++++ b/crates/metal2vulkan-runtime/src/stage_trace.rs
++@@ -61,8 +61,51 @@
++     /// changes made).
++     SubmitStep = 16,
++     /// The scheduler's thread went to sleep (id 0, `arg`: slice in ms, | 0x8000 on the GPU).
++     SchedulerSleep = 20,
+++    /// A memory operation began (`arg`: 1 foreground placement, 2 room keeper, 3 release).
+++    MemoryBegin = 40,
+++    /// Its pool (`arg`: memory type * 2 + 1 for images, + 0 for buffers).
+++    MemoryPool = 41,
+++    /// Its requested backing bytes in 64 KiB units (rounded up, saturated at 65535).
+++    MemoryBytes = 42,
+++    /// Its pool's available contiguous range in 64 KiB units (rounded up, saturated at 65535) at the decision.
+++    MemoryAvailable = 43,
+++    /// Its Vulkan allocation ended (`arg`: 1 success, 0 refused).
+++    MemoryAllocated = 44,
+++    /// Existing backing was reused (`arg`: 1 pooled placement, 2 spare placement, 3 spare for room).
+++    MemoryReused = 45,
+++    /// Its memory handle's bits 0..15.
+++    MemoryHandleLow = 46,
+++    /// Its memory handle's bits 32..47.
+++    MemoryHandleHigh = 47,
+++    /// Its backing was retained for reuse (`arg`: total spare bytes in 64 KiB units (rounded up, saturated at 65535)).
+++    MemoryCached = 48,
+++    /// Its physical release was queued (`arg`: pending bytes in 64 KiB units (rounded up, saturated at 65535)).
+++    MemoryDeferred = 49,
+++    /// Its physical release began.
+++    MemoryFreeBegin = 50,
+++    /// Its physical release ended.
+++    MemoryFreeEnd = 51,
+++    /// A release ran inline because the bounded queue was full.
+++    MemoryQueueFull = 52,
+++    /// Completion processing began.
+++    CompleteBegin = 53,
+++    /// Completion state and resource ownership were collected.
+++    CompleteState = 54,
+++    /// User completion handlers returned.
+++    CompleteHandlers = 55,
+++    /// Retained objects and runtime resources were released.
+++    CompleteRetained = 56,
+++    /// Completion gate and command-pool preparation ended.
+++    CompleteEnd = 57,
+++    /// Its memory handle's bits 16..31.
+++    MemoryHandleMid = 58,
+++    /// Its memory handle's bits 48..63.
+++    MemoryHandleTop = 59,
+++    /// Vulkan command buffer belonging to this runtime command (full handle in `link`).
+++    VulkanCommandBuffer = 60,
+++
++     /// Something woke the scheduler's thread (id 0, `arg`: 0 commit, 1 completion, 2 host).
++     SchedulerWake = 21,
++     /// The scheduler's thread resumed after its sleep (id 0, `arg`: 1 timed out).
++     SchedulerResumed = 22,
++@@ -74,8 +117,9 @@
++
++ struct Slot {
++     when: AtomicU64,
++     id: AtomicU64,
+++    link: AtomicU64,
++     /// stage | arg << 16 | sequence << 32: a reader takes the slot only where the sequence is the
++     /// one it asked for.
++     word: AtomicU64,
++ }
++@@ -83,8 +127,9 @@
++ #[allow(clippy::declare_interior_mutable_const)]
++ const EMPTY: Slot = Slot {
++     when: AtomicU64::new(0),
++     id: AtomicU64::new(0),
+++    link: AtomicU64::new(0),
++     word: AtomicU64::new(0),
++ };
++ static SLOTS: [Slot; RING] = [EMPTY; RING];
++ static NEXT: AtomicU64 = AtomicU64::new(1);
++@@ -125,16 +170,22 @@
++ }
++
++ /// Record `stage` of `id` with `arg`, now, where the diagnostics are on ([`diagnostics`]).
++ pub(crate) fn mark(id: usize, stage: Stage, arg: u32) {
+++    mark_link(id, stage, arg, 0);
+++}
+++
+++/// A stage plus a full-width related object id (for Vulkan command-buffer joins).
+++pub(crate) fn mark_link(id: usize, stage: Stage, arg: u32, link: u64) {
++     if !diagnostics() {
++         return;
++     }
++     let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
++     let slot = &SLOTS[(sequence as usize) & (RING - 1)];
++     slot.word.store(0, Ordering::Release);
++     slot.when.store(now_nanos(), Ordering::Relaxed);
++     slot.id.store(id as u64, Ordering::Relaxed);
+++    slot.link.store(link, Ordering::Relaxed);
++     let word = stage as u64 | ((arg as u64 & 0xffff) << 16) | ((sequence & 0xffff_ffff) << 32);
++     slot.word.store(word, Ordering::Release);
++ }
++
++@@ -145,8 +196,10 @@
++     /// Host uptime nanoseconds.
++     pub when: u64,
++     /// The command buffer's id (0: the scheduler's thread).
++     pub id: u64,
+++    /// Related object id, zero for stages without a link.
+++    pub link: u64,
++     /// Its place among all records.
++     pub sequence: u32,
++     /// [`Stage`] as its number.
++     pub stage: u16,
++@@ -165,12 +218,14 @@
++         let word = slot.word.load(Ordering::Acquire);
++         if word >> 32 == sequence & 0xffff_ffff && word & 0xffff != 0 {
++             let when = slot.when.load(Ordering::Relaxed);
++             let id = slot.id.load(Ordering::Relaxed);
+++            let link = slot.link.load(Ordering::Relaxed);
++             if slot.word.load(Ordering::Acquire) == word {
++                 out[written] = StageRecord {
++                     when,
++                     id,
+++                    link,
++                     sequence: sequence as u32,
++                     stage: (word & 0xffff) as u16,
++                     arg: ((word >> 16) & 0xffff) as u16,
++                 };
 +diff --git a/crates/metal2vulkan-runtime/src/texture/in_place_image.rs b/crates/metal2vulkan-runtime/src/texture/in_place_image.rs
 +--- a/crates/metal2vulkan-runtime/src/texture/in_place_image.rs
 ++++ b/crates/metal2vulkan-runtime/src/texture/in_place_image.rs
@@ -951,33 +2024,410 @@ new file mode 100644
 ++        req.memory_type_bits as u64, why, 0, 0,
 ++    ], class);
 ++}
-+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
-+--- a/crates/metal2vulkan-runtime/src/texture.rs
-++++ b/crates/metal2vulkan-runtime/src/texture.rs
-+@@ -2205,8 +2205,18 @@
-+                          texture was made"
-+                             .to_owned(),
-+                     )
-+                 } else if texels.buffer.copied() {
-++                    // This refuses before querying image requirements. Distinguish it
-++                    // from an actual Vulkan bind alignment/size/type refusal.
-++                    let layout = texels.layout;
-++                    let (_, buffer_offset, type_index) = texels.buffer.memory();
-++                    crate::shadow::coachz_record_placement([
-++                        plan.format.as_raw() as u64, plan.extent[0] as u64, plan.extent[1] as u64,
-++                        layout.row_pitch, layout.offset, buffer_offset + layout.offset,
-++                        0, 0, texels.buffer.memory_room().saturating_sub(layout.offset),
-++                        type_index as u64, 0, 8, 0, 0,
-++                    ], class);
-+                     // A copied host buffer's bytes the GPU uses lie in memory of the device's
-+                     // own, no import of the pages (`copied.rs`): the shadow copies them, its
-+                     // copies the buffer's uses, which commits copy in and completions merge back.
-+                     ShadowCause::Refused(
+diff --git a/patches/mesa/coachz-port-ir3-fragment-consts.patch b/patches/mesa/coachz-port-ir3-fragment-consts.patch
+new file mode 100644
+--- /dev/null
++++ b/patches/mesa/coachz-port-ir3-fragment-consts.patch
+@@ -0,0 +1,22 @@
++diff --git a/src/freedreno/ir3/ir3_shader.h b/src/freedreno/ir3/ir3_shader.h
++index 85ac86b..7bee2de 100644
++--- a/src/freedreno/ir3/ir3_shader.h
+++++ b/src/freedreno/ir3/ir3_shader.h
++@@ -1161,7 +1161,16 @@ _ir3_max_const(const struct ir3_shader_variant *v, bool safe_constlen)
++    } else if (safe_constlen) {
++       return compiler->max_const_safe - safe_shared_consts_size;
++    } else if (v->type == MESA_SHADER_FRAGMENT) {
++-      return compiler->max_const_frag - shared_consts_size;
+++      /* Where a fragment shader may fill the whole pipeline's const space
+++       * (max_const_frag == max_const_pipeline), a large one does, with pushed
+++       * UBO ranges and its preamble: any const of another stage then makes
+++       * ir3_trim_constlen swap it for its safe_constlen variant, which reads
+++       * its uniforms from memory. Leave the other stages the share a safe
+++       * variant would leave them.
+++       */
+++      uint32_t others = compiler->max_const_frag == compiler->max_const_pipeline ?
+++         compiler->max_const_safe - safe_shared_consts_size : 0;
+++      return compiler->max_const_frag - shared_consts_size - others;
++    } else {
++       return compiler->max_const_geom - shared_consts_size_geom;
++    }
+diff --git a/patches/mesa/coachz-port-turnip-keep-device.patch b/patches/mesa/coachz-port-turnip-keep-device.patch
+new file mode 100644
+--- /dev/null
++++ b/patches/mesa/coachz-port-turnip-keep-device.patch
+@@ -0,0 +1,37 @@
++diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
++index 6aa16fa..51a8cae 100644
++--- a/src/freedreno/vulkan/tu_knl_darwin.cc
+++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
++@@ -1733,6 +1733,15 @@ darwin_device_get_suspend_count(struct tu_device *dev, uint64_t *suspend_count)
++    return 0;
++ }
++ 
+++/* Submissions of this process's devices the kernel ended at a hang or a fault (darwin_device_check_status). */
+++static uint32_t darwin_restarts;
+++extern "C" __attribute__((visibility("default"))) uint32_t tu_darwin_restarts(void);
+++extern "C" __attribute__((visibility("default"))) uint32_t
+++tu_darwin_restarts(void)
+++{
+++   return p_atomic_read(&darwin_restarts);
+++}
+++
++ static VkResult
++ darwin_device_check_status(struct tu_device *device)
++ {
++@@ -1743,10 +1752,13 @@ darwin_device_check_status(struct tu_device *device)
++    if (kr != KERN_SUCCESS)
++       return vk_device_set_lost(&device->vk, "error getting GPU status: 0x%x", kr);
++    if (reply.faults != device->fault_count) {
++-      const uint64_t before = device->fault_count;
+++      /* UniXNU c72a8a5: the kernel ended a submission of this device (a hang or a fault): it retired that submission, restarted the
+++       * GPU and replayed every other one. The device's memory, pipelines and queues are as they were, so the device is not lost: a
+++       * Metal device keeps its resources across a GPU restart and only the command buffer in flight ends with an error, and a render
+++       * server cannot make its resources again. The count is kept for telemetry (tu_darwin_restarts).
+++       */
+++      p_atomic_add(&darwin_restarts, (uint32_t)(reply.faults - device->fault_count));
++       device->fault_count = reply.faults;
++-      return vk_device_set_lost(&device->vk, "GPU faults changed %llu -> %llu (global + client VM)",
++-                                (unsigned long long)before, (unsigned long long)reply.faults);
++    }
++    return VK_SUCCESS;
++ }
+diff --git a/patches/mesa/coachz-port-turnip-one-va.patch b/patches/mesa/coachz-port-turnip-one-va.patch
+new file mode 100644
+--- /dev/null
++++ b/patches/mesa/coachz-port-turnip-one-va.patch
+@@ -0,0 +1,109 @@
++diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
++index 18c8419..6aa16fa 100644
++--- a/src/freedreno/vulkan/tu_knl_darwin.cc
+++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
++@@ -100,6 +100,22 @@ struct darwin_va {
++    uint64_t used;   /* bytes handed out */
++ };
++ 
+++/* One allocator for the process: every device of the process maps through the one kernel connection (dw.conn), whose
+++ * window of GPU addresses they share. A device of its own allocator handed out the window's first addresses again while
+++ * another device's mappings lay there: the kernel refused the map, and the cleanup lost the device. A range a destroyed
+++ * device never freed stays taken. */
+++static struct darwin_va darwin_process_va;
+++static pthread_mutex_t darwin_process_va_lock = PTHREAD_MUTEX_INITIALIZER;
+++
+++static uint64_t
+++darwin_va_holes(void)
+++{
+++   pthread_mutex_lock(&darwin_process_va_lock);
+++   const uint64_t holes = darwin_process_va.holes;
+++   pthread_mutex_unlock(&darwin_process_va_lock);
+++   return holes;
+++}
+++
++ struct darwin_retire_state {
++    pthread_mutex_t lock;
++    struct darwin_retired_bo *entries;   /* a ring of `capacity` records, grown when full */
++@@ -111,7 +127,6 @@ struct darwin_retire_state {
++    uint64_t cache_bytes, cache_stamp, cache_cleaned_s;
++    uint32_t pressure_seen;
++    struct darwin_bo_cache_stats cache_stats;
++-   struct darwin_va va;
++ };
++ static struct darwin_retire_state *darwin_stats_state;   /* for tu_darwin_bo_cache_stats */
++ 
++@@ -131,7 +146,7 @@ tu_darwin_bo_cache_stats(uint64_t out[8])
++    out[4] = retire->cache_stats.flushes;
++    out[5] = retire->cache_bytes;
++    out[6] = retire->cache_stats.bytes_peak;
++-   out[7] = retire->va.holes;
+++   out[7] = darwin_va_holes();
++    pthread_mutex_unlock(&retire->lock);
++ }
++ 
++@@ -606,11 +621,11 @@ static VkResult
++ darwin_allocate_iova(struct tu_device *dev, uint64_t size, uint64_t client_iova,
++                      enum tu_bo_alloc_flags flags, uint64_t *iova)
++ {
++-   struct darwin_va *va = &((struct darwin_retire_state *)dev->darwin_retire)->va;
+++   struct darwin_va *va = &darwin_process_va;
++    *iova = 0;
++-   mtx_lock(&dev->vma_mutex);
+++   pthread_mutex_lock(&darwin_process_va_lock);
++    if (!va->seeded) {
++-      /* Nothing else allocates from the heap the device made: the whole range is free. */
+++      /* The first device of the process: the whole range is free. */
++       va->seeded = true;
++       darwin_va_add(va, dev->physical_device->va_start, dev->physical_device->va_size);
++    }
++@@ -619,7 +634,7 @@ darwin_allocate_iova(struct tu_device *dev, uint64_t size, uint64_t client_iova,
++          if (darwin_va_alloc_at(va, client_iova, size))
++             *iova = client_iova;
++          else {
++-            mtx_unlock(&dev->vma_mutex);
+++            pthread_mutex_unlock(&darwin_process_va_lock);
++             return VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS;
++          }
++       } else {
++@@ -628,17 +643,17 @@ darwin_allocate_iova(struct tu_device *dev, uint64_t size, uint64_t client_iova,
++    } else {
++       *iova = darwin_va_alloc(va, size, os_page_size, false);
++    }
++-   mtx_unlock(&dev->vma_mutex);
+++   pthread_mutex_unlock(&darwin_process_va_lock);
++    return *iova ? VK_SUCCESS : VK_ERROR_OUT_OF_DEVICE_MEMORY;
++ }
++ 
++ static void
++ darwin_free_iova(struct tu_device *dev, uint64_t iova, uint64_t size)
++ {
++-   struct darwin_va *va = &((struct darwin_retire_state *)dev->darwin_retire)->va;
++-   mtx_lock(&dev->vma_mutex);
++-   darwin_va_free(va, iova, size);
++-   mtx_unlock(&dev->vma_mutex);
+++   (void)dev;
+++   pthread_mutex_lock(&darwin_process_va_lock);
+++   darwin_va_free(&darwin_process_va, iova, size);
+++   pthread_mutex_unlock(&darwin_process_va_lock);
++ }
++ 
++ /* Hands the CPU lease, the kernel allocation and the GPU range of a BO back. VK_NOT_READY: the kernel still holds it (retry later);
++@@ -694,7 +709,7 @@ darwin_cache_log(struct darwin_retire_state *retire)
++            (unsigned long long)st->lookups, (unsigned long long)st->hits, (unsigned long long)(st->hits * 100 / st->lookups),
++            (unsigned long long)(st->hits * 1000 / st->lookups % 10), (unsigned long long)retire->cache_count,
++            (unsigned long long)(retire->cache_bytes >> 20), (unsigned long long)st->evictions, (unsigned long long)st->flushes,
++-           (unsigned long long)retire->va.holes);
+++           (unsigned long long)darwin_va_holes());
++ }
++ 
++ /* Drops the cache entry at the index for real. VK_NOT_READY keeps it. */
++@@ -1689,8 +1704,6 @@ darwin_device_finish(struct tu_device *dev)
++       if (retire->cache_stats.lookups)
++          darwin_cache_log(retire);
++       darwin_stats_state = NULL;
++-      rb_tree_foreach_safe(struct darwin_va_hole, hole, &retire->va.address, by_address)
++-         free(hole);
++       pthread_mutex_destroy(&retire->lock);
++       free(retire->entries);
++       free(retire->cache);
+diff --git a/patches/mesa/coachz-port-turnip-row-pitch.patch b/patches/mesa/coachz-port-turnip-row-pitch.patch
+new file mode 100644
+--- /dev/null
++++ b/patches/mesa/coachz-port-turnip-row-pitch.patch
+@@ -0,0 +1,32 @@
++diff --git a/src/freedreno/vulkan/tu_clear_blit.cc b/src/freedreno/vulkan/tu_clear_blit.cc
++index cf2ae62..2c5666c 100644
++--- a/src/freedreno/vulkan/tu_clear_blit.cc
+++++ b/src/freedreno/vulkan/tu_clear_blit.cc
++@@ -5723,12 +5723,21 @@ bool
++ tu_attachment_unpadded(struct tu_cmd_buffer *cmd, const struct tu_image_view *iview)
++ {
++    const struct fd_dev_info *info = cmd->device->physical_device->info;
++-   return iview->image->layout[0].tile_mode == TILE6_LINEAR &&
++-          (iview->image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT ||
++-           (iview->image->vk.external_handle_types &
++-            (VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT |
++-             VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT))) &&
++-          (iview->view.width % info->gmem_align_w || iview->view.height % info->gmem_align_h);
+++   const struct fdl_layout *layout = &iview->image->layout[0];
+++   if (layout->tile_mode != TILE6_LINEAR ||
+++       !(iview->image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT ||
+++         (iview->image->vk.external_handle_types &
+++          (VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT |
+++           VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT))))
+++      return false;
+++   /* A blit event's blocks reach up to gmem_align_w - 1 texels past a row's last one and up to gmem_align_h - 1 rows past
+++    * the last row. Rows whose pitch holds the width rounded up to a block take that reach in their own padding (a surface
+++    * 3048 texels wide with 64-byte rows has 8 texels of it), so only a height that is not whole blocks, or a pitch tighter
+++    * than that, needs the draws and 2D blits: a screen-size surface otherwise paid a shaded load and a 2D store per pass.
+++    */
+++   const uint32_t level = iview->vk.base_mip_level;
+++   const uint32_t reach = ALIGN_POT(iview->view.width, info->gmem_align_w) * layout->cpp;
+++   return iview->view.height % info->gmem_align_h || reach > fdl_pitch(layout, level);
++ }
++ 
++ template <chip CHIP>
+diff --git a/patches/mesa/coachz-port-turnip-submit-cuts.patch b/patches/mesa/coachz-port-turnip-submit-cuts.patch
+new file mode 100644
+--- /dev/null
++++ b/patches/mesa/coachz-port-turnip-submit-cuts.patch
+@@ -0,0 +1,174 @@
++diff --git a/src/freedreno/vulkan/tu_knl.cc b/src/freedreno/vulkan/tu_knl.cc
++index 9c545c6..16db0b9 100644
++--- a/src/freedreno/vulkan/tu_knl.cc
+++++ b/src/freedreno/vulkan/tu_knl.cc
++@@ -318,6 +318,13 @@ tu_submit_add_entries(struct tu_device *dev, void *submit,
++                                                  num_entries);
++ }
++ 
+++void
+++tu_submit_begin_command_buffer(struct tu_device *dev, void *submit)
+++{
+++   if (dev->instance->knl->submit_begin_command_buffer)
+++      dev->instance->knl->submit_begin_command_buffer(dev, submit);
+++}
+++
++ void
++ tu_submit_add_bind(struct tu_device *dev,
++                    void *_submit,
++diff --git a/src/freedreno/vulkan/tu_knl.h b/src/freedreno/vulkan/tu_knl.h
++index 7260521..2c09442 100644
++--- a/src/freedreno/vulkan/tu_knl.h
+++++ b/src/freedreno/vulkan/tu_knl.h
++@@ -167,6 +167,11 @@ struct tu_knl {
++    void (*submit_add_entries)(struct tu_device *device, void *_submit,
++                               struct tu_cs_entry *entries,
++                               unsigned num_entries);
+++   /* Optional: the entries added next open a command buffer that sets up its
+++    * own command processor state (tu_init_hw), so a backend that has to cut a
+++    * submission into several kernel submissions may cut before them.
+++    */
+++   void (*submit_begin_command_buffer)(struct tu_device *device, void *_submit);
++    void (*submit_add_bind)(struct tu_device *device,
++                            void *_submit,
++                            struct tu_sparse_vma *vma, uint64_t vma_offset,
++@@ -332,6 +337,9 @@ tu_submit_add_entries(struct tu_device *dev, void *submit,
++                       struct tu_cs_entry *entries,
++                       unsigned num_entries);
++ 
+++void
+++tu_submit_begin_command_buffer(struct tu_device *dev, void *submit);
+++
++ void
++ tu_submit_add_bind(struct tu_device *device,
++                    void *_submit,
++diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
++index 51a8cae..480e605 100644
++--- a/src/freedreno/vulkan/tu_knl_darwin.cc
+++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
++@@ -1244,8 +1244,21 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
++ 
++ struct tu_darwin_queue_submit {
++    struct util_dynarray commands; /* NativeAdrenoAbiSubmitBuffer */
+++   struct util_dynarray starts;   /* uint32_t: the index in commands where a command buffer that sets up its own state begins */
++ };
++ 
+++/* Submissions that took more than one kernel submission: [0] such submissions, [1] cuts made where a command buffer begins, [2] cuts
+++ * made inside a command stream (no command buffer began within reach), [3] the most indirect buffers one submission had.
+++ */
+++static uint64_t darwin_split_counts[4];
+++extern "C" __attribute__((visibility("default"))) void tu_darwin_split_stats(uint64_t out[4]);
+++extern "C" __attribute__((visibility("default"))) void
+++tu_darwin_split_stats(uint64_t out[4])
+++{
+++   for (unsigned i = 0; i < 4; i++)
+++      out[i] = p_atomic_read(&darwin_split_counts[i]);
+++}
+++
++ static void *
++ darwin_submit_create(struct tu_device *device)
++ {
++@@ -1258,9 +1271,18 @@ darwin_submit_finish(struct tu_device *device, void *_submit)
++ {
++    struct tu_darwin_queue_submit *submit = (struct tu_darwin_queue_submit *)_submit;
++    util_dynarray_fini(&submit->commands);
+++   util_dynarray_fini(&submit->starts);
++    vk_free(&device->vk.alloc, submit);
++ }
++ 
+++static void
+++darwin_submit_begin_command_buffer(struct tu_device *device, void *_submit)
+++{
+++   struct tu_darwin_queue_submit *submit = (struct tu_darwin_queue_submit *)_submit;
+++   const uint32_t at = util_dynarray_num_elements(&submit->commands, NativeAdrenoAbiSubmitBuffer);
+++   util_dynarray_append(&submit->starts, at);
+++}
+++
++ static void
++ darwin_submit_add_entries(struct tu_device *device, void *_submit,
++                           struct tu_cs_entry *entries, unsigned num_entries)
++@@ -1473,7 +1495,7 @@ struct tu_darwin_submit_rec {
++    uint32_t call_us;       /* the kernel calls, ring-space waits included */
++    uint32_t space_wait_us; /* of call_us, waiting for ring space */
++    uint16_t busy;          /* kIOReturnBusy answers */
++-   uint8_t chunks;
+++   uint8_t chunks;         /* kernel submissions; bit 7: one of the cuts fell inside a command stream */
++    uint8_t buffers;        /* indirect buffers in all chunks, 255 at most */
++ };
++ static_assert(sizeof(struct tu_darwin_submit_rec) == 32, "submit record");
++@@ -1612,8 +1634,34 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
++    if (total) {
++       const NativeAdrenoAbiSubmitBuffer *all =
++          util_dynarray_element(&submit->commands, NativeAdrenoAbiSubmitBuffer, 0);
++-      for (unsigned at = 0; at < total; at += NativeAdrenoAbiMaxBuffers) {
++-         unsigned count = MIN2(total - at, (unsigned)NativeAdrenoAbiMaxBuffers);
+++      bool inside = false;
+++      if (total > darwin_split_counts[3])
+++         p_atomic_set(&darwin_split_counts[3], total);
+++      if (total > NativeAdrenoAbiMaxBuffers)
+++         p_atomic_inc(&darwin_split_counts[0]);
+++      for (unsigned at = 0, count = 0; at < total; at += count) {
+++         count = MIN2(total - at, (unsigned)NativeAdrenoAbiMaxBuffers);
+++         if (at + count < total) {
+++            /* The kernel ends every submission with both threads selected and concurrent binning on, and starts the next one with a
+++             * thread synchronization (NativeAdrenoRing's a7xx_submit framing). A command stream cut in two would run its second
+++             * half in that state instead of the one its first half set (BR alone with concurrent binning off, or BV in a visibility
+++             * pass): both threads would execute the rest of a pass. So the cut is made where a command buffer begins, the last such
+++             * place within reach: tu_init_hw selects the threads again there, as at the start of any submission.
+++             */
+++            unsigned cut = 0;
+++            util_dynarray_foreach (&submit->starts, uint32_t, start) {
+++               if (*start > at && *start <= at + count)
+++                  cut = *start;
+++            }
+++            if (cut) {
+++               count = cut - at;
+++               p_atomic_inc(&darwin_split_counts[1]);
+++            } else {
+++               /* One command buffer of more indirect buffers than a kernel submission takes: cut as before, and counted. */
+++               inside = true;
+++               p_atomic_inc(&darwin_split_counts[2]);
+++            }
+++         }
++          uint32_t chunk_fence = 0;
++          VkResult result = darwin_submit_chunk(queue, all + at, count, &chunk_fence, &rec);
++          if (result != VK_SUCCESS)
++@@ -1626,6 +1674,8 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
++       }
++       p_atomic_set(&queue->fence, fence);
++       rec.buffers = MIN2(total, 255u);
+++      if (inside)
+++         rec.chunks |= 0x80;   /* a cut inside a command stream */
++    } else {
++       /* Nothing to run: the signals resolve with the last earlier submission. */
++       fence = p_atomic_read(&queue->fence) > 0 ? (uint32_t)p_atomic_read(&queue->fence) : 0;
++@@ -1818,6 +1868,7 @@ static const struct tu_knl darwin_knl_funcs = {
++    .submit_create = darwin_submit_create,
++    .submit_finish = darwin_submit_finish,
++    .submit_add_entries = darwin_submit_add_entries,
+++   .submit_begin_command_buffer = darwin_submit_begin_command_buffer,
++    .submit_add_bind = darwin_submit_add_bind,
++    .queue_submit = darwin_queue_submit,
++    .queue_wait_fence = darwin_queue_wait_fence,
++diff --git a/src/freedreno/vulkan/tu_queue.cc b/src/freedreno/vulkan/tu_queue.cc
++index 1c97946..b021a46 100644
++--- a/src/freedreno/vulkan/tu_queue.cc
+++++ b/src/freedreno/vulkan/tu_queue.cc
++@@ -489,6 +489,17 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
++       struct tu_cmd_buffer *cmd_buffer = cmd_buffers[i];
++       struct tu_cs *cs = &cmd_buffer->cs;
++ 
+++      /* A primary command buffer the application began opens with tu_init_hw,
+++       * which selects the threads and sets every register it relies on. The
+++       * ones tu_insert_dynamic_cmdbufs adds for a suspended render pass
+++       * continue the state of the command buffer before them.
+++       */
+++      if (cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY &&
+++          cmd_buffer->queue_family_index == TU_QUEUE_GENERAL &&
+++          cmd_buffer->vk.pool !=
+++             vk_command_pool_from_handle(device->dynamic_rendering_pool))
+++         tu_submit_begin_command_buffer(device, submit);
+++
++       if (perf_pass_index != ~0) {
++          struct tu_cs_entry *perf_cs_entry =
++             &cmd_buffer->device->perfcntrs_pass_cs_entries[perf_pass_index];
 diff --git a/patches/mesa/turnip-coachz-diagnostics.patch b/patches/mesa/turnip-coachz-diagnostics.patch
 new file mode 100644
 --- /dev/null
 +++ b/patches/mesa/turnip-coachz-diagnostics.patch
-@@ -0,0 +1,358 @@
+@@ -0,0 +1,1100 @@
 +diff --git a/src/freedreno/fdl/fd6_layout.c b/src/freedreno/fdl/fd6_layout.c
 +--- a/src/freedreno/fdl/fd6_layout.c
 ++++ b/src/freedreno/fdl/fd6_layout.c
@@ -1011,6 +2461,334 @@ new file mode 100644
 +    uint32_t plane;
 + };
 +
++diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
++--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
+++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
++@@ -501,8 +501,10 @@
++    struct tu_cs *cs = &cmd_buffer->cs;
++    struct tu_cache_state *cache = &cmd_buffer->state.cache;
++    BITMASK_ENUM(tu_cmd_flush_bits) flushes = cache->flush_bits;
++
+++   if (flushes)
+++      trace_start_cache_flush(&cmd_buffer->trace, cs, cmd_buffer, flushes, 0);
++    tu6_emit_flushes<CHIP>(cmd_buffer, cs, cache);
++
++    if ((flushes & TU_CMD_FLAG_WAIT_FOR_BR) && CHIP >= A7XX &&
++        !(cmd_buffer->state.pass && cmd_buffer->state.renderpass_cb_disabled) &&
++@@ -568,8 +570,10 @@
++       util_dynarray_append(&cmd_buffer->cb_control_points, cb_patch);
++
++       trace_end_concurrent_binning_barrier(&cmd_buffer->trace, cs);
++    }
+++   if (flushes)
+++      trace_end_cache_flush(&cmd_buffer->trace, cs);
++ }
++ TU_GENX(tu_emit_cache_flush);
++
++ /* Renderpass cache flushes inside the draw_cs */
++@@ -583,13 +587,18 @@
++
++    struct tu_cs *cs = &cmd_buffer->draw_cs;
++    struct tu_cache_state *cache = &cmd_buffer->state.renderpass_cache;
++
+++   const uint32_t traced_flushes = cache->flush_bits;
+++   if (traced_flushes)
+++      trace_start_cache_flush(&cmd_buffer->trace, cs, cmd_buffer, traced_flushes, 1);
++    tu6_emit_flushes<CHIP>(cmd_buffer, cs, cache);
++    if (cmd_buffer->state.renderpass_cache.flush_bits &
++        TU_CMD_FLAG_BLIT_CACHE_CLEAN) {
++       cmd_buffer->state.blit_cache_cleaned = true;
++    }
+++   if (traced_flushes)
+++      trace_end_cache_flush(&cmd_buffer->trace, cs);
++ }
++ TU_GENX(tu_emit_cache_flush_renderpass);
++
++ template <chip CHIP>
++@@ -5701,8 +5710,9 @@
++    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
++    VK_FROM_HANDLE(tu_pipeline, pipeline, _pipeline);
++
++    if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_COMPUTE) {
+++      cmd->state.coachz_compute_pipeline = (uint64_t)_pipeline;
++       cmd->state.shaders[MESA_SHADER_COMPUTE] =
++          pipeline->shaders[MESA_SHADER_COMPUTE];
++       tu_cs_emit_state_ib(&cmd->cs,
++                           pipeline->shaders[MESA_SHADER_COMPUTE]->state);
++@@ -5710,8 +5720,9 @@
++       return;
++    }
++
++    assert(pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS);
+++   cmd->state.coachz_graphics_pipeline = (uint64_t)_pipeline;
++
++    struct tu_graphics_pipeline *gfx_pipeline = tu_pipeline_to_graphics(pipeline);
++    cmd->state.dirty |= TU_CMD_DIRTY_DESC_SETS | TU_CMD_DIRTY_SHADER_CONSTS |
++                        TU_CMD_DIRTY_VS_PARAMS | TU_CMD_DIRTY_PROGRAM;
++@@ -8560,22 +8571,26 @@
++ {
++    const struct tu_program_state *program = &cmd->state.program;
++    struct tu_render_pass_state *rp = &cmd->state.rp;
++
+++   trace_start_draw_setup(&cmd->rp_trace, &cmd->draw_cs, cmd);
+++
+++   /* Emit state first, because it's needed for bandwidth calculations */
+++   uint32_t dynamic_draw_state_dirty = 0;
+++   if (!BITSET_IS_EMPTY(cmd->vk.dynamic_graphics_state.dirty) ||
+++       (cmd->state.dirty & ~TU_CMD_DIRTY_COMPUTE_DESC_SETS)) {
+++      dynamic_draw_state_dirty = tu_emit_draw_state<CHIP>(cmd);
+++   }
+++
+++   trace_end_draw_setup(&cmd->rp_trace, &cmd->draw_cs);
+++   /* Draw hashes must follow the dirty-state update, which selects the actual executable. */
++    trace_start_draw(
++       &cmd->rp_trace, &cmd->draw_cs, cmd, draw_count,
++       cmd->state.program.stage_blake3[MESA_SHADER_VERTEX],
++       cmd->state.program.stage_blake3[MESA_SHADER_TESS_CTRL],
++       cmd->state.program.stage_blake3[MESA_SHADER_TESS_EVAL],
++       cmd->state.program.stage_blake3[MESA_SHADER_GEOMETRY],
++       cmd->state.program.stage_blake3[MESA_SHADER_FRAGMENT]);
++-
++-   /* Emit state first, because it's needed for bandwidth calculations */
++-   uint32_t dynamic_draw_state_dirty = 0;
++-   if (!BITSET_IS_EMPTY(cmd->vk.dynamic_graphics_state.dirty) ||
++-       (cmd->state.dirty & ~TU_CMD_DIRTY_COMPUTE_DESC_SETS)) {
++-      dynamic_draw_state_dirty = tu_emit_draw_state<CHIP>(cmd);
++-   }
++
++    /* Primitive restart value works in non-indexed draws, we have to disable
++     * prim restart for such draws since we may read stale restart index.
++     */
++@@ -9040,13 +9055,15 @@
++    tu6_emit_vs_params(cmd, 0, firstVertex, firstInstance);
++
++    tu6_draw_common<CHIP>(cmd, cs, false, vertexCount);
++
+++   trace_start_draw_packet(&cmd->rp_trace, cs, cmd, 1, 0, vertexCount, instanceCount, 0, firstVertex, 0);
++    tu_cs_emit_pkt7(cs, CP_DRAW_INDX_OFFSET, 3);
++    tu_cs_emit(cs, tu_draw_initiator(cmd, DI_SRC_SEL_AUTO_INDEX));
++    tu_cs_emit(cs, instanceCount);
++    tu_cs_emit(cs, vertexCount);
++
+++   trace_end_draw_packet(&cmd->rp_trace, cs);
++    trace_end_draw(&cmd->rp_trace, cs);
++ }
++ TU_GENX(tu_CmdDraw);
++
++@@ -9087,12 +9104,14 @@
++          tu_cs_emit_draw_state(cs, TU_DRAW_STATE_VS_PARAMS, cmd->state.vs_params);
++          cmd->state.dirty &= ~TU_CMD_DIRTY_VS_PARAMS;
++       }
++
+++      trace_start_draw_packet(&cmd->rp_trace, cs, cmd, 2, i, draw->vertexCount, instanceCount, stride, draw->firstVertex, 0);
++       tu_cs_emit_pkt7(cs, CP_DRAW_INDX_OFFSET, 3);
++       tu_cs_emit(cs, tu_draw_initiator(cmd, DI_SRC_SEL_AUTO_INDEX));
++       tu_cs_emit(cs, instanceCount);
++       tu_cs_emit(cs, draw->vertexCount);
+++      trace_end_draw_packet(&cmd->rp_trace, cs);
++    }
++
++    if (i != 0)
++       trace_end_draw(&cmd->rp_trace, cs);
++@@ -9114,16 +9133,18 @@
++    tu6_emit_vs_params(cmd, 0, vertexOffset, firstInstance);
++
++    tu6_draw_common<CHIP>(cmd, cs, true, indexCount);
++
+++   trace_start_draw_packet(&cmd->rp_trace, cs, cmd, 3, 0, indexCount, instanceCount, 0, firstIndex, 0);
++    tu_cs_emit_pkt7(cs, CP_DRAW_INDX_OFFSET, 7);
++    tu_cs_emit(cs, tu_draw_initiator(cmd, DI_SRC_SEL_DMA));
++    tu_cs_emit(cs, instanceCount);
++    tu_cs_emit(cs, indexCount);
++    tu_cs_emit(cs, firstIndex);
++    tu_cs_emit_qw(cs, cmd->state.index_va);
++    tu_cs_emit(cs, cmd->state.max_index_count);
++
+++   trace_end_draw_packet(&cmd->rp_trace, cs);
++    trace_end_draw(&cmd->rp_trace, cs);
++ }
++ TU_GENX(tu_CmdDrawIndexed);
++
++@@ -9166,15 +9187,17 @@
++          tu_cs_emit_draw_state(cs, TU_DRAW_STATE_VS_PARAMS, cmd->state.vs_params);
++          cmd->state.dirty &= ~TU_CMD_DIRTY_VS_PARAMS;
++       }
++
+++      trace_start_draw_packet(&cmd->rp_trace, cs, cmd, 4, i, draw->indexCount, instanceCount, stride, draw->firstIndex, 0);
++       tu_cs_emit_pkt7(cs, CP_DRAW_INDX_OFFSET, 7);
++       tu_cs_emit(cs, tu_draw_initiator(cmd, DI_SRC_SEL_DMA));
++       tu_cs_emit(cs, instanceCount);
++       tu_cs_emit(cs, draw->indexCount);
++       tu_cs_emit(cs, draw->firstIndex);
++       tu_cs_emit_qw(cs, cmd->state.index_va);
++       tu_cs_emit(cs, cmd->state.max_index_count);
+++      trace_end_draw_packet(&cmd->rp_trace, cs);
++    }
++
++    if (i != 0)
++       trace_end_draw(&cmd->rp_trace, cs);
++@@ -9213,16 +9236,18 @@
++       draw_wfm(cmd);
++
++    tu6_draw_common<CHIP>(cmd, cs, false, 0);
++
+++   trace_start_draw_packet(&cmd->rp_trace, cs, cmd, 5, 0, drawCount, 0, stride, vk_buffer_address(&buf->vk, offset), 0);
++    tu_cs_emit_pkt7(cs, CP_DRAW_INDIRECT_MULTI, 6);
++    tu_cs_emit(cs, tu_draw_initiator(cmd, DI_SRC_SEL_AUTO_INDEX));
++    tu_cs_emit(cs, A6XX_CP_DRAW_INDIRECT_MULTI_1_OPCODE(INDIRECT_OP_NORMAL) |
++                   A6XX_CP_DRAW_INDIRECT_MULTI_1_DST_OFF(vs_params_offset(cmd)));
++    tu_cs_emit(cs, drawCount);
++    tu_cs_emit_qw(cs, vk_buffer_address(&buf->vk, offset));
++    tu_cs_emit(cs, stride);
++
+++   trace_end_draw_packet(&cmd->rp_trace, cs);
++    trace_end_draw(&cmd->rp_trace, cs);
++ }
++ TU_GENX(tu_CmdDrawIndirect);
++
++@@ -9244,8 +9269,9 @@
++       draw_wfm(cmd);
++
++    tu6_draw_common<CHIP>(cmd, cs, true, 0);
++
+++   trace_start_draw_packet(&cmd->rp_trace, cs, cmd, 6, 0, drawCount, 0, stride, vk_buffer_address(&buf->vk, offset), 0);
++    tu_cs_emit_pkt7(cs, CP_DRAW_INDIRECT_MULTI, 9);
++    tu_cs_emit(cs, tu_draw_initiator(cmd, DI_SRC_SEL_DMA));
++    tu_cs_emit(cs, A6XX_CP_DRAW_INDIRECT_MULTI_1_OPCODE(INDIRECT_OP_INDEXED) |
++                   A6XX_CP_DRAW_INDIRECT_MULTI_1_DST_OFF(vs_params_offset(cmd)));
++@@ -9254,8 +9280,9 @@
++    tu_cs_emit(cs, cmd->state.max_index_count);
++    tu_cs_emit_qw(cs, vk_buffer_address(&buf->vk, offset));
++    tu_cs_emit(cs, stride);
++
+++   trace_end_draw_packet(&cmd->rp_trace, cs);
++    trace_end_draw(&cmd->rp_trace, cs);
++ }
++ TU_GENX(tu_CmdDrawIndexedIndirect);
++
++@@ -9284,8 +9311,9 @@
++    draw_wfm(cmd);
++
++    tu6_draw_common<CHIP>(cmd, cs, false, 0);
++
+++   trace_start_draw_packet(&cmd->rp_trace, cs, cmd, 7, 0, drawCount, 0, stride, vk_buffer_address(&buf->vk, offset), vk_buffer_address(&count_buf->vk, countBufferOffset));
++    tu_cs_emit_pkt7(cs, CP_DRAW_INDIRECT_MULTI, 8);
++    tu_cs_emit(cs, tu_draw_initiator(cmd, DI_SRC_SEL_AUTO_INDEX));
++    tu_cs_emit(cs, A6XX_CP_DRAW_INDIRECT_MULTI_1_OPCODE(INDIRECT_OP_INDIRECT_COUNT) |
++                   A6XX_CP_DRAW_INDIRECT_MULTI_1_DST_OFF(vs_params_offset(cmd)));
++@@ -9293,8 +9321,9 @@
++    tu_cs_emit_qw(cs, vk_buffer_address(&buf->vk, offset));
++    tu_cs_emit_qw(cs, vk_buffer_address(&count_buf->vk, countBufferOffset));
++    tu_cs_emit(cs, stride);
++
+++   trace_end_draw_packet(&cmd->rp_trace, cs);
++    trace_end_draw(&cmd->rp_trace, cs);
++ }
++ TU_GENX(tu_CmdDrawIndirectCount);
++
++@@ -9318,8 +9347,9 @@
++    draw_wfm(cmd);
++
++    tu6_draw_common<CHIP>(cmd, cs, true, 0);
++
+++   trace_start_draw_packet(&cmd->rp_trace, cs, cmd, 8, 0, drawCount, 0, stride, vk_buffer_address(&buf->vk, offset), vk_buffer_address(&count_buf->vk, countBufferOffset));
++    tu_cs_emit_pkt7(cs, CP_DRAW_INDIRECT_MULTI, 11);
++    tu_cs_emit(cs, tu_draw_initiator(cmd, DI_SRC_SEL_DMA));
++    tu_cs_emit(cs, A6XX_CP_DRAW_INDIRECT_MULTI_1_OPCODE(INDIRECT_OP_INDIRECT_COUNT_INDEXED) |
++                   A6XX_CP_DRAW_INDIRECT_MULTI_1_DST_OFF(vs_params_offset(cmd)));
++@@ -9329,8 +9359,9 @@
++    tu_cs_emit_qw(cs, vk_buffer_address(&buf->vk, offset));
++    tu_cs_emit_qw(cs, vk_buffer_address(&count_buf->vk, countBufferOffset));
++    tu_cs_emit(cs, stride);
++
+++   trace_end_draw_packet(&cmd->rp_trace, cs);
++    trace_end_draw(&cmd->rp_trace, cs);
++ }
++ TU_GENX(tu_CmdDrawIndexedIndirectCount);
++
++@@ -9358,8 +9389,9 @@
++    tu6_emit_vs_params(cmd, 0, 0, firstInstance);
++
++    tu6_draw_common<CHIP>(cmd, cs, false, 0);
++
+++   trace_start_draw_packet(&cmd->rp_trace, cs, cmd, 9, 0, 0, instanceCount, vertexStride, vk_buffer_address(&buf->vk, counterBufferOffset), 0);
++    tu_cs_emit_pkt7(cs, CP_DRAW_AUTO, 6);
++    tu_cs_emit(cs, tu_draw_initiator(cmd, DI_SRC_SEL_AUTO_XFB));
++    if (CHIP >= A7XX) {
++       /* On a7xx the counter value and offset are shifted right by 2, so
++@@ -9371,8 +9403,9 @@
++    tu_cs_emit_qw(cs, vk_buffer_address(&buf->vk, counterBufferOffset));
++    tu_cs_emit(cs, counterOffset);
++    tu_cs_emit(cs, vertexStride);
++
+++   trace_end_draw_packet(&cmd->rp_trace, cs);
++    trace_end_draw(&cmd->rp_trace, cs);
++ }
++ TU_GENX(tu_CmdDrawIndirectByteCountEXT);
++
++diff --git a/src/freedreno/vulkan/tu_cmd_buffer.h b/src/freedreno/vulkan/tu_cmd_buffer.h
++--- a/src/freedreno/vulkan/tu_cmd_buffer.h
+++++ b/src/freedreno/vulkan/tu_cmd_buffer.h
++@@ -463,8 +463,11 @@
++ struct tu_cmd_state
++ {
++    uint32_t dirty;
++
+++   /* Diagnostics: actual bound Vulkan objects, never a last-compile TLS value. */
+++   uint64_t coachz_graphics_pipeline, coachz_compute_pipeline;
+++
++    struct tu_shader *shaders[MESA_SHADER_STAGES];
++
++    struct tu_program_state program;
++
++diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
++--- a/src/freedreno/vulkan/tu_device.cc
+++++ b/src/freedreno/vulkan/tu_device.cc
++@@ -2312,12 +2312,28 @@
++    struct tu_suballoc_bo *bo = (struct tu_suballoc_bo *) timestamps;
++    struct tu_u_trace_submission_data *submission_data =
++       (struct tu_u_trace_submission_data *) flush_data;
++
+++   if (submission_data->timestamp_wait_failed)
+++      return U_TRACE_NO_TIMESTAMP;
+++
++    /* Only need to stall on results for the first entry: */
++    if (offset_B == 0) {
++-      tu_queue_wait_fence(submission_data->queue, submission_data->fence,
++-                          1000000000);
+++      VkResult ready = tu_queue_wait_fence(submission_data->queue, submission_data->fence,
+++                                         1000000000);
+++#ifdef __APPLE__
+++      if (utctx->out && getenv("COACHZ_GPU_WORK_TRACE")) {
+++         flockfile(utctx->out);
+++         fprintf(utctx->out, "batch_link,%u,%u,%u,%u,%u,%d\n",
+++                 utctx->frame_nr, utctx->batch_nr, submission_data->submission_id,
+++                 submission_data->queue->msm_queue_id, submission_data->fence, ready);
+++         funlockfile(utctx->out);
+++      }
+++#endif
+++      if (ready != VK_SUCCESS) {
+++         submission_data->timestamp_wait_failed = true;
+++         return U_TRACE_NO_TIMESTAMP;
+++      }
++    }
++
++    uint64_t *ts = (uint64_t *) ((char *) tu_suballoc_bo_map(bo) + offset_B);
++
++diff --git a/src/freedreno/vulkan/tu_device.h b/src/freedreno/vulkan/tu_device.h
++--- a/src/freedreno/vulkan/tu_device.h
+++++ b/src/freedreno/vulkan/tu_device.h
++@@ -668,8 +668,10 @@
++     * this queue and fence indicates it.
++     */
++    struct tu_queue *queue;
++    uint32_t fence;
+++   /* Trace worker only: never read unretired timestamp storage after a failed wait. */
+++   bool timestamp_wait_failed;
++
++    uint32_t cmd_buffer_count;
++    uint32_t last_buffer_with_tracepoints;
++    void *mem_ctx;
 +diff --git a/src/freedreno/vulkan/tu_image.cc b/src/freedreno/vulkan/tu_image.cc
 +--- a/src/freedreno/vulkan/tu_image.cc
 ++++ b/src/freedreno/vulkan/tu_image.cc
@@ -1336,6 +3114,420 @@ new file mode 100644
 +    return VK_SUCCESS;
 + }
 +
++diff --git a/src/freedreno/vulkan/tu_pipeline.cc b/src/freedreno/vulkan/tu_pipeline.cc
++--- a/src/freedreno/vulkan/tu_pipeline.cc
+++++ b/src/freedreno/vulkan/tu_pipeline.cc
++@@ -34,8 +34,49 @@
++
++ /* The vertex and fragment shader hashes (tu_hash32) of the last program a pipeline creation built on this thread, read and cleared by the
++  * host frontend right after it asks for a pipeline (tu_darwin_last_program): the pipeline log names a pass's shader by them. */
++ static __thread uint32_t tu_last_program_hash[2];
+++#ifdef __APPLE__
+++#include <atomic>
+++using CoachzPipelineEmit = void (*)(uint64_t,uint32_t,const char *,const char *,const char *);
+++using CoachzShaderEmit = void (*)(uint32_t,const char *,uint32_t,uint32_t,uint32_t,uint32_t,int32_t,int32_t);
+++static std::atomic<CoachzPipelineEmit> coachz_pipeline_emit;
+++static std::atomic<CoachzShaderEmit> coachz_shader_emit;
+++extern "C" __attribute__((visibility("default"))) uint32_t
+++tu_darwin_set_profile_callbacks(CoachzPipelineEmit pipeline,CoachzShaderEmit shader);
+++extern "C" __attribute__((visibility("default"))) uint32_t
+++tu_darwin_set_profile_callbacks(CoachzPipelineEmit pipeline,CoachzShaderEmit shader) {
+++   coachz_pipeline_emit.store(pipeline,std::memory_order_release);
+++   coachz_shader_emit.store(shader,std::memory_order_release);
+++   return (coachz_pipeline_emit.load(std::memory_order_acquire)?1u:0u) |
+++          (coachz_shader_emit.load(std::memory_order_acquire)?2u:0u);
+++}
+++static void coachz_profile_pipeline(struct tu_pipeline *pipeline,uint32_t bind) {
+++   CoachzPipelineEmit emit=coachz_pipeline_emit.load(std::memory_order_acquire);
+++   if (emit) emit((uint64_t)tu_pipeline_to_handle(pipeline),bind,
+++      pipeline->program.stage_blake3[MESA_SHADER_VERTEX],
+++      pipeline->program.stage_blake3[MESA_SHADER_FRAGMENT],
+++      pipeline->program.stage_blake3[MESA_SHADER_COMPUTE]);
+++}
+++static void coachz_profile_shader(mesa_shader_stage stage,const struct ir3_shader_variant *v) {
+++   CoachzShaderEmit emit=coachz_shader_emit.load(std::memory_order_acquire);
+++   if (emit && v) emit(stage,v->blake3_str,v->info.instrs_count,v->info.instrs_per_cat[5],
+++      v->info.systall,v->info.sstall,v->info.max_waves,v->info.max_reg);
+++}
+++#else
+++static void coachz_profile_shader(mesa_shader_stage,const struct ir3_shader_variant *) {}
+++static void coachz_profile_pipeline(struct tu_pipeline *,uint32_t) {}
+++#endif
+++
+++static __thread uint32_t tu_last_compute_hash;
+++extern "C" __attribute__((visibility("default"))) uint32_t tu_darwin_last_compute_program(void);
+++extern "C" __attribute__((visibility("default"))) uint32_t
+++tu_darwin_last_compute_program(void)
+++{
+++   uint32_t hash = tu_last_compute_hash;
+++   tu_last_compute_hash = 0;
+++   return hash;
+++}
++ extern "C" __attribute__((visibility("default"))) void tu_darwin_last_program(uint32_t *vs, uint32_t *fs);
++ extern "C" __attribute__((visibility("default"))) void
++ tu_darwin_last_program(uint32_t *vs, uint32_t *fs)
++ {
++@@ -2356,8 +2397,9 @@
++             }
++          }
++
++          if (variants[stage]) {
+++            coachz_profile_shader(stage,variants[stage]);
++             memcpy(prog->stage_blake3[stage], variants[stage]->blake3_str,
++                    sizeof(variants[stage]->blake3_str));
++             if (stage == MESA_SHADER_VERTEX)
++                tu_last_program_hash[0] = tu_hash32(variants[stage]->blake3_str);
++@@ -4873,8 +4915,9 @@
++    if (result == VK_SUCCESS) {
++       TU_RMV(graphics_pipeline_create, dev, tu_pipeline_to_graphics(pipeline));
++
++       *pPipeline = tu_pipeline_to_handle(pipeline);
+++      coachz_profile_pipeline(pipeline,0);
++    } else
++       *pPipeline = VK_NULL_HANDLE;
++
++    return result;
++@@ -5068,8 +5111,13 @@
++
++    TU_RMV(compute_pipeline_create, dev, pipeline);
++
++    *pPipeline = tu_pipeline_to_handle(&pipeline->base);
+++   memcpy(pipeline->base.program.stage_blake3[MESA_SHADER_COMPUTE], v->blake3_str, sizeof(v->blake3_str));
+++   coachz_profile_shader(MESA_SHADER_COMPUTE,v);
+++   coachz_profile_pipeline(&pipeline->base,1);
+++
+++   tu_last_compute_hash = tu_hash32(v->blake3_str);
++
++    return VK_SUCCESS;
++
++ fail:
++@@ -5131,8 +5179,10 @@
++    VK_FROM_HANDLE(tu_pipeline, pipeline, _pipeline);
++
++    if (!_pipeline)
++       return;
+++
+++   coachz_profile_pipeline(pipeline, UINT32_MAX);
++
++    TU_RMV(resource_destroy, dev, pipeline);
++
++    tu_pipeline_finish(pipeline, dev, pAllocator);
++diff --git a/src/freedreno/vulkan/tu_queue.cc b/src/freedreno/vulkan/tu_queue.cc
++--- a/src/freedreno/vulkan/tu_queue.cc
+++++ b/src/freedreno/vulkan/tu_queue.cc
++@@ -7,8 +7,13 @@
++  * Copyright © 2015 Intel Corporation
++  */
++
++ #include "tu_queue.h"
+++
+++#include <inttypes.h>
+++#include <stdio.h>
+++#include <stdlib.h>
+++#include <time.h>
++
++ #include "vk_util.h"
++
++ #include "tu_buffer.h"
++@@ -343,8 +348,11 @@
++    struct tu_device *device = queue->device;
++
++    pthread_mutex_lock(&device->submit_mutex);
++
+++#ifdef __APPLE__
+++   uint32_t profile_submission = 0, profile_fence = 0;
+++#endif
++    void *submit = tu_submit_create(device);
++    if (!submit)
++       return VK_ERROR_OUT_OF_HOST_MEMORY;
++
++@@ -453,8 +461,11 @@
++    }
++
++    struct tu_u_trace_submission_data *u_trace_submission_data = NULL;
++
+++#ifdef __APPLE__
+++   uint32_t profile_submission = 0, profile_fence = 0;
+++#endif
++    void *submit = tu_submit_create(device);
++    if (!submit)
++       goto fail_create_submit;
++
++@@ -587,10 +598,29 @@
++    }
++
++    device->submit_count++;
++
+++#ifdef __APPLE__
+++   profile_submission = u_trace_submission_data ? u_trace_submission_data->submission_id : 0;
+++   profile_fence = queue->fence;
+++#endif
++    pthread_mutex_unlock(&device->submit_mutex);
++    pthread_cond_broadcast(&queue->device->timeline_cond);
+++
+++#ifdef __APPLE__
+++   if (u_trace_submission_data && device->trace_context.out && getenv("COACHZ_GPU_WORK_TRACE")) {
+++      FILE *out = device->trace_context.out;
+++      const uint64_t host_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+++      flockfile(out);
+++      for (uint32_t i = 0; i < cmdbuf_count; i++) {
+++         fprintf(out, "submit,%" PRIu64 ",%u,%u,%u,%" PRIu64 ",%u,%p\n",
+++                 host_ns, profile_submission, queue->msm_queue_id, profile_fence,
+++                 (uint64_t)(uintptr_t)vk_command_buffer_to_handle(&cmd_buffers[i]->vk), i,
+++                 (void *)queue);
+++      }
+++      funlockfile(out);
+++   }
+++#endif
++
++    u_trace_context_process(&device->trace_context, false);
++
++ out:
++diff --git a/src/freedreno/vulkan/tu_tracepoints.py b/src/freedreno/vulkan/tu_tracepoints.py
++--- a/src/freedreno/vulkan/tu_tracepoints.py
+++++ b/src/freedreno/vulkan/tu_tracepoints.py
++@@ -150,8 +150,13 @@
++               Arg(type='const char *',                          var='lrzWriteDisableReason',                                c_format='%s'),
++               Arg(type='int32_t',                               var='lrzWriteDisabledAtDraw',                               c_format='%d'),
++               Arg(type='uint32_t',                              var='lrzStatus', c_format='%s', to_prim_type='(fd_lrz_gpu_dir_to_str((enum fd_lrz_gpu_dir)({} & 0xff)))', is_indirect=True),])
++
+++# Separate state/descriptor setup from execution, including indirect and multi-draw paths.
+++begin_end_tp('draw_setup', tp_default_enabled=False,
+++             tp_struct=[Arg(type='uint32_t', name='draw_index',
+++                            var='cmd->state.rp.drawcall_count', c_format='%u')])
+++
++ begin_end_tp('draw',
++              [Arg(type='uint32_t', var='count', c_format='%u'),
++               Arg(type='tu_sha1_str', var='vs_sha1',  c_format='%s',
++                   copy_func='strcpy'),
++@@ -162,15 +167,65 @@
++               Arg(type='tu_sha1_str', var='gs_sha1',  c_format='%s',
++                   copy_func='strcpy'),
++               Arg(type='tu_sha1_str', var='fs_sha1',  c_format='%s',
++                   copy_func='strcpy'),
++-              ], tp_default_enabled=False)
+++              ],
+++             tp_struct=[Arg(type='uint32_t', name='draw_index', var='cmd->state.rp.drawcall_count', c_format='%u'),
+++                        Arg(type='uint64_t', name='pipeline_handle', var='cmd->state.coachz_graphics_pipeline', c_format='%" PRIu64 "'),
+++                        Arg(type='uint32_t', name='viewport_count', var='cmd->vk.dynamic_graphics_state.vp.viewport_count', c_format='%u'),
+++                        Arg(type='uint32_t', name='scissor_count', var='cmd->vk.dynamic_graphics_state.vp.scissor_count', c_format='%u'),
+++                        Arg(type='float', name='viewport0_x', var='cmd->vk.dynamic_graphics_state.vp.viewports[0].x', c_format='%g'),
+++                        Arg(type='float', name='viewport0_y', var='cmd->vk.dynamic_graphics_state.vp.viewports[0].y', c_format='%g'),
+++                        Arg(type='float', name='viewport0_width', var='cmd->vk.dynamic_graphics_state.vp.viewports[0].width', c_format='%g'),
+++                        Arg(type='float', name='viewport0_height', var='cmd->vk.dynamic_graphics_state.vp.viewports[0].height', c_format='%g'),
+++                        Arg(type='int32_t', name='scissor0_x', var='cmd->vk.dynamic_graphics_state.vp.scissors[0].offset.x', c_format='%d'),
+++                        Arg(type='int32_t', name='scissor0_y', var='cmd->vk.dynamic_graphics_state.vp.scissors[0].offset.y', c_format='%d'),
+++                        Arg(type='uint32_t', name='scissor0_width', var='cmd->vk.dynamic_graphics_state.vp.scissors[0].extent.width', c_format='%u'),
+++                        Arg(type='uint32_t', name='scissor0_height', var='cmd->vk.dynamic_graphics_state.vp.scissors[0].extent.height', c_format='%u'),
+++                        Arg(type='uint32_t', name='topology', var='cmd->vk.dynamic_graphics_state.ia.primitive_topology', c_format='%u'),
+++                        Arg(type='uint32_t', name='attachment_count', var='cmd->vk.dynamic_graphics_state.cb.attachment_count', c_format='%u'),
+++                        Arg(type='uint32_t', name='color_write_enables', var='cmd->vk.dynamic_graphics_state.cb.color_write_enables', c_format='%u'),
+++                        Arg(type='uint32_t', name='color0_blend_enable', var='cmd->vk.dynamic_graphics_state.cb.attachment_count > 0 ? cmd->vk.dynamic_graphics_state.cb.attachments[0].blend_enable : 0', c_format='%u'),
+++                        Arg(type='uint32_t', name='color0_write_mask', var='cmd->vk.dynamic_graphics_state.cb.attachment_count > 0 ? cmd->vk.dynamic_graphics_state.cb.attachments[0].write_mask : 0', c_format='%u'),
+++                        Arg(type='uint32_t', name='color1_blend_enable', var='cmd->vk.dynamic_graphics_state.cb.attachment_count > 1 ? cmd->vk.dynamic_graphics_state.cb.attachments[1].blend_enable : 0', c_format='%u'),
+++                        Arg(type='uint32_t', name='color1_write_mask', var='cmd->vk.dynamic_graphics_state.cb.attachment_count > 1 ? cmd->vk.dynamic_graphics_state.cb.attachments[1].write_mask : 0', c_format='%u'),
+++                        Arg(type='uint32_t', name='color2_blend_enable', var='cmd->vk.dynamic_graphics_state.cb.attachment_count > 2 ? cmd->vk.dynamic_graphics_state.cb.attachments[2].blend_enable : 0', c_format='%u'),
+++                        Arg(type='uint32_t', name='color2_write_mask', var='cmd->vk.dynamic_graphics_state.cb.attachment_count > 2 ? cmd->vk.dynamic_graphics_state.cb.attachments[2].write_mask : 0', c_format='%u'),
+++                        Arg(type='uint32_t', name='color3_blend_enable', var='cmd->vk.dynamic_graphics_state.cb.attachment_count > 3 ? cmd->vk.dynamic_graphics_state.cb.attachments[3].blend_enable : 0', c_format='%u'),
+++                        Arg(type='uint32_t', name='color3_write_mask', var='cmd->vk.dynamic_graphics_state.cb.attachment_count > 3 ? cmd->vk.dynamic_graphics_state.cb.attachments[3].write_mask : 0', c_format='%u'),
+++                        Arg(type='uint32_t', name='color4_blend_enable', var='cmd->vk.dynamic_graphics_state.cb.attachment_count > 4 ? cmd->vk.dynamic_graphics_state.cb.attachments[4].blend_enable : 0', c_format='%u'),
+++                        Arg(type='uint32_t', name='color4_write_mask', var='cmd->vk.dynamic_graphics_state.cb.attachment_count > 4 ? cmd->vk.dynamic_graphics_state.cb.attachments[4].write_mask : 0', c_format='%u'),
+++                        Arg(type='uint32_t', name='color5_blend_enable', var='cmd->vk.dynamic_graphics_state.cb.attachment_count > 5 ? cmd->vk.dynamic_graphics_state.cb.attachments[5].blend_enable : 0', c_format='%u'),
+++                        Arg(type='uint32_t', name='color5_write_mask', var='cmd->vk.dynamic_graphics_state.cb.attachment_count > 5 ? cmd->vk.dynamic_graphics_state.cb.attachments[5].write_mask : 0', c_format='%u'),
+++                        Arg(type='uint32_t', name='color6_blend_enable', var='cmd->vk.dynamic_graphics_state.cb.attachment_count > 6 ? cmd->vk.dynamic_graphics_state.cb.attachments[6].blend_enable : 0', c_format='%u'),
+++                        Arg(type='uint32_t', name='color6_write_mask', var='cmd->vk.dynamic_graphics_state.cb.attachment_count > 6 ? cmd->vk.dynamic_graphics_state.cb.attachments[6].write_mask : 0', c_format='%u'),
+++                        Arg(type='uint32_t', name='color7_blend_enable', var='cmd->vk.dynamic_graphics_state.cb.attachment_count > 7 ? cmd->vk.dynamic_graphics_state.cb.attachments[7].blend_enable : 0', c_format='%u'),
+++                        Arg(type='uint32_t', name='color7_write_mask', var='cmd->vk.dynamic_graphics_state.cb.attachment_count > 7 ? cmd->vk.dynamic_graphics_state.cb.attachments[7].write_mask : 0', c_format='%u')],
+++             tp_default_enabled=False)
+++
+++# One emitted packet per direct/multi subdraw, or one explicitly labelled
+++# hardware-indirect batch. Indirect count buffers are addresses, not fake CPU
+++# snapshots of the eventual GPU-selected count.
+++begin_end_tp('draw_packet',
+++    args=[Arg(type='uint32_t', var='kind', c_format='%u'),
+++          Arg(type='uint32_t', var='subdraw', c_format='%u'),
+++          Arg(type='uint32_t', var='count', c_format='%u'),
+++          Arg(type='uint32_t', var='instances', c_format='%u'),
+++          Arg(type='uint32_t', var='stride', c_format='%u'),
+++          Arg(type='uint64_t', var='parameters', c_format='%" PRIu64 "'),
+++          Arg(type='uint64_t', var='count_address', c_format='%" PRIu64 "')],
+++    tp_struct=[Arg(type='uint64_t', name='pipeline_handle',
+++                   var='cmd->state.coachz_graphics_pipeline', c_format='%" PRIu64 "')],
+++    tp_default_enabled=False)
++
++ begin_end_tp('binning_ib')
++ begin_end_tp('concurrent_binning_ib')
++ begin_end_tp('draw_ib_sysmem')
++ begin_end_tp('draw_ib_gmem')
++ begin_end_tp('concurrent_binning_barrier')
+++begin_end_tp('cache_flush',
+++    args=[Arg(type='uint32_t', var='flush_bits', c_format='0x%x'),
+++          Arg(type='uint8_t', var='renderpass', c_format='%u')])
++
++ begin_end_tp('generic_clear',
++     args=[Arg(type='enum VkFormat',  var='format',  c_format='%s', to_prim_type='vk_format_description({})->short_name'),
++           Arg(type='bool',           var='ubwc',    c_format='%s', to_prim_type='({} ? "true" : "false")'),
++@@ -274,18 +329,18 @@
++           Arg(type='uint16_t', var='num_groups_y',   c_format='%u'),
++           Arg(type='uint16_t', var='num_groups_z',   c_format='%u'),
++           Arg(type='tu_sha1_str', var='cs_sha1',
++               c_format='%s', copy_func='strcpy'),
++-          ])
+++          ], tp_struct=[Arg(type='uint64_t', name='pipeline_handle', var='cmd->state.coachz_compute_pipeline', c_format='%" PRIu64 "')])
++
++ begin_end_tp('compute_indirect',
++              args=[Arg(type='uint8_t', var='unaligned', c_format='%u'),
++                    Arg(type='tu_sha1_str', var='cs_sha1',
++                        c_format='%s', copy_func='strcpy'),
++                    ],
++              end_args=[ArgStruct(type='VkDispatchIndirectCommand', var='size',
++                                       is_indirect=True, c_format="%ux%ux%u",
++-                                      fields=['x', 'y', 'z'])])
+++                                      fields=['x', 'y', 'z'])], tp_struct=[Arg(type='uint64_t', name='pipeline_handle', var='cmd->state.coachz_compute_pipeline', c_format='%" PRIu64 "')])
++
++ # Performance warnings
++
++ singular_tp('warning_slow_clear_lrz', toggle_name='perf_warnings')
++diff --git a/src/util/perf/u_trace.c b/src/util/perf/u_trace.c
++--- a/src/util/perf/u_trace.c
+++++ b/src/util/perf/u_trace.c
++@@ -23,8 +23,13 @@
++
++ #include "u_trace.h"
++
++ #include <inttypes.h>
+++#ifdef __APPLE__
+++#include <unistd.h>
+++#include <time.h>
+++#include <limits.h>
+++#endif
++
++ #include "util/list.h"
++ #include "util/u_call_once.h"
++ #include "util/u_debug.h"
++@@ -176,8 +181,13 @@
++ static void
++ print_csv_start(struct u_trace_context *utctx)
++ {
++    fprintf(utctx->out, "frame,batch,time_ns,event,\n");
+++#ifdef __APPLE__
+++   const char *epoch = getenv("COACHZ_GPU_WORK_EPOCH");
+++   if (getenv("COACHZ_GPU_WORK_TRACE") && epoch)
+++      fprintf(utctx->out, "profile,1,%u,%s\n", (unsigned)getpid(), epoch);
+++#endif
++ }
++
++ static void
++ print_csv_end(struct u_trace_context *utctx)
++@@ -211,15 +221,21 @@
++                 uint64_t ns,
++                 int32_t delta,
++                 const void *indirect)
++ {
+++#ifdef __APPLE__
+++   flockfile(utctx->out);
+++#endif
++    fprintf(utctx->out, "%u,%u,%"PRIu64",%s,",
++            utctx->frame_nr, utctx->batch_nr, ns, evt->tp->name);
++    if (evt->tp->print) {
++       evt->tp->print(utctx->out, evt->payload, indirect);
++    } else {
++       fprintf(utctx->out, "\n");
++    }
+++#ifdef __APPLE__
+++   funlockfile(utctx->out);
+++#endif
++ }
++
++ static struct u_trace_printer csv_printer = {
++    .start = print_csv_start,
++@@ -331,9 +347,24 @@
++    u_trace_state.enabled_traces =
++       debug_get_flags_option("MESA_GPU_TRACES", config_control, 0);
++    const char *tracefile_name = debug_get_option_trace_file();
++    if (tracefile_name && __normal_user()) {
++-      u_trace_state.trace_file = fopen(tracefile_name, "w");
+++#ifdef __APPLE__
+++      const char *profile_fd = getenv("COACHZ_GPU_WORK_FD");
+++      if (getenv("COACHZ_GPU_WORK_TRACE") && profile_fd) {
+++         char *end = NULL;
+++         long source_fd = strtol(profile_fd, &end, 10);
+++         if (end != profile_fd && !*end && source_fd >= 0 && source_fd <= INT_MAX) {
+++            int owned_fd = dup((int)source_fd);
+++            if (owned_fd >= 0) {
+++               u_trace_state.trace_file = fdopen(owned_fd, "a");
+++               if (!u_trace_state.trace_file) close(owned_fd);
+++            }
+++         }
+++      }
+++#endif
+++      if (!u_trace_state.trace_file)
+++         u_trace_state.trace_file = fopen(tracefile_name, "w");
++       if (u_trace_state.trace_file != NULL) {
++          atexit(trace_file_fini);
++       }
++    }
++@@ -724,8 +755,12 @@
++          }
++       }
++
++       int32_t delta;
+++#ifdef __APPLE__
+++      const bool profile_missing_timestamp = timestamp == U_TRACE_NO_TIMESTAMP &&
+++         getenv("COACHZ_GPU_WORK_TRACE");
+++#endif
++
++       if (!utctx->first_time_ns)
++          utctx->first_time_ns = timestamp;
++
++@@ -751,9 +786,16 @@
++          indirect_data = utctx->dummy_indirect_data;
++       }
++
++       if (utctx->out) {
++-         utctx->out_printer->event(utctx, event, timestamp, delta, indirect_data);
+++         uint64_t printed_timestamp = timestamp;
+++#ifdef __APPLE__
+++         /* A failed fence wait is missing data, never a zero-cost operation
+++          * inheriting the preceding event's timestamp. */
+++         if (profile_missing_timestamp)
+++            printed_timestamp = U_TRACE_NO_TIMESTAMP;
+++#endif
+++         utctx->out_printer->event(utctx, event, printed_timestamp, delta, indirect_data);
++       }
++ #ifdef HAVE_PERFETTO
++       if (event->tp->perfetto &&
++           (p_atomic_read_relaxed(&utctx->enabled_traces) &
++@@ -767,8 +809,29 @@
++    }
++
++    if (utctx->out) {
++       utctx->out_printer->end_of_batch(utctx);
+++      /* The daemon may be killed without running its destructor. Flush complete
+++       * batches on the trace worker, outside the render/submit critical path. */
+++      fflush(utctx->out);
+++#ifdef __APPLE__
+++      if (getenv("COACHZ_GPU_WORK_TRACE")) {
+++         /* One process-wide output stream; the FILE lock also protects this
+++          * sync clock when a process happens to create multiple devices. */
+++         static uint64_t last_sync;
+++         const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+++         flockfile(utctx->out);
+++         fprintf(utctx->out, "batch_end,%u,%u,%u,%" PRIu64 ",%d\n",
+++                 utctx->frame_nr, utctx->batch_nr, utctx->event_nr, now,
+++                 ferror(utctx->out));
+++         fflush(utctx->out);
+++         if (now - last_sync >= 1000000000ull) {
+++            fsync(fileno(utctx->out));
+++            last_sync = now;
+++         }
+++         funlockfile(utctx->out);
+++      }
+++#endif
++    }
++
++    utctx->batch_nr++;
++    utctx->last_time_ns = 0;
 diff --git a/patches/mesa/turnip-gmem-memory-side-swap.patch b/patches/mesa/turnip-gmem-memory-side-swap.patch
 new file mode 100644
 --- /dev/null
@@ -1477,22 +3669,19 @@ new file mode 100644
 diff --git a/scripts/build-adreno-metal-bridge.py b/scripts/build-adreno-metal-bridge.py
 --- a/scripts/build-adreno-metal-bridge.py
 +++ b/scripts/build-adreno-metal-bridge.py
-@@ -66,9 +66,9 @@
-     # The host's diagnostics switch (SHENG_DIAG, from the boot argument sheng-diag=1): without it the stage ring and the allocation sites
+@@ -67,7 +67,7 @@ PATCHES = [ROOT / 'drivers/AdrenoMetal/bridge/patches' / name for name in [
      # keep nothing. The stage ring also marks the steps inside a batch's submission (SubmitStep: placed, gathered, vkQueueSubmit, changes).
      '0024-diagnostics-switch-and-submit-steps.patch',
      # Preserve specialized link names and source definitions; share large indexed constants and expose Vulkan allocation sizes.
 -    '0025-specialized-links-shared-constants-and-allocation-size.patch']]
 +    '0025-specialized-links-shared-constants-and-allocation-size.patch', '0026-coachz-copy-profile.patch']]
-
-
+ 
+ 
  def git_tree(*steps):
-     # The source tree a scratch index holds after HEAD and the given commands, without touching the source's own index.
 diff --git a/scripts/data/adreno-compiler-inputs.json b/scripts/data/adreno-compiler-inputs.json
 --- a/scripts/data/adreno-compiler-inputs.json
 +++ b/scripts/data/adreno-compiler-inputs.json
-@@ -55,9 +55,12 @@
-     "patches/mesa/turnip-builtin-shader-pack.patch",
+@@ -56,7 +56,15 @@
      "patches/mesa/turnip-host-import-images.patch",
      "patches/mesa/turnip-render-mode-for-attachment-memory.patch",
      "patches/mesa/turnip-gmem-mutable-swap.patch",
@@ -1500,8 +3689,12 @@ diff --git a/scripts/data/adreno-compiler-inputs.json b/scripts/data/adreno-comp
 +    "patches/mesa/turnip-current-queue-priorities.patch",
 +    "patches/mesa/turnip-transient-attachments-in-gmem.patch",
 +    "patches/mesa/turnip-gmem-memory-side-swap.patch",
-+    "patches/mesa/turnip-coachz-diagnostics.patch"
++    "patches/mesa/turnip-coachz-diagnostics.patch",
++    "patches/mesa/coachz-port-ir3-fragment-consts.patch",
++    "patches/mesa/coachz-port-turnip-one-va.patch",
++    "patches/mesa/coachz-port-turnip-keep-device.patch",
++    "patches/mesa/coachz-port-turnip-row-pitch.patch",
++    "patches/mesa/coachz-port-turnip-submit-cuts.patch"
    ],
    "integer_fma_reference": {
      "repository": "https://github.com/ucb-bar/berkeley-softfloat-3",
-     "commit": "a0c6494cdc11865811dec815d5c0049fba9d82a8",

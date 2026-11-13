@@ -56,7 +56,7 @@ class SequenceTests(unittest.TestCase):
         self.assertLess(board.index('__atomic_store_n(&gPmAsleep, 1u'), board.index('while (__atomic_load_n(&gPmUsers'))
         self.assertLess(board.index('while (__atomic_load_n(&gPmUsers'), board.index('const int status = coachz_gpu_pm_suspend();'))
         # Only after the power button, and the first submission wakes it.
-        self.assertIn('if (!gPmArmed || gPmAsleep', board)
+        self.assertIn('if (!gPmArmed || __atomic_load_n(&gPmAsleep, __ATOMIC_ACQUIRE)) continue;', board)
         ring = (ROOT / 'platform/coachz-prelink/patches/gpu/Adreno740.patch').read_text()
         self.assertLess(ring.index('+    if(native_adreno_power_get)native_adreno_power_get();'), ring.index('     status=preemption()?target->submitFramed(words,word_count,number,&value)'))
 
