@@ -37,12 +37,17 @@ extern "C" void native_adreno_publisher_lock(int locked);
 extern "C" void native_adreno_set_restart(NativeAdrenoRestart restart, void *cookie);
 extern "C" volatile uint32_t native_adreno_recovery[8];
 extern "C" volatile uint32_t native_adreno_unstick[15];
+// NativeLegacyDisplay: swaps retired when the scanout client took the frame (sheng-early-retire), and those whose copy then failed.
+extern "C" volatile uint64_t native_legacy_early_retires, native_legacy_early_failures;
 extern "C" {
 extern volatile uint32_t native_adreno_ring_log[4][4 + 112];
 extern volatile uint32_t native_adreno_ring_log_count;
 extern volatile uint32_t native_adreno_ib_log[8][4 + 208];
 extern volatile uint32_t native_adreno_ib_log_count;
 extern volatile uint64_t native_adreno_submit_ticks[64], native_adreno_submit_cost[3], native_adreno_wait_outer[5], native_gop_wait_stats[7];
+extern volatile uint64_t native_adreno_submit_phase[7];
+extern volatile uint32_t native_adreno_ib_probe_request, native_adreno_ib_probe_fence, native_adreno_ib_probe_count, native_adreno_ib_probe_pid;
+extern volatile uint32_t native_adreno_ib_probe_dwords[36];
 }
 extern "C" unsigned NativeAdrenoGpuContextInputBits();
 // The framework's two weak board hooks. [1] of the first is the GPU's current level, which it notes per job. The second names a process still mapping a
@@ -613,6 +618,45 @@ void stampReport() {
         native_gop_wait_stats[0], native_gop_wait_stats[1], native_gop_wait_stats[1] ? native_gop_wait_stats[6] / native_gop_wait_stats[1] / 1000 : 0, native_gop_wait_stats[5] / 1000, native_gop_wait_stats[2]);
     printf("COACHZ gpu stamps: %u submissions, queue mean %llu max %llu us, gpu mean %llu max %llu us, gpu <1 %u <2 %u <4 %u <8 %u <16 %u <32 %u more %u ms\n", n, queue / n, queueMax, gpu / n, gpuMax,
         bins[0], bins[1], bins[2], bins[3], bins[4], bins[5], bins[6]);
+    // The submission path by phase (NativeAdrenoSubmit::submit), mean per submission over the boot.
+    if (const uint64_t s = native_adreno_submit_cost[0]) {
+        const volatile uint64_t *p = native_adreno_submit_phase;
+        printf("COACHZ gpu submit phases: check %llu retire %llu hold %llu wc %llu publish %llu choose %llu ring %llu us over %llu\n", p[0] * 10 / 192 / s, p[1] * 10 / 192 / s,
+            p[2] * 10 / 192 / s, p[3] * 10 / 192 / s, p[4] * 10 / 192 / s, p[5] * 10 / 192 / s, p[6] * 10 / 192 / s, s);
+    }
+}
+
+// sheng-diag=1: one render server submission of 2 to 36 IBs at a time carries the CP's and the RB's always-on counter before each IB and after the last
+// (NativeAdrenoSubmit, fence page from byte 2048). Printed as the first stamps and the ticks (19.2 MHz) between boundaries, to set beside the command
+// buffers' own stamps in the work trace (same counter, same fence). k217b: 0.1-1.3 ms between command buffers that no command buffer's stamps cover.
+void ibProbeReport() {
+    static int diagnostic = -1;
+    if (diagnostic < 0) {unsigned on = 0; diagnostic = PE_parse_boot_argn("sheng-diag", &on, sizeof(on)) && on ? 1 : 0;}
+    if (!diagnostic) return;
+    if (const uint32_t fence = native_adreno_ib_probe_fence) {
+        if (static_cast<int32_t>(gRing.completedFence() - fence) < 0) return;   // still on the GPU
+        const uint32_t n = native_adreno_ib_probe_count;
+        uint32_t words[4 * 37] = {};
+        if (n >= 2 && n <= 36 && gRing.readFenceWords(2048, words, 4 * (n + 1)) == kIOReturnSuccess) {
+            auto cp = [&](uint32_t i) {return static_cast<uint64_t>(words[4 * i + 1]) << 32 | words[4 * i];};
+            auto rb = [&](uint32_t i) {return static_cast<uint64_t>(words[4 * i + 3]) << 32 | words[4 * i + 2];};
+            char line[420]; size_t at = 0;
+            at += static_cast<size_t>(snprintf(line, sizeof(line), "COACHZ gpu ibs: fence %u pid %u n %u cp0 0x%llx rb0 0x%llx dwords", fence, native_adreno_ib_probe_pid, n,
+                static_cast<unsigned long long>(cp(0)), static_cast<unsigned long long>(rb(0))));
+            for (uint32_t i = 0; i < n && at < sizeof(line); ++i) at += static_cast<size_t>(snprintf(line + at, sizeof(line) - at, " %u", native_adreno_ib_probe_dwords[i]));
+            printf("%s\n", line);
+            for (unsigned which = 0; which < 2; ++which) {
+                at = static_cast<size_t>(snprintf(line, sizeof(line), "COACHZ gpu ibs %s:", which ? "rb" : "cp"));
+                for (uint32_t i = 1; i <= n && at < sizeof(line); ++i) {
+                    const uint64_t a = which ? rb(i - 1) : cp(i - 1), b = which ? rb(i) : cp(i);
+                    at += static_cast<size_t>(snprintf(line + at, sizeof(line) - at, " %lld", static_cast<long long>(b - a)));
+                }
+                printf("%s\n", line);
+            }
+        }
+        native_adreno_ib_probe_fence = 0;
+    }
+    native_adreno_ib_probe_request = 1;
 }
 
 // The firmware framebuffer as the panel scans it, 4096 pixels scattered over the frame: how many values each channel holds, which of its bits are ever set and green's most common
@@ -669,9 +713,15 @@ void reportThread(void *, wait_result_t) {
         printf("COACHZ gpu stall: kicks %u (last fence %u), bus drains %u (last fence %u), ended after kick %u after drain %u, longest %u waits, left alone %u\n",
             native_adreno_unstick[0], native_adreno_unstick[1], native_adreno_unstick[4], native_adreno_unstick[7], native_adreno_unstick[9],
             native_adreno_unstick[11], native_adreno_unstick[12], native_adreno_unstick[14]);
+        // Whether the render server got its swap back when the scanout client took each frame, or only when the copy finished: k216
+        // showed it recording the next frame 0.3 ms after the client took one, and committing it only once that frame's copy completed.
+        printf("COACHZ gpu swap: early retires %llu, early copies failed %llu, of %llu frames offered\n",
+            (unsigned long long)native_legacy_early_retires, (unsigned long long)native_legacy_early_failures,
+            (unsigned long long)native_gop_gpu_offers);
         printf("COACHZ gpu irq: %u interrupts, %u fences; waits slept %u, timed out %u; errors ahb %u atb %u cp hw %u (0x%x) hang %u uche %u; gmu %u (0x%x) hfi %u (0x%x)\n",
             gIrqAll, gFlushTs, gIdleBlocks, gIdleTimeouts, gIrqAhb, gIrqAtb, gIrqCpHw, gCpHwStatus, gIrqHang, gIrqOob, gGmuAoIrqs, gGmuAoStatus, gHfiIrqs, gHfiInfo);
         stampReport();
+        ibProbeReport();
         frameSample();
         // Imported BOs the submit path left alone under IO coherence: [2] before submissions, [3] after completions.
         printf("COACHZ gpu9: coherent %u, maintenance skipped before submit %u after completion %u\n", native_adreno_io_coherent,

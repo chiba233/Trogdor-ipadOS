@@ -67,13 +67,20 @@ def gpu_stack_overlay():
     # allocated memory under TU_DEBUG=sysmem (b95b4c9) and the memory-side colour swap of GMEM transfers (93ad2ce), then the diagnostics,
     # then later UniXNU fixes on the same Mesa commit (85fda3b): 215672b fragment consts that leave the other stages room (no safe_constlen
     # variant), 97437dc one GPU address allocator per process, c72a8a5 the device kept after a GPU restart, 6061e10 the row pitch for padding,
-    # d76f17d long submissions cut where a command buffer begins.
+    # d76f17d long submissions cut where a command buffer begins; then this connection's completed fences answered without a kernel call and
+    # a wait for any of several submitted syncs as one kernel wait for the first.
     mesa_patches = [UNIXNU / 'patches/mesa' / name for name in ('turnip-transient-attachments-in-gmem.patch',
                                                                  'turnip-gmem-memory-side-swap.patch', 'turnip-coachz-diagnostics.patch',
                                                                  'coachz-port-ir3-fragment-consts.patch', 'coachz-port-turnip-one-va.patch',
                                                                  'coachz-port-turnip-keep-device.patch', 'coachz-port-turnip-row-pitch.patch',
-                                                                 'coachz-port-turnip-submit-cuts.patch')]
-    runtime_patch = UNIXNU / 'drivers/AdrenoMetal/bridge/patches/0026-coachz-copy-profile.patch'
+                                                                 'coachz-port-turnip-submit-cuts.patch', 'coachz-turnip-darwin-fence-waits.patch')]
+    # The overlay's runtime patches, which the bridge builder applies after its recorded ones: the copy profile, the compile thread at the
+    # asking thread's priority, two-plane pictures up to the plug-in's size kept as images, and the runtime's command buffer threads at the
+    # fixed priority of the thread that starts them.
+    runtime_patches = [UNIXNU / 'drivers/AdrenoMetal/bridge/patches' / name for name in ('0026-coachz-copy-profile.patch',
+                                                                                         '0027-coachz-compile-at-the-asking-priority.patch',
+                                                                                         '0028-coachz-ycbcr-image-for-small-pictures.patch',
+                                                                                         '0029-coachz-runtime-threads-at-the-spawning-priority.patch')]
     def apply(tree, patch, reverse=False, check=False):
         command = ['git', '-C', str(tree), 'apply']
         if reverse:
@@ -90,11 +97,12 @@ def gpu_stack_overlay():
             mesa_applied.append(patch)
         yield
     finally:
-        # The bridge builder applies its exact recorded patch sequence. Remove this
-        # sequence's last patch only if the builder reached it, including on failure.
+        # The bridge builder applies its exact recorded patch sequence. Remove the overlay's
+        # patches, last first, as far as the builder reached them, including on failure.
         try:
-            if apply(runtime, runtime_patch, reverse=True, check=True).returncode == 0:
-                apply(runtime, runtime_patch, reverse=True)
+            for patch in reversed(runtime_patches):
+                if apply(runtime, patch, reverse=True, check=True).returncode == 0:
+                    apply(runtime, patch, reverse=True)
         finally:
             try:
                 for patch in reversed(mesa_applied):

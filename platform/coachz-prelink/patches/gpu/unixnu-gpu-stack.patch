@@ -2024,6 +2024,212 @@ new file mode 100644
 ++        req.memory_type_bits as u64, why, 0, 0,
 ++    ], class);
 ++}
+diff --git a/drivers/AdrenoMetal/bridge/patches/0027-coachz-compile-at-the-asking-priority.patch b/drivers/AdrenoMetal/bridge/patches/0027-coachz-compile-at-the-asking-priority.patch
+new file mode 100644
+--- /dev/null
++++ b/drivers/AdrenoMetal/bridge/patches/0027-coachz-compile-at-the-asking-priority.patch
+@@ -0,0 +1,71 @@
++diff --git a/crates/metal2vulkan-runtime/src/device/compiles.rs b/crates/metal2vulkan-runtime/src/device/compiles.rs
++--- a/crates/metal2vulkan-runtime/src/device/compiles.rs
+++++ b/crates/metal2vulkan-runtime/src/device/compiles.rs
++@@ -288,7 +288,51 @@
++         .unwrap_or_default();
++     drop(restore);
++     (made, messages)
+++}
+++
+++/// Coachz: the asking thread's scheduling policy and priority, for the thread that makes its call
+++/// ([`adopt_scheduling`]). A render server's threads on iOS run at a fixed priority with no class
+++/// (backboardd's display thread at 54), above the user-initiated class the runtime's thread
+++/// raises itself to: on the iPad a compile the display thread waited for ran below it, behind the
+++/// video decoder and the encoder (0.1 to 2.3 s a pipeline of wall time).
+++#[cfg(any(target_os = "macos", target_os = "ios"))]
+++fn asking_scheduling() -> Option<(libc::c_int, libc::sched_param)> {
+++    let mut policy = 0;
+++    // SAFETY: plain data the call fills for this thread's own handle.
+++    let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
+++    // SAFETY: the calling thread's own handle and the two outputs above.
+++    let read = unsafe { libc::pthread_getschedparam(libc::pthread_self(), &mut policy, &mut param) };
+++    (read == 0).then_some((policy, param))
+++}
+++
+++/// No scheduling to carry here ([`asking_scheduling`] on macOS and iOS).
+++#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+++fn asking_scheduling() -> Option<()> {
+++    None
+++}
+++
+++/// Take the asking thread's policy and priority where its priority is above this thread's, so the
+++/// call it waits for runs no lower than it would have run on that thread. Nothing where the read
+++/// failed or this thread is already as high.
+++#[cfg(any(target_os = "macos", target_os = "ios"))]
+++fn adopt_scheduling(asking: Option<(libc::c_int, libc::sched_param)>) {
+++    let Some((policy, param)) = asking else { return };
+++    let mut own_policy = 0;
+++    // SAFETY: plain data the call fills for this thread's own handle.
+++    let mut own: libc::sched_param = unsafe { std::mem::zeroed() };
+++    // SAFETY: this thread's own handle and the outputs above.
+++    if unsafe { libc::pthread_getschedparam(libc::pthread_self(), &mut own_policy, &mut own) } != 0 {
+++        return;
+++    }
+++    if param.sched_priority > own.sched_priority {
+++        // SAFETY: this thread's own handle and a policy and priority another thread of the process runs at.
+++        unsafe { libc::pthread_setschedparam(libc::pthread_self(), policy, &param) };
+++    }
++ }
+++
+++/// Nothing to take here ([`adopt_scheduling`] on macOS and iOS).
+++#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+++fn adopt_scheduling(_asking: Option<()>) {}
++ 
++ /// Run `call`, one Vulkan call that may compile, at the user-initiated quality of service or
++ /// above (the module docs). It runs here where this thread is at that class, and otherwise on a
++@@ -301,6 +345,7 @@
++     // The driver diagnostics this thread's call is measured to report: the driver reports them
++     // on the thread that makes the call (`driver_facts.rs`).
++     let expected = crate::driver_facts::expected_here();
+++    let asking = asking_scheduling();
++     let mut asked = Some(call);
++     let made = std::thread::scope(|scope| {
++         let taken = &mut asked;
++@@ -309,6 +354,7 @@
++             std::thread::Builder::new().name("metal2vulkan-compile".into()),
++             move || {
++                 exit_guard::raise_to_user_initiated();
+++                adopt_scheduling(asking);
++                 let _busy = exit_guard::enter()?;
++                 let call = taken.take()?;
++                 Some(holding(|| crate::driver_facts::expecting(expected, call)))
+diff --git a/drivers/AdrenoMetal/bridge/patches/0028-coachz-ycbcr-image-for-small-pictures.patch b/drivers/AdrenoMetal/bridge/patches/0028-coachz-ycbcr-image-for-small-pictures.patch
+new file mode 100644
+--- /dev/null
++++ b/drivers/AdrenoMetal/bridge/patches/0028-coachz-ycbcr-image-for-small-pictures.patch
+@@ -0,0 +1,55 @@
++diff --git a/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs b/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs
++--- a/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs
+++++ b/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs
++@@ -185,6 +185,31 @@
++     ];
++ }
++ 
+++/// The largest picture, in texels, whose two-plane texture keeps its converted image on a device
+++/// that reads planes in place: `METAL2VULKAN_YCBCR_IMAGE_TEXELS`, 0 (none) where unset or not a
+++/// number.
+++fn coachz_image_texels() -> u64 {
+++    static TEXELS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+++    *TEXELS.get_or_init(|| {
+++        std::env::var("METAL2VULKAN_YCBCR_IMAGE_TEXELS").ok().and_then(|value| value.trim().parse().ok()).unwrap_or(0)
+++    })
+++}
+++
+++/// Two-plane textures asked whether they read their planes in place, and those of them that kept
+++/// their image by [`coachz_image_texels`].
+++static COACHZ_ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+++static COACHZ_KEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+++
+++/// The two counts for the Coachz frontend's rows: the textures kept by the bound in the high 32 bits,
+++/// the textures asked in the low 32 (each saturated).
+++#[no_mangle]
+++pub extern "C" fn metal2vulkan_coachz_ycbcr_counts() -> u64 {
+++    use std::sync::atomic::Ordering::Relaxed;
+++    let kept = COACHZ_KEPT.load(Relaxed).min(u64::from(u32::MAX));
+++    let asked = COACHZ_ASKED.load(Relaxed).min(u64::from(u32::MAX));
+++    kept << 32 | asked
+++}
+++
++ impl Device {
++     /// The planes in place of a converted texture of `descriptor` over `texels`, whose planes
++     /// `planes` lie in `span` of the texels' buffer (the module docs), or why it keeps its image
++@@ -196,7 +221,19 @@
++         (planes, span): (&YCbCrPlanes, &Range<u64>),
++     ) -> Result<PlanesInPlace, KeptImage> {
++         let profile = self.compile_device().profile();
+++        COACHZ_ASKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++         if !profile.reads_ycbcr_planes_in_place() {
+++            return Err(KeptImage::Device);
+++        }
+++        // Coachz: a picture of at most `METAL2VULKAN_YCBCR_IMAGE_TEXELS` texels keeps its image. The
+++        // planes read in place cost the conversion and filtering of the codes at every sample of
+++        // every pass, so their cost follows the pixels a pass covers; the image converts the
+++        // picture's own texels once per change of its planes and is then sampled as any image.
+++        // QuartzCore scales a 640 x 360 video layer up to the whole 2266 x 1488 panel: its in-place
+++        // fragment program was 1036 instructions with 20 samples and 76 % of the composite pass's
+++        // draw time. Both forms read Metal's texels (the module docs of `ycbcr.rs`).
+++        if descriptor.width.saturating_mul(descriptor.height) <= coachz_image_texels() {
+++            COACHZ_KEPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++             return Err(KeptImage::Device);
++         }
++         let words = YCbCrInPlace::of(planes).ok_or(KeptImage::Layout)?;
+diff --git a/drivers/AdrenoMetal/bridge/patches/0029-coachz-runtime-threads-at-the-spawning-priority.patch b/drivers/AdrenoMetal/bridge/patches/0029-coachz-runtime-threads-at-the-spawning-priority.patch
+new file mode 100644
+--- /dev/null
++++ b/drivers/AdrenoMetal/bridge/patches/0029-coachz-runtime-threads-at-the-spawning-priority.patch
+@@ -0,0 +1,65 @@
++diff --git a/crates/metal2vulkan-runtime/src/exit_guard.rs b/crates/metal2vulkan-runtime/src/exit_guard.rs
++--- a/crates/metal2vulkan-runtime/src/exit_guard.rs
+++++ b/crates/metal2vulkan-runtime/src/exit_guard.rs
++@@ -914,16 +914,61 @@
++ {
++     #[cfg(test)]
++     let on_start = ON_START.with(|on_start| on_start.borrow().clone());
+++    let spawning = coachz_spawning_scheduling();
++     spawn(builder, move || {
++         run_at_user_interactive();
+++        coachz_take_scheduling(spawning);
++         #[cfg(test)]
++         if let Some(on_start) = on_start {
++             on_start();
++         }
++         f()
++     })
+++}
+++
+++/// Coachz: the policy and priority of the thread that starts one of these threads, where it runs at a
+++/// fixed priority (not `SCHED_OTHER`). The render server commits from its encoding thread at the
+++/// compositor's own FIFO priority (54 on iPadOS 17), so the scheduler, the queue waiters and the
+++/// handler threads it starts serve those commits at the same priority; a process whose threads
+++/// timeshare keeps the user-interactive class alone.
+++#[cfg(any(target_os = "macos", target_os = "ios"))]
+++fn coachz_spawning_scheduling() -> Option<(libc::c_int, libc::sched_param)> {
+++    let mut policy = 0;
+++    // SAFETY: plain data the call fills for this thread's own handle.
+++    let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
+++    // SAFETY: the calling thread's own handle and the two outputs above.
+++    let read = unsafe { libc::pthread_getschedparam(libc::pthread_self(), &mut policy, &mut param) };
+++    (read == 0 && policy != libc::SCHED_OTHER).then_some((policy, param))
++ }
++ 
+++/// Nothing to carry here ([`coachz_spawning_scheduling`] on macOS and iOS).
+++#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+++fn coachz_spawning_scheduling() -> Option<()> {
+++    None
+++}
+++
+++/// Take the starting thread's policy and priority ([`coachz_spawning_scheduling`]) where it is above
+++/// this thread's.
+++#[cfg(any(target_os = "macos", target_os = "ios"))]
+++fn coachz_take_scheduling(spawning: Option<(libc::c_int, libc::sched_param)>) {
+++    let Some((policy, param)) = spawning else { return };
+++    let mut own_policy = 0;
+++    // SAFETY: plain data the call fills for this thread's own handle.
+++    let mut own: libc::sched_param = unsafe { std::mem::zeroed() };
+++    // SAFETY: this thread's own handle and the outputs above.
+++    if unsafe { libc::pthread_getschedparam(libc::pthread_self(), &mut own_policy, &mut own) } != 0 {
+++        return;
+++    }
+++    if param.sched_priority > own.sched_priority {
+++        // SAFETY: this thread's own handle and a policy and priority another thread of the process runs at.
+++        unsafe { libc::pthread_setschedparam(libc::pthread_self(), policy, &param) };
+++    }
+++}
+++
+++/// Nothing to take here ([`coachz_take_scheduling`] on macOS and iOS).
+++#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+++fn coachz_take_scheduling(_spawning: Option<()>) {}
+++
++ /// A test's step between the guard's two counts, run once: between a section's end and its
++ /// making's ([`Busy`]'s drop), or between [`Guard::close`]'s read of the sections and its read of
++ /// the makings, whichever this thread reaches first (`tests::exit_guard`).
 diff --git a/patches/mesa/coachz-port-ir3-fragment-consts.patch b/patches/mesa/coachz-port-ir3-fragment-consts.patch
 new file mode 100644
 --- /dev/null
@@ -2423,6 +2629,114 @@ new file mode 100644
 +       if (perf_pass_index != ~0) {
 +          struct tu_cs_entry *perf_cs_entry =
 +             &cmd_buffer->device->perfcntrs_pass_cs_entries[perf_pass_index];
+diff --git a/patches/mesa/coachz-turnip-darwin-fence-waits.patch b/patches/mesa/coachz-turnip-darwin-fence-waits.patch
+new file mode 100644
+--- /dev/null
++++ b/patches/mesa/coachz-turnip-darwin-fence-waits.patch
+@@ -0,0 +1,103 @@
++diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
++--- a/src/freedreno/vulkan/tu_knl_darwin.cc
+++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
++@@ -402,10 +402,38 @@ dw_status_to_vk(struct tu_device *dev, kern_return_t kr, const char *what)
++    return vk_device_set_lost(&dev->vk, "%s failed: 0x%x", what, kr);
++ }
++ 
+++/* Coachz: the newest of this connection's fences a kernel wait reported complete. Every queue of the connection uses kernel queue 0,
+++ * which completes its submissions in order (darwin_queue_submit, darwin_submit_chunk), so every fence of this connection at or before
+++ * it completed too, compared as msm compares fences (32-bit serial order). A wait for such a fence needs no kernel call: k217b's kernel
+++ * answered about 1900 fence calls a second at once, from the deferred-storage sweep after each completed wait (one call per BO fence)
+++ * and from the 200 us polling of a wait for any of several syncs. 0: none seen yet. */
+++static uint32_t dw_completed_fence;
+++
+++static bool
+++dw_fence_known_complete(uint32_t fence)
+++{
+++   const uint32_t seen = p_atomic_read(&dw_completed_fence);
+++   return fence && seen && (int32_t)(fence - seen) <= 0;
+++}
+++
+++static void
+++dw_note_fence_complete(uint32_t fence)
+++{
+++   uint32_t seen = p_atomic_read(&dw_completed_fence);
+++   while (fence && (!seen || (int32_t)(fence - seen) > 0)) {
+++      const uint32_t prior = p_atomic_cmpxchg(&dw_completed_fence, seen, fence);
+++      if (prior == seen)
+++         break;
+++      seen = prior;
+++   }
+++}
+++
++ /* Waits for a fence in short kernel waits so the connection lock is never held for long. */
++ static VkResult
++ dw_wait_fence_raw(struct tu_device *dev, uint32_t fence, uint64_t abs_timeout_ns)
++ {
+++   if (dw_fence_known_complete(fence))
+++      return VK_SUCCESS;
++    for (;;) {
++       uint64_t now = os_time_get_nano();
++       /* The rest of the wait, at most 100 ms a call: the kernel sleeps between fence interrupts until the fence or the
++@@ -415,8 +443,10 @@ dw_wait_fence_raw(struct tu_device *dev, uint32_t fence, uint64_t abs_timeout_ns
++          slice = abs_timeout_ns > now ? MIN2(abs_timeout_ns - now, slice) : 0;
++       NativeAdrenoAbiWaitFence req = {.fence = fence, .timeout_ns = slice};
++       kern_return_t kr = dw_call(NativeAdrenoMethodWaitFence, &req, sizeof(req), NULL, 0);
++-      if (kr == KERN_SUCCESS)
+++      if (kr == KERN_SUCCESS) {
+++         dw_note_fence_complete(fence);
++          return VK_SUCCESS;
+++      }
++       if (kr != kIOReturnTimeout)
++          return dw_status_to_vk(dev, kr, "wait fence");
++       if (slice == 0)
++@@ -1424,6 +1454,26 @@ vk_darwin_sync_wait_many(struct vk_device *_device, uint32_t wait_count,
++       return VK_SUCCESS;
++ 
++    if (wait_flags & VK_SYNC_WAIT_ANY) {
+++      /* Coachz: where every sync already rests on a submission, the one submitted first completes first (kernel queue 0 runs this
+++       * connection's submissions in order, dw_completed_fence): one kernel wait for it, which sleeps until its fence interrupt, answers
+++       * the whole wait. A sync still waiting for its submission (wait-before-signal) keeps the polling below. */
+++      {
+++         bool all_submitted = true;
+++         uint32_t first = 0;
+++         for (uint32_t i = 0; i < wait_count; i++) {
+++            struct vk_darwin_sync *s = container_of(waits[i].sync, struct vk_darwin_sync, vk);
+++            if (s->state == DARWIN_SYNC_SIGNALED)
+++               return VK_SUCCESS;
+++            if (s->state != DARWIN_SYNC_FENCE || !s->fence) {
+++               all_submitted = false;
+++               break;
+++            }
+++            if (!first || (int32_t)(s->fence - first) < 0)
+++               first = s->fence;
+++         }
+++         if (all_submitted && first)
+++            return dw_wait_fence_locked_free(device, first, abs_timeout_ns);
+++      }
++       /* Poll every sync in turn until one is done or the deadline passes. */
++       for (;;) {
++          for (uint32_t i = 0; i < wait_count; i++) {
++@@ -1439,6 +1489,21 @@ vk_darwin_sync_wait_many(struct vk_device *_device, uint32_t wait_count,
++       }
++    }
++ 
+++   /* Coachz: the sync submitted last first. Its completion means every earlier submission of this connection completed
+++    * (dw_completed_fence), so the waits for the others below are answered without a kernel call: one kernel wait instead of one each. */
+++   {
+++      uint32_t last = 0;
+++      for (uint32_t i = 0; i < wait_count; i++) {
+++         struct vk_darwin_sync *s = container_of(waits[i].sync, struct vk_darwin_sync, vk);
+++         if (s->state == DARWIN_SYNC_FENCE && s->fence && (!last || (int32_t)(s->fence - last) > 0))
+++            last = s->fence;
+++      }
+++      if (last) {
+++         VkResult result = dw_wait_fence_locked_free(device, last, abs_timeout_ns);
+++         if (result != VK_SUCCESS)
+++            return result;
+++      }
+++   }
++    for (uint32_t i = 0; i < wait_count; i++) {
++       struct vk_darwin_sync *s = container_of(waits[i].sync, struct vk_darwin_sync, vk);
++       VkResult result = darwin_sync_wait(device, s, abs_timeout_ns);
 diff --git a/patches/mesa/turnip-coachz-diagnostics.patch b/patches/mesa/turnip-coachz-diagnostics.patch
 new file mode 100644
 --- /dev/null
@@ -3669,19 +3983,23 @@ new file mode 100644
 diff --git a/scripts/build-adreno-metal-bridge.py b/scripts/build-adreno-metal-bridge.py
 --- a/scripts/build-adreno-metal-bridge.py
 +++ b/scripts/build-adreno-metal-bridge.py
-@@ -67,7 +67,7 @@ PATCHES = [ROOT / 'drivers/AdrenoMetal/bridge/patches' / name for name in [
+@@ -67,7 +67,11 @@ PATCHES = [ROOT / 'drivers/AdrenoMetal/bridge/patches' / name for name in [
      # keep nothing. The stage ring also marks the steps inside a batch's submission (SubmitStep: placed, gathered, vkQueueSubmit, changes).
      '0024-diagnostics-switch-and-submit-steps.patch',
      # Preserve specialized link names and source definitions; share large indexed constants and expose Vulkan allocation sizes.
 -    '0025-specialized-links-shared-constants-and-allocation-size.patch']]
-+    '0025-specialized-links-shared-constants-and-allocation-size.patch', '0026-coachz-copy-profile.patch']]
++    '0025-specialized-links-shared-constants-and-allocation-size.patch', '0026-coachz-copy-profile.patch',
++    # A compile the asking thread waits for at that thread's priority; two-plane pictures up to the plug-in's size kept as images;
++    # the runtime's command buffer threads at the fixed priority of the thread that starts them.
++    '0027-coachz-compile-at-the-asking-priority.patch', '0028-coachz-ycbcr-image-for-small-pictures.patch',
++    '0029-coachz-runtime-threads-at-the-spawning-priority.patch']]
  
  
  def git_tree(*steps):
 diff --git a/scripts/data/adreno-compiler-inputs.json b/scripts/data/adreno-compiler-inputs.json
 --- a/scripts/data/adreno-compiler-inputs.json
 +++ b/scripts/data/adreno-compiler-inputs.json
-@@ -56,7 +56,15 @@
+@@ -56,7 +56,16 @@
      "patches/mesa/turnip-host-import-images.patch",
      "patches/mesa/turnip-render-mode-for-attachment-memory.patch",
      "patches/mesa/turnip-gmem-mutable-swap.patch",
@@ -3694,7 +4012,8 @@ diff --git a/scripts/data/adreno-compiler-inputs.json b/scripts/data/adreno-comp
 +    "patches/mesa/coachz-port-turnip-one-va.patch",
 +    "patches/mesa/coachz-port-turnip-keep-device.patch",
 +    "patches/mesa/coachz-port-turnip-row-pitch.patch",
-+    "patches/mesa/coachz-port-turnip-submit-cuts.patch"
++    "patches/mesa/coachz-port-turnip-submit-cuts.patch",
++    "patches/mesa/coachz-turnip-darwin-fence-waits.patch"
    ],
    "integer_fma_reference": {
      "repository": "https://github.com/ucb-bar/berkeley-softfloat-3",
