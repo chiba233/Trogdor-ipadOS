@@ -108,19 +108,40 @@ Not done in step 1: CAMNOC QoS (cpastop_v150_110.h), the camera SMMU bank, inter
 
 Written and checked on the host (kernel flags, `-Werror` for the app, `tests/test_camera.py`); not run on hardware.
 
-- `/chosen/coachz-camera = 2` (`tools/xnu_screen.py --camera-service`): after the step-1 run the camera stays powered, the colour bar
-  is switched off, and the sensor waits in standby (MODE_SELECT 0, registers kept). While a client asks, it streams into a ring of
-  four 4 MiB buffers from 0x84000000 (ending at 0x85000000, below mpss_mem); frame n's buffer is queued at frame n - 1's start, and its
-  write-master done publishes it. Exposure lines and analog gain requested by the client are written between frames, within
-  ov8856.c's ranges.
+- `/chosen/coachz-camera = 2` (`tools/xnu_screen.py --camera-service`): after the step-1 run everything is powered down, the GPIO7
+  rails included. A client's start powers the whole path up again (votes, clocks, the sensor's power order, CCI, identification,
+  CSIPHY, PPI, CSID, VFE) and streams without the colour bar into a ring of four 4 MiB buffers from 0x84000000 (ending at
+  0x85000000, below mpss_mem); its stop or close powers everything down. The ring follows mainline camss-vfe-17x.c: two addresses
+  are queued before the stream (each with an RDI0 register update), each write-master done completes the older one and queues the
+  next (address and frame increment only). The earlier scheme queued at each start of frame and published the buffer queued last,
+  which was the one the next frame was being written into: k222's tearing. Exposure lines and analog gain requested by the client
+  are written between frames, within ov8856.c's ranges.
+- `/chosen/coachz-camera` bit 0x100 (`--camera-front-probe`): before the rear run, a read-only chip ID probe of the front sensor on
+  CCI0 master 0 (GPIO6 rails, MCLK0 on GPIO13 at 19.2 MHz from XO instead of the node's 24 MHz, which needs the Agera PLL2, reset
+  GPIO30), at 0x36, 0x10 and 0x3c (OmniVision 0x300a), 0x20 (Hynix 0x0f16) and 0x37 (GalaxyCore 0xf0/0xf1, 8-bit registers),
+  each read with the register width of the candidates at that address, then powered off with the pins restored. The rear run also
+  makes one plain read at 0x0c on master 1.
 - `CoachzCamera.cpp`: the IOService CoachzCamera with NativeSandboxGrantProcess "*" and CoachzCameraUserClient (start, stop,
   status, exposure and gain, newest frame into a structure output). Frames are copied from their physical pages with
   `IOMemoryDescriptor::readBytes`, so neither a permanent kernel mapping nor a memory-mapping message is needed.
-- `apps/camera/CoachzCamera.m`: the viewer. It copies the newest frame about fifteen times a second, turns each 2x2 SGRBG cell into
-  one pixel (820x616), shows it, and moves the mean towards mid grey with exposure first and gain after.
+- `apps/camera/CoachzCamera.m`: the viewer. It copies the newest frame about fifteen times a second and develops it at full size:
+  black level subtracted (estimated from the darkest green cells, shown on screen), grey-world white balance, bilinear SGRBG
+  demosaic, sRGB gamma; exposure first and gain after move the linear mean towards 18 % grey. The sensor does no white balance
+  (ov8856.c writes its MWB gains only as one digital gain), which is why k222's raw picture was green. A copy the ring overtook
+  (three more frames complete during it) is taken again, and counted.
   `tools/coachz_apps.py` builds and signs it, delivers it in the addon with its CodeDirectory in the apps trust cache, the installer
   copies it into `/var/jb/Applications` and registers it, and `coachz-prelink-apps.patch` adds its path to the applications whose
   process tree skips the sandbox.
+
+## Gaps
+
+- The rear VCM: sc7180-trogdor-mipi-camera.dtsi has actuator_rear on CCI0 master 1 supplied by pp2800_wf_cam (GPIO7), and
+  ChromeOS's model.yaml says the rear camera supports autofocus, but no public source gives its model or address (camx reads them
+  from the module's binary configuration). Kukui's OV8856 module has a dongwoon,dw9768 at 0x0c (mt8183-kukui-krane.dtsi), another
+  board. Until the 0x0c read and a source agree, the lens is not driven and stays where its spring holds it.
+- OV8856's black level has no value in mainline ov8856.c or libcamera's sensor helpers; the viewer estimates it.
+- The camera LED: no node in the ChromeOS or mainline device trees, so it is wired to a rail; the boot log prints both enables as the
+  firmware left them.
 
 ## Next steps
 
@@ -129,6 +150,10 @@ Written and checked on the host (kernel flags, `-Werror` for the app, `tests/tes
    has a UVC component by name. The IPSW is the A10X iPad Pro's (Lightning), and iPadOS 17's external camera support is limited to the
    USB-C iPads. AVCapture here therefore needs a capture device of its own, behind the camera services the OS volume does start
    (`mediaserverd`, `dietapplecamerad`, `continuitycaptured`); until then the viewer app is how the camera is seen.
+   This IPSW's built-in camera path is the A10X ISP: the kernelcache carries `com.apple.driver.AppleH9CameraInterface` (7.8.0), whose
+   user client and ISP firmware protocol the capture stack above it speaks. UniXNU and the other ports record no camera work (umi:
+   camera not implemented), so either that interface is answered for this sensor or a capture source is added where the capture stack
+   enumerates devices; which of the two is smaller is not yet read from the shared cache.
 
 ## On hardware
 
