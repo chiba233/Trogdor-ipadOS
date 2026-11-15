@@ -878,7 +878,7 @@
 +#define CMD_DB_CX_LVL 0x6c2e7863u, 0x00006c76u
 +#define GMU_LEVELS_GX 8u
 +#define GMU_LEVELS_CX 2u
-+/* This board's OPP tables as Debian reads them (opp-825000000 needs a higher speed bin), with the "off" level Linux adds first. */
++/* sc7180.dtsi's GPU and GMU OPP tables (opp-825000000 is opp-supported-hw 0x04, the gpu-speed-bin fuse decides), with the "off" level a6xx_gmu.c adds first. */
 +static const struct { uint32_t khz, level; } gmu_gx_levels[GMU_LEVELS_GX] = {{0, 0}, {180000, 48}, {267000, 64}, {355000, 128}, {430000, 192},
 +    {565000, 256}, {650000, 320}, {800000, 384}};
 +static const struct { uint32_t khz, level; } gmu_cx_levels[GMU_LEVELS_CX] = {{0, 0}, {200000, 48}};

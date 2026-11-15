@@ -260,6 +260,25 @@ def main():
                         '-framework', 'Foundation', '-larchive', '-o', str(helper)], check=True)
         subprocess.run(['codesign', '--force', '--sign', '-', '--entitlements',
                         str(ROOT / 'platform/coachz-prelink/apps/entitlements.plist'), str(helper)], check=True)
+    # The camera viewer (apps/camera): delivered beside the environment; the installer copies it into /var/jb/Applications.
+    # Signed as a standalone executable, outside a bundle, so its signature seals no bundle resources the delivery leaves out.
+    camera_bin = out / 'CoachzCamera.executable'
+    subprocess.run(['xcrun', '--sdk', 'iphoneos', 'clang', '-target', 'arm64-apple-ios17.0', '-isysroot', sdk, '-fobjc-arc',
+                    '-O2', '-Wall', '-Wextra', '-Werror', str(ROOT / 'platform/coachz-prelink/apps/camera/CoachzCamera.m'),
+                    '-framework', 'UIKit', '-framework', 'CoreGraphics', '-framework', 'Foundation', '-framework', 'IOKit',
+                    '-o', str(camera_bin)], check=True)
+    camera_info = plistlib.dumps({'CFBundleIdentifier': 'com.coachz.camera', 'CFBundleExecutable': 'CoachzCamera',
+                                  'CFBundleName': 'Camera', 'CFBundleDisplayName': 'Coachz Camera', 'CFBundlePackageType': 'APPL',
+                                  'CFBundleVersion': '1', 'CFBundleShortVersionString': '1.0', 'MinimumOSVersion': '17.0',
+                                  'CFBundleSupportedPlatforms': ['iPhoneOS'], 'UIDeviceFamily': [1, 2], 'LSRequiresIPhoneOS': True,
+                                  'UIRequiredDeviceCapabilities': ['arm64'],
+                                  'UISupportedInterfaceOrientations~ipad': ['UIInterfaceOrientationLandscapeLeft',
+                                                                           'UIInterfaceOrientationLandscapeRight',
+                                                                           'UIInterfaceOrientationPortrait'],
+                                  'UILaunchScreen': {}}, fmt=plistlib.FMT_XML)
+    subprocess.run(['codesign', '--force', '--sign', '-', '--entitlements',
+                    str(ROOT / 'platform/coachz-prelink/apps/camera/entitlements.plist'), str(camera_bin)], check=True)
+    camera_exe = camera_bin.read_bytes()
     stock = (a.assets / 'launchd-stock.plist').read_bytes()
     manifest, job = launchd_manifest(stock)
     (out / 'launchd.plist').write_bytes(manifest)
@@ -347,7 +366,7 @@ def main():
                     info.size = len(data)
                 tar.addfile(info, io.BytesIO(data) if data is not None else None)
 
-    hashes = cdhashes(helper.read_bytes()) | cdhashes(original_check) | cdhashes(original_daemon) | signature_cdhashes(manifest_signature)
+    hashes = cdhashes(camera_exe) | cdhashes(helper.read_bytes()) | cdhashes(original_check) | cdhashes(original_daemon) | signature_cdhashes(manifest_signature)
     with tarfile.open(payload) as environment:
         for info in environment:
             if info.isfile():
@@ -366,7 +385,9 @@ def main():
              ('owner-apps/LaunchDaemons/com.coachz.apps.plist', 0o644, job),
              ('owner-apps/xpc/launchd.plist', 0o644, manifest),
              ('owner-apps/xpc/launchd.plist.sig', 0o644, manifest_signature),
-             ('owner-apps/xpc/coachz-apps-manifest', 0o644, b'direct launchd job\n')]
+             ('owner-apps/xpc/coachz-apps-manifest', 0o644, b'direct launchd job\n'),
+             ('owner-apps/CoachzCamera.app/CoachzCamera', 0o755, camera_exe),
+             ('owner-apps/CoachzCamera.app/Info.plist', 0o644, camera_info)]
     gpu = a.gpu_addon.read_bytes()
     magic, count, total = struct.unpack_from('<8sI4xQ', gpu)
     assert magic == b'NGPUADD2' and total == len(gpu) and count + len(files) <= 4096

@@ -22,7 +22,8 @@ SMMU = ROOT / 'kits/ArmSmmu4K'
 OUT = ROOT / 'build/coachz-venus'
 OUT.mkdir(parents=True, exist_ok=True)
 KIT_CALLS = {'_ArmSmmu4KLivePrepare', '_ArmSmmu4KProgramDisabledContext', '_ArmSmmu4KLiveUpdateContextBatch'}
-KERNEL_CALLS = {'_coachz_rpmh_cx_request', '_coachz_venus_bus_vote', '_coachz_venus_fw', '_coachz_venus_fw_bytes', '_armcpu_spi_attach'}
+KERNEL_CALLS = {'_coachz_rpmh_cx_request', '_coachz_venus_bus_vote', '_coachz_venus_config_vote', '_coachz_venus_fw', '_coachz_venus_fw_bytes',
+                '_coachz_video_audit_memory', '_cpu_number', '_thread_tid', '_armcpu_spi_attach'}
 
 
 def require(value, why):

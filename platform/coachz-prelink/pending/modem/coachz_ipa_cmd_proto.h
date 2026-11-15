@@ -23,7 +23,8 @@ static inline uint32_t cic_endpoint_id(unsigned name) { return cipa_endpoints[na
 /* ------------------------------------------------------------------ ipa_endpoint_program (v4.2, AP endpoints) */
 /* Linux buffer facts behind the RX aggregation byte limit (arm64, 4 KiB pages): NET_SKB_PAD = 64 (L1_CACHE_BYTES),
    IPA_RX_BUFFER_OVERHEAD = PAGE_SIZE - SKB_MAX_ORDER(NET_SKB_PAD, 0) = NET_SKB_PAD + SKB_DATA_ALIGN(sizeof(struct
-   skb_shared_info)) = 64 + 320, IPA_MTU = ETH_DATA_LEN. Debian's LAN RX aggregation register confirms the result (6 KB). */
+   skb_shared_info)) = 64 + 320, IPA_MTU = ETH_DATA_LEN. With ipa_data-v4.2.c's LAN RX buffer_size 8192 and no hard limit,
+   ipa_endpoint.c ipa_aggr_size_kb gives (8192 - 64 - 1500 - 384) / 1024 = 6 KB. */
 #define CIC_NET_SKB_PAD 64u
 #define CIC_RX_BUFFER_OVERHEAD 384u
 #define CIC_MTU 1500u

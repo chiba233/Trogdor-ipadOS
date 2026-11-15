@@ -60,7 +60,7 @@ stop在gate中取消并禁用timer，再移除event sources并释放provider；�
 
 1. 主机编译/运行 `ambient_light_model_test.c`，核对无LIGHT、误把PROX当LIGHT、无符号lux、0lux、ODR0、短包/错误、多LIGHT、滤波、防抖、手动暂停。
 2. 在项目实际XNU头文件和链接符号下编译服务，确认IOKit生命周期；不得把桩类型检查当内核编译通过。
-3. 真机先确认LIGHT确实存在且可运行，和Debian的 `in_illuminance_input` 同单位对照；遮挡和照明时有合理响应，错误不变成0lux。
+3. 真机先确认LIGHT确实存在且可运行，按主线 cros_ec_light 的单位（lux）对照；遮挡和照明时有合理响应，错误不变成0lux。
 4. 只开诊断状态验证EC链路不影响按键、背光、电池和IMU，再明确授予本地调光许可。
 5. 检查手动滑块/亮度键暂停、调暗延迟、最暗仍亮、熄屏不误唤醒；核对实际PWM回读和可见亮度，而非只看请求次数。
 6. 原生自动亮度UI、CoreBrightness事件订阅与策略验收单独记录；当前不能宣称已支持。

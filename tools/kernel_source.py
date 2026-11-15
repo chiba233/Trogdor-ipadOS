@@ -69,6 +69,9 @@ def patched_drivers(base, platform, out):
             shutil.copytree(ROOT / 'boot/usb_compat', copy / 'usb/compat')
             shutil.copytree(ROOT / 'platform' / platform / 'pending/modem', copy / 'modem')
             shutil.copytree(ROOT / 'platform' / platform / 'pending/baseband', copy / 'baseband')
+        if (overlay / 'camera/coachz_camera.c').is_file():
+            # The camera's register tables are GPL sources' data: generated into the build copy only (tools/camera_tables.py).
+            subprocess.run([sys.executable, str(ROOT / 'tools/camera_tables.py'), str(copy / 'camera/coachz_camera_tables.h')], check=True)
     return options
 
 

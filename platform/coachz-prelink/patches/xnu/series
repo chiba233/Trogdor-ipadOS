@@ -157,11 +157,15 @@ coachz-prelink-fsevents-sample.patch
 coachz-prelink-file-services.patch
 # Userspace sees one volume on "/": the SystemOS union is reported as the root volume it covers (getfsstat, statfs, stat, getattrlist).
 coachz-prelink-root-view.patch
-
-# Drain cached zero-fill before batch-mapping managed IOSurface pages as uncached on Coachz.
+# Clean old cached zero-fill before batch-mapping managed video/IOSurface pages as uncached on Coachz.
 coachz-prelink-video-cache.patch
-
+# Read existing page metadata for the video client's own locked planes; no faults, wiring, cache maintenance or address export.
+coachz-prelink-video-audit.patch
+# /chosen/coachz-camera: the rear camera's step-1 run (drivers/RamBlock/camera/coachz_camera.c), its cx consumer and its MM0 bus vote.
+coachz-prelink-camera.patch
 # /chosen/coachz-baseband: the cellular bridge (pending/baseband): QRTR hooks in the Wi-Fi thread, its firmware on the Data volume, CommCenter running.
 coachz-prelink-baseband.patch
 # The VideoToolbox decoder for the video codec (package/CoachzVideoDecoder.c) on the Data volume, shown in /System/Library/VideoDecoders through a bindfs union.
 coachz-prelink-video-decoder.patch
+# The early log mirrored into depthcharge's ramoops buffer (drivers/RamBlock/earlylog/coachz_early_log.c): arm_init reads the probe's note, kernel_bootstrap_thread starts it, coachz_early.c mirrors every byte.
+coachz-prelink-early-log.patch

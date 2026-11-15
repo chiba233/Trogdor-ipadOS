@@ -13,7 +13,7 @@
  	extern void coachz_battery_start(void);
 --- /dev/null
 +++ b/bsd/dev/coachz_wifi.c
-@@ -0,0 +1,5769 @@
+@@ -0,0 +1,5777 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/* WCN3990 / SC7180: the modem that hosts the WLAN firmware, started as mainline's qcom_q6v5_mss does (coachz-wifi=4), and the SMEM
 + * inventory (coachz-wifi=1 plus an explicit /arm-io/coachz-wifi ADT node). With the modem up: SMP2P, GLINK over SMEM, QRTR and
@@ -344,8 +344,8 @@
 +/*
 + * coachz-ddr-vote=1: the DDR and memory NoC bandwidth mainline votes for this SoC's top CPU and GPU states (sc7180.dtsi: the A76 at
 + * 2.4 GHz and the GPU at 800 MHz both ask 8532000 kBps peak on their path to EBI1), turned into BCM commands as bcm-voter.c does
-+ * (wifi_bcm_send). Nothing else in XNU votes: before it, CoachzGpu.cpp's memory loops measured 195 ns and 8 GB/s on the A76 against
-+ * Debian's 132 ns and 11-13 GB/s, and after it 134-142 ns and 11-12 GB/s on hardware (k84). Sent once and kept: at start (1) or 150 s
++ * (wifi_bcm_send). Nothing else in XNU votes: before it, CoachzGpu.cpp's memory loops measured 195 ns and 8 GB/s on the A76,
++ * and after it 134-142 ns and 11-12 GB/s on hardware (k84). Sent once and kept: at start (1) or 150 s
 + * after it (2, the before/after comparison); the memory probe runs again after it (coachz_ddr_voted: 1 sent and completed, 2 failed).
 + */
 +volatile uint32_t coachz_ddr_voted;
@@ -602,8 +602,8 @@
 +{
 +    static const struct wifi_bcm bcms[] = {
 +        {"MC0", 4, 2, 0, 0, 8532000}, {"ACV", 4, 2, 8, 0, 0}, {"SH0", 16, 1, 0, 0, 8532000}, {"SH4", 16, 1, 0, 0, 8532000},
-+        /* The eMMC's path to memory at its HS400 peak, as Debian's interconnect summary reads: xm_emmc (CN1), qnm_aggre1_noc (SN7),
-+         * qns_gemnoc_sf (SN0). Without them sequential reads stayed near 50 MB/s where Debian reads 150 to 195. */
++        /* sdhc-ddr at sc7180.dtsi sdhc_1 opp-384000000 (its sdhc-ddr peak, the value below; its average 390000 kBps and cpu-sdhc's 1600000 kBps peak are not sent): xm_emmc
++         * (CN1), qnm_aggre1_noc (SN7), qns_gemnoc_sf (SN0), the BCMs sc7180.c puts on that path. Without them sequential reads stayed near 50 MB/s. */
 +        {"CN1", 8, 1, 0, 0, 5400000}, {"SN7", 16, 1, 0, 0, 5400000}, {"SN0", 16, 1, 0, 0, 5400000},
 +    };
 +    uint64_t now;
@@ -695,7 +695,14 @@
 +    volatile uint32_t *base = (volatile uint32_t *)(rsc + 0xd00), *tcs = (volatile uint32_t *)(rsc + 0xd00);   /* TCS 0, active */
 +    const uint32_t control = 0x14 / 4, status = 0x18 / 4, enable = 0x1c / 4, wait = 0x10 / 4, msgid = 0x30 / 4, addr = 0x34 / 4,
 +        data = 0x38 / 4, cmd_status = 0x3c / 4;
-+    if (!(tcs[status] & 1)) { printf("COACHZ mpss: rpmh tcs 0 busy (0x%x), no vote\n", tcs[status]); return; }
++    /* TCS 0 is the one wifi_rpmh_send drives for every other vote (the SDHCI supplies and cx.lvl among them, at the same point of
++     * boot): written without its owner flag, the two sequences mixed their command, enable and IRQ_CLEAR writes. */
++    while (!__sync_bool_compare_and_swap(&wifi_tcs_busy, 0u, 1u)) delay(100);
++    if (!(tcs[status] & 1)) {
++        __atomic_store_n(&wifi_tcs_busy, 0u, __ATOMIC_RELEASE);
++        printf("COACHZ mpss: rpmh tcs 0 busy (0x%x), no vote\n", tcs[status]);
++        return;
++    }
 +    base[0] |= 1u;                                /* IRQ_ENABLE for TCS 0 (the status bit is what is polled) */
 +    tcs[msgid] = 8u | (1u << 16) | (1u << 8);      /* CMD_MSGID_LEN, WRITE, RESP_REQ */
 +    tcs[addr] = 0x30060;                          /* mss.lvl from CMD DB */
@@ -719,6 +726,7 @@
 +    tcs[control] = v & ~(1u << 16);
 +    tcs[enable] = 0;
 +    base[0] &= ~1u;
++    __atomic_store_n(&wifi_tcs_busy, 0u, __ATOMIC_RELEASE);
 +    printf("COACHZ mpss: rpmh vote mss.lvl=0 irq 0x%x after %u us, cmd status 0x%x (issued %u completed %u), tcs status 0x%x\n",
 +        irq, waited, cmd, (cmd >> 8) & 1, (cmd >> 16) & 1, st);
 +}
@@ -1021,7 +1029,7 @@
 +    return sent < 0 ? sent : cx ? -10 + cx : sent;
 +}
 +static const uint64_t wifi_mba_base = 0x94400000ull, wifi_mba_size = 0x200000ull;
-+/* mpss_mem of the LTE SKUs (sc7180-trogdor-lte-sku.dtsi, the same in the device tree Debian runs on this machine): 140 MiB. k85-k92
++/* mpss_mem of the LTE SKUs (sc7180-trogdor-lte-sku.dtsi overrides sc7180-trogdor.dtsi's 32 MiB): 140 MiB. k85-k92
 + * gave the LTE MBA only the 32 MiB of sc7180-trogdor.dtsi, and it stopped after "Secure Device : 1" every time. */
 +static const uint64_t wifi_mpss_base = 0x86000000ull, wifi_mpss_size = 0x8c00000ull;
 +
@@ -1379,7 +1387,7 @@
 +#define WIFI_MDT_RELOCATABLE (1u << 27)
 +/* mpss-metadata: Linux allocates its 16 KiB inside 0xa0000000-0xc0000000 (sc7180-trogdor.dtsi alloc-ranges); here the start of it. */
 +static const uint64_t wifi_mdata_base = 0xa0000000ull, wifi_mdata_size = 0x4000ull;
-+/* rmtfs_mem as the device tree Debian runs has it: 8 MiB that rmtfs_mem.c shares with the modem (qcom,vmid 15), no guard pages. */
++/* rmtfs_mem as sc7180-trogdor.dtsi enlarges it: 8 MiB that rmtfs_mem.c shares with the modem (sc7180.dtsi qcom,vmid MSS_MSA, 15), no guard pages. */
 +static const uint64_t wifi_rmtfs_base = 0x94600000ull, wifi_rmtfs_size = 0x800000ull;
 +
 +static int32_t
@@ -1709,7 +1717,7 @@
 + * three interconnect paths of ipa_data-v4.2.c (memory 80 MBps average and 465 MBps peak to EBI1, imem 68.57 MBps, config 30 MBps from
 + * the apps) as the BCMs on them in mainline sc7180.c (qnm_aggre2_noc SN9, qns_gemnoc_sf SN0, qxs_imem SN1, qnm_gemnoc SN12, qhs_ipa
 + * CN0; MC0, ACV, SH0 and SH4 already carry the DDR vote's larger peak), then the core clock RPMH_IPA_CLK at 100 MHz (clk-rpmh.c: BCM
-+ * IP0, state = rate / (aux unit * 1000), active only, commit). Debian logs "received modem starting event" before the MBA reports.
++ * IP0, state = rate / (aux unit * 1000), active only, commit). ipa_modem.c handles QCOM_SSR_BEFORE_POWERUP ("received modem starting event") before the MBA starts.
 + * Kept on: Linux holds it until the IPA microcontroller, which the modem loads, reports in.
 + */
 +static int
@@ -1741,10 +1749,10 @@
 +/*
 + * The link to the running modem, set up as Linux does once the modem is up: GLINK over SMEM (qcom_glink_smem.c with qcom_glink_native.c;
 + * the AP's FIFO is item 479, the modem's 480, the descriptor 478 holds our FIFO's tail and head, then the modem's), QRTR on GLINK's
-+ * "IPCRTR" channel (net/qrtr af_qrtr.c and the in-kernel name service ns.c, this side node 1 as Debian's qrtr-ns -f 1), and the remote
++ * "IPCRTR" channel (net/qrtr af_qrtr.c and the in-kernel name service ns.c, this side node 1, af_qrtr.c's qrtr_local_nid), and the remote
 + * file system the modem keeps its EFS on (linux-msm rmtfs: QMI service 14 version 1 instance 0, 512-byte sectors moved between the EFS
 + * images and rmtfs_mem). The images (modem_fs1, fs2, fsc, fsg) come with the firmware blob and stay in memory: writes are kept there
-+ * only, as Debian's rmtfs -r keeps them. Polled: Linux takes the GLINK interrupt (SPI 449) and kicks the modem through the APSS IPC
++ * only, as linux-msm rmtfs keeps them with -r. Polled: Linux takes the GLINK interrupt (SPI 449) and kicks the modem through the APSS IPC
 + * register bit 12.
 + */
 +#define WG_FIFO_BYTES 16384u
@@ -2217,8 +2225,8 @@
 +}
 +
 +/*
-+ * ath10k_hw_power_on before the QMI client starts: the WCN3990's five supplies (sc7180-trogdor.dtsi), as the regulator core and
-+ * qcom-rpmh-regulator.c leave them on Debian here (read back there: these voltages, normal mode, enabled): the initial mode (HPM, 7)
++ * ath10k_hw_power_on before the QMI client starts: the WCN3990's five supplies (sc7180-trogdor.dtsi &wifi), as the regulator core and
++ * qcom-rpmh-regulator.c leave them: each node's regulator-min-microvolt (core.c sets the minimum of a regulator it cannot read), the initial mode (HPM, 7)
 + * when the regulator registers, then at enable the cached voltage in mV and the enable bit, each an active-only VRM request waited for.
 + * The SoC has no "qdss" or "cxo_ref_clk_pin" clock on this node.
 + */
@@ -3074,13 +3082,13 @@
 +            WS_PUT32(ws_mhz[c]);
 +            WS_PUT32(ws_mhz[c]);
 +            WS_PUT32(0);
-+            /* ath10k_update_channel_list on the world domain (Debian's iw reg get) through ath10k_wmi_put_wmi_channel: the mode (11G 1, 11A 0) in
++            /* ath10k_update_channel_list on cfg80211's world domain (reg.c world_regdom) through ath10k_wmi_put_wmi_channel: the mode (11G 1, 11A 0) in
 +             * the low bits, PASSIVE bit 7 where it asks for a passive scan (all of 5 GHz, channels 12 and 13), DFS bit 10, ALLOW_HT bit 11, ALLOW_VHT
 +             * bit 12. The scans themselves stay passive. */
 +            const uint32_t mhz = ws_mhz[c];
 +            WS_PUT32((mhz < 3000 ? 1u : 0u) | (mhz > 2462 ? 1u << 7 : 0) | ((mhz >= 5260 && mhz <= 5720) ? 1u << 10 : 0) | 1u << 11 | 1u << 12);
-+            WS_PUT32(40u << 8 | 40u << 16);   /* min 0, max and regulatory 20 dBm in half dB: the world entries of Debian's iw reg get */
-+            WS_PUT32(6u | 40u << 8);          /* antenna 6 dBi, max tx */
++            WS_PUT32(40u << 8 | 40u << 16);   /* min 0, max and regulatory 20 dBm in half dB: reg.c world_regdom */
++            WS_PUT32(6u | 40u << 8);          /* antenna 6 dBi (world_regdom's rule; ath10k's channels start at 0, see the source list), max tx */
 +        }
 +    } else if (command == params + 2) {
 +        WS_PUT32(0x5001);   /* WMI_TLV_VDEV_CREATE_CMDID */
@@ -3708,7 +3716,7 @@
 +    return 0;
 +}
 +
-+/* Our HT and VHT capability, as Debian's iw phy shows for this radio; A-MPDU exponent 3 with 8 us spacing, two streams. */
++/* Our HT and VHT capability as constants (mainline: the firmware's service-ready ht_cap_info and vht_cap_info through mac.c ath10k_get_ht_cap and ath10k_create_vht_cap); A-MPDU 64K and 8 us density are mac.c's fixed values, two streams. */
 +#define WJ_HT_CAP 0x19efu
 +#define WJ_VHT_CAP (0x739139b2u & ~(1u << 11 | 1u << 12 | 7u << 13 | 7u << 16 | 1u << 19 | 1u << 20))   /* no sounding is set up: no beamforming */
 +
@@ -5506,7 +5514,7 @@
 +    __asm__ volatile ("dsb sy" ::: "memory");
 +    if (!wg.rmtfs) wg.rmtfs = ml_io_map_unmappable((vm_offset_t)wifi_rmtfs_base, (vm_size_t)wifi_rmtfs_size, 0x6);
 +    if (!wifi_efs_count) {
-+        /* Without images in the blob: four blank 2 MiB ones, which is what Debian's /lib/firmware/rmtfs holds on this machine. */
++        /* Without images in the blob: four blank 2 MiB ones. */
 +        static const char *const names[4] = {"modem_fs1", "modem_fs2", "modem_fsc", "modem_fsg"};
 +        for (unsigned i = 0; i < 4; i++) {
 +            uint8_t *blank = kalloc_data(2u << 20, Z_WAITOK | Z_ZERO);

@@ -17,7 +17,9 @@
  * PART_CONFIG that selects a boot partition is reported and left alone, so the card is not used.
  *
  * Boot arguments: coachz-emmc=1 reads at high speed, =2 also writes inside the window, =3 also takes HS400 with enhanced strobe, as
- * Debian does on this card (mmc_select_hs400es, GPLL6 at 384 MHz, CX nominal). coachz-sd=1 reads a card, =2 also writes to it. Without
+ * mainline does for this controller (sc7180.dtsi sdhc_1: mmc-hs400-enhanced-strobe, so mmc.c mmc_select_hs400es; its opp-384000000
+ * with required-opps rpmhpd_opp_nom, CX nominal; gcc-sc7180.c ftbl_gcc_sdcc1_apps_clk_src: 384 MHz is GPLL6_OUT_MAIN divided by 1).
+ * coachz-sd=1 reads a card, =2 also writes to it. Without
  * them nothing is mapped.
  */
 #include <sys/param.h>
@@ -114,6 +116,8 @@ struct sdcc {
     int vqmmc_enabled;          /* msm_host->vqmmc_enabled */
     uint32_t rcg_hz;
     unsigned cx_level;
+    int cx_result;        /* the last coachz_rpmh_cx_request result (emmc_fatal) */
+    unsigned cx_votes;
     /* interrupts */
     uint32_t hc_status;         /* accumulated INT_STATUS of the current request */
     int pwr_pending, pwr_flag;
@@ -232,14 +236,23 @@ static int rcg_set(struct sdcc *s, uint32_t rate)
     return 0;
 }
 
-/* dev_pm_opp_set_rate: the rate the RCG can make (floor), CX for its OPP first when going up, then the clock. */
+/* dev_pm_opp_set_rate: the rate the RCG can make (floor), CX for its OPP first when going up, then the clock. A failed CX vote
+ * fails the call before the clock changes, as _set_required_opps does: running the higher rate on a lower corner is how commands
+ * stop answering. */
 static uint32_t opp_set_rate(struct sdcc *s, uint32_t target)
 {
     const uint32_t sources = s->gpll6 ? CM_HS400_SOURCES : CM_STAGE1_SOURCES;
     const struct cm_freq *f = cm_rcg_floor(s->freqs, s->nfreqs, target, sources);
     if (!f) f = cm_rcg_floor(s->freqs, s->nfreqs, 0xffffffffu, sources);
     const unsigned level = cm_sdcc_opp_level(s->sdcc1, f->hz);
-    if (level > s->cx_level) { if (coachz_rpmh_cx_request(s->cx_consumer, level)) printf("COACHZ mmc %s: cx vote failed\n", s->name); }
+    if (level > s->cx_level) {
+        const int voted = coachz_rpmh_cx_request(s->cx_consumer, level);
+        s->cx_result = voted; s->cx_votes++;
+        if (voted) {
+            printf("COACHZ mmc %s: cx vote for %u Hz (level %u) failed: %d; the clock stays at %u Hz\n", s->name, f->hz, level, voted, s->rcg_hz);
+            return 0;
+        }
+    }
     if (!rcg_set(s, f->hz)) return 0;
     if (level < s->cx_level) (void)coachz_rpmh_cx_request(s->cx_consumer, level);
     s->cx_level = level;
@@ -528,7 +541,7 @@ static void msm_set_clock(struct sdcc *s, unsigned clock)
         /* msm_get_clock_mult_for_bus_mode: HS400 is DDR off a clock of twice the bus rate. */
         const uint32_t rate = opp_set_rate(s, s->ios.clock * (hs400 ? 2u : 1u));
         if (!rate) printf("COACHZ mmc %s: failed to set clock at rate %u\n", s->name, s->ios.clock);
-        s->clk_rate = s->ios.clock * (hs400 ? 2u : 1u);
+        else s->clk_rate = s->ios.clock * (hs400 ? 2u : 1u);   /* msm_set_clock_rate_for_bus_mode keeps clk_rate on failure */
     }
     wr16(s->hc, CM_SDHCI_CLOCK_CONTROL, 0);
     if (clock) enable_clk(s, rd16(s->hc, CM_SDHCI_CLOCK_CONTROL));
@@ -632,6 +645,27 @@ static int set_signal_voltage(struct sdcc *s, unsigned signal)
     return err;
 }
 
+/* The eMMC holds the root and the log ring, so once it stops nothing reaches the disk and every report so far was empty. A software
+ * timeout (no interrupt at all within the limit) or no card on the eMMC therefore panics with the state that separates the causes,
+ * which the screen shows: the controller's own INT_STATUS against the interrupt handler's copy and the GIC's pending, enable and
+ * active bits for its SPI (raised but not delivered), the clock against the CX vote (a rate the rail does not carry), the bus state
+ * and the supplies' power-control status. */
+static void emmc_fatal(struct sdcc *s, const char *what, unsigned opcode, uint32_t sw)
+{
+    static vm_offset_t gicd;
+    if (!s->sdcc1) return;
+    if (!gicd) gicd = ml_io_map(0x17a00000u, 0x1000);   /* GICv3 distributor, interrupt-controller@17a00000 */
+    const uint32_t word = (s->hc_intid / 32u) * 4u, bit = 1u << (s->hc_intid % 32u);
+    const int pend = gicd ? !!(*(volatile uint32_t *)(gicd + 0x200 + word) & bit) : -1;
+    const int en = gicd ? !!(*(volatile uint32_t *)(gicd + 0x100 + word) & bit) : -1;
+    const int act = gicd ? !!(*(volatile uint32_t *)(gicd + 0x300 + word) & bit) : -1;
+    panic("COACHZ eMMC %s CMD%u: sw 0x%x hw int 0x%x enable 0x%x signal 0x%x present 0x%x clock 0x%x pwrctl 0x%x adma 0x%x; "
+          "gic spi %u pending %d enabled %d active %d; rcg %u Hz, cx level %u, last vote %d of %u", what, opcode, sw,
+          rd32(s->hc, CM_SDHCI_INT_STATUS), rd32(s->hc, CM_SDHCI_INT_ENABLE), rd32(s->hc, CM_SDHCI_SIGNAL_ENABLE),
+          rd32(s->hc, CM_SDHCI_PRESENT_STATE), rd16(s->hc, CM_SDHCI_CLOCK_CONTROL), rd32(s->hc, CM_MSM_PWRCTL_STATUS),
+          rd32(s->hc, CM_SDHCI_ADMA_ERROR), s->hc_intid - 32u, pend, en, act, s->rcg_hz, s->cx_level, s->cx_result, s->cx_votes);
+}
+
 /* ------------------------------------------------------------------ requests (sdhci_send_command, sdhci_irq) */
 static int wait_int(struct sdcc *s, uint32_t any, unsigned ms, uint32_t *status)
 {
@@ -710,6 +744,7 @@ static int request(struct sdcc *s, struct sdcc_cmd *cmd, struct sdcc_data *data)
     const unsigned limit_ms = cmd->busy_timeout_ms > 9000u ? cmd->busy_timeout_ms + 1000u : 10000u;
     if (!wait_int(s, CM_INT_RESPONSE | CM_INT_CMD_ERRORS | CM_INT_AUTO_CMD_ERR, limit_ms, &st)) {
         printf("COACHZ mmc %s: CMD%u timed out in software, status 0x%x\n", s->name, cmd->opcode, st);
+        emmc_fatal(s, "command timed out in software", cmd->opcode, st);
         cmd->error = -ETIMEDOUT;
     } else if ((st & CM_INT_AUTO_CMD_ERR) && data && !data->sbc && s->auto12) {
         data->error = (rd16(s->hc, CM_SDHCI_AUTO_CMD_STATUS) & CM_AUTO_CMD_TIMEOUT) ? -ETIMEDOUT : -EILSEQ;
@@ -731,6 +766,7 @@ static int request(struct sdcc *s, struct sdcc_cmd *cmd, struct sdcc_data *data)
         if (data || (cmd->flags & CM_RSP_BUSY)) {
             /* Data, or the busy end of an R1B command, both signalled by DATA_END. */
             if (!wait_int(s, CM_INT_DATA_END | CM_INT_DATA_ERRORS | CM_INT_AUTO_CMD_ERR, limit_ms, &st)) {
+                emmc_fatal(s, data ? "data timed out in software" : "busy timed out in software", cmd->opcode, st);
                 if (data) data->error = -ETIMEDOUT; else cmd->error = -ETIMEDOUT;
             } else if (st & CM_INT_DATA_ERRORS) {
                 const int e = (st & CM_INT_DATA_TIMEOUT) ? -ETIMEDOUT : (st & CM_INT_ADMA_ERROR) ? -EIO : -EILSEQ;
@@ -1186,6 +1222,7 @@ static int rescan(struct sdcc *s)
     (void)send_cmd(s, &ifc, 0);   /* mmc_send_if_cond_pcie: no SD Express here, errors ignored */
     if (!sd_attach(s) || !mmc_attach(s)) { s->card_registered = 1; return 0; }
     printf("COACHZ mmc %s: no card attached\n", s->name);
+    emmc_fatal(s, "no card attached", 0, __atomic_load_n(&s->hc_status, __ATOMIC_ACQUIRE));
     power_off(s);
     return -EIO;
 }

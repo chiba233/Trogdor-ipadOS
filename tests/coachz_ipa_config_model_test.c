@@ -54,7 +54,7 @@ static void checks(void)
     CHECK(cip_endpoint_check(7u << 8 | 4u << 16 | 7u << 24) == 11u + 1u);                    /* RX 11 beyond the limit */
     CHECK(cip_endpoint_check(9u << 8 | 3u << 16 | 9u << 24) == CI_EP_AP_LAN_RX + 1u);        /* RX 8 is a TX pipe: wrong direction */
     CHECK(cip_endpoint_check(7u << 8 | 31u << 16 | 15u << 24) == CIP_ENDPOINT_MAX + 1u);     /* limit 46 */
-    CHECK(cip_endpoint_check(0x08090811u) == 0);   /* FLAVOR_0 read on Debian: 8 TX, 9 RX from 8 */
+    CHECK(cip_endpoint_check(0x08090811u) == 0);   /* a FLAVOR_0 (ipa_reg-v4.2.c fields) of 8 TX, 9 RX from 8, as ipa_data-v4.2.c's endpoints need; hardware's is read at run time */
     CHECK(!cip_endpoint_defined(&cipa_endpoints[5]) && cip_endpoint_defined(&cipa_endpoints[4]));
 
     /* resources: one group each way, so X limits only */

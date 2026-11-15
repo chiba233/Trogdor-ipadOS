@@ -57,7 +57,7 @@
 +static volatile uint64_t touch_report_at;
  
  /*
-  * Frames as hid-multitouch.c assembles them for this part's class (Debian binds hid-multitouch with quirks 0x51c10, MT_CLS_WIN_8:
+  * Frames as hid-multitouch.c assembles them for this part's class (the Win8 blob makes hid-core.c pick MT_CLS_WIN_8, 0x51c10:
 @@ -171,7 +165,6 @@
  static struct { int id; unsigned x, y; } frame_contact[FRAME_CONTACTS];
  static unsigned frame_count, frame_expected, frame_received;

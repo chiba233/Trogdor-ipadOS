@@ -679,7 +679,7 @@
 +	}
 +
 +	// One word from the gas gauge, as sbs-battery reads it through Linux's cros-ec tunnel: remote bus 0, address 0x0b, write the register,
-+	// read two bytes (EC_CMD_I2C_PASSTHRU; only the gauge's command byte is written). Debian shows the same temperature and cycle count.
++	// read two bytes (EC_CMD_I2C_PASSTHRU; only the gauge's command byte is written). As mainline: sc7180-trogdor.dtsi i2c-tunnel, cros-ec-sbs.dtsi sbs-battery@b, sbs-battery.c TEMP 0x08, CYCLE_COUNT 0x17.
 +	bool sbsWord(uint8_t reg, uint16_t *out) {
 +		const uint8_t args[11] = {0, 2, 0x0b, 0x00, 1, 0, 0x0b, 0x80, 2, 0, reg};
 +		uint8_t r[4];

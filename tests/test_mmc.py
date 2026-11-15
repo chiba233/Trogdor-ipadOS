@@ -12,7 +12,7 @@ PENDING = ROOT / 'platform/coachz-prelink/drivers/RamBlock/mmc'
 # Just enough of the XNU kernel interfaces for a syntax and type check of coachz_sdcc.c on the host.
 STUBS = {
     'sys/param.h': '#include <stdbool.h>\n#include <stddef.h>\n#include <stdint.h>\n',
-    'sys/systm.h': 'int printf(const char *, ...);\n',
+    'sys/systm.h': 'int printf(const char *, ...);\nvoid panic(const char *, ...) __attribute__((noreturn));\n',
     'sys/errno.h': ''.join(f'#define {name} {value}\n' for name, value in [
         ('EIO', 5), ('ENOMEM', 12), ('EFAULT', 14), ('ENODEV', 19), ('EINVAL', 22), ('EAGAIN', 35), ('ETIMEDOUT', 60),
         ('ENOSYS', 78), ('EILSEQ', 92), ('EBADMSG', 94), ('EOPNOTSUPP', 102)]),

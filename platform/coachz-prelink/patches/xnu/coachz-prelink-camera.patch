@@ -1,0 +1,49 @@
+--- a/osfmk/arm64/coachz_thread.c
++++ b/osfmk/arm64/coachz_thread.c
+@@ -732,6 +732,9 @@
+ 		{
+ 			extern void coachz_bridge_start(void);
+ 			coachz_bridge_start();
++			/* The rear camera's step-1 run (drivers/RamBlock/camera/coachz_camera.c, /chosen/coachz-camera): started once. */
++			extern void coachz_camera_start(void);
++			coachz_camera_start();
+ 			extern void coachz_staged_mark_built(void);
+ 			coachz_staged_mark_built();
+ 		}
+--- a/bsd/dev/coachz_wifi.c
++++ b/bsd/dev/coachz_wifi.c
+@@ -360,7 +360,7 @@
+  * others): cmd-db lookups, active-only writes through the TCS above, and cx.lvl as rpmhpd aggregates it, the highest corner any
+  * consumer asks for (a plain write by one would drop another's level). The modem's proxy vote is one such consumer.
+  */
+-enum { COACHZ_CX_MSS_PROXY = 3, COACHZ_CX_CONSUMERS = 6 };   /* 1, 2 SDCC; 4 usb_1; 5 venus (CoachzVenus.cpp) */
++enum { COACHZ_CX_MSS_PROXY = 3, COACHZ_CX_CONSUMERS = 7 };   /* 1, 2 SDCC; 4 usb_1; 5 venus (CoachzVenus.cpp); 6 camera */
+ static uint32_t coachz_cx_corner[COACHZ_CX_CONSUMERS], coachz_cx_written = 0xffffffffu;
+ static volatile uint32_t coachz_cx_busy;
+ static uint8_t coachz_aux[4][64];
+@@ -585,6 +585,25 @@
+     return db ? wifi_bcm_send(db, "venus config", &path, 1) : -1;
+ }
+ 
++/*
++ * The camera's path to memory (drivers/RamBlock/camera/coachz_camera.c): CPAS's cam_hf_1_mnoc path in sc7180-camera.dtsi is
++ * qxm_camnoc_hf0 to ebi, whose mmss hop qns_mem_noc_hf (32 bytes, one channel) is MM0's only node in sc7180.c; qns_llcc and ebi carry
++ * the DDR vote's top level. The display's qxm_mdp0 also reaches DDR through qns_mem_noc_hf, and nothing else votes MM0 here, so its
++ * share (as coachz_venus_bus_vote computes it) is always included and the peak never drops below its floor. kB/s in.
++ */
++int coachz_camera_bus_vote(uint64_t avg_kbps, uint64_t peak_kbps);
++int
++coachz_camera_bus_vote(uint64_t avg_kbps, uint64_t peak_kbps)
++{
++    const uint64_t display_bw = 2160ull * (1440 + 3 + 6 + 31) * 60 * 4;
++    const uint64_t display_prefill = display_bw * 24 / (31 + 6);
++    const uint64_t display_fetch = display_bw > display_prefill ? display_bw : display_prefill;
++    const uint64_t display_avg = display_fetch * 120 / 100 / 1000, display_peak = 1600000;
++    const struct wifi_bcm path = {"MM0", 32, 1, 0, avg_kbps + display_avg, peak_kbps > display_peak ? peak_kbps : display_peak};
++    const vm_offset_t db = wifi_cmd_db();
++    return db ? wifi_bcm_send(db, "camera bus", &path, 1) : -1;
++}
++
+ static int
+ wifi_bcm_send(vm_offset_t db, const char *tag, const struct wifi_bcm *bcms, unsigned count)
+ {

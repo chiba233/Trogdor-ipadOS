@@ -1,0 +1,110 @@
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -358,6 +358,8 @@
+ 
+ 	arm_slide_rebase_and_sign_image();
+ 
++	/* The probe's ramoops note sits past boot_args in the same page, which the copy below does not keep. */
++	coachz_early_note_ramoops((const uint8_t *)args + 0x800);
+ 	/* If kernel integrity is supported, use a constant copy of the boot args. */
+ 	const_boot_args = *args;
+ 	BootArgs = args = &const_boot_args;
+--- a/osfmk/arm64/coachz_early.h
++++ b/osfmk/arm64/coachz_early.h
+@@ -16,4 +16,14 @@
+ void coachz_early_band(uint32_t rows);
+ void coachz_early_disable(void);
+ 
++/*
++ * Depthcharge's ramoops buffer, as the boot probe left it at boot_args page + 0x800 ("CZRAMOOP", u64 base, u64 size). arm_init reads it
++ * before the boot args are copied; drivers/RamBlock/earlylog/coachz_early_log.c maps it and turns the mirror on.
++ */
++extern uint64_t coachz_ramoops_base, coachz_ramoops_size;
++extern volatile uint8_t *volatile coachz_early_mirror;
++extern volatile uint64_t *coachz_early_mirror_head;
++extern uint64_t coachz_early_mirror_mask;
++void coachz_early_note_ramoops(const uint8_t *note);
++
+ #endif
+--- a/osfmk/arm64/coachz_early.c
++++ b/osfmk/arm64/coachz_early.c
+@@ -54,15 +54,49 @@
+ char coachz_log_capture[1u << 20];
+ volatile uint64_t coachz_log_head;
+ 
++/*
++ * The same bytes, mirrored into depthcharge's ramoops buffer once coachz_early_log.c has mapped it (Device memory: byte stores, and the
++ * head as one aligned u64), so that a boot that stops before the disk log opens leaves its tail for the next boot to read back.
++ */
++uint64_t coachz_ramoops_base, coachz_ramoops_size;
++volatile uint8_t *volatile coachz_early_mirror;
++volatile uint64_t *coachz_early_mirror_head;
++uint64_t coachz_early_mirror_mask;
++
++void
++coachz_early_note_ramoops(const uint8_t *note)
++{
++	static const char magic[8] = {'C', 'Z', 'R', 'A', 'M', 'O', 'O', 'P'};
++	for (unsigned i = 0; i < 8; i++) {
++		if (note[i] != (uint8_t)magic[i]) {
++			return;
++		}
++	}
++	uint64_t base = 0, size = 0;
++	for (unsigned i = 0; i < 8; i++) {
++		base |= (uint64_t)note[8 + i] << (8 * i);
++		size |= (uint64_t)note[16 + i] << (8 * i);
++	}
++	coachz_ramoops_base = base;
++	coachz_ramoops_size = size;
++}
++
+ /* User-space output for the disk log only: it never reaches the screen. */
+ void
+ coachz_log_append(const char *bytes, size_t count)
+ {
+ 	uint64_t at = __atomic_fetch_add(&coachz_log_head, count, __ATOMIC_RELAXED);
++	volatile uint8_t *mirror = __atomic_load_n(&coachz_early_mirror, __ATOMIC_ACQUIRE);
+ 
+ 	for (size_t i = 0; i < count; i++) {
+ 		coachz_log_capture[(at + i) & ((1u << 20) - 1)] = bytes[i];
++		if (mirror) {
++			mirror[(at + i) & coachz_early_mirror_mask] = (uint8_t)bytes[i];
++		}
+ 	}
++	if (mirror) {
++		*coachz_early_mirror_head = at + count;
++	}
+ }
+ 
+ void
+@@ -70,6 +104,11 @@
+ {
+ 	uint64_t at = __atomic_fetch_add(&coachz_log_head, 1, __ATOMIC_RELAXED);
+ 	coachz_log_capture[at & ((1u << 20) - 1)] = c;
++	volatile uint8_t *mirror = __atomic_load_n(&coachz_early_mirror, __ATOMIC_ACQUIRE);
++	if (mirror) {
++		mirror[at & coachz_early_mirror_mask] = (uint8_t)c;
++		*coachz_early_mirror_head = at + 1;
++	}
+ 	if (early_fb == NULL || early_muted) {
+ 		return;
+ 	}
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -632,6 +632,15 @@
+ 	kernel_startup_initialize_upto(STARTUP_SUB_THREAD_CALL);
+ 
+ 	/*
++	 * Coachz: mirror the early log into depthcharge's ramoops buffer and read back what the boot before left there
++	 * (drivers/RamBlock/earlylog/coachz_early_log.c). VM and thread calls work from here; IOKit and bsd_init come later.
++	 */
++	{
++		extern void coachz_early_log_start(void);
++		coachz_early_log_start();
++	}
++
++	/*
+ 	 * Remain on current processor as
+ 	 * additional processors come online.
+ 	 */

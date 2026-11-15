@@ -6,7 +6,7 @@
 // venus_boot_no_tz and venus_reset_cpu; hfi_venus.c venus_interface_queues_init, venus_run, venus_boot_core, venus_core_init and
 // its queue reads and writes; hfi_cmds.c the SYS packets), drivers/clk/qcom/videocc-sc7180.c (video_pll0, video_cc_venus_clk_src,
 // the branches and both GDSCs), clk-alpha-pll.c (Fabia configure and enable), gdsc.c, gcc-sc7180.c (the always-on video AHB and XO
-// branches), drivers/soc/qcom/mdt_loader.c, and the device tree Debian runs on this machine (sc7180.dtsi: video-codec@aa00000, its
+// branches), drivers/soc/qcom/mdt_loader.c, and mainline's sc7180.dtsi (video-codec@aa00000, its
 // video-firmware child, memory@8f600000, iommus <&apps_smmu 0xc00 0x60> and <0xc42 0>).
 //
 // Trogdor's TF-A offers no PAS calls, which is why its device tree has the video-firmware child: Linux then boots the firmware
@@ -30,21 +30,28 @@
 #include <IOKit/IOLocks.h>
 #include <kern/thread.h>
 #include <kern/clock.h>
+#include <kern/task.h>
+#include <arm/cpu_number.h>
+#include <vm/vm_map.h>
 #include <libkern/c++/OSMetaClass.h>
 #include <libkern/c++/OSSymbol.h>
 #include <mach/kmod.h>
 #include <pexpert/pexpert.h>
+#include <pexpert/device_tree.h>
 #include <stdarg.h>
 #include <string.h>
 #include "ArmSmmu4KLive.h"
 #include "CoachzVideoAbi.h"
+#include "CoachzVideoProbe.h"
 
 extern "C" vm_offset_t ml_io_map(vm_offset_t physical, vm_size_t size);
 extern "C" unsigned int pmap_cache_attributes(ppnum_t pn);
 extern "C" void pmap_set_cache_attributes(ppnum_t pn, unsigned int cacheattr);
+extern "C" kern_return_t coachz_video_audit_memory(vm_map_t map, uint64_t address, uint64_t bytes, uint32_t result[6]);
 extern "C" void dcache_incoherent_io_flush64(addr64_t pa, unsigned int count, unsigned int remaining, unsigned int *res);
 extern "C" int coachz_rpmh_cx_request(unsigned consumer, unsigned level);          // coachz_wifi.c: cx.lvl aggregated over consumers
 extern "C" int coachz_venus_bus_vote(uint64_t avg_kbps, uint64_t peak_kbps);       // coachz_wifi.c: MM1 and MM2
+extern "C" int coachz_venus_config_vote(int enable);                            // CN0, aggregated with the IPA consumer
 extern "C" uint8_t *volatile coachz_venus_fw;                                       // coachz_wifi.c: venus.mbn, SHA-256 checked
 extern "C" size_t coachz_venus_fw_bytes;
 extern "C" int armcpu_spi_attach(uint32_t, bool, void (*)(void *), void *, uint32_t *, uint64_t *);   // ArmCpu.cpp, IOReturn
@@ -58,7 +65,7 @@ namespace {
 
 void log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void log(const char *fmt, ...) {
-  char line[224]; va_list ap; va_start(ap, fmt); vsnprintf(line, sizeof line, fmt, ap); va_end(ap);
+  char line[512]; va_list ap; va_start(ap, fmt); vsnprintf(line, sizeof line, fmt, ap); va_end(ap);
   printf("COACHZ venus: %s\n", line);
 }
 void barrier() { __asm__ volatile("dsb sy" ::: "memory"); }
@@ -105,6 +112,7 @@ constexpr uint32_t kHwVersion = kWrapper + 0x00, kIntrStatus = kWrapper + 0x0c, 
 constexpr uint32_t kCpaStart = kWrapper + 0x1020, kCpaEnd = kWrapper + 0x1024, kFwStart = kWrapper + 0x1028, kFwEnd = kWrapper + 0x102c,
                    kNonpixStart = kWrapper + 0x1030, kNonpixEnd = kWrapper + 0x1034, kCpuClockConfig = kWrapper + 0x2000,
                    kCpuCgcDis = kWrapper + 0x2010, kCpuStatus = kWrapper + 0x2014, kA9ssSwReset = kWrapper + 0x3000;
+constexpr uint32_t kCpuAxiHalt = kWrapper + 0x2008, kCpuAxiHaltStatus = kWrapper + 0x200c;
 
 // ---- HFI (hfi_venus.c, hfi_cmds.h, hfi_msgs.h, hfi_helper.h) ----
 constexpr uint32_t kQueueCount = 3, kCmdQ = 0, kMsgQ = 1, kDbgQ = 2;
@@ -207,8 +215,10 @@ bool power_on() {
   set_bits(gVideoCc, kVideoCcXo, 1u, 1u);
   // venus_runtime_resume: icc_set_bw(video-mem, 20000 kB/s), icc_set_bw(cpu-cfg, 1000) (CN0 is kept on); then the cx performance state.
   const int bus = coachz_venus_bus_vote(20000, 20000);
+  const int cfg = coachz_venus_config_vote(1);
   const int cx = coachz_rpmh_cx_request(kCxConsumer, kCxLowSvs);
-  log("bus vote %d, cx low_svs vote %d", bus, cx);
+  log("bus vote %d, cpu-cfg vote %d, cx low_svs vote %d", bus, cfg, cx);
+  if (bus < 0 || cfg < 0 || cx) return false;
   step("video_pll0");
   if (!pll_on()) return false;
   step("venus_clk_src");
@@ -506,6 +516,13 @@ int queue_read(unsigned i, uint32_t *buf, uint32_t capacity) {
 void soft_int() { wr(gVenus, kSoftInt, kSoftIntH2a); }
 // hfi_venus.c venus_iface_cmdq_write: one writer at a time (the client threads and the message thread all send).
 IOLock *gHfiLock;
+IOLock *gCoreLock, *gRxLock;
+volatile uint32_t gTransport, gIrqReaders;
+volatile uint32_t gFaultSerial;
+uint32_t gCoreEpoch = 1;
+bool gCollapsed, gCoreReady, gRuntimePm;
+bool core_resume();
+bool core_recover();
 bool send(const uint32_t *packet, const char *what) {
   if (gHfiLock) IOLockLock(gHfiLock);
   const int written = queue_write(kCmdQ, packet);
@@ -516,13 +533,13 @@ bool send(const uint32_t *packet, const char *what) {
 }
 
 // venus_run: the shared region's place, then venus_boot_core: interrupts, CTRL_INIT, and the firmware's status in SCIACMDARG0.
-bool run() {
+bool run(bool interrupts = true) {
   wr(gVenus, kUcRegionAddr, static_cast<uint32_t>(kSharedIova));
   wr(gVenus, kUcRegionSize, kSharedQSize);
   wr(gVenus, kSciaCmdArg2, static_cast<uint32_t>(kSharedIova));
   wr(gVenus, kSciaCmdArg1, 0x01);
   wr(gVenus, kSfrAddr, static_cast<uint32_t>(kSharedIova + kSfrOffset));
-  wr(gVenus, kIntrMask, kIntrMaskA2hVcodec);
+  wr(gVenus, kIntrMask, interrupts ? kIntrMaskA2hVcodec : ~0u);
   wr(gVenus, kCtrlInit, 1);
   uint32_t status = 0; unsigned tries = 0;
   while (!status && tries < 100) {
@@ -546,7 +563,7 @@ void print_sfr(const char *when) {
 
 uint32_t gPacket[1024 * 3];
 unsigned gDebugLines, gInitDone, gVersionSeen;
-volatile uint32_t gSysError;   // SYS_ERROR or the watchdog: every session fails, nothing restarts the core (no venus_sys_error_handler)
+volatile uint32_t gSysError;   // SYS_ERROR/watchdog: fail clients first, then the worker cold-restarts the core
 
 // ---- dynamic buffers: dma_alloc_attrs with DMA_ATTR_WRITE_COMBINE as helpers.c and vb2-dma-contig take them, each buffer its own
 // contiguous allocation mapped at an IOVA of its own ----
@@ -669,20 +686,23 @@ bool pll_rate(const Opp &o) {
 // core_clks_set_rate through the OPP: a higher corner is voted before the clock rises, a lower one after it falls; the clock core
 // changes the PLL (the parent) before the RCG.
 bool set_opp(unsigned index) {
-  if (index == gOpp || index >= 5) return true;
+  if (index >= 5) return false;
+  if (index == gOpp) return true;
   const Opp &o = kOpps[index];
-  const bool up = index > gOpp;
-  if (up && coachz_rpmh_cx_request(kCxConsumer, o.cx)) { log("cx vote %u refused", o.cx); return false; }
-  const bool ok = pll_rate(o);
+  const bool unknown = gOpp >= 5;
+  const bool up = index > gOpp || unknown;
+  if (unknown && coachz_rpmh_cx_request(kCxConsumer, kOpps[4].cx)) return false;
+  if (up && !unknown && coachz_rpmh_cx_request(kCxConsumer, o.cx)) { log("cx vote %u refused", o.cx); return false; }
+  bool ok = pll_rate(o);
   if (ok) {
     wr(gVideoCc, kVenusRcgCfg, (rd(gVideoCc, kVenusRcgCfg) & ~(0x7u << 8 | 0x1fu)) | 1u << 8 | o.div_field);
     set_bits(gVideoCc, kVenusRcgCmd, 1u, 1u);
-    if (!poll(gVideoCc, kVenusRcgCmd, 1u, 0, 500)) log("venus_clk_src: update did not clear (CMD 0x%x)", rd(gVideoCc, kVenusRcgCmd));
+    if (!poll(gVideoCc, kVenusRcgCmd, 1u, 0, 500)) { log("venus_clk_src: update did not clear (CMD 0x%x)", rd(gVideoCc, kVenusRcgCmd)); ok = false; }
   }
-  if (ok && !up) coachz_rpmh_cx_request(kCxConsumer, o.cx);
+  if (ok && (!up || unknown)) coachz_rpmh_cx_request(kCxConsumer, o.cx);
   log("core clock %u MHz: %s, PLL MODE 0x%x L 0x%x, RCG CFG 0x%x", o.hz / 1000000, ok ? "set" : "FAILED", rd(gVideoCc, kPllMode),
       rd(gVideoCc, kPllL), rd(gVideoCc, kVenusRcgCfg));
-  if (ok) gOpp = index;
+  gOpp = ok ? index : 5; // a failed latch/RCG update leaves the physical rate unknown
   return ok;
 }
 
@@ -701,7 +721,8 @@ constexpr uint32_t kPropFrameSize = 0x1001, kPropFormatSelect = 0x1003, kPropPro
     kIndexInputCrop = 0x0700000e;
 constexpr uint32_t kEventSysError = 0x1, kEventSessionError = 0x2, kEventSufficient = 0x1000001, kEventInsufficient = 0x1000002,
     kEventSeqChanged = 0x1000003, kEventReleaseRef = 0x1000006;
-constexpr uint32_t kBufInput = 1, kBufOutput = 2, kBufOutput2 = 3, kNv12 = 0x2, kNv12Ubwc = 0x8002;
+constexpr uint32_t kBufInput = 1, kBufOutput = 2, kBufOutput2 = 3, kNv12 = 0x2, kNv12Ubwc = 0x8002,
+    kP010 = 0x4003, kTp10Ubwc = 0xc002, kBitDepth10 = 0x20002;
 constexpr uint32_t kFlushOutput = 0x1000002, kFlushAll = 0x1000004;
 constexpr uint32_t kFlagEos = 0x1, kFlagCorrupt = 0x8, kFlagTimestampInvalid = 0x100, kFlagDropFrame = 0x20000000;
 constexpr uint32_t kPicI = 0x01, kPicIdr = 0x08;
@@ -713,6 +734,16 @@ constexpr uint32_t kTimeoutMs = 1000;   // hfi.c wait_session_msg: TIMEOUT 1 s
 // helpers.c get_framesize_raw_nv12 and get_framesize_raw_nv12_ubwc.
 uint32_t al(uint32_t v, uint32_t a) { return (v + a - 1) / a * a; }
 uint32_t framesz_nv12(uint32_t w, uint32_t h) { return al(al(w, 128) * al(h, 32) + al(w, 128) * al((h + 1) >> 1, 16), 4096); }
+uint32_t framesz_p010(uint32_t w, uint32_t h) { return al(al(w * 2, 128) * (al(h, 32) + al((h + 1) >> 1, 16)), 4096); }
+// helpers.c get_framesize_raw_yuv420_tp10_ubwc: packed 10-bit DPB, with separate aligned Y/UV metadata and extra space.
+uint32_t framesz_tp10(uint32_t w, uint32_t h) {
+  const uint32_t stride = al(w * 4 / 3, 256);
+  const uint32_t y = al(stride * al(h, 16), 4096), uv = al(stride * al((h + 1) / 2, 16), 4096);
+  const uint32_t ym = al(al((w + 47) / 48, 64) * al((h + 3) / 4, 16), 4096);
+  const uint32_t uvm = al(al(((w + 1) / 2 + 23) / 24, 64) * al(((h + 1) / 2 + 3) / 4, 16), 4096);
+  const uint32_t extra = stride * 48 > 24576 ? stride * 48 : 24576;
+  return al(y + uv + ym + uvm + extra, 4096);
+}
 uint32_t framesz_ubwc(uint32_t w, uint32_t h) {
   const uint32_t y_meta = al(al(al(w, 32) / 32, 64) * al(al(h, 8) / 8, 16), 4096);
   const uint32_t y = al(al(w, 128) * al(h, 32), 4096);
@@ -732,13 +763,32 @@ uint32_t framesz_compressed(uint32_t w, uint32_t h) {
 enum State { kDeinit, kInit, kCaptureSetup, kStopped, kDecoding, kDrain, kDrc, kSeek };
 enum Owner : uint32_t { kDriver, kFirmware, kClient };
 struct Bufreq { uint32_t type, size, region_size, hold_count, count_min, count_actual, contiguous, alignment; };
-struct Frame { Buffer buf; uint32_t owner; };
+struct Frame {
+  Buffer buf; uint32_t owner, payload;
+  uint64_t probe_token, probe_fbd_ticks;
+  bool probe_pending;
+};
 constexpr unsigned kMaxSessions = 6, kRing = 256, kMaxInternal = 24;
+// hfi_session_ftb_done's metadata, accumulated for OUTPUT2 only. Empty returns during flush are counted separately from pictures.
+struct FbdStats {
+  uint32_t count, nonempty, min_filled, max_filled, zero, short_picture, offsets, max_offset, flags;
+  uint32_t i, p, b, idr, other, corrupt, errors, drops, flushing, stale, bounds, address, dimensions;
+  uint32_t last_width, last_height, first_error;
+};
+// Input digests bracket ownership; observation ticks are not ETB/IRQ timestamps.
+struct InputProbe {
+  uint64_t token, before_hash, after_hash, observe_begin_ticks, observe_end_ticks, etb_ticks;
+  uint32_t bytes, index, error;
+  bool valid, completed, requested;
+};
+uint32_t gOutput2CodedSize; // explicit experiment only; the default is vdec_output_conf's aligned capture size
 struct Session {
   uint32_t id; bool used;
+  uint32_t epoch; bool quarantined;
   IOLock *lock;   // replies, events and what the message thread changes
   IOLock *op;     // one client operation at a time (the message thread never takes it)
-  uint32_t codec, width, height, out_width, out_height;
+  uint32_t codec, width, height, out_width, out_height, fps;
+  bool client_p010;
   State state;
   bool reconfig, drain_active, drain_pending, flushing, failed;
   uint32_t error;
@@ -754,6 +804,9 @@ struct Session {
   uint32_t crop_l, crop_t, crop_w, crop_h;
   CoachzVideoEvent ring[kRing]; uint32_t head, tail, lost;
   uint32_t frames, inputs;
+  FbdStats fbd;
+  InputProbe input_probe[kRing]; // token association survives input-slot reuse and B-frame output reordering
+  uint32_t sample_generation, sample_count, anomaly_samples, periodic_samples;
 };
 Session gSessions[kMaxSessions];
 IOLock *gSessionsLock;
@@ -767,7 +820,11 @@ Session *session_by_id(uint32_t id) {
 }
 // Under s->lock.
 void push_locked(Session *s, const CoachzVideoEvent &e) {
-  if (s->head - s->tail >= kRing) { s->lost++; return; }
+  if (s->head - s->tail >= kRing) {
+    if (++s->lost <= 4) log("event lost session 0x%x kind %u gen %u token %llu index %u flags 0x%x count %u",
+        s->id, e.kind, e.generation, e.token, e.index, e.flags, s->lost);
+    return;
+  }
   s->ring[s->head % kRing] = e;
   s->head++;
   IOLockWakeup(s->lock, &s->head, false);
@@ -776,7 +833,7 @@ void push(Session *s, const CoachzVideoEvent &e) { IOLockLock(s->lock); push_loc
 void fail(Session *s, uint32_t error, const char *why) {
   IOLockLock(s->lock);
   if (!s->failed) {
-    s->failed = true; s->error = error;
+    s->failed = true; s->error = error; s->reconfig = false;
     CoachzVideoEvent e = {}; e.kind = CoachzVideoEventError; e.status = error;
     push_locked(s, e);
     log("session 0x%x failed: %s (0x%x)", s->id, why, error);
@@ -837,30 +894,38 @@ bool flush_session(Session *s, uint32_t type) {
 }
 
 // load_scale_v4 and load_scale_bw over every running session: vpp 200 and vsp 10 cycles a macroblock for every decoder of
-// hfi_platform_v4.c codec_freq_data, 21/20 and 10/7 overheads, the frame rate vdec_inst_init assumes; the lowest OPP at or above.
-void load_scale() {
+// hfi_platform_v4.c codec_freq_data, 21/20 and 10/7 overheads, the media frame rate (default 30); the lowest OPP at or above.
+bool load_scale() {
   IOLockLock(gScaleLock);
   uint64_t freq = 0, mbs_total = 0;
+  IOLockLock(gSessionsLock);
   for (Session &s : gSessions) {
-    if (!s.used || s.state == kDeinit) continue;
-    const uint64_t mbs = static_cast<uint64_t>(al(s.width, 16) / 16) * (al(s.height, 16) / 16) * kFps;
+    if (!s.used) continue;
+    IOLockLock(s.lock);
+    if (s.failed || s.epoch != gCoreEpoch || s.state == kDeinit) { IOLockUnlock(s.lock); continue; }
+    const uint32_t fps = s.fps ? s.fps : kFps;
+    const uint64_t mbs = static_cast<uint64_t>(al(s.width, 16) / 16) * (al(s.height, 16) / 16) * fps;
     uint64_t vpp = mbs * 200; vpp += vpp / 20;
-    const uint64_t vsp = mbs * 10 + static_cast<uint64_t>(kFps) * s.payload_max * 8 * 10 / 7;
+    const uint64_t vsp = mbs * 10 + static_cast<uint64_t>(fps) * s.payload_max * 8 * 10 / 7;
     freq += vpp > vsp ? vpp : vsp;
     mbs_total += mbs;
+    IOLockUnlock(s.lock);
   }
+  IOLockUnlock(gSessionsLock);
   unsigned index = 4;
   for (unsigned i = 0; i < 5; ++i) if (kOpps[i].hz >= freq) { index = i; break; }
-  set_opp(index);
+  if (index != gOpp) log("load %llu Hz, %llu macroblocks/s -> %u MHz", freq, mbs_total, kOpps[index].hz / 1000000);
+  bool ok = set_opp(index);
   uint64_t avg = 0, peak = 0;
   if (mbs_total) for (unsigned i = 0; i < 3; ++i) { if (i && mbs_total > kBwDec[i].mbs) break; avg = kBwDec[i].avg; peak = kBwDec[i].peak; }
   if (!avg && !peak) avg = 1000;   // the minimum vote load_scale_bw keeps
   if (avg != gBwAvg || peak != gBwPeak) {
     const int voted = coachz_venus_bus_vote(avg, peak);
     log("bus vote avg %llu peak %llu kB/s: %d", avg, peak, voted);
-    gBwAvg = avg; gBwPeak = peak;
+    if (voted >= 0) { gBwAvg = avg; gBwPeak = peak; } else ok = false;
   }
   IOLockUnlock(gScaleLock);
+  return ok;
 }
 
 // ---- the message thread (hfi_venus.c venus_isr_thread, hfi_msgs.c hfi_process_msg_packet) ----
@@ -915,13 +980,50 @@ void fbd(Session *s, const uint32_t *p, unsigned dwords) {
     for (uint32_t i = 0; i < s->ndpb; ++i) if (tag == kVb2MaxFrame + i) s->dpb[i].owner = kDriver;
     return;
   }
+  if (stream != 1) return; // hfi_session_ftb_done recognizes only OUTPUT and OUTPUT2
+  uint64_t message_ticks;
+  clock_get_uptime(&message_ticks);
   const uint32_t gen = tag >> 16, index = tag & 0xffff;
   IOLockLock(s->lock);
+  FbdStats &d = s->fbd;
+  ++d.count;
+  d.flags |= hflags;
+  if (filled) {
+    if (!d.nonempty || filled < d.min_filled) d.min_filled = filled;
+    if (filled > d.max_filled) d.max_filled = filled;
+    ++d.nonempty;
+  } else ++d.zero;
+  if (offset) ++d.offsets;
+  if (offset > d.max_offset) d.max_offset = offset;
+  if (hflags & kFlagCorrupt) ++d.corrupt;
+  if (hflags & kFlagDropFrame) ++d.drops;
+  if (error) { if (!d.errors) d.first_error = error; ++d.errors; }
+  if (s->flushing) ++d.flushing;
+  switch (pic) {
+  case 1: ++d.i; break;
+  case 2: ++d.p; break;
+  case 4: ++d.b; break;
+  case 8: ++d.idr; break;
+  default: ++d.other; break;
+  }
+  d.last_width = p[15]; d.last_height = p[16];
+  if (filled && (p[15] != s->out_width || p[16] != s->out_height)) ++d.dimensions;
   if (gen != s->generation || index >= s->nopb || s->opb[index].owner != kFirmware) {
+    ++d.stale;
+    if (d.stale <= 4) log("ownership session 0x%x FBD gen %u current %u token %llu index %u owner %u count %u",
+        s->id, gen, s->generation, ts, index, index < s->nopb ? s->opb[index].owner : ~0u, d.stale);
     IOLockUnlock(s->lock);
     return;   // a buffer of an older output generation, freed when that generation went
   }
   Frame &o = s->opb[index];
+  o.probe_pending = false;
+  if (p[23] != o.buf.iova) ++d.address;
+  const uint32_t sample_bytes = s->bit_depth == kBitDepth10 ? 2 : 1;
+  const uint32_t stride = al(s->width * sample_bytes, 128), scanlines = al(s->height, 32);
+  const uint64_t visible = coachz_video_visible_end(stride, scanlines, s->crop_l, s->crop_t, s->crop_w, s->crop_h, sample_bytes);
+  const bool in_range = visible && offset <= o.buf.bytes && visible <= o.buf.bytes - offset;
+  if (!in_range || offset > o.buf.bytes || filled > o.buf.bytes - offset) ++d.bounds;
+  if (filled && visible && filled < visible) ++d.short_picture;
   o.owner = kDriver;
   const bool last = hflags & kFlagEos;
   CoachzVideoEvent e = {};
@@ -934,6 +1036,51 @@ void fbd(Session *s, const uint32_t *p, unsigned dwords) {
   const bool deliver = filled && !(hflags & kFlagDropFrame) && !s->flushing && !s->failed;
   bool requeue = false;
   if (deliver) {
+    const InputProbe &timing = s->input_probe[ts % kRing];
+    const uint64_t etb_ticks = timing.valid && timing.token == ts ? timing.etb_ticks : 0;
+    e.flags |= CoachzVideoEventTiming;
+    e.count = static_cast<uint32_t>(message_ticks); e.bytes = static_cast<uint32_t>(message_ticks >> 32);
+    e.stride = static_cast<uint32_t>(etb_ticks); e.scanlines = static_cast<uint32_t>(etb_ticks >> 32);
+    if (s->sample_generation != gen) { s->sample_generation = gen; s->sample_count = 0; }
+    const bool anomaly = error || (hflags & kFlagCorrupt) || (visible && filled < visible);
+    const bool periodic = (s->frames + 1) % 120 == 0 && s->periodic_samples < 8;
+    if (in_range && (s->sample_count < 4 || periodic || (anomaly && s->anomaly_samples < 4))) {
+      if (periodic) ++s->periodic_samples;
+      else if (s->sample_count >= 4) ++s->anomaly_samples;
+      ++s->sample_count;
+      e.flags |= CoachzVideoFrameSample;
+      InputProbe &input = s->input_probe[ts % kRing];
+      const bool input_found = input.valid && input.token == ts;
+      if (input_found) input.requested = true;
+      log("input reference session 0x%x gen %u token %llu found %u bytes %u before %016llx completed %u after %016llx error 0x%x observe-begin %llu observe-end %llu",
+          s->id, gen, ts, input_found, input_found ? input.bytes : 0, input_found ? input.before_hash : 0,
+          input_found && input.completed, input_found ? input.after_hash : 0, input_found ? input.error : 0,
+          input_found ? input.observe_begin_ticks : 0, input_found ? input.observe_end_ticks : 0);
+      clock_get_uptime(&o.probe_fbd_ticks);
+      o.probe_token = ts;
+      o.probe_pending = true;
+      __asm__ volatile("dmb sy" ::: "memory");
+      const volatile uint8_t *base = o.buf.va + offset;
+      const volatile uint8_t *y = base + static_cast<uint64_t>(s->crop_t) * stride + s->crop_l * sample_bytes;
+      const volatile uint8_t *uv = base + static_cast<uint64_t>(stride) * scanlines + static_cast<uint64_t>(s->crop_t / 2) * stride + (s->crop_l & ~1u) * sample_bytes;
+      uint32_t zy, zuv;
+      const uint32_t hy = coachz_video_probe_plane(y, stride, s->crop_w * sample_bytes, s->crop_h, &zy);
+      const uint32_t huv = coachz_video_probe_plane(uv, stride, al(s->crop_w, 2) * sample_bytes, (s->crop_h + 1) / 2, &zuv);
+      const CoachzVideoPlaneDigest full_y = coachz_video_digest_plane(y, stride, s->crop_w * sample_bytes, s->crop_h);
+      const CoachzVideoPlaneDigest full_uv = coachz_video_digest_plane(uv, stride, al(s->crop_w, 2) * sample_bytes, (s->crop_h + 1) / 2);
+      uint32_t attrs = 0;
+      for (size_t page = 0; page < o.buf.bytes / kPage; ++page) {
+        const unsigned attr = pmap_cache_attributes(static_cast<ppnum_t>(o.buf.pa / kPage + page));
+        attrs |= 1u << (attr < 31 ? attr : 31);
+      }
+      uint64_t observed;
+      clock_get_uptime(&observed);
+      log("full FBD session 0x%x gen %u token %llu index %u ticks %llu..%llu Y %016llx UV %016llx zero-bytes %llu/%llu zero-rows %u/%u attr-mask 0x%x pages %zu",
+          s->id, gen, ts, index, o.probe_fbd_ticks, observed, full_y.hash, full_uv.hash, full_y.zero_bytes, full_uv.zero_bytes,
+          full_y.zero_rows, full_uv.zero_rows, attrs, o.buf.bytes / kPage);
+      log("sample session 0x%x gen %u token %llu index %u %ux%u stride %u rows %u fill %u off %u flags 0x%x pic 0x%x err 0x%x Y %08x UV %08x zero %u/%u",
+          s->id, gen, ts, index, s->crop_w, s->crop_h, stride, scanlines, filled, offset, hflags, pic, error, hy, huv, zy, zuv);
+    }
     o.owner = kClient; e.index = index; s->frames++;
     push_locked(s, e);
   } else {
@@ -942,16 +1089,16 @@ void fbd(Session *s, const uint32_t *p, unsigned dwords) {
     if (requeue) o.owner = kFirmware;
   }
   if (last) {
-    CoachzVideoEvent d = {}; d.kind = CoachzVideoEventDrained;
-    push_locked(s, d);
+    CoachzVideoEvent drained = {}; drained.kind = CoachzVideoEventDrained;
+    push_locked(s, drained);
     if (s->state == kDrain) { s->state = kStopped; s->drain_active = false; }
   }
   IOLockUnlock(s->lock);
-  if (requeue) ftb(s, 1, o, tag);
+  if (requeue && !ftb(s, 1, o, tag)) fail(s, 0xfffffffau, "empty output queue write");
 }
 void dispatch(unsigned dwords) {
   const uint32_t *p = gPacket, type = p[1];
-  if (type == kMsgSysInit && dwords >= 4) { gInitDone = 1; log("SYS_INIT_DONE: error 0x%x, %u properties", p[2], p[3]); return; }
+  if (type == kMsgSysInit && dwords >= 4) { gInitDone = p[2] ? 2 : 1; log("SYS_INIT_DONE: error 0x%x, %u properties", p[2], p[3]); return; }
   if (type == kMsgSysPropertyInfo && dwords >= 4 && p[3] == kPropImageVersion) {
     char version[128]; const char *v = reinterpret_cast<const char *>(&p[4]); size_t k = 0;
     while (k + 1 < sizeof version && 16 + k < static_cast<size_t>(dwords) * 4 && v[k]) { version[k] = v[k]; ++k; }
@@ -974,6 +1121,7 @@ void dispatch(unsigned dwords) {
     // hfi_msg_event_notify_pkt: session header, event, event_data1, event_data2, then the extended data.
     if (p[3] == kEventSysError) {
       gSysError = 1;
+      __atomic_fetch_add(&gFaultSerial, 1u, __ATOMIC_RELEASE);
       log("SYS_ERROR (data 0x%x 0x%x)", dwords > 4 ? p[4] : 0, dwords > 5 ? p[5] : 0);
       print_sfr("sys error");
       for (Session &x : gSessions) if (x.used) fail(&x, 0xffffffffu, "system error");
@@ -1012,9 +1160,26 @@ void dispatch(unsigned dwords) {
     // hfi_msg_session_empty_buffer_done_pkt: error, offset, filled, input_tag.
     const uint32_t tag = dwords > 6 ? p[6] : ~0u;
     if (tag < s->ninput) {
+      uint64_t message_ticks;
+      clock_get_uptime(&message_ticks);
       IOLockLock(s->lock);
+      Frame &in = s->input[tag];
+      InputProbe &probe = s->input_probe[in.probe_token % kRing];
+      if (in.owner == kFirmware && probe.valid && probe.token == in.probe_token && probe.index == tag && probe.bytes <= in.buf.bytes) {
+        __asm__ volatile("dmb sy" ::: "memory");
+        const CoachzVideoPlaneDigest after = coachz_video_digest_plane(in.buf.va, probe.bytes, probe.bytes, 1);
+        probe.after_hash = after.hash; probe.completed = true; probe.error = p[3];
+        clock_get_uptime(&probe.observe_end_ticks);
+        if (probe.requested) log("input completion session 0x%x token %llu bytes %u before %016llx after %016llx error 0x%x observe-begin %llu observe-end %llu",
+            s->id, probe.token, probe.bytes, probe.before_hash, probe.after_hash, probe.error, probe.observe_begin_ticks, probe.observe_end_ticks);
+      }
       s->input[tag].owner = kDriver;
       CoachzVideoEvent e = {}; e.kind = CoachzVideoEventInputDone; e.index = tag; e.status = p[3];
+      if (probe.valid && probe.token == in.probe_token && probe.index == tag) {
+        e.token = probe.token; e.flags |= CoachzVideoEventTiming;
+        e.count = static_cast<uint32_t>(message_ticks); e.bytes = static_cast<uint32_t>(message_ticks >> 32);
+        e.stride = static_cast<uint32_t>(probe.etb_ticks); e.scanlines = static_cast<uint32_t>(probe.etb_ticks >> 32);
+      }
       push_locked(s, e);
       IOLockUnlock(s->lock);
     }
@@ -1029,6 +1194,8 @@ volatile uint32_t gIrqPending, gIrqs, gIrqStatus;
 int gIrqChan;
 // venus_isr: the wrapper's status kept for the thread, the A2H soft interrupt and the status cleared (level-high SPI 174 drops).
 void venus_irq(void *) {
+  __atomic_fetch_add(&gIrqReaders, 1u, __ATOMIC_SEQ_CST);
+  if (!__atomic_load_n(&gTransport, __ATOMIC_SEQ_CST)) { __atomic_fetch_sub(&gIrqReaders, 1u, __ATOMIC_SEQ_CST); return; }
   const uint32_t status = rd(gVenus, kIntrStatus);
   if (status & (0x4u | 0x10u | 1u << 30)) __atomic_fetch_or(&gIrqStatus, status, __ATOMIC_RELAXED);
   wr(gVenus, kA2hSoftIntClr, 1);
@@ -1036,8 +1203,9 @@ void venus_irq(void *) {
   __atomic_fetch_add(&gIrqs, 1u, __ATOMIC_RELAXED);
   __atomic_store_n(&gIrqPending, 1, __ATOMIC_RELEASE);
   coachz_venus_thread_wakeup(&gIrqChan, 0, 0);
+  __atomic_fetch_sub(&gIrqReaders, 1u, __ATOMIC_SEQ_CST);
 }
-void read_queues() {
+void read_queues_unlocked() {
   for (unsigned n = 0; n < 256; ++n) {
     const int dwords = queue_read(kMsgQ, gPacket, sizeof gPacket / 4);
     if (!dwords) break;
@@ -1052,6 +1220,17 @@ void read_queues() {
   }
 }
 bool gIrqAttached;
+void read_queues() {
+  IOLockLock(gRxLock);
+  if (__atomic_load_n(&gTransport, __ATOMIC_SEQ_CST)) {
+    if (!gIrqAttached) {
+      const uint32_t raw = rd(gVenus, kIntrStatus);
+      if (raw) { wr(gVenus, kA2hSoftIntClr, 1); wr(gVenus, kIntrClear, raw); }
+    }
+    read_queues_unlocked();
+  }
+  IOLockUnlock(gRxLock);
+}
 void message_thread(void *, wait_result_t) {
   uint64_t hz = 0; __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(hz));
   if (!hz) hz = 19200000;
@@ -1066,11 +1245,8 @@ void message_thread(void *, wait_result_t) {
       // WRAPPER_INTR_STATUS_A2HWD_MASK: the firmware's watchdog.
       if (!gSysError) { log("watchdog interrupt (status 0x%x)", status); print_sfr("watchdog"); smmu_report("watchdog"); }
       gSysError = 1;
+      __atomic_fetch_add(&gFaultSerial, 1u, __ATOMIC_RELEASE);
       for (Session &x : gSessions) if (x.used) fail(&x, 0xfffffffeu, "watchdog");
-    }
-    if (!gIrqAttached) {
-      const uint32_t raw = rd(gVenus, kIntrStatus);
-      if (raw) { wr(gVenus, kA2hSoftIntClr, 1); wr(gVenus, kIntrClear, raw); }
     }
     read_queues();
     if (tick % 6000 == 5999) smmu_report("running");
@@ -1083,21 +1259,22 @@ void free_capture(Session *s) {
   for (uint32_t i = 0; i < s->nopb; ++i) buffer_free(&s->opb[i].buf);
   IOLockLock(s->lock); s->ndpb = 0; s->nopb = 0; s->generation++; IOLockUnlock(s->lock);
 }
-void free_internal(Session *s, bool keep_persist) {
-  uint32_t kept = 0;
-  for (uint32_t i = 0; i < s->ninternal; ++i) {
+bool free_internal(Session *s, bool keep_persist, bool notify = true) {
+  for (uint32_t i = 0; i < s->ninternal;) {
     const uint32_t type = s->internal_type[i];
-    if (keep_persist && (type == 4 || type == 5)) {
-      s->internal[kept] = s->internal[i]; s->internal_size[kept] = s->internal_size[i]; s->internal_type[kept++] = type;
-      continue;
-    }
+    if (keep_persist && (type == 4 || type == 5)) { ++i; continue; }
     // intbufs_unset_buffers: HFI_CMD_SESSION_RELEASE_BUFFERS with a response for each.
     const Buffer &b = s->internal[i];
     const uint32_t pkt[9] = {36, kCmdReleaseBuffers, s->id, type, s->internal_size[i], 0, 1, 1, b.iova};
-    if (!s->failed && !gSysError) call(s, pkt, kMsgReleaseBuffers, "release internal buffer");
+    if (notify && (s->failed || gSysError || !call(s, pkt, kMsgReleaseBuffers, "release internal buffer"))) return false;
     buffer_free(&s->internal[i]);
+    // Remove each acknowledged entry immediately. A later failure leaves every remaining registration available to abort/recovery.
+    --s->ninternal;
+    memmove(&s->internal[i], &s->internal[i + 1], (s->ninternal - i) * sizeof s->internal[0]);
+    memmove(&s->internal_type[i], &s->internal_type[i + 1], (s->ninternal - i) * sizeof s->internal_type[0]);
+    memmove(&s->internal_size[i], &s->internal_size[i + 1], (s->ninternal - i) * sizeof s->internal_size[0]);
   }
-  s->ninternal = kept;
+  return true;
 }
 // intbufs_set_buffer: count_actual buffers of a type that has a size, one SET_BUFFERS each.
 bool intbufs_set(Session *s, uint32_t type) {
@@ -1120,14 +1297,19 @@ bool output_conf(Session *s) {
   const uint32_t w = s->width, h = s->height;
   const uint32_t mbs = (al(h, 16) * al(w, 16)) / 256;
   const uint32_t mode[1] = {s->pic_struct != 1 || mbs <= 3600 ? 1u : 2u};   // venus_helper_get_work_mode (NUM_MBS_720P; progressive is 1)
-  const uint32_t opb_fmt[2] = {kBufOutput2, kNv12}, dpb_fmt[2] = {kBufOutput, kNv12Ubwc};
-  const uint32_t ms_out[2] = {kBufOutput, 0}, ms_out2[2] = {kBufOutput2, 1}, out2_size[3] = {kBufOutput2, w, h};
+  const bool ten = s->bit_depth == kBitDepth10;
+  const uint32_t opb_fmt[2] = {kBufOutput2, ten ? kP010 : kNv12}, dpb_fmt[2] = {kBufOutput, ten ? kTp10Ubwc : kNv12Ubwc};
+  // Linux v7.3.3 still uses the aligned capture size. The opt-in comparison changes only this FRAME_SIZE property after a sequence
+  // event: buffer sizes, scanlines, crop and DPB layout retain the mainline calculation. It is not an accepted firmware workaround.
+  const bool coded = gOutput2CodedSize && s->seq_w && s->seq_h;
+  const uint32_t ms_out[2] = {kBufOutput, 0}, ms_out2[2] = {kBufOutput2, 1},
+      out2_size[3] = {kBufOutput2, coded ? s->seq_w : w, coded ? s->seq_h : h};
   if (!(set_prop(s, kPropWorkMode, mode, 1, "work mode") && set_prop(s, kPropFormatSelect, opb_fmt, 2, "OPB format") &&
         set_prop(s, kPropMultiStream, ms_out, 2, "multistream OUTPUT") && set_prop(s, kPropMultiStream, ms_out2, 2, "multistream OUTPUT2") &&
         set_prop(s, kPropFormatSelect, dpb_fmt, 2, "DPB format") && set_prop(s, kPropFrameSize, out2_size, 3, "OUTPUT2 frame size") &&
         get_bufreq(s, "output requirements"))) return false;
-  s->dpb_bytes = framesz_ubwc(w, h);
-  s->opb_bytes = framesz_nv12(w, h);
+  s->dpb_bytes = ten ? framesz_tp10(w, h) : framesz_ubwc(w, h);
+  s->opb_bytes = ten ? framesz_p010(w, h) : framesz_nv12(w, h);
   const Bufreq *rd_ = bufreq(s, kBufOutput), *ro = bufreq(s, kBufOutput2);
   if (!rd_ || !ro || rd_->size > s->dpb_bytes || ro->size > s->opb_bytes) {
     log("session 0x%x: output requirements %u and %u exceed %u and %u", s->id, rd_ ? rd_->size : 0, ro ? ro->size : 0, s->dpb_bytes, s->opb_bytes);
@@ -1148,12 +1330,16 @@ bool num_bufs(Session *s) {
 void release(Session *s);
 // vdec_open's defaults, vdec_session_init, vdec_queue_setup for OUTPUT and vdec_start_output.
 bool create(Session *s, uint32_t codec, uint32_t width, uint32_t height) {
+  if (s->failed || gSysError || s->epoch != gCoreEpoch) return false;
+  IOLockLock(s->lock);
   s->codec = codec;
+  s->fps = kFps;
   s->width = width < kFrameMin ? kFrameMin : width > kFrameMax ? kFrameMax : width;
   s->height = height < kFrameMin ? kFrameMin : height > kFrameMax ? kFrameMax : height;
   // vdec_s_fmt: the OUTPUT format's size, and the capture format tried from it (its height aligned to 32).
   s->out_width = s->width; s->out_height = s->height; s->height = al(s->height, 32);
   s->pic_struct = 1; s->bit_depth = 0;   // vdec_inst_init: HFI_INTERLACE_FRAME_PROGRESSIVE, VIDC_BITDEPTH_8
+  IOLockUnlock(s->lock);
   const uint32_t init[5] = {20, kCmdSessionInit, s->id, kDomainDecoder, codec};
   if (!call(s, init, kMsgSessionInit, "session init")) return false;
   s->state = kDeinit;
@@ -1188,7 +1374,7 @@ bool create(Session *s, uint32_t codec, uint32_t width, uint32_t height) {
     s->input[i].owner = kDriver;
   }
   s->state = kInit;
-  load_scale();
+  if (!load_scale()) return false;
   log("session 0x%x: codec 0x%x %ux%u started, %u inputs of %u KiB, %u internal buffers", s->id, codec, width, height, s->ninput,
       s->input_bytes / 1024, s->ninternal);
   return !s->failed;
@@ -1197,21 +1383,31 @@ bool create(Session *s, uint32_t codec, uint32_t width, uint32_t height) {
 // counts, the scratch buffers again (venus_helper_intbufs_realloc), the DPB (venus_helper_alloc_dpb_bufs: the OUTPUT requirement's
 // count_min), SESSION_CONTINUE, the DPB and capture buffers queued (venus_helper_queue_dpb_bufs, venus_helper_process_initial_cap_bufs).
 bool start_capture(Session *s) {
-  if (s->state == kDrc) { flush_session(s, kFlushOutput); s->state = kCaptureSetup; }
+  if (s->failed || gSysError || s->epoch != gCoreEpoch) return false;
+  if (s->state == kDrc) {
+    if (!flush_session(s, kFlushOutput)) return false;
+    s->state = kCaptureSetup;
+  }
   if (s->state != kCaptureSetup) { IOLockLock(s->lock); s->reconfig = false; IOLockUnlock(s->lock); return true; }
-  // vdec_event_change switches a 10-bit sequence to P010 / TP10 UBWC; the client here takes 8-bit NV12 only.
-  if (s->bit_depth) { log("session 0x%x: bit depth 0x%x is not 8", s->id, s->bit_depth); return false; }
+  // vdec_event_change / venus_helper_get_out_fmts: 10-bit HEVC and VP9 use TP10 UBWC DPB and P010 OUTPUT2. An older client has not
+  // opted in to 16-bit samples, so it retains the former rejection instead of reading P010 as NV12.
+  if (s->bit_depth && (s->bit_depth != kBitDepth10 || !s->client_p010 ||
+      (s->codec != CoachzVideoHEVC && s->codec != CoachzVideoVP9))) {
+    log("session 0x%x: bit depth 0x%x not supported by this codec/client", s->id, s->bit_depth); return false;
+  }
   free_capture(s);
   // vdec_event_change through vdec_try_fmt_common: the width clamped, the capture height also aligned to 32.
   const uint32_t w = s->seq_w < kFrameMin ? kFrameMin : s->seq_w > kFrameMax ? kFrameMax : s->seq_w;
   const uint32_t h = s->seq_h < kFrameMin ? kFrameMin : s->seq_h > kFrameMax ? kFrameMax : s->seq_h;
+  IOLockLock(s->lock);
   s->width = w; s->height = al(h, 32); s->out_width = s->seq_w; s->out_height = s->seq_h;
+  IOLockUnlock(s->lock);
   if (!output_conf(s) || !num_bufs(s)) return false;
   // venus_helper_intbufs_realloc and venus_helper_alloc_dpb_bufs read the requirements after the counts.
-  free_internal(s, true);
+  if (!free_internal(s, true)) return false;
   if (!get_bufreq(s, "capture requirements")) return false;
   for (uint32_t i = 0; i < 3; ++i) if (!intbufs_set(s, kInternalTypes[i])) return false;
-  load_scale();
+  if (!load_scale()) return false;
   const Bufreq *rdpb = bufreq(s, kBufOutput), *ropb = bufreq(s, kBufOutput2);
   uint32_t ndpb = rdpb ? rdpb->hold_count : 0;
   if (ndpb > kVb2MaxFrame) ndpb = kVb2MaxFrame;
@@ -1232,8 +1428,6 @@ bool start_capture(Session *s) {
   }
   IOLockLock(s->lock); s->nopb = nopb; IOLockUnlock(s->lock);
   if (!cmd(s, kCmdContinue, 0, "continue")) return false;
-  for (uint32_t i = 0; i < s->ndpb; ++i) { s->dpb[i].owner = kFirmware; if (!ftb(s, 0, s->dpb[i], kVb2MaxFrame + i)) return false; }
-  for (uint32_t i = 0; i < s->nopb; ++i) { s->opb[i].owner = kFirmware; if (!ftb(s, 1, s->opb[i], s->generation << 16 | i)) return false; }
   IOLockLock(s->lock);
   const bool eos = s->drain_pending;
   if (eos) { s->drain_pending = false; s->drain_active = true; }
@@ -1241,37 +1435,66 @@ bool start_capture(Session *s) {
   s->reconfig = false;
   CoachzVideoEvent e = {};
   e.kind = CoachzVideoEventOutputs; e.generation = s->generation; e.count = s->nopb; e.bytes = s->opb_bytes;
-  e.stride = al(s->width, 128); e.scanlines = al(s->height, 32); e.width = s->out_width; e.height = s->out_height;
+  e.flags = s->bit_depth == kBitDepth10 ? CoachzVideoOutputP010 : 0;
+  e.stride = al(s->width * (s->bit_depth == kBitDepth10 ? 2 : 1), 128); e.scanlines = al(s->height, 32); e.width = s->out_width; e.height = s->out_height;
   e.crop_left = s->crop_l; e.crop_top = s->crop_t; e.crop_width = s->crop_w; e.crop_height = s->crop_h;
   push_locked(s, e);
   IOLockUnlock(s->lock);
+  // A fast FBD must follow Outputs in the client event ring. Unlike V4L2, this client learns its mappings through that event.
+  for (uint32_t i = 0; i < s->ndpb; ++i) { s->dpb[i].owner = kFirmware; if (!ftb(s, 0, s->dpb[i], kVb2MaxFrame + i)) return false; }
+  for (uint32_t i = 0; i < s->nopb; ++i) { s->opb[i].owner = kFirmware; if (!ftb(s, 1, s->opb[i], s->generation << 16 | i)) return false; }
   log("session 0x%x: capture %ux%u (crop %ux%u), DPB %u x %u KiB, OPB %u x %u KiB, generation %u, %zu ranges, %zu table pages", s->id,
       s->out_width, s->out_height, s->crop_w, s->crop_h, s->ndpb, s->dpb_bytes / 1024, s->nopb, s->opb_bytes / 1024, s->generation,
       gRangeCount, gPool.used);
-  if (eos) etb(s, 0xdeadb000u, 0, 0, kFlagEos, 0xffff, 0);
-  return true;
+  log("session 0x%x: OUTPUT2 frame size %ux%u (%s), stride %u scanlines %u, %s %u fps", s->id,
+      gOutput2CodedSize ? s->seq_w : s->width, gOutput2CodedSize ? s->seq_h : s->height,
+      gOutput2CodedSize ? "coded-size experiment" : "mainline capture size", e.stride, e.scanlines,
+      s->bit_depth == kBitDepth10 ? "P010" : "NV12", s->fps);
+  return !eos || etb(s, 0xdeadb000u, 0, 0, kFlagEos, 0xffff, 0);
 }
 // vdec_session_release after vdec_stop_streaming of both queues: flush, stop, unload resources, the internal buffers, deinit, abort on
 // any failure, then every buffer.
 void release(Session *s) {
-  if (s->state != kDeinit && !s->failed && !gSysError) flush_session(s, kFlushAll);
-  bool abort = s->failed || gSysError;
-  if (!abort && s->state != kDeinit) {
+  // A core reset invalidates every old firmware session; its buffers can be reclaimed without sending commands to the new epoch.
+  bool safe = s->epoch != gCoreEpoch, abort = s->failed || gSysError;
+  if (!safe && s->state == kDeinit) abort = true; // a partially started create must abort before its registered buffers are freed
+  if (!safe && !abort && s->state != kDeinit && !flush_session(s, kFlushAll)) abort = true;
+  if (!safe && !abort && s->state != kDeinit) {
     const bool stopped = cmd(s, kCmdStop, kMsgStop, "stop");
     const bool unloaded = cmd(s, kCmdReleaseResources, kMsgReleaseResources, "release resources");
+    safe = stopped && unloaded;
     abort = !stopped || !unloaded;
   }
-  free_internal(s, false);
-  if (!gSysError && !cmd(s, kCmdSessionEnd, kMsgSessionEnd, "session end")) abort = true;
-  if (abort && !gSysError) cmd(s, kCmdSessionAbort, kMsgSessionAbort, "session abort");
-  free_capture(s);
-  for (uint32_t i = 0; i < s->ninput; ++i) buffer_free(&s->input[i].buf);
-  s->ninput = 0;
-  s->state = kDeinit;
-  log("session 0x%x released: %u inputs, %u frames%s", s->id, s->inputs, s->frames, abort ? ", aborted" : "");
+  if (!abort && s->epoch == gCoreEpoch) {
+    if (!free_internal(s, false) || !cmd(s, kCmdSessionEnd, kMsgSessionEnd, "session end")) abort = true;
+    else safe = true;
+  }
+  if (abort && !gSysError && s->epoch == gCoreEpoch && cmd(s, kCmdSessionAbort, kMsgSessionAbort, "session abort")) safe = true;
+  if (safe) {
+    free_internal(s, false, false);
+    free_capture(s);
+    for (uint32_t i = 0; i < s->ninput; ++i) buffer_free(&s->input[i].buf);
+    s->ninput = 0; s->state = kDeinit; s->quarantined = false;
+    log("session 0x%x released: %u inputs, %u frames%s", s->id, s->inputs, s->frames, abort ? ", aborted" : "");
+  } else {
+    // Do not return memory to the VM while the old core may still DMA into it. The recovery thread reclaims it after AXI halt/reset.
+    s->quarantined = true; gSysError = 1;
+    fail(s, 0xfffffffcu, "release did not quiesce DMA");
+    log("session 0x%x quarantined: %u inputs, %u frames; buffers kept for core reset", s->id, s->inputs, s->frames);
+  }
+  IOLockLock(s->lock);
+  const FbdStats d = s->fbd;
+  const uint32_t lost = s->lost;
+  IOLockUnlock(s->lock);
+  log("session 0x%x FBD: n%u filled%u..%u zero%u short%u offsets%u/max%u flags0x%x pic I/P/B/IDR/other %u/%u/%u/%u/%u corrupt%u error%u/0x%x drop%u flush%u stale%u bounds%u addr%u dims%u/last%ux%u lost%u",
+      s->id, d.count, d.min_filled, d.max_filled, d.zero, d.short_picture, d.offsets, d.max_offset, d.flags,
+      d.i, d.p, d.b, d.idr, d.other, d.corrupt, d.errors, d.first_error, d.drops, d.flushing, d.stale, d.bounds, d.address, d.dimensions,
+      d.last_width, d.last_height, lost);
 }
 
 Session *session_open() {
+  IOLockLock(gCoreLock);
+  if (!core_resume()) { IOLockUnlock(gCoreLock); return nullptr; }
   IOLockLock(gSessionsLock);
   Session *found = nullptr;
   for (unsigned i = 0; i < kMaxSessions && !found; ++i) {
@@ -1281,18 +1504,166 @@ Session *session_open() {
     bzero(s, sizeof *s);
     s->lock = lock; s->op = op;
     s->id = 0x56000000u | (++gSerial & 0xffffu) << 4 | i;
-    s->used = true; s->state = kDeinit;
+    s->used = true; s->state = kDeinit; s->epoch = gCoreEpoch;
     found = s;
   }
   IOLockUnlock(gSessionsLock);
+  IOLockUnlock(gCoreLock);
   return found;
 }
 void session_close(Session *s) {
+  IOLockLock(gCoreLock);
+  if (gSysError && s->epoch == gCoreEpoch) core_recover();
   IOLockLock(s->op);
   release(s);
   IOLockUnlock(s->op);
-  IOLockLock(gSessionsLock); s->used = false; IOLockUnlock(gSessionsLock);
-  load_scale();
+  IOLockLock(gSessionsLock); s->used = s->quarantined; IOLockUnlock(gSessionsLock);
+  if (!gSysError && !gCollapsed) load_scale();
+  IOLockUnlock(gCoreLock);
+}
+
+// ---- runtime PM and recovery: hfi_venus.c venus_suspend_3xx/venus_resume; core.c venus_sys_error_handler ----
+// gCoreLock excludes open/close and power transitions. gRxLock excludes the one message reader. Recovery also takes every client
+// operation lock, so no command writer can race a reset. The IRQ gate drains readers before any clock/domain is removed.
+bool stop_transport() {
+  wr(gVenus, kIntrMask, ~0u);
+  __atomic_store_n(&gTransport, 0, __ATOMIC_SEQ_CST);
+  unsigned waited = 0;
+  while (__atomic_load_n(&gIrqReaders, __ATOMIC_SEQ_CST) && waited++ < 10000) IODelay(1);
+  if (__atomic_load_n(&gIrqReaders, __ATOMIC_SEQ_CST)) return false;
+  wr(gVenus, kA9ssSwReset, rd(gVenus, kA9ssSwReset) | 1u << 4); // venus_set_hw_state(false), no TZ
+  set_bits(gVenus, kCpuAxiHalt, 1u << 16, 1u << 16);
+  if (!poll(gVenus, kCpuAxiHaltStatus, 1u << 24, 1u << 24, 500000)) {
+    log("AXI halt failed; clocks and DMA buffers retained"); return false;
+  }
+  __atomic_store_n(&gIrqPending, 0, __ATOMIC_RELEASE);
+  __atomic_store_n(&gIrqStatus, 0, __ATOMIC_RELEASE);
+  return true;
+}
+bool domains_off() {
+  // poweroff_coreid / vcodec_control_v4: SC7180's GDSC has HW_CTRL_TRIGGER, so genpd_set_hwmode(false) clears HW_CTRL and waits for
+  // ON before dropping vcodec0's clocks and domain. Then remove the parent's branches/domain and PLL (core_power_v4, Fabia disable).
+  set_bits(gVideoCc, kVcodec0Gdsc, kGdscHwControl, 0); IODelay(1);
+  if (!poll(gVideoCc, kVcodec0Gdsc, kGdscPwrOn, kGdscPwrOn, 1500)) return false;
+  set_bits(gVideoCc, kVcodec0Axi, 1u, 0); set_bits(gVideoCc, kVcodec0Core, 1u, 0);
+  set_bits(gVideoCc, kVcodec0Gdsc, kGdscSwCollapse, kGdscSwCollapse);
+  if (!poll(gVideoCc, kVcodec0Gdsc, kGdscPwrOn, 0, 1500)) return false;
+  set_bits(gVideoCc, kCtlAxi, 1u, 0); set_bits(gVideoCc, kAhb, 1u, 0); set_bits(gVideoCc, kCtlCore, 1u, 0);
+  set_bits(gVideoCc, kVenusGdsc, kGdscSwCollapse, kGdscSwCollapse);
+  if (!poll(gVideoCc, kVenusGdsc, kGdscPwrOn, 0, 1500)) return false;
+  set_bits(gVideoCc, kPllMode, kPllOutctrl, 0); set_bits(gVideoCc, kPllUser, kPllOutMask, 0); wr(gVideoCc, kPllOpmode, 0);
+  gCollapsed = true; gOpp = 0; gBwAvg = 0; gBwPeak = 0;
+  const int cx = coachz_rpmh_cx_request(kCxConsumer, 0), cfg = coachz_venus_config_vote(0), bus = coachz_venus_bus_vote(0, 0);
+  log("power collapsed: cx %d cpu-cfg %d video-mem %d (display reservation retained)", cx, cfg, bus);
+  return true; // a failed vote drop leaves excess bandwidth/power, not an unsafe clock-on state
+}
+bool init_hfi(bool reader_locked) {
+  const uint32_t faults = __atomic_load_n(&gFaultSerial, __ATOMIC_ACQUIRE);
+  gInitDone = 0; gVersionSeen = 0; gDebugLines = 0;
+  const uint32_t init[3] = {12, kCmdSysInit, kArchOx};
+  const uint32_t version[4] = {16, kCmdSysGetProperty, 1, kPropImageVersion};
+  const uint32_t debug[6] = {24, kCmdSysSetProperty, 1, kPropDebugConfig, kDebugError | kDebugFatal, kDebugModeQueue};
+  const uint32_t power[5] = {20, kCmdSysSetProperty, 1, kPropPowerPlane, 1};
+  qhdr(kMsgQ)[kQRxReq] = 1; barrier();
+  const bool sent = send(init, "SYS_INIT") && send(version, "image version") && send(debug, "debug config") && send(power, "power control");
+  for (unsigned ms = 0; ms < 3000 && !(gInitDone && gVersionSeen) && __atomic_load_n(&gFaultSerial, __ATOMIC_ACQUIRE) == faults; ms += 10) {
+    if (reader_locked) {
+      const uint32_t raw = rd(gVenus, kIntrStatus);
+      if (raw) { wr(gVenus, kA2hSoftIntClr, 1); wr(gVenus, kIntrClear, raw); }
+      read_queues_unlocked();
+    } else read_queues();
+    IOSleep(10);
+  }
+  return sent && gInitDone == 1 && gVersionSeen && __atomic_load_n(&gFaultSerial, __ATOMIC_ACQUIRE) == faults;
+}
+// Called with gCoreLock held; there is no client of the current epoch while a normal resume runs.
+bool core_resume() {
+  if (!gCoreReady || gSysError) return false;
+  if (!gCollapsed) return true;
+  IOLockLock(gRxLock);
+  bool ok = power_on();
+  if (ok) { reset_cpu(); ok = run(false) && vcodec0_on(); }
+  if (ok) {
+    gCollapsed = false;
+    __atomic_store_n(&gTransport, 1, __ATOMIC_SEQ_CST);
+    wr(gVenus, kIntrMask, kIntrMaskA2hVcodec);
+    log("power resumed: retained firmware and HFI queues, epoch %u", gCoreEpoch);
+  } else { gCoreReady = false; gSysError = 1; log("power resume failed; cold recovery pending"); }
+  IOLockUnlock(gRxLock);
+  return ok;
+}
+bool core_suspend() {
+  IOLockLock(gRxLock);
+  bool ready = rd(gVenus, kSciaCmdArg0) & 1u << 8;
+  if (!ready) {
+    bool idle = false;
+    for (unsigned i = 0; i < 100; ++i) {
+      if ((rd(gVenus, kCpuStatus) & 1u) && (rd(gVenus, kSciaCmdArg0) & 1u << 30)) { idle = true; break; }
+      IODelay(1500);
+    }
+    const uint32_t pc[2] = {8, 0x10002}; // pkt_sys_pc_prep; 4xx does not wait for a SYS_PC_PREP response
+    if (idle && send(pc, "PC_PREP")) for (unsigned i = 0; i < 100; ++i) {
+      if ((rd(gVenus, kCpuStatus) & 1u) && (rd(gVenus, kSciaCmdArg0) & 1u << 8)) { ready = true; break; }
+      IODelay(1500);
+    }
+  }
+  bool ok = false;
+  if (ready) {
+    ok = stop_transport() && domains_off();
+    if (!ok) { gCoreReady = false; gSysError = 1; log("power collapse failed; cold recovery pending"); }
+  } else log("power collapse deferred: firmware not idle/PC_READY");
+  IOLockUnlock(gRxLock);
+  return ok;
+}
+bool core_recover() {
+  if (!gSysError) return true;
+  for (Session &s : gSessions) if (s.used) fail(&s, 0xffffffffu, "core recovery");
+  for (Session &s : gSessions) IOLockLock(s.op);
+  IOLockLock(gRxLock);
+  gCoreReady = false;
+  // Re-establish register access even if an earlier collapse stopped partway. Keep the highest corner until a complete cycle has
+  // turned the PLL off; an unknown old rate must never be paired with the low-SVS boot vote.
+  bool ok = coachz_venus_bus_vote(20000, 20000) >= 0 && coachz_venus_config_vote(1) >= 0 &&
+      coachz_rpmh_cx_request(kCxConsumer, kOpps[4].cx) == 0 && pll_on() && rcg_150() && gdsc_on(kVenusGdsc, false, "recovery venus") &&
+      branch_on(gVideoCc, kCtlCore, "recovery core") && branch_on(gVideoCc, kAhb, "recovery ahb") &&
+      branch_on(gVideoCc, kCtlAxi, "recovery axi") && vcodec0_on();
+  if (ok) ok = stop_transport() && domains_off();
+  if (ok) {
+    ++gCoreEpoch;
+    size_t span = 0;
+    ok = power_on() && load_firmware(coachz_venus_fw, coachz_venus_fw_bytes, &span);
+    if (ok) { queues_init(); reset_cpu(); ok = run(false) && init_hfi(true) && vcodec0_on(); }
+  }
+  if (ok) {
+    gCollapsed = false; gCoreReady = true; gSysError = 0;
+    __atomic_store_n(&gTransport, 1, __ATOMIC_SEQ_CST);
+    wr(gVenus, kIntrMask, kIntrMaskA2hVcodec);
+    for (Session &s : gSessions) if (s.used && s.quarantined) {
+      release(&s);
+      IOLockLock(gSessionsLock); s.used = s.quarantined; IOLockUnlock(gSessionsLock);
+    }
+    log("core recovered: epoch %u; failed clients must recreate their sessions", gCoreEpoch);
+  } else log("core recovery failed; retry pending, unquiesced buffers remain owned");
+  IOLockUnlock(gRxLock);
+  for (unsigned i = kMaxSessions; i; --i) IOLockUnlock(gSessions[i - 1].op);
+  return ok;
+}
+void power_thread(void *, wait_result_t) {
+  unsigned idle = 0;
+  for (;;) {
+    IOSleep(100);
+    IOLockLock(gCoreLock);
+    if (gSysError) { core_recover(); idle = 0; }
+    else if (gRuntimePm && gCoreReady && !gCollapsed) {
+      bool active = false;
+      IOLockLock(gSessionsLock);
+      for (Session &s : gSessions) if (s.used && s.epoch == gCoreEpoch) { active = true; break; }
+      IOLockUnlock(gSessionsLock);
+      idle = active ? 0 : idle + 1;
+      if (idle >= 10) { core_suspend(); idle = 0; }
+    }
+    IOLockUnlock(gCoreLock);
+  }
 }
 
 // The client's operations, each under s->op.
@@ -1300,25 +1671,44 @@ IOReturn queue_input(Session *s, uint32_t index, uint32_t bytes, uint64_t token,
   if (s->failed || gSysError) return kIOReturnNotReady;
   if (index >= s->ninput || !bytes || bytes > s->input_bytes) return kIOReturnBadArgument;
   IOLockLock(s->op);
+  if (s->failed || gSysError || s->epoch != gCoreEpoch) { IOLockUnlock(s->op); return kIOReturnNotReady; }
   IOReturn result = kIOReturnSuccess;
   IOLockLock(s->lock);
   if (s->input[index].owner != kDriver) result = kIOReturnBusy;
   else {
     s->input[index].owner = kFirmware;
     if (s->state == kStopped) s->state = kDecoding;   // V4L2_DEC_CMD_START after a drain
-    if (bytes > s->payload_max) s->payload_max = bytes;
+    // load_scale_v4 takes the maximum of the most recent payload in each input slot, rather than a lifetime high-water mark.
+    s->input[index].payload = bytes;
+    s->payload_max = 0;
+    for (uint32_t i = 0; i < s->ninput; ++i) if (s->input[i].payload > s->payload_max) s->payload_max = s->input[i].payload;
     s->inputs++;
   }
   IOLockUnlock(s->lock);
   // session_process_buf: the bitstream at offset 0, the client's token as the timestamp the firmware carries to the picture.
   if (result == kIOReturnSuccess) {
     __asm__ volatile("dsb sy" ::: "memory");
+    uint64_t observe_begin_ticks;
+    clock_get_uptime(&observe_begin_ticks);
+    const CoachzVideoPlaneDigest before = coachz_video_digest_plane(s->input[index].buf.va, bytes, bytes, 1);
+    IOLockLock(s->lock);
+    s->input[index].probe_token = token;
+    InputProbe &probe = s->input_probe[token % kRing];
+    probe = {};
+    probe.valid = true; probe.token = token; probe.bytes = bytes; probe.index = index;
+    probe.before_hash = before.hash; probe.observe_begin_ticks = observe_begin_ticks;
+    IOLockUnlock(s->lock);
     const bool scale = s->inputs < 4 || (s->inputs & 63) == 0;
-    if (!etb(s, s->input[index].buf.iova, s->input[index].buf.bytes, bytes, 0, index, token)) {
+    bool queued = !scale || load_scale();
+    if (queued) {
+      IOLockLock(s->lock);
+      clock_get_uptime(&probe.etb_ticks);
+      IOLockUnlock(s->lock);
+      queued = etb(s, s->input[index].buf.iova, s->input[index].buf.bytes, bytes, 0, index, token);
+    }
+    if (!queued) {
       IOLockLock(s->lock); s->input[index].owner = kDriver; IOLockUnlock(s->lock);
       result = kIOReturnError;
-    } else if (scale) {
-      load_scale();
     }
   }
   IOLockUnlock(s->op);
@@ -1328,20 +1718,36 @@ IOReturn return_output(Session *s, uint32_t generation, uint32_t index) {
   IOLockLock(s->op);
   IOLockLock(s->lock);
   bool queue = false;
-  if (generation == s->generation && index < s->nopb && s->opb[index].owner == kClient) {
+  const bool valid = generation == s->generation && index < s->nopb && s->opb[index].owner == kClient;
+  const bool trace = valid && s->opb[index].probe_pending;
+  uint64_t token = 0, fbd_ticks = 0, returned = 0;
+  if (trace) {
+    token = s->opb[index].probe_token; fbd_ticks = s->opb[index].probe_fbd_ticks;
+    s->opb[index].probe_pending = false;
+    clock_get_uptime(&returned);
+  }
+  if (valid) {
     queue = !s->failed && !s->reconfig && (s->state == kDecoding || s->state == kDrain || s->state == kStopped);
     s->opb[index].owner = queue ? kFirmware : kDriver;
   }
   IOLockUnlock(s->lock);
-  if (queue) ftb(s, 1, s->opb[index], generation << 16 | index);
+  const bool ok = !queue || ftb(s, 1, s->opb[index], generation << 16 | index);
+  if (trace) {
+    uint64_t submitted;
+    clock_get_uptime(&submitted);
+    log("return session 0x%x gen %u token %llu index %u fbd %llu returned %llu submitted %llu requeue %u ok %u",
+        s->id, generation, token, index, fbd_ticks, returned, submitted, queue, ok);
+  }
+  if (!ok) fail(s, 0xfffffffau, "output queue write");
   IOLockUnlock(s->op);
-  return kIOReturnSuccess;
+  return ok ? kIOReturnSuccess : kIOReturnError;
 }
 // vdec_decoder_cmd(V4L2_DEC_CMD_STOP): an empty EOS input at 0xdeadb000 once both queues stream; before the first sequence nothing
 // is pending.
 IOReturn drain(Session *s) {
   if (s->failed || gSysError) return kIOReturnNotReady;
   IOLockLock(s->op);
+  if (s->failed || gSysError || s->epoch != gCoreEpoch) { IOLockUnlock(s->op); return kIOReturnNotReady; }
   IOLockLock(s->lock);
   const bool streaming = s->state == kDecoding || s->state == kDrc;
   if (s->state == kDecoding) { s->state = kDrain; s->drain_active = true; }
@@ -1349,27 +1755,37 @@ IOReturn drain(Session *s) {
   else if ((s->state == kInit || s->state == kCaptureSetup) && s->inputs) s->drain_pending = true;
   else if (s->state != kDrain && s->state != kDrc) { CoachzVideoEvent d = {}; d.kind = CoachzVideoEventDrained; push_locked(s, d); }
   IOLockUnlock(s->lock);
-  if (streaming) etb(s, 0xdeadb000u, 0, 0, kFlagEos, 0xffff, 0);
+  const bool ok = !streaming || etb(s, 0xdeadb000u, 0, 0, kFlagEos, 0xffff, 0);
   IOLockUnlock(s->op);
-  return kIOReturnSuccess;
+  return ok ? kIOReturnSuccess : kIOReturnError;
 }
 // vdec_stop_output (HFI_FLUSH_ALL, then SEEK) and vdec_start_output from SEEK: the DPB queued again, the capture buffers the firmware
 // returned queued again by the driver itself.
 IOReturn flush_client(Session *s) {
   if (s->failed || gSysError) return kIOReturnNotReady;
   IOLockLock(s->op);
+  if (s->failed || gSysError || s->epoch != gCoreEpoch) { IOLockUnlock(s->op); return kIOReturnNotReady; }
   const bool capture = s->state == kDecoding || s->state == kDrain || s->state == kStopped;
-  if (s->state != kDeinit) flush_session(s, kFlushAll);
+  if (s->state != kDeinit && !flush_session(s, kFlushAll)) {
+    fail(s, 0xfffffffbu, "flush not acknowledged"); IOLockUnlock(s->op); return kIOReturnError;
+  }
+  IOLockLock(s->lock); s->drain_active = false; s->drain_pending = false; IOLockUnlock(s->lock);
   if (capture) {
     IOLockLock(s->lock); s->state = kDecoding; s->drain_active = false; IOLockUnlock(s->lock);
-    for (uint32_t i = 0; i < s->ndpb; ++i) if (s->dpb[i].owner == kDriver) { s->dpb[i].owner = kFirmware; ftb(s, 0, s->dpb[i], kVb2MaxFrame + i); }
+    bool queued = true;
+    for (uint32_t i = 0; i < s->ndpb; ++i) if (s->dpb[i].owner == kDriver) {
+      s->dpb[i].owner = kFirmware;
+      if (!ftb(s, 0, s->dpb[i], kVb2MaxFrame + i)) { queued = false; break; }
+    }
     for (uint32_t i = 0; i < s->nopb; ++i) {
+      if (!queued) break;
       IOLockLock(s->lock);
       const bool idle = s->opb[i].owner == kDriver;
       if (idle) s->opb[i].owner = kFirmware;
       IOLockUnlock(s->lock);
-      if (idle) ftb(s, 1, s->opb[i], s->generation << 16 | i);
+      if (idle && !ftb(s, 1, s->opb[i], s->generation << 16 | i)) queued = false;
     }
+    if (!queued) { fail(s, 0xfffffffau, "flush output queue write"); IOLockUnlock(s->op); return kIOReturnError; }
   }
   CoachzVideoEvent done = {}; done.kind = CoachzVideoEventFlushed; done.generation = s->generation;
   push(s, done);
@@ -1384,14 +1800,23 @@ uint32_t wait_events(Session *s, CoachzVideoEvent *out, uint32_t max, uint32_t m
   for (;;) {
     if (s->reconfig && !s->failed) {
       IOLockLock(s->op);
-      if (s->reconfig && !start_capture(s)) fail(s, 0xfffffffdu, "capture configuration");
+      if (s->reconfig && !s->failed && !start_capture(s)) fail(s, 0xfffffffdu, "capture configuration");
       IOLockUnlock(s->op);
     }
     IOLockLock(s->lock);
     while (s->head == s->tail && !s->reconfig &&
            IOLockSleepDeadline(s->lock, &s->head, deadline, THREAD_INTERRUPTIBLE) == THREAD_AWAKENED) {}
     uint32_t n = 0;
-    while (n < max && s->tail != s->head) out[n++] = s->ring[s->tail++ % kRing];
+    while (n < max && s->tail != s->head) {
+      const CoachzVideoEvent &event = s->ring[s->tail++ % kRing];
+      out[n++] = event;
+      if (event.kind == CoachzVideoEventFrame && (event.flags & CoachzVideoFrameSample)) {
+        uint64_t ticks;
+        clock_get_uptime(&ticks);
+        log("dequeue session 0x%x gen %u token %llu index %u ticks %llu queued %u lost %u",
+            s->id, event.generation, event.token, event.index, ticks, s->head - s->tail, s->lost);
+      }
+    }
     const bool again = !n && s->reconfig && !s->failed;
     IOLockUnlock(s->lock);
     if (!again) return n;
@@ -1521,6 +1946,8 @@ OSDefineMetaClassAndStructors(CoachzVenus, IOService)
 class CoachzVenusUserClient : public IOUserClient {
   OSDeclareDefaultStructors(CoachzVenusUserClient)
   Session *session = nullptr;
+  vm_map_t audit_map = nullptr; // a reference to the opener's map; no private task/map layouts in this service
+  uint32_t audit_queries = 0;
   void close_session() {
     Session *s = __atomic_exchange_n(&session, static_cast<Session *>(nullptr), __ATOMIC_ACQ_REL);
     if (s) session_close(s);
@@ -1528,7 +1955,13 @@ class CoachzVenusUserClient : public IOUserClient {
 public:
   bool initWithTask(task_t task, void *security, UInt32 type, OSDictionary *properties) override {
     session = nullptr;
-    return IOUserClient::initWithTask(task, security, type, properties);
+    if (!IOUserClient::initWithTask(task, security, type, properties)) return false;
+    audit_map = get_task_map_reference(task);
+    return audit_map != nullptr;
+  }
+  void free() override {
+    if (audit_map) { vm_map_deallocate(audit_map); audit_map = nullptr; }
+    IOUserClient::free();
   }
   IOReturn clientClose() override {
     close_session();
@@ -1554,18 +1987,20 @@ public:
     const uint32_t n = args->scalarInputCount;
     const uint64_t *in = args->scalarInput;
     if (selector == CoachzVideoCreate) {
-      if (n != 3 || session || args->structureOutputSize < sizeof(CoachzVideoInfo)) return kIOReturnBadArgument;
+      if ((n != 3 && n != 4) || session || args->structureOutputSize < sizeof(CoachzVideoInfo) ||
+          (n == 4 && (in[3] & ~static_cast<uint64_t>(CoachzVideoClientP010)))) return kIOReturnBadArgument;
       const uint32_t codec = static_cast<uint32_t>(in[0]);
       if (codec != CoachzVideoH264 && codec != CoachzVideoHEVC && codec != CoachzVideoVP8 && codec != CoachzVideoVP9) return kIOReturnUnsupported;
       if (gSysError) return kIOReturnNotReady;
       Session *s = session_open();
       if (!s) return kIOReturnNoResources;
+      s->client_p010 = n == 4 && (in[3] & CoachzVideoClientP010);
       IOLockLock(s->op);
       const bool ok = create(s, codec, static_cast<uint32_t>(in[1]), static_cast<uint32_t>(in[2]));
       IOLockUnlock(s->op);
       if (!ok) { session_close(s); return kIOReturnError; }
       session = s;
-      CoachzVideoInfo info = {COACHZ_VIDEO_VERSION, s->ninput, s->input_bytes, 0};
+      CoachzVideoInfo info = {COACHZ_VIDEO_VERSION, s->ninput, s->input_bytes, s->id};
       memcpy(args->structureOutput, &info, sizeof info);
       args->structureOutputSize = sizeof info;
       return kIOReturnSuccess;
@@ -1573,6 +2008,33 @@ public:
     Session *s = session;
     if (!s) return kIOReturnNotReady;
     switch (selector) {
+    case CoachzVideoAuditMemory: {
+      if (n != 2 || args->structureOutputSize < sizeof(CoachzVideoMapAudit)) return kIOReturnBadArgument;
+      static_assert(sizeof(CoachzVideoMapAudit) == 6 * sizeof(uint32_t), "page-audit ABI");
+      uint32_t audit[6] = {};
+      const uint32_t sid = s->id;
+      const kern_return_t status = coachz_video_audit_memory(audit_map, in[0], in[1], audit);
+      const uint32_t query = __atomic_add_fetch(&audit_queries, 1u, __ATOMIC_RELAXED);
+      if (query <= 64 || !(query & (query - 1))) {
+        uint64_t ticks;
+        clock_get_uptime(&ticks);
+        log("audit context session 0x%x query %u ticks %llu thread %llu cpu %d status 0x%x", sid, query, ticks,
+            thread_tid(current_thread()), cpu_number(), status);
+      }
+      memcpy(args->structureOutput, audit, sizeof audit);
+      args->structureOutputSize = sizeof audit;
+      return status == KERN_SUCCESS ? kIOReturnSuccess : status == KERN_INVALID_ARGUMENT ? kIOReturnBadArgument : kIOReturnNotReady;
+    }
+    case CoachzVideoSetFrameRate: {
+      if (n != 1 || in[0] < 1 || in[0] > 480) return kIOReturnBadArgument;
+      IOLockLock(s->op);
+      if (s->failed || gSysError || s->epoch != gCoreEpoch) { IOLockUnlock(s->op); return kIOReturnNotReady; }
+      IOLockLock(s->lock); s->fps = static_cast<uint32_t>(in[0]); IOLockUnlock(s->lock);
+      const bool ok = load_scale();
+      log("session 0x%x: frame rate %u fps, scale %s", s->id, s->fps, ok ? "set" : "failed");
+      IOLockUnlock(s->op);
+      return ok ? kIOReturnSuccess : kIOReturnError;
+    }
     case CoachzVideoQueueInput:
       if (n != 4) return kIOReturnBadArgument;
       return queue_input(s, static_cast<uint32_t>(in[0]), static_cast<uint32_t>(in[1]), in[2], static_cast<uint32_t>(in[3]));
@@ -1611,7 +2073,7 @@ void publish_service() {
   IOService *provider = IOService::getResourceService();
   const bool attached = service && service->init() && service->attach(provider);
   const bool running = attached && service->start(provider) && service->publish();
-  log("service %s (meta 0x%x)", running ? "published" : "NOT published", meta);
+  log("service %s (meta 0x%x), audit-version %u", running ? "published" : "NOT published", meta, COACHZ_VIDEO_AUDIT_VERSION);
   OSSafeReleaseNULL(service);
 }
 
@@ -1619,8 +2081,20 @@ void venus_thread(void *, wait_result_t) {
   // venus.mbn arrives with the modem firmware (coachz_wifi.c reads the blob early); the apps SMMU with the USB host stack.
   for (unsigned s = 0; s < 120 && !__atomic_load_n(&coachz_venus_fw, __ATOMIC_ACQUIRE); ++s) IOSleep(1000);
   if (!__atomic_load_n(&coachz_venus_fw, __ATOMIC_ACQUIRE)) { log("no venus.mbn in the firmware blob; the codec stays off"); return; }
+  DTEntry chosen; const void *value = nullptr; unsigned bytes = 0;
+  if (SecureDTLookupEntry(nullptr, "/chosen", &chosen) == kSuccess &&
+      SecureDTGetProperty(chosen, "coachz-venus-output2-coded", &value, &bytes) == kSuccess && bytes == sizeof gOutput2CodedSize) {
+    memcpy(&gOutput2CodedSize, value, sizeof gOutput2CodedSize);
+    gOutput2CodedSize = gOutput2CodedSize == 1;
+  }
+  uint32_t runtime_pm = 0;
+  if (SecureDTLookupEntry(nullptr, "/chosen", &chosen) == kSuccess &&
+      SecureDTGetProperty(chosen, "coachz-venus-runtime-pm", &value, &bytes) == kSuccess && bytes == sizeof runtime_pm)
+    memcpy(&runtime_pm, value, sizeof runtime_pm);
+  gRuntimePm = runtime_pm == 1;
   step("windows and memory");
   gHfiLock = IOLockAlloc(); gSmmuLock = IOLockAlloc(); gScaleLock = IOLockAlloc(); gSessionsLock = IOLockAlloc();
+  gCoreLock = IOLockAlloc(); gRxLock = IOLockAlloc();
   for (Session &s : gSessions) { s.lock = IOLockAlloc(); s.op = IOLockAlloc(); }
   gSmmu.gr0 = reinterpret_cast<volatile uint8_t *>(ml_io_map(kSmmuBase, 0x1000));
   gSmmu.gr1 = reinterpret_cast<volatile uint8_t *>(ml_io_map(kSmmuBase + 0x1000, 0x1000));
@@ -1628,7 +2102,7 @@ void venus_thread(void *, wait_result_t) {
   gVenus = reinterpret_cast<volatile uint8_t *>(ml_io_map(kVenusBase, kVenusBytes));
   gVideoCc = reinterpret_cast<volatile uint8_t *>(ml_io_map(kVideoCcBase, kVideoCcBytes));
   gGcc = reinterpret_cast<volatile uint8_t *>(ml_io_map(kGccPage, 0x1000));
-  if (!gSmmu.gr0 || !gSmmu.gr1 || !gVenus || !gVideoCc || !gGcc || !gHfiLock || !gSmmuLock || !gScaleLock || !gSessionsLock) {
+  if (!gSmmu.gr0 || !gSmmu.gr1 || !gVenus || !gVideoCc || !gGcc || !gHfiLock || !gSmmuLock || !gScaleLock || !gSessionsLock || !gCoreLock || !gRxLock) {
     log("register window or lock missing"); return;
   }
   for (Session &s : gSessions) if (!s.lock || !s.op) { log("no session locks"); return; }
@@ -1654,19 +2128,15 @@ void venus_thread(void *, wait_result_t) {
 
   // venus_core_init: SYS_INIT, the image version, then venus_sys_set_default_properties (debug to the queue: error and fatal, as
   // venus_fw_debug; codec power plane control on, as venus_fw_low_power_mode).
-  const uint32_t init[3] = {12, kCmdSysInit, kArchOx};
-  const uint32_t version[4] = {16, kCmdSysGetProperty, 1, kPropImageVersion};
-  const uint32_t debug[6] = {24, kCmdSysSetProperty, 1, kPropDebugConfig, kDebugError | kDebugFatal, kDebugModeQueue};
-  const uint32_t power[5] = {20, kCmdSysSetProperty, 1, kPropPowerPlane, 1};
-  qhdr(kMsgQ)[kQRxReq] = 1; barrier();
-  const bool sent = send(init, "SYS_INIT") && send(version, "image version") && send(debug, "debug config") && send(power, "power control");
-  for (unsigned ms = 0; ms < 3000 && !(gInitDone && gVersionSeen); ms += 10) { read_queues(); IOSleep(10); }
+  __atomic_store_n(&gTransport, 1, __ATOMIC_SEQ_CST);
+  const bool sent = init_hfi(false);
   smmu_report("after SYS_INIT");
   print_sfr("after SYS_INIT");
   log("SYS packets sent %d; init %s, version %s, SCIACMDARG0 0x%x, CPU status 0x%x", sent, gInitDone ? "done" : "MISSING",
       gVersionSeen ? "read" : "MISSING", rd(gVenus, kSciaCmdArg0), rd(gVenus, kCpuStatus));
-  if (!gInitDone) return;
+  if (!sent || gInitDone != 1) return;
   if (!vcodec0_on()) { log("vcodec0 did not power on; no sessions"); return; }
+  gCoreReady = true;
 
   // From here the message thread reads the queues, woken by SPI 174 (venus_isr), polling every 10 ms without it.
   thread_t thread = THREAD_NULL;
@@ -1681,6 +2151,10 @@ void venus_thread(void *, wait_result_t) {
   self_test();
   log("interrupts so far %u", gIrqs);
   publish_service();
+  if (kernel_thread_start(power_thread, nullptr, &thread) == KERN_SUCCESS) {
+    thread_deallocate(thread);
+    log("recovery worker started; idle runtime PM %s", gRuntimePm ? "enabled" : "disabled");
+  } else log("no recovery/power worker");
 }
 
 }  // namespace

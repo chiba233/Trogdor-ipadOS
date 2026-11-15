@@ -99,7 +99,7 @@ class BasebandBridgeTests(unittest.TestCase):
         self.assertEqual([line for line in context if line not in produced], [])
         series = [line for line in (PATCHES / 'series').read_text().splitlines() if line and not line.startswith('#')]
         # Only the video decoder's kern_exec.c hook (built on the baseband patch's result) follows it.
-        self.assertEqual(series[-2:], ['coachz-prelink-baseband.patch', 'coachz-prelink-video-decoder.patch'])
+        self.assertEqual(series[-3:], ['coachz-prelink-baseband.patch', 'coachz-prelink-video-decoder.patch', 'coachz-prelink-early-log.patch'])
 
     def test_in_the_build(self):
         self.assertIn("'pending/baseband', copy / 'baseband'", (ROOT / 'tools/kernel_source.py').read_text())
@@ -131,6 +131,28 @@ class BasebandBridgeTests(unittest.TestCase):
         self.assertNotIn('baseband', [child.name() for child in plain.children])
         with self.assertRaises(ValueError):
             screen.pack(b'', b'', 0, 0, baseband=True)   # the bridge needs the prelinked kernel
+
+    def test_gestalt_cache_identity(self):
+        """A MobileGestalt cache made as another product type than the displayed identity is refused; the bridge keeps that identity."""
+        screen = load_screen()
+        if not screen.OS_PROFILE.is_file():
+            self.skipTest('needs the pinned UniXNU OS profile')
+        import plistlib
+        root = screen.Node()
+        root.set('name', b'device-tree\0')
+        root.child('chosen').child('memory-map')
+        window, tree, ramdisk, cache = 0x80000000, 0x2000000, bytes(0x5000), bytes(0x1234)
+        def model(**kw):
+            out = screen.read_tree(screen.prelink_tree(root.write(), window, tree, ramdisk, cache, full_screen=True, **kw))
+            props = dict((k, v) for k, _, v in out.props)
+            return props['model'], props['target-type']
+        self.assertEqual(model(baseband=True), (b'iPad14,1\0', b'J310\0'))
+        self.assertEqual(model(), (b'iPad14,1\0', b'J310\0'))
+        def gestalt(product):
+            return plistlib.dumps({'CacheExtra': {screen.GESTALT_PRODUCT_TYPE: product}, 'CacheData': b''})
+        self.assertEqual(model(baseband=True, gestalt_cache=gestalt('iPad14,1')), (b'iPad14,1\0', b'J310\0'))
+        with self.assertRaises(ValueError):
+            model(baseband=True, gestalt_cache=gestalt('iPad14,2'))
 
     def test_cellular_compat_branch(self):
         sys.path.insert(0, str(ROOT / 'tools'))

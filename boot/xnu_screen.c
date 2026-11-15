@@ -3,6 +3,7 @@
    return to Linux. Once XNU runs, the screen is the only output. */
 #include "xnu_checkpoint.h"
 #include "display.h"
+#include "fdt.h"
 #define HEADER 1152u
 #define SCREEN_VERSION 12u
 static uint32_t le32(const uint8_t *p) {
@@ -74,6 +75,19 @@ int xnu_screen_load(const uint8_t *p,size_t len,const void *dt,uint64_t affinity
     copy(a+0x6c,p+128,1024);wr64(a+0x478,memory);
     copy(t,p+adt,(size_t)adtsize);wr64(t+v[10],phys);wr64(t+v[11],memory);
     copy(window+disk,p+ramdisk,(size_t)(len-ramdisk));
+    /* Depthcharge's ramoops buffer (src/boot/ramoops.c adds /reserved-memory/ramoops from coreboot's CBMEM entry and marks it used):
+       a warm reset keeps it and neither XNU nor Linux allocates it. XNU's early log mirrors itself there (args page + 0x800). */
+    {
+        uint32_t n=0;const uint8_t *r=(const uint8_t *)fdt_property(dt,FDT_MAX_SIZE,"/reserved-memory/ramoops","reg",&n);
+        if(r && n==16) {
+            uint64_t lo=(uint64_t)fdt_be32(r)<<32|fdt_be32(r+4),sz=(uint64_t)fdt_be32(r+8)<<32|fdt_be32(r+12);
+            if(sz>=65536 && sz<=(16u<<20) && !(lo&4095) && lo<=UINT64_MAX-sz && !(lo<phys+memory && phys<lo+sz) &&
+               !(lo<video->pa+video->bytes && video->pa<lo+sz) && !(lo<input+len && input<lo+sz)) {
+                const char m[]="CZRAMOOP";for(unsigned i=0;i<8;i++)a[0x800+i]=(uint8_t)m[i];
+                wr64(a+0x808,lo);wr64(a+0x810,sz);
+            }
+        }
+    }
     splash(video,0xffffffu);
     __asm__ volatile("dsb sy; ic iallu; dsb sy; isb":::"memory");
     out->entry=phys+bias+entry-base;out->args=phys+args;

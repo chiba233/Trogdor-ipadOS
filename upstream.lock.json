@@ -59,6 +59,24 @@
         "xpc_private.h"
       ],
       "content_sha256": "72c48878886d2acf45602edd88725d6d3a3e826d8e6b069a7a0d53071ca545d9"
+    },
+    "linux-camera": {
+      "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux",
+      "ref": "v6.12",
+      "commit": "adc218676eef25575469234709c2d87185ca223a",
+      "license": "GPL-2.0",
+      "files": {
+        "drivers/media/i2c/ov8856.c": "3b94338f55ed39fc1ea3dbb21840cf580b4cee97"
+      }
+    },
+    "chromiumos-camx": {
+      "url": "https://chromium.googlesource.com/chromiumos/third_party/kernel",
+      "ref": "factory-trogdor-13443.B-chromeos-5.4",
+      "commit": "44fb63215f7a54137b33a7abd9701068f792d542",
+      "license": "GPL-2.0-only",
+      "files": {
+        "drivers/media/platform/camx/cam_sensor_module/cam_csiphy/include/cam_csiphy_1_2_2_hwreg.h": "3a7b8cb0b14627572e23ab240b54607522e7b4ad"
+      }
     }
   }
 }

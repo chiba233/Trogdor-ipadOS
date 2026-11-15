@@ -9,9 +9,9 @@
  static uint32_t coachz_cx_corner[COACHZ_CX_CONSUMERS], coachz_cx_written = 0xffffffffu;
  static volatile uint32_t coachz_cx_busy;
  static uint8_t coachz_aux[4][64];
-@@ -540,6 +540,31 @@
+@@ -540,22 +540,85 @@
  }
- 
+
  /* The commands ordered by VCD (stable) with the commit bit on the last BCM of each VCD, sent through the active TCS in one go. */
 +static int wifi_bcm_send(vm_offset_t db, const char *tag, const struct wifi_bcm *bcms, unsigned count);
 +
@@ -22,14 +22,20 @@
 +/*
 + * The video codec's path to memory, as venus_runtime_resume and load_scale_v4 ask for it (icc_set_bw on "video-mem": qxm_venus0 in
 + * MM1, qns_mem_noc_sf in MM2; qns_llcc and ebi already carry the DDR vote's top level; "cpu-cfg" is CN0, kept on). MM1 also carries
-+ * the display's qxm_mdp0, which Debian's interconnect summary reads as 920678 kB/s average and 1600000 peak: nobody else votes MM1
-+ * here, so that share is added and the peak never drops below it. kB/s in, as icc_set_bw takes them. Returns wifi_bcm_send's result.
++ * the display's qxm_mdp0. For Coachz's boe,nv110wtm-n61 (sc7180-trogdor-coachz.dtsi), panel-edp.c's 60 Hz mode has 2160 active
++ * columns and 1440 + 3 + 6 + 31 total lines. _dpu_plane_calc_bw uses width * vtotal * fps * cpp; prefill uses 24/(vbp + vsync),
++ * and _dpu_core_perf_calc_bw multiplies by 120/100 (catalog/dpu_6_2_sc7180.h). There is one mdp0-mem path in sc7180.dtsi; its peak floor
++ * is min_dram_ib = 1600000 kB/s. Add that display share to MM1, whose only voter here is this function. Values below are derived
++ * from Linux v7.3.3 source, in the kB/s icc_set_bw takes. Returns wifi_bcm_send's result.
 + */
 +int coachz_venus_bus_vote(uint64_t avg_kbps, uint64_t peak_kbps);
 +int
 +coachz_venus_bus_vote(uint64_t avg_kbps, uint64_t peak_kbps)
 +{
-+    const uint64_t display_avg = 920678, display_peak = 1600000;
++    const uint64_t display_bw = 2160ull * (1440 + 3 + 6 + 31) * 60 * 4;
++    const uint64_t display_prefill = display_bw * 24 / (31 + 6);
++    const uint64_t display_fetch = display_bw > display_prefill ? display_bw : display_prefill;
++    const uint64_t display_avg = display_fetch * 120 / 100 / 1000, display_peak = 1600000;
 +    const struct wifi_bcm bcms[] = {
 +        {"MM1", 32, 1, 0, avg_kbps + display_avg, peak_kbps > display_peak ? peak_kbps : display_peak},
 +        {"MM2", 32, 1, 0, avg_kbps, peak_kbps},
@@ -38,13 +44,86 @@
 +    return db ? wifi_bcm_send(db, "venus bus", bcms, 2) : -1;
 +}
 +
++/* CN0 is shared by the IPA configuration path and Venus cpu-cfg. Aggregate these consumers before programming the BCM,
++ * as qcom_icc_aggregate does: sum average bandwidth, maximum peak. Keep the vote update and RPMh send in the same critical section. */
++static volatile uint32_t coachz_cn0_busy;
++static uint64_t coachz_cn0_external_avg, coachz_cn0_external_peak, coachz_cn0_venus_avg, coachz_cn0_venus_peak;
++
++int coachz_venus_config_vote(int enable);
++int
++coachz_venus_config_vote(int enable)
++{
++    const struct wifi_bcm path = {"CN0", 4, 1, 0, enable ? 1000 : 0, 0};
++    const vm_offset_t db = wifi_cmd_db();
++    return db ? wifi_bcm_send(db, "venus config", &path, 1) : -1;
++}
++
  static int
  wifi_bcm_send(vm_offset_t db, const char *tag, const struct wifi_bcm *bcms, unsigned count)
  {
-@@ -839,6 +864,18 @@
+     uint32_t address[8], data[8], vcd[8], sorted_address[8], sorted_data[8], status[8] = {0};
+     unsigned n = 0;
+     if (count > 8) return -5;
++    bool cn0 = false;
++    uint64_t cfg_avg = 0, cfg_peak = 0;
++    for (unsigned i = 0; i < count; ++i) if (!strcmp(bcms[i].name, "CN0")) { cn0 = true; cfg_avg = bcms[i].avg; cfg_peak = bcms[i].peak; }
++    if (cn0) {
++        unsigned waited = 0;
++        while (__sync_lock_test_and_set(&coachz_cn0_busy, 1)) { if (++waited >= 500000) return -6; delay(1); }
++    }
++    const bool venus_cfg = !strcmp(tag, "venus config");
++    bool cn0_encoded = false;
+     for (unsigned i = 0; i < count; i++) {
+         uint32_t addr = 0, aux = 0, len = 0;
+         if (!wifi_db_find(db, bcms[i].name, &addr, &aux, &len) || len < 8) { printf("COACHZ %s: %s not in cmd-db\n", tag, bcms[i].name); continue; }
+         const uint32_t unit = wifi_db_u16(db, aux) | wifi_db_u16(db, aux + 2u) << 16, width = wifi_db_u16(db, aux + 4u), v = wifi_db_u16(db, aux + 6u) & 0xffu;
+         if (!unit || !width) { printf("COACHZ %s: %s has unit %u width %u, skipped\n", tag, bcms[i].name, unit, width); continue; }
++        uint64_t avg = bcms[i].avg, peak = bcms[i].peak;
++        if (cn0 && !strcmp(bcms[i].name, "CN0")) {
++            cn0_encoded = true;
++            avg += venus_cfg ? coachz_cn0_external_avg : coachz_cn0_venus_avg;
++            const uint64_t other = venus_cfg ? coachz_cn0_external_peak : coachz_cn0_venus_peak;
++            if (other > peak) peak = other;
++        }
+         uint64_t x = 0, y = bcms[i].mask;
+         if (!y) {
+-            x = wifi_bcm_div(wifi_bcm_div(bcms[i].avg * width, (uint64_t)bcms[i].buswidth * bcms[i].channels) * 1000, unit);
+-            y = wifi_bcm_div(wifi_bcm_div(bcms[i].peak * width, bcms[i].buswidth) * 1000, unit);
+-        }
++            x = wifi_bcm_div(wifi_bcm_div(avg * width, (uint64_t)bcms[i].buswidth * bcms[i].channels) * 1000, unit);
++            y = wifi_bcm_div(wifi_bcm_div(peak * width, bcms[i].buswidth) * 1000, unit);
++        }
++        /* sc7180.c bcm_cn0.keepalive; bcm-voter.c bcm_aggregate retains a minimum active vote with no consumers. */
++        if (!strcmp(bcms[i].name, "CN0") && !x && !y) x = y = 1;
+         if (x > 0x3fff) x = 0x3fff;
+         if (y > 0x3fff) y = 0x3fff;
+         printf("COACHZ %s: %s address 0x%x unit %u width %u vcd %u vote x %llu y %llu\n", tag, bcms[i].name, addr, unit, width, v,
+@@ -574,10 +637,18 @@
+         sorted_data[i] = data[order[i]];
+         if (i + 1 == sorted || vcd[order[i + 1]] != vcd[order[i]]) sorted_data[i] |= 1u << 30;
+     }
+-    const int sent = sorted ? wifi_rpmh_send(sorted_address, sorted_data, sorted, status) : -4;
++    int sent = sorted ? wifi_rpmh_send(sorted_address, sorted_data, sorted, status) : -4;
++    if (cn0 && !cn0_encoded && sent >= 0) sent = -7;
+     printf("COACHZ %s: %u BCMs sent, result %d\n", tag, sorted, sent);
+     for (unsigned i = 0; i < sorted; i++)
+         printf("COACHZ %s: command %u address 0x%x data 0x%x status 0x%x\n", tag, i, sorted_address[i], sorted_data[i], status[i]);
++    if (cn0) {
++        if (sent >= 0) {
++            if (venus_cfg) { coachz_cn0_venus_avg = cfg_avg; coachz_cn0_venus_peak = cfg_peak; }
++            else { coachz_cn0_external_avg = cfg_avg; coachz_cn0_external_peak = cfg_peak; }
++        }
++        __sync_lock_release(&coachz_cn0_busy);
++    }
+     return sent;
+ }
+
+@@ -845,6 +916,18 @@
+                 __atomic_store_n(&wifi_efs_count, wifi_efs_count + 1, __ATOMIC_RELEASE);
+             } else if (copy) {
                  kfree_data(copy, (size_t)size);
-             }
-         }
++            }
++        }
 +        /* The video firmware (linux-firmware qcom/venus-5.4/venus.mbn, at most VENUS_FW_MEM_SIZE as venus_load_fw allows), kept for
 +         * CoachzVenus.cpp, which copies its segments into the venus region itself. */
 +        if (!error && !memcmp(digest, entry + 32, 32) && !strcmp(name, "venus.mbn") && size >= 4096 && size <= (6u << 20) &&
@@ -55,8 +134,6 @@
 +                __atomic_store_n(&coachz_venus_fw, copy, __ATOMIC_RELEASE);
 +            } else if (copy) {
 +                kfree_data(copy, (size_t)((size + 511) & ~511ull));
-+            }
-+        }
+             }
+         }
          if (!error && !memcmp(digest, entry + 32, 32) && !strcmp(name, "qdsp6sw.mbn") && size >= 4096) {
-             wifi_mpss_at = wifi_fw_blob + offset;
-             wifi_mpss_bytes = size;

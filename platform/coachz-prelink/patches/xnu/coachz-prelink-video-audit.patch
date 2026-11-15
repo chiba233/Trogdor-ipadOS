@@ -1,0 +1,48 @@
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -14996,3 +14996,45 @@
+ }
+ 
+ #endif /* DEVELOPMENT || DEBUG */
++
++#if defined(ARM64_BOARD_CONFIG_BCM2837) && !XNU_MONITOR
++/* Read-only metadata for the video decoder's locked source/destination planes. The caller retains this client-owned map.
++ * Do not wire pages, fault them in, flush caches or return addresses. PP WIMG metadata is not a dump of every alias PTE.
++ * The six words are CoachzVideoMapAudit version/pages/unmapped/unmanaged/changed/attribute_mask. */
++kern_return_t coachz_video_audit_memory(vm_map_t map, uint64_t address, uint64_t bytes, uint32_t result[6]);
++
++kern_return_t
++coachz_video_audit_memory(vm_map_t map, uint64_t address, uint64_t bytes, uint32_t result[6])
++{
++	bzero(result, 6 * sizeof(*result));
++	if (!map || !bytes || bytes > 64U * 1024U * 1024U || address > UINT64_MAX - bytes) {
++		return KERN_INVALID_ARGUMENT;
++	}
++	uint64_t end = address + bytes;
++	if (address < vm_map_min(map) || end > vm_map_max(map)) {
++		return KERN_INVALID_ARGUMENT;
++	}
++	result[0] = 1;
++	result[1] = (uint32_t)(((end - 1) / PAGE_SIZE) - address / PAGE_SIZE + 1);
++	pmap_t pmap = vm_map_pmap(map);
++	uint64_t va = address & ~((uint64_t)PAGE_SIZE - 1);
++	for (uint32_t i = 0; i < result[1]; ++i, va += PAGE_SIZE) {
++		ppnum_t pn = pmap_find_phys_nofault(pmap, va);
++		if (!pn) {
++			++result[2];
++			continue;
++		}
++		if (!pa_valid((pmap_paddr_t)pn * PAGE_SIZE)) {
++			++result[3];
++			continue;
++		}
++		unsigned attr = pmap_cache_attributes(pn);
++		if (pmap_find_phys_nofault(pmap, va) != pn) {
++			++result[4];
++			continue;
++		}
++		result[5] |= 1U << (attr < 31 ? attr : 31);
++	}
++	return KERN_SUCCESS;
++}
++#endif

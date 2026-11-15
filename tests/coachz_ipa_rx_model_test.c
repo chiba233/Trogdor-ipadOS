@@ -1,6 +1,6 @@
 /* Host model of the pending IPA RX endpoint (platform/coachz-prelink/pending/modem/coachz_ipa_rx_proto.h): buffer TREs,
-   the replenish doorbell rule, status parsing as ipa_endpoint_status_parse does, and the default route, compared with the
-   ROUTE value read on Debian with mainline's IPA driver set up on this machine. */
+   the replenish doorbell rule, status parsing as ipa_endpoint_status_parse does, and the default route, against the ROUTE value
+   mainline's ipa_endpoint_default_route_set computes from ipa_reg-v4.2.c's fields. */
 #include <stdio.h>
 #include <string.h>
 #include "coachz_ipa_rx_proto.h"
@@ -72,7 +72,7 @@ static void parsing(void)
 
 static void route(void)
 {
-    CHECK(cir_default_route(8) == 0x01100050u);                 /* Debian's ROUTE */
+    CHECK(cir_default_route(8) == 0x01100050u);                 /* ipa_endpoint_default_route_set, LAN RX endpoint 8 (ipa_data-v4.2.c), ipa_reg-v4.2.c ROUTE fields */
     CHECK(cir_default_route(0) == 0x01000040u);                 /* ipa_endpoint_default_route_clear */
 }
 
@@ -80,6 +80,6 @@ int main(void)
 {
     GROUP("buffers and doorbells", buffers());
     GROUP("status parsing", parsing());
-    GROUP("default route against Debian", route());
+    GROUP("default route as mainline computes it", route());
     return failures != 0;
 }

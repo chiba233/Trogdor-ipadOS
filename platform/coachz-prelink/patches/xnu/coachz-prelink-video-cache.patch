@@ -1,16 +1,28 @@
 --- a/osfmk/arm/pmap/pmap.c
 +++ b/osfmk/arm/pmap/pmap.c
-@@ -10684,6 +10684,9 @@
+@@ -45,6 +45,7 @@
+ #include <kern/zalloc.h>
+ #include <kern/zalloc_internal.h>
+ #include <kern/kalloc.h>
++#include <kern/clock.h>
+ #include <kern/spl.h>
+ #include <kern/startup.h>
+ #include <kern/trustcache.h>
+@@ -10684,6 +10685,13 @@
  	uint64_t state = states.state;
  	bool tlb_flush_pass_needed = !!(states.tlb_flush_pass_needed);
  	bool rt_cache_flush_pass_needed = !!(states.rt_cache_flush_pass_needed);
 +#if defined(ARM64_BOARD_CONFIG_BCM2837)
 +	unsigned int coachz_cleaned_pages = 0;
++#if !XNU_MONITOR
++	uint64_t coachz_batch_begin;
++	clock_get_uptime(&coachz_batch_begin);
++#endif
 +#endif
  
  	/* For verifying progress. */
  	__assert_only const uint64_t page_index_old = page_index;
-@@ -10728,6 +10731,22 @@
+@@ -10728,6 +10736,22 @@
  			if (pp_attr_template & PP_ATTR_WIMG_MASK) {
  				wimg_bits_new = pp_attr_template & PP_ATTR_WIMG_MASK;
  			}
@@ -33,18 +45,22 @@
  
  			/* Update the cache attributes in PTE and PP_ATTR table. */
  			if (wimg_bits_new != wimg_bits_prev) {
-@@ -10902,6 +10921,17 @@
+@@ -10902,6 +10926,21 @@
  	states_new.page_index = page_index;
  	states_new.state = state;
  	states_new.tlb_flush_pass_needed = tlb_flush_pass_needed ? 1 : 0;
 +#if defined(ARM64_BOARD_CONFIG_BCM2837) && !XNU_MONITOR
 +	if (coachz_cleaned_pages) {
-+		static uint64_t coachz_batches, coachz_pages;
++		static uint64_t coachz_batches, coachz_pages, coachz_batch_ticks;
++		uint64_t coachz_batch_end;
++		clock_get_uptime(&coachz_batch_end);
++		uint64_t elapsed = coachz_batch_end - coachz_batch_begin;
++		uint64_t ticks = __atomic_add_fetch(&coachz_batch_ticks, elapsed, __ATOMIC_RELAXED);
 +		uint64_t n = __atomic_add_fetch(&coachz_batches, 1, __ATOMIC_RELAXED);
 +		uint64_t pages = __atomic_add_fetch(&coachz_pages, coachz_cleaned_pages, __ATOMIC_RELAXED);
 +		if (n <= 8 || !(n & (n - 1))) {
-+			kprintf("COACHZ surface cache: batch %llu attr 0x%x cleaned %u pages before mapping, total %llu\n",
-+			    n, cacheattr, coachz_cleaned_pages, pages);
++			kprintf("COACHZ surface cache: batch %llu attr 0x%x cleaned %u pages before mapping, total %llu ticks %llu cumulative-ticks %llu\n",
++			    n, cacheattr, coachz_cleaned_pages, pages, elapsed, ticks);
 +		}
 +	}
 +#endif

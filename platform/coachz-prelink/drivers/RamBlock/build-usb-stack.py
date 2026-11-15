@@ -14,8 +14,10 @@ stack = HERE / 'usb'
 mmc = HERE / 'mmc'
 usbsoc = HERE / 'usbsoc'
 modem = HERE / 'modem'
+camera = HERE / 'camera'
 vsync = HERE / 'vsync'
-for source in sorted(stack.glob('*.c')) + [HERE / 'coachz_usb.c', HERE / 'coachz_usb_hid.c', HERE / 'coachz_zed_input.c', mmc / 'coachz_sdcc.c', usbsoc / 'coachz_usb_soc.c', modem / 'coachz_ipa_config.c', modem / 'coachz_gsi.c', HERE / 'coachz_modem.c', vsync / 'coachz_vsync.c']:
+earlylog = HERE / 'earlylog'
+for source in sorted(stack.glob('*.c')) + [HERE / 'coachz_usb.c', HERE / 'coachz_usb_hid.c', HERE / 'coachz_zed_input.c', mmc / 'coachz_sdcc.c', usbsoc / 'coachz_usb_soc.c', modem / 'coachz_ipa_config.c', modem / 'coachz_gsi.c', HERE / 'coachz_modem.c', camera / 'coachz_camera.c', vsync / 'coachz_vsync.c', earlylog / 'coachz_early_log.c']:
     destination = out / (source.stem + '.o')
     command, index, arguments = [], 0, record['arguments']
     while index < len(arguments):
@@ -30,7 +32,7 @@ for source in sorted(stack.glob('*.c')) + [HERE / 'coachz_usb.c', HERE / 'coachz
         elif value not in ('-MD', '-MP') and not value.startswith('-DMOCKFS') and value != '-Werror':
             command.append(value)
         index += 1
-    own = source.name in ('coachz_modem.c', 'coachz_zed_input.c') or source.parent in (mmc, usbsoc, modem, vsync)
+    own = source.name in ('coachz_modem.c', 'coachz_zed_input.c') or source.parent in (mmc, usbsoc, modem, camera, vsync, earlylog)
     if own:
         # Our own code: warnings stay on (but do not fail the archive), and no USB compatibility headers.
         command[1:1] = ['-I', str(modem if source.name == 'coachz_modem.c' else source.parent)]
@@ -56,7 +58,7 @@ ram_block_command = json.loads((driver / 'compile-command.json').read_text())
 iokit_record = json.loads((ROOT / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/IOPlatformExpert.cpo.json')
                           .read_text().strip().rstrip(','))
 # The cellular bridge (pending/baseband) the same way: it subclasses IOService and IOUserClient and is pulled in by coachz_wifi.c and kern_exec.c.
-for source in (mmc / 'CoachzMmcBlock.cpp', HERE / 'baseband/coachz_baseband.cpp'):
+for source in (mmc / 'CoachzMmcBlock.cpp', HERE / 'baseband/coachz_baseband.cpp', camera / 'CoachzCamera.cpp'):
     command = [str(source) if value.endswith('NativeRamBlock.cpp') else
                str(driver / (source.stem + '.o')) if value.endswith('NativeRamBlock.o') else value for value in ram_block_command]
     if command == ram_block_command or str(source) not in command:
@@ -65,6 +67,6 @@ for source in (mmc / 'CoachzMmcBlock.cpp', HERE / 'baseband/coachz_baseband.cpp'
     if result.returncode:
         raise SystemExit(source.name + ':\n' + (result.stdout + result.stderr)[-3500:])
 (driver / 'libRamBlock.a').unlink(missing_ok=True)
-subprocess.run(['xcrun', 'ar', 'rcs', driver / 'libRamBlock.a', driver / 'NativeRamBlock.o', driver / 'CoachzMmcBlock.o', driver / 'coachz_baseband.o',
+subprocess.run(['xcrun', 'ar', 'rcs', driver / 'libRamBlock.a', driver / 'NativeRamBlock.o', driver / 'CoachzMmcBlock.o', driver / 'coachz_baseband.o', driver / 'CoachzCamera.o',
                 driver / 'original-bindings.o'], check=True)
 print(len(objects), 'USB stack objects archived')

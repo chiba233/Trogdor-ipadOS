@@ -20,6 +20,21 @@
 
 extern char **environ;
 static NSString *const base = @"/private/var/ngpu/owner-apps";
+
+/* The delivered CoachzCamera.app, into /var/jb/Applications (root-owned, 0755 directories, the executable 0755). 0 when it is in place. */
+static int installCameraApp(void)
+{
+    NSFileManager *fm=NSFileManager.defaultManager;
+    NSString *from=[base stringByAppendingPathComponent:@"CoachzCamera.app"], *to=@"/var/jb/Applications/CoachzCamera.app";
+    if(![fm fileExistsAtPath:[from stringByAppendingPathComponent:@"CoachzCamera"]])return ENOENT;
+    NSString *staging=[to stringByAppendingString:@".coachz-new"];
+    [fm removeItemAtPath:staging error:nil];
+    if(![fm copyItemAtPath:from toPath:staging error:nil])return EIO;
+    [fm setAttributes:@{NSFilePosixPermissions:@0755,NSFileOwnerAccountID:@0,NSFileGroupOwnerAccountID:@0} ofItemAtPath:staging error:nil];
+    [fm setAttributes:@{NSFilePosixPermissions:@0755} ofItemAtPath:[staging stringByAppendingPathComponent:@"CoachzCamera"] error:nil];
+    [fm removeItemAtPath:to error:nil];
+    return [fm moveItemAtPath:staging toPath:to error:nil]?0:EIO;
+}
 static NSMutableSet<NSData *> *records;
 
 @interface LSApplicationProxy : NSObject
@@ -271,7 +286,11 @@ static int bootstrap(void)
     BOOL visibilityChanged=NO;
     int r=enableSystemAppVisibility(&visibilityChanged);if(r)return r;
     NSString *uiMarker=@"/private/var/db/coachz-apps-ui-ready";
-    NSString *uiRevision=[@"2\n" stringByAppendingString:revision];
+    NSString *uiRevision=[@"3\n" stringByAppendingString:revision];
+    /* The camera viewer (apps/camera) ships beside the environment, not in it: copied into place on every start so a later image
+     * replaces it without touching the extracted environment's revision. */
+    int camera=installCameraApp();
+    fprintf(stderr,"COACHZ apps: camera app %d\n",camera);
     BOOL registerApps=fresh || visibilityChanged ||
         ![uiRevision isEqual:[NSString stringWithContentsOfFile:uiMarker encoding:NSUTF8StringEncoding error:nil]];
     /* The delivered static cache covers the two applications and all bootstrap tools. */
@@ -286,9 +305,11 @@ static int bootstrap(void)
     }
     if(registerApps) {
         /* lsd may appear late. Retry registration without restarting the system shell. */
-        for(NSString *app in @[@"Sileo.app",@"TrollStoreLite.app"]) {
+        NSArray *apps=camera?@[@"Sileo.app",@"TrollStoreLite.app"]:@[@"Sileo.app",@"TrollStoreLite.app",@"CoachzCamera.app"];
+        for(NSString *app in apps) {
             NSString *path=[@"/var/jb/Applications" stringByAppendingPathComponent:app];
-            NSString *identifier=[app isEqualToString:@"Sileo.app"]?@"org.coolstar.SileoStore":@"com.opa334.TrollStoreLite";
+            NSString *identifier=[app isEqualToString:@"Sileo.app"]?@"org.coolstar.SileoStore":
+                [app isEqualToString:@"CoachzCamera.app"]?@"com.coachz.camera":@"com.opa334.TrollStoreLite";
             int status=EAGAIN;
             for(unsigned i=0;i<12 && status;i++) {
                 status=run(@"/var/jb/usr/bin/uicache",@[@"-v",@"-p",path]);

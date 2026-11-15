@@ -231,7 +231,7 @@
   * module list and checking with each as to how it feels about the
 --- a/security/mac_base.c
 +++ b/security/mac_base.c
-@@ -119,8 +119,116 @@
+@@ -119,8 +119,118 @@
  #define DPRINTF(x)
  #endif
  
@@ -262,7 +262,9 @@
 +	bool application = strcmp(path, "/private/var/jb/Applications/Sileo.app/Sileo") == 0 ||
 +	    strcmp(path, "/var/jb/Applications/Sileo.app/Sileo") == 0 ||
 +	    strcmp(path, "/private/var/jb/Applications/TrollStoreLite.app/TrollStoreLite") == 0 ||
-+	    strcmp(path, "/var/jb/Applications/TrollStoreLite.app/TrollStoreLite") == 0;
++	    strcmp(path, "/var/jb/Applications/TrollStoreLite.app/TrollStoreLite") == 0 ||
++	    strcmp(path, "/private/var/jb/Applications/CoachzCamera.app/CoachzCamera") == 0 ||
++	    strcmp(path, "/var/jb/Applications/CoachzCamera.app/CoachzCamera") == 0;
 +	if (installer || application) {
 +		__atomic_store_n(&p->p_coachz_apps_nosandbox, 1, __ATOMIC_RELEASE);
 +		printf("COACHZ apps: task marked pid %d installer %d application %d\n", proc_pid(p), installer, application);

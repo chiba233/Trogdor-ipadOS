@@ -84,7 +84,7 @@ static void setup_lists(void)
     CHECK(cic_mem_setup(0, 0x81100000ull, c) == 4);
     CHECK(c[0].opcode == CIC_CMD_HDR_INIT_LOCAL && (cic_rd32(c[0].payload + 8) & 0xfffu) == 0x140u);
     CHECK(cic_rd32(c[1].payload + 4) == 0x5f0u && cic_rd32(c[2].payload + 4) == 0x7f0u && cic_rd32(c[3].payload + 4) == 0xbf0u);
-    CHECK(cic_local_pkt_proc_cntxt(0) == 0x5f0u);                                         /* Debian's LOCAL_PKT_PROC_CNTXT */
+    CHECK(cic_local_pkt_proc_cntxt(0) == 0x5f0u);                                         /* ipa_mem.c: mem_offset + IPA_MEM_MODEM_PROC_CTX 0x05f0 (ipa_data-v4.2.c) */
     CHECK(cic_filtered() == 0x12u && cic_filter_count() == 14 && cic_route_count() == 15 && cic_table_valid());
     CHECK(cic_table_bytes() == 136u);
     uint8_t table[136];

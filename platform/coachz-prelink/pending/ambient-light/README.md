@@ -1,6 +1,6 @@
 # EC 光感与自动亮度（pending，未接入）
 
-> 这台 Coachz 没有光感（Debian 的 IIO 只有加速度计和陀螺仪），这份驱动留着不接入，给有 EC 光感的设备用。
+> 这台 Coachz 没有光感（EC 固件 firmware-trogdor-13577.B-master 的 board/coachz/board.h：motion sensors 只有 LID_ACCEL 和 LID_GYRO），这份驱动留着不接入，给有 EC 光感的设备用。
 
 这里仅有待接入源码和说明。没有修改活动内核、编译参数、补丁列表、打包脚本或其他驱动；没有编译、执行测试、连接设备、写盘或提交。
 

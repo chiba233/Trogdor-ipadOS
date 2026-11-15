@@ -152,7 +152,7 @@
 +}
 +
 +/*
-+ * Report 1 of this controller's descriptor (read from the part, the same 1193 bytes Debian's sysfs shows): five contacts of eight bytes,
++ * Report 1 of this controller's descriptor (1193 bytes, read from the part in the i2c-hid probe above): five contacts of eight bytes,
 + * each tip switch in bit 0 and pressure in bits 7:1 of its first byte, confidence in bit 0 and the contact identifier in bits 7:1 of the
 + * second, X (0..12960) and Y (0..8640) little endian, width and height; then the contact count. 12960 x 8640 is six times the 2160 x 1440
 + * panel. No scan time and no in-range usage.
@@ -173,7 +173,7 @@
 +static volatile uint64_t touch_down_since, touch_report_at;
 +
 +/*
-+ * Frames as hid-multitouch.c assembles them for this part's class (Debian binds hid-multitouch with quirks 0x51c10, MT_CLS_WIN_8:
++ * Frames as hid-multitouch.c assembles them for this part's class (the Win8 blob makes hid-core.c pick MT_CLS_WIN_8, 0x51c10:
 + * ALWAYS_VALID, IGNORE_DUPLICATES, HOVERING, CONTACT_CNT_ACCURATE, STICKY_FINGERS, WIN8_PTP_BUTTONS; mt_touch_input_mapping adds
 + * CONFIDENCE for a Win8 touch screen with a confidence usage). mt_touch_report: a nonzero contact count is the number of contacts the
 + * frame holds; a zero count continues the frame (more than five contacts come in several reports); only that many slots are contacts

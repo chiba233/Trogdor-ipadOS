@@ -25,6 +25,7 @@ int coachz_usb_open(uint64_t *blocks);
 int coachz_usb_open_keyboard(void);
 int coachz_usb_host_enabled(void);   // CoachzUsbHost.cpp
 void coachz_usb_host_start(void);
+void coachz_venus_start(void);   // package/CoachzVenus.cpp: waits for venus.mbn and the apps SMMU the host stack enables
 int coachz_emmc_root(void);
 int coachz_sdcc_window(const char *name, uint64_t *first, uint64_t *blocks);
 int coachz_mmc_log_write(uint64_t block, uint32_t count, const void *data);
@@ -70,6 +71,9 @@ static bool persistent_data;
 extern "C" {
 extern char coachz_log_capture[];
 extern volatile uint64_t coachz_log_head;
+// earlylog/coachz_early_log.c: the ramoops mirror learns what reached the disk; the boot before's unsaved tail, printed once.
+void coachz_early_log_stored(uint64_t stored);
+void coachz_early_log_report(void);
 }
 static const uint64_t kCaptureBytes = 1ull << 20;
 static CoachzUSBDataWindow log_window;
@@ -136,6 +140,7 @@ static void log_store(void) {
   log_flushes++;
   // The eMMC's cache is off: a finished write is on flash.
   if (ok) ok = log_write_header() && (log_on_emmc || coachz_usb_sync());
+  if (ok) coachz_early_log_stored(log_taken);
 }
 
 static void log_flush(thread_call_param_t, thread_call_param_t) {
@@ -160,6 +165,7 @@ static void log_flush(thread_call_param_t, thread_call_param_t) {
       log_window.first = first + next * slot_blocks;
       log_window.blocks = slot_blocks;
       kprintf("COACHZ log: kernel log ring on the eMMC at block %llu, %llu MiB, slot %u, boot %llu\n", log_window.first, slot_blocks / 2048, next, log_boot);
+      coachz_early_log_report();
     }
   }
   if (!log_on_emmc || log_window.blocks) {
@@ -217,7 +223,10 @@ static void log_start(IOLock *gate, uint64_t capacity) {
   if (!log_buffer || !log_call) return;
   memset(log_buffer, 0, 128 * 512);
   log_gate = gate;
-  if (!log_on_emmc) kprintf("COACHZ log: kernel log ring at block %llu, %llu MiB\n", log_window.first, log_window.blocks / 2048);
+  if (!log_on_emmc) {
+    kprintf("COACHZ log: kernel log ring at block %llu, %llu MiB\n", log_window.first, log_window.blocks / 2048);
+    coachz_early_log_report();
+  }
   thread_call_enter(log_call);
   if (coachz_usb_keyboard_enabled() && (keyboard_call = thread_call_allocate(keyboard_poll, nullptr))) {
     thread_call_enter(keyboard_call);
@@ -272,6 +281,7 @@ bool NativeRamBlock::start(IOService *provider)
     if (coachz_usb_host_enabled()) {
       coachz_usb_host_start();
       kprintf("COACHZ USB: the Apple host stack takes the controller, no libpayload stack\n");
+      coachz_venus_start();
     } else {
       const int keyboard = coachz_usb_open_keyboard();
       kprintf("COACHZ USB: keyboard stack %d, no disk published here\n", keyboard);
