@@ -69,21 +69,32 @@ def gpu_stack_overlay():
     # variant), 97437dc one GPU address allocator per process, c72a8a5 the device kept after a GPU restart, 6061e10 the row pitch for padding,
     # d76f17d long submissions cut where a command buffer begins; then this connection's completed fences answered without a kernel call and
     # a wait for any of several submitted syncs as one kernel wait for the first; then small BOs kept past a second, larger first command
-    # stream chunks, 4 MiB timestamp blocks and no preemption-latency captures on a GPU that does not preempt.
+    # stream chunks, 4 MiB timestamp blocks and no preemption-latency captures on a GPU that does not preempt; then the diagnostics'
+    # timestamp copy once a submission and BO cache notes, command stream chunks kept across resets, and BOs up to 4 MiB kept cached.
     mesa_patches = [UNIXNU / 'patches/mesa' / name for name in ('turnip-transient-attachments-in-gmem.patch',
                                                                  'turnip-gmem-memory-side-swap.patch', 'turnip-coachz-diagnostics.patch',
                                                                  'coachz-port-ir3-fragment-consts.patch', 'coachz-port-turnip-one-va.patch',
                                                                  'coachz-port-turnip-keep-device.patch', 'coachz-port-turnip-row-pitch.patch',
                                                                  'coachz-port-turnip-submit-cuts.patch', 'coachz-turnip-darwin-fence-waits.patch',
-                                                                 'coachz-turnip-fewer-bo-maps.patch')]
+                                                                 'coachz-turnip-fewer-bo-maps.patch',
+                                                                 'coachz-turnip-diagnostic-bo-stats-and-copy-once.patch',
+                                                                 'coachz-turnip-cs-chunks-kept.patch', 'coachz-turnip-cache-keeps-4m.patch')]
     # The overlay's runtime patches, which the bridge builder applies after its recorded ones: the copy profile, the compile thread at the
     # asking thread's priority, two-plane pictures up to the plug-in's size kept as images, and the runtime's command buffer threads at the
-    # fixed priority of the thread that starts them, and twice the spare descriptor pools with 64 sets in a command buffer's first.
+    # fixed priority of the thread that starts them, and twice the spare descriptor pools with 64 sets in a command buffer's first;
+    # render encoders made in the last one's box, spare descriptor pools taken inside sections, passes that split for a memoryless
+    # write or reach part of the frame kept out of inline recording (the latter over their draws' bounds), and converted video pictures
+    # not zeroed on the host.
     runtime_patches = [UNIXNU / 'drivers/AdrenoMetal/bridge/patches' / name for name in ('0026-coachz-copy-profile.patch',
                                                                                          '0027-coachz-compile-at-the-asking-priority.patch',
                                                                                          '0028-coachz-ycbcr-image-for-small-pictures.patch',
                                                                                          '0029-coachz-runtime-threads-at-the-spawning-priority.patch',
-                                                                                         '0030-coachz-more-spare-descriptor-pools.patch')]
+                                                                                         '0030-coachz-more-spare-descriptor-pools.patch',
+                                                                                         '0031-coachz-render-encoder-boxes-reused.patch',
+                                                                                         '0032-coachz-sections-take-spare-descriptor-pools.patch',
+                                                                                         '0033-coachz-memoryless-writers-keep-secondary.patch',
+                                                                                         '0034-coachz-partial-passes-bounded-render-area.patch',
+                                                                                         '0035-coachz-converted-ycbcr-images-unzeroed.patch')]
     def apply(tree, patch, reverse=False, check=False):
         command = ['git', '-C', str(tree), 'apply']
         if reverse:

@@ -4762,11 +4762,10 @@ diff --git a/bridge/NativeMetalObjects.h b/bridge/NativeMetalObjects.h
 diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
 --- a/bridge/NativeMetalObjects.rs
 +++ b/bridge/NativeMetalObjects.rs
-@@ -250,9 +250,18 @@
-     seen.push(key);
+@@ -251,7 +251,16 @@ fn log_message(message: &DebugMessage) {
      eprintln!("native-metal message {} {:?}: [{}] {}", seen.len(), message.severity, message.id_name, message.text);
  }
-
+ 
 +unsafe extern "C" { fn native_bridge_coachz_problem(text: *const c_char); }
  fn observe_message(message: &DebugMessage) {
 +    // Mesa __vk_errorv reports driver failures at Warning, including device loss.
@@ -4780,9 +4779,7 @@ diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
      use std::sync::atomic::Ordering::Relaxed;
      if message.id_name == "shadowed-texture" {
          note_shadow(&message.text);
-     }
-@@ -659,9 +668,9 @@
-         "supportsYCBCRFormats12" => format_supported(PixelFormat::YCBCR124202P) as u64,
+@@ -660,7 +669,7 @@ fn device_answer(device: &NmbDevice, selector: &str, arg: u64) -> Result<u64, St
          "supportsYCBCRPackedFormats12" => format_supported(PixelFormat::YCBCR124202PPACKED) as u64,
          "minimumLinearTextureAlignmentForPixelFormat:" => p
              .minimum_linear_texture_alignment_for_pixel_format(raw::<PixelFormat>(arg, "pixel format")?)
@@ -4791,9 +4788,7 @@ diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
          "supportsTextureSampleCount:" => gap(p.supports_texture_sample_count(arg))?,
          "supportsVertexAmplificationCount:" => gap(p.supports_vertex_amplification_count(arg))?,
          "supportsRasterizationRateMapWithLayerCount:" => gap(p.supports_rasterization_rate_map_with_layer_count(arg))?,
-         "supportsFamily:" => (d.supports_family(arg as i64) || TARGET_FAMILIES.iter().any(|f| f.raw() == arg as i64)) as u64,
-@@ -699,9 +708,9 @@
-         let d = &get(device)?.0;
+@@ -700,7 +709,7 @@ pub extern "C" fn nmb_device_linear_bytes_per_row(device: *const NmbDevice, form
          let alignment = d
              .properties()
              .minimum_linear_texture_alignment_for_pixel_format(raw::<PixelFormat>(format, "pixel format")?)
@@ -4802,23 +4797,45 @@ diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
          let info = d.pixel_format_info(format);
          // Flags bit 0x400: a format of blocks, which the alignment query has refused already.
          if info.flags & 0x400 != 0 || info.words[0] == 0 {
-             return Err(format!("pixel format {format} has no texel size"));
-@@ -1146,9 +1155,9 @@
-         Ok(boxed(NmbTexture(texture.map_err(e("linear texture"))?)))
+@@ -901,6 +910,12 @@ unsafe fn no_copy(device: *mut NmbDevice, pointer: *mut c_void, length: u64, opt
+                 Some(&noted) => now != Some(noted),
+                 None => gate.forgot || now.is_none(),
+             };
++            // Coachz: pages as they were noted after an earlier buffer pinned exactly this range already carry the objects pinning
++            // gives them (copy-on-write resolves at the first wire), so the walk after this buffer would find them again. Where a
++            // pin did change them, the next buffer over the range finds pages other than noted and imports them at the address,
++            // as for a remap: a skipped walk can cost a fresh import, never a join of earlier pages. k219's render server spent
++            // about 1.7 % of its display thread in mach_vm_region_recurse here, two walks per no-copy buffer.
++            let unchanged = now.is_some() && gate.seen.get(&range).copied() == now;
+             NO_COPY_REMAPS[0].fetch_add(1, Relaxed);
+             if changed {
+                 NO_COPY_REMAPS[1].fetch_add(1, Relaxed);
+@@ -909,7 +924,11 @@ unsafe fn no_copy(device: *mut NmbDevice, pointer: *mut c_void, length: u64, opt
+             // SAFETY: as above.
+             let buffer = unsafe { device.0.new_buffer_with_bytes_no_copy(memory, length, modes, deallocator) };
+             // Noted as they are once the buffer pinned them (pinning for writing may give the range objects of its own).
+-            match (&buffer, pages_identity(range.0, range.1)) {
++            let pinned = match (&buffer, unchanged) {
++                (Ok(_), true) => now,
++                _ => pages_identity(range.0, range.1),
++            };
++            match (&buffer, pinned) {
+                 (Ok(_), Some(pages)) => {
+                     if gate.seen.len() >= NO_COPY_RANGES_NOTED && !gate.seen.contains_key(&range) {
+                         gate.seen.clear();
+@@ -1147,7 +1166,7 @@ pub extern "C" fn nmb_texture_new_linear(buffer: *mut NmbBuffer, descriptor: *co
      })
  }
-
+ 
 -/// A view of `texture`: of the whole texture as `format` where `whole`, else of `levels` and `slices` (start, count) as `format` and `kind`.
 +/// A view of `texture`: the whole texture where `whole`, otherwise `levels` and `slices`.
  #[unsafe(no_mangle)]
  pub extern "C" fn nmb_texture_new_view(texture: *mut NmbTexture, format: u64, kind: u64, levels: *const u64, slices: *const u64, whole: bool)
                                         -> *mut NmbTexture {
-     guard(std::ptr::null_mut(), || {
-@@ -1452,8 +1461,15 @@
-         Ok(boxed(NmbFunction(function)))
+@@ -1453,6 +1472,13 @@ pub unsafe extern "C" fn nmb_function_new_zero_constants(library: *mut NmbLibrar
      })
  }
-
+ 
 +/// # Safety
 +/// The source remains live for this call. The returned wrapper owns its clone.
 +#[unsafe(no_mangle)]
@@ -4829,42 +4846,36 @@ diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
  #[unsafe(no_mangle)]
  pub extern "C" fn nmb_function_release(function: *mut NmbFunction) {
      release(function)
- }
-@@ -1475,8 +1491,13 @@
-     guard(-1, || Ok(get(function)?.0.patch_control_point_count().map_err(e("patch control point count"))?.map_or(-1, i64::from)))
- }
-
+@@ -1477,6 +1503,11 @@ pub extern "C" fn nmb_function_patch_control_point_count(function: *const NmbFun
+ 
  // ---- pipelines and states ----
-+
+ 
 +#[unsafe(no_mangle)]
 +pub extern "C" fn nmb_profile_set_alias_callback(callback: Option<unsafe extern "C" fn(u64, *const u8, usize)>) -> u32 {
 +    ComputePipelineState::coachz_set_profile_alias(callback)
 +}
-
++
  pub struct NmbComputePipeline(ComputePipelineState);
  pub struct NmbRenderPipeline(RenderPipelineState);
  pub struct NmbSampler(SamplerState);
-@@ -1557,8 +1578,15 @@
-         let resolved = unsafe { pipeline_options(options)? };
-         let state = get(device)?.0.new_compute_pipeline_state(&compute_descriptor(descriptor)?, &resolved).map_err(e("compute pipeline"))?;
-         Ok(boxed(NmbComputePipeline(state)))
+@@ -1560,6 +1591,13 @@ pub unsafe extern "C" fn nmb_compute_pipeline_new_with_descriptor(device: *mut N
      })
-+}
-+
+ }
+ 
 +/// # Safety
 +/// The source remains live for this call. The returned wrapper owns its clone.
 +#[unsafe(no_mangle)]
 +pub unsafe extern "C" fn nmb_compute_pipeline_copy(source: *const NmbComputePipeline) -> *mut NmbComputePipeline {
 +    guard(std::ptr::null_mut(), || Ok(boxed(NmbComputePipeline(get(source)?.0.clone()))))
- }
-
++}
++
  #[unsafe(no_mangle)]
  pub extern "C" fn nmb_compute_pipeline_release(pipeline: *mut NmbComputePipeline) {
-@@ -1687,8 +1715,34 @@
-         Ok(boxed(NmbRenderPipeline(state)))
+     release(pipeline)
+@@ -1688,6 +1726,32 @@ pub unsafe extern "C" fn nmb_render_pipeline_new_with_options(device: *mut NmbDe
      })
  }
-
+ 
 +/// # Safety
 +/// `hashes` names four writable words; the pipeline remains live during the call.
 +#[unsafe(no_mangle)]
@@ -4894,28 +4905,24 @@ diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
  fn render_descriptor(descriptor: *const NmbRenderPipelineDescriptor) -> Result<RenderPipelineDescriptor, String> {
          let d = get(descriptor)?;
          // Each stage's linked functions ride on its function descriptor, as the compute pipeline's do (compute_descriptor).
-         let stage_linked = |functions, count, private, private_count| -> Result<LinkedFunctions, String> {
-@@ -1755,8 +1809,15 @@
-             tessellation.factor_scale_enabled = t.factor_scale_enabled != 0;
-             out.tessellation = Some(tessellation);
-         }
+@@ -1758,6 +1822,13 @@ fn render_descriptor(descriptor: *const NmbRenderPipelineDescriptor) -> Result<R
          Ok(out)
-+}
-+
+ }
+ 
 +/// # Safety
 +/// The source remains live for this call. The returned wrapper owns its clone.
 +#[unsafe(no_mangle)]
 +pub unsafe extern "C" fn nmb_render_pipeline_copy(source: *const NmbRenderPipeline) -> *mut NmbRenderPipeline {
 +    guard(std::ptr::null_mut(), || Ok(boxed(NmbRenderPipeline(get(source)?.0.clone()))))
- }
-
++}
++
  #[unsafe(no_mangle)]
  pub extern "C" fn nmb_render_pipeline_release(pipeline: *mut NmbRenderPipeline) {
-@@ -2203,8 +2264,14 @@
-         Ok(get(command_buffer)?.0.status().raw())
+     release(pipeline)
+@@ -2204,6 +2275,12 @@ pub extern "C" fn nmb_command_buffer_status(command_buffer: *const NmbCommandBuf
      })
  }
-
+ 
 +/// Stable identity used by the runtime stage trace, without taking its state lock.
 +#[unsafe(no_mangle)]
 +pub extern "C" fn nmb_command_buffer_trace_id(command_buffer: *const NmbCommandBuffer) -> u64 {
@@ -4925,19 +4932,15 @@ diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
  #[unsafe(no_mangle)]
  pub extern "C" fn nmb_command_buffer_error(command_buffer: *const NmbCommandBuffer, out: *mut c_char, size: usize) -> usize {
      guard(0, || {
-         let cb = &get(command_buffer)?.0;
-@@ -2426,8 +2493,9 @@
-     pub height: u64,
+@@ -2427,6 +2504,7 @@ pub struct NmbRenderPassDescriptor {
      pub array_length: u64,
      pub samples: u64,
      pub visibility: *const NmbBuffer,
 +    pub coachz_quarter_turn: u64,
  }
-
+ 
  fn texture_of(a: &NmbPassAttachment) -> Result<Option<Texture>, String> {
-     if a.texture.is_null() { Ok(None) } else { Ok(Some(get(a.texture)?.0.clone())) }
-@@ -2438,8 +2506,9 @@
-                                          -> *mut NmbEncoder {
+@@ -2439,6 +2517,7 @@ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer,
      guard(std::ptr::null_mut(), || {
          let d = get(descriptor)?;
          let mut pass = RenderPassDescriptor::new();
@@ -4945,9 +4948,7 @@ diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
          for (slot, a) in pass.color_attachments.iter_mut().zip(d.colors.iter()) {
              slot.texture = texture_of(a)?;
              slot.resolve_texture = optional(a.resolve_texture)?.map(|t| t.0.clone());
-             slot.resolve_level = a.resolve_level;
-@@ -3041,4 +3110,64 @@
-         let queue = get(device)?.0.new_command_queue_with_max_command_buffer_count(count).map_err(e("command queue"))?;
+@@ -3042,3 +3121,63 @@ pub extern "C" fn nmb_queue_new_with_max_command_buffer_count(device: *mut NmbDe
          Ok(Box::into_raw(Box::new(NmbQueue(queue))))
      })
  }

@@ -2271,6 +2271,540 @@ new file mode 100644
 + 
 + /// The most sets a pool is opened for.
 + pub(super) const MOST: u32 = 1024;
+diff --git a/drivers/AdrenoMetal/bridge/patches/0031-coachz-render-encoder-boxes-reused.patch b/drivers/AdrenoMetal/bridge/patches/0031-coachz-render-encoder-boxes-reused.patch
+new file mode 100644
+--- /dev/null
++++ b/drivers/AdrenoMetal/bridge/patches/0031-coachz-render-encoder-boxes-reused.patch
+@@ -0,0 +1,112 @@
++diff --git a/crates/metal2vulkan-runtime/src/device/mod.rs b/crates/metal2vulkan-runtime/src/device/mod.rs
++index f606cba..83f2964 100644
++--- a/crates/metal2vulkan-runtime/src/device/mod.rs
+++++ b/crates/metal2vulkan-runtime/src/device/mod.rs
++@@ -486,6 +486,8 @@ pub(super) struct DeviceShared {
++     pub(super) live_binds: crate::live_bind::SpareLiveBinds,
++     /// The bind memos its ended render encoders left, which the next ones take (`binding.rs`).
++     pub(super) bind_memos: crate::binding::SpareBindMemos,
+++    /// The boxes its ended render encoders left, which the next ones are made in (`render.rs`).
+++    pub(super) lowerings: crate::render::SpareLowerings,
++     /// The rooms of the draws its render encoders kept for instances recorded inline after a
++     /// split, which the next such instances take (`render/inline_splits.rs`).
++     pub(super) kept_rooms: crate::render::SpareKept,
++@@ -1914,6 +1916,7 @@ impl Device {
++             spares: Spares::default(),
++             live_binds: Default::default(),
++             bind_memos: Default::default(),
+++            lowerings: Default::default(),
++             kept_rooms: Default::default(),
++             counts: Default::default(),
++             parking: parking.map_or_else(OnceLock::new, OnceLock::from),
++diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
++index 2068a64..1ec0a2f 100644
++--- a/crates/metal2vulkan-runtime/src/render.rs
+++++ b/crates/metal2vulkan-runtime/src/render.rs
++@@ -1941,7 +1941,9 @@ impl RenderLowering {
++         let live = core.device().shared().live_binds.take();
++         // The views and sampler descriptions its binds made or found (`binding::BindMemo`).
++         let bind_memo = core.device().shared().bind_memos.take();
++-        Box::new(RenderLowering {
+++        // The box the device's last ended render encoder left (`SpareLowerings`).
+++        let room = core.device().shared().lowerings.take();
+++        SpareLowerings::fill(room, RenderLowering {
++             core,
++             earlier: Vec::new(),
++             current: Instance {
++@@ -2056,6 +2058,56 @@ impl RenderLowering {
++     }
++ }
++ 
+++/// The most boxes of ended render encoders a device keeps for the next ones.
+++const SPARE_LOWERINGS: usize = 4;
+++
+++/// The boxes of a device's ended render encoders, which the render encoders it opens next are
+++/// made in: at most [`SPARE_LOWERINGS`], the latest given taken first. Coachz: a render encoder's
+++/// state is a box of over 10 KiB, which the allocator returned at every `end_encoding` and gave
+++/// again at the next pass; k219's render server spent about 2.7 % of its encoding thread in the
+++/// `madvise` of that free (the small chunk it emptied). An encoder that does not end through
+++/// `end_pass` frees its box as before.
+++#[derive(Default)]
+++pub(crate) struct SpareLowerings(Mutex<Vec<Box<std::mem::MaybeUninit<RenderLowering>>>>);
+++
+++impl SpareLowerings {
+++    /// The box an ended encoder gave back, if any.
+++    fn take(&self) -> Option<Box<std::mem::MaybeUninit<RenderLowering>>> {
+++        lock(&self.0).pop()
+++    }
+++
+++    /// `lowering` in `room`, else in a new box.
+++    fn fill(
+++        room: Option<Box<std::mem::MaybeUninit<RenderLowering>>>,
+++        lowering: RenderLowering,
+++    ) -> Box<RenderLowering> {
+++        match room {
+++            Some(room) => Box::write(room, lowering),
+++            None => Box::new(lowering),
+++        }
+++    }
+++
+++    /// The encoder `lowering` moved out of its box, and the box, emptied, to give back.
+++    fn empty(
+++        lowering: Box<RenderLowering>,
+++    ) -> (RenderLowering, Box<std::mem::MaybeUninit<RenderLowering>>) {
+++        let raw = Box::into_raw(lowering);
+++        // SAFETY: `raw` is the box's initialized value, read out exactly once; the box is then
+++        // the same allocation as uninitialized room of the same layout, never read before
+++        // `fill` writes it, and freed without a drop if it goes.
+++        unsafe { (std::ptr::read(raw), Box::from_raw(raw.cast())) }
+++    }
+++
+++    /// Keep `room` for the next encoder where fewer than [`SPARE_LOWERINGS`] are kept; else it
+++    /// goes.
+++    fn give(&self, room: Box<std::mem::MaybeUninit<RenderLowering>>) {
+++        let mut spare = lock(&self.0);
+++        if spare.len() < SPARE_LOWERINGS {
+++            spare.push(room);
+++        }
+++    }
+++}
+++
++ impl CommandBuffer {
++     /// A secondary command buffer of this command buffer's pool, begun inside a pass compatible
++     /// with `compatible`: the draws of a render pass instance (the module docs).
++@@ -3982,6 +4034,7 @@ impl RenderLowering {
++         // Whether a command of the pass may read an attachment's bytes it did not name.
++         let unnamed_reads =
++             self.barrier_inside || self.reaches_unnamed || !self.executions.is_empty();
+++        let (lowering, room) = SpareLowerings::empty(self);
++         let RenderLowering {
++             mut core,
++             mut earlier,
++@@ -4017,7 +4070,9 @@ impl RenderLowering {
++             live,
++             bind_memo,
++             ..
++-        } = *self;
+++        } = lowering;
+++        // Its box, which the device's next render encoder is made in (`SpareLowerings`).
+++        core.device().shared().lowerings.give(room);
++         // The views and sampler descriptions its binds made or found, which the device's next
++         // render encoder takes (`binding::BindMemo`).
++         core.device().shared().bind_memos.give(bind_memo);
+diff --git a/drivers/AdrenoMetal/bridge/patches/0032-coachz-sections-take-spare-descriptor-pools.patch b/drivers/AdrenoMetal/bridge/patches/0032-coachz-sections-take-spare-descriptor-pools.patch
+new file mode 100644
+--- /dev/null
++++ b/drivers/AdrenoMetal/bridge/patches/0032-coachz-sections-take-spare-descriptor-pools.patch
+@@ -0,0 +1,82 @@
++diff --git a/crates/metal2vulkan-runtime/src/device/prime.rs b/crates/metal2vulkan-runtime/src/device/prime.rs
++index 919f5c9..9da4551 100644
++--- a/crates/metal2vulkan-runtime/src/device/prime.rs
+++++ b/crates/metal2vulkan-runtime/src/device/prime.rs
++@@ -1170,6 +1170,13 @@ impl Primer<'_> {
++             let pool = device.create_descriptor_pool(&info, None).map_err(vulkan)?;
++             self.made(Call::CreateDescriptorPool);
++             self.hold(pool);
+++            // Coachz: the reset of a spare pool a section takes (`spares.rs`), of the pool while it
+++            // holds no set yet.
+++            // The pool is this priming's alone and no set of it is allocated.
+++            device
+++                .reset_descriptor_pool(pool, vk::DescriptorPoolResetFlags::empty())
+++                .map_err(vulkan)?;
+++            self.made(Call::ResetDescriptorPool);
++             // A set of it, written: the runtime releases its pools with their sets.
++             let info = vk::DescriptorSetAllocateInfo::default()
++                 .descriptor_pool(pool)
++diff --git a/crates/metal2vulkan-runtime/src/exit_guard.rs b/crates/metal2vulkan-runtime/src/exit_guard.rs
++index b63cd37..c329123 100644
++--- a/crates/metal2vulkan-runtime/src/exit_guard.rs
+++++ b/crates/metal2vulkan-runtime/src/exit_guard.rs
++@@ -405,6 +405,8 @@ calls! {
++     CmdCopyImage => c"vkCmdCopyImage",
++     CreateDescriptorPool => c"vkCreateDescriptorPool",
++     AllocateDescriptorSets => c"vkAllocateDescriptorSets",
+++    // Coachz: a spare descriptor pool taken inside a section is reset there (`spares.rs`).
+++    ResetDescriptorPool => c"vkResetDescriptorPool",
++     UpdateDescriptorSets => c"vkUpdateDescriptorSets",
++     CreateBuffer => c"vkCreateBuffer",
++     GetBufferMemoryRequirements => c"vkGetBufferMemoryRequirements",
++@@ -536,6 +538,7 @@ pub(crate) const HOST_STEP: &[Call] = &[
++     Call::CmdCopyImageToBuffer,
++     Call::CreateDescriptorPool,
++     Call::AllocateDescriptorSets,
+++    Call::ResetDescriptorPool,
++     Call::UpdateDescriptorSets,
++     Call::CreateBuffer,
++     Call::GetBufferMemoryRequirements,
++diff --git a/crates/metal2vulkan-runtime/src/spares.rs b/crates/metal2vulkan-runtime/src/spares.rs
++index 5bdb4dc..d6cf212 100644
++--- a/crates/metal2vulkan-runtime/src/spares.rs
+++++ b/crates/metal2vulkan-runtime/src/spares.rs
++@@ -86,10 +86,11 @@
++ //!   those encoders took, `WorkCounts::encoder_primaries_begun_ahead`.
++ //! - **Descriptor pools are reset by the taker**, on the thread that encodes: the program's own, or
++ //!   one running the program's code (a handler).
++-//! - **Taken outside sections alone.** A section of the exit guard (a host step's recording on the
++-//!   scheduler's thread) calls only the guard's table of entry points, which holds no reset of a
++-//!   pool, and takes no spare: a command buffer or command recorded there makes its
++-//!   pools as before; what it made is given back all the same. A command buffer that encoded
+++//! - **Command pools taken outside sections alone.** A section of the exit guard (a host step's
+++//!   recording on the scheduler's thread) calls only the guard's table of entry points, which holds
+++//!   no reset of a command pool, and takes no spare command pool: a command buffer recorded there
+++//!   makes its pool as before; what it made is given back all the same. Coachz: the table holds
+++//!   the descriptor pools' reset, so a section takes spare descriptor pools as any thread does. A command buffer that encoded
++ //!   nothing, whose submissions record only their barriers, in sections, takes its spare command
++ //!   pool at its commit, on the committing thread.
++ //! - **Given back once nothing of them is pending.** A command buffer that completed
++@@ -368,17 +369,17 @@ impl Spares {
++ 
++     /// A spare descriptor pool of `device`, reset, with room for one set of `needs`, the newest
++     /// such: a command buffer's arena's, or, for a fitted arena (`fitted`, the most descriptors
++-    /// it takes a spare of), one of the fitted arenas' own; `None` when there is none, or this
++-    /// thread is in a section.
+++    /// it takes a spare of), one of the fitted arenas' own; `None` when there is none.
++     pub(super) fn descriptor_pool(
++         &self,
++         device: &DeviceShared,
++         needs: &SetNeeds,
++         fitted: Option<u64>,
++     ) -> Result<Option<DescriptorPool>, Error> {
++-        if exit_guard::in_section() {
++-            return Ok(None);
++-        }
+++        // Coachz: taken inside a section too: the guard's table holds the reset
+++        // (`exit_guard::Call::ResetDescriptorPool`, primed with the rest). k220's render server
+++        // made a new pool for every video picture's YCbCr conversion, whose owned sets a texture
+++        // makes inside a section: about 2.2 % of its display thread mapped those pools' memory.
++         let pools = match fitted {
++             Some(_) => &self.fitted_pools,
++             None => &self.descriptor_pools,
+diff --git a/drivers/AdrenoMetal/bridge/patches/0033-coachz-memoryless-writers-keep-secondary.patch b/drivers/AdrenoMetal/bridge/patches/0033-coachz-memoryless-writers-keep-secondary.patch
+new file mode 100644
+--- /dev/null
++++ b/drivers/AdrenoMetal/bridge/patches/0033-coachz-memoryless-writers-keep-secondary.patch
+@@ -0,0 +1,103 @@
++diff --git a/crates/metal2vulkan-runtime/src/device/mod.rs b/crates/metal2vulkan-runtime/src/device/mod.rs
++index 83f2964..e7d11c0 100644
++--- a/crates/metal2vulkan-runtime/src/device/mod.rs
+++++ b/crates/metal2vulkan-runtime/src/device/mod.rs
++@@ -488,6 +488,8 @@ pub(super) struct DeviceShared {
++     pub(super) bind_memos: crate::binding::SpareBindMemos,
++     /// The boxes its ended render encoders left, which the next ones are made in (`render.rs`).
++     pub(super) lowerings: crate::render::SpareLowerings,
+++    /// The pass shapes whose first instance keeps out of inline recording (`render.rs`).
+++    pub(super) memoryless_writers: crate::render::MemorylessWriters,
++     /// The rooms of the draws its render encoders kept for instances recorded inline after a
++     /// split, which the next such instances take (`render/inline_splits.rs`).
++     pub(super) kept_rooms: crate::render::SpareKept,
++@@ -1917,6 +1919,7 @@ impl Device {
++             live_binds: Default::default(),
++             bind_memos: Default::default(),
++             lowerings: Default::default(),
+++            memoryless_writers: Default::default(),
++             kept_rooms: Default::default(),
++             counts: Default::default(),
++             parking: parking.map_or_else(OnceLock::new, OnceLock::from),
++diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
++index 1ec0a2f..97f40a8 100644
++--- a/crates/metal2vulkan-runtime/src/render.rs
+++++ b/crates/metal2vulkan-runtime/src/render.rs
++@@ -2058,6 +2058,52 @@ impl RenderLowering {
++     }
++ }
++ 
+++/// The most pass shapes [`MemorylessWriters`] holds before it starts again.
+++const MEMORYLESS_WRITER_SHAPES: usize = 256;
+++
+++/// The shapes of the passes whose first instance recorded inline and split before a later draw
+++/// that wrote a memoryless color (`render/inline_first.rs`): such a pass's first instance records
+++/// in a secondary from then on, so the draws that write the color stay in its instance and its
+++/// transient image. Coachz: split there, the color got a backing image, cleared to what the first
+++/// instance left, and the pass's later instances loaded and stored it; on Turnip under
+++/// `TU_DEBUG=sysmem` those instances rendered in system memory. In k220 the render server's
+++/// full-screen composite did so about six times a second: the backing's clear about 1.5 ms and the
+++/// next instance 1.7 to 5.8 ms after a first of 4 to 6 ms in tile memory. A shape is the colors'
+++/// formats and whether each is memoryless, the extent, layers, samples and whether a depth or
+++/// stencil is attached; passes of one shape that do not write the color lose only the inline
+++/// recording, as before it existed.
+++#[derive(Default)]
+++pub(crate) struct MemorylessWriters(Mutex<std::collections::HashSet<u64>>);
+++
+++impl MemorylessWriters {
+++    fn shape(layout: &PassLayout) -> u64 {
+++        use std::hash::{Hash, Hasher};
+++        let mut hash = std::collections::hash_map::DefaultHasher::new();
+++        for color in &layout.colors {
+++            match color {
+++                Some(color) => (true, color.target.format, color.memoryless).hash(&mut hash),
+++                None => false.hash(&mut hash),
+++            }
+++        }
+++        (layout.extent, layout.layers, layout.samples, layout.depth_stencil.is_some()).hash(&mut hash);
+++        hash.finish()
+++    }
+++
+++    /// Whether a pass of `layout`'s shape split before a draw that wrote a memoryless color.
+++    pub(super) fn holds(&self, layout: &PassLayout) -> bool {
+++        lock(&self.0).contains(&Self::shape(layout))
+++    }
+++
+++    /// A pass of `layout`'s shape split before a draw that wrote a memoryless color.
+++    fn note(&self, layout: &PassLayout) {
+++        let mut shapes = lock(&self.0);
+++        if shapes.len() >= MEMORYLESS_WRITER_SHAPES {
+++            shapes.clear();
+++        }
+++        shapes.insert(Self::shape(layout));
+++    }
+++}
+++
++ /// The most boxes of ended render encoders a device keeps for the next ones.
++ const SPARE_LOWERINGS: usize = 4;
++ 
++@@ -7946,6 +7992,7 @@ impl RenderLowering {
++         )?;
++         if first_write && matches!(next, Next::New { split: true, .. }) {
++             device.shared().counts.inline_memoryless_write_split();
+++            device.shared().memoryless_writers.note(&self.layout);
++         }
++         if attached {
++             device.shared().counts.attachment_read_through_copy();
++diff --git a/crates/metal2vulkan-runtime/src/render/inline_first.rs b/crates/metal2vulkan-runtime/src/render/inline_first.rs
++index 7dad382..44b8e5d 100644
++--- a/crates/metal2vulkan-runtime/src/render/inline_first.rs
+++++ b/crates/metal2vulkan-runtime/src/render/inline_first.rs
++@@ -384,6 +384,12 @@ impl RenderLowering {
++             counts.pass_not_inline(NotInline::MemorylessWrites);
++             return Ok(None);
++         }
+++        // Coachz: a pass of a shape that split before a later draw wrote a memoryless color
+++        // (`MemorylessWriters`) keeps its first instance in a secondary.
+++        if self.core.device().shared().memoryless_writers.holds(&self.layout) {
+++            counts.pass_not_inline(NotInline::MemorylessWrites);
+++            return Ok(None);
+++        }
++         let plain = made
++             && !self.replaying
++             && !self.rerouting
+diff --git a/drivers/AdrenoMetal/bridge/patches/0034-coachz-partial-passes-bounded-render-area.patch b/drivers/AdrenoMetal/bridge/patches/0034-coachz-partial-passes-bounded-render-area.patch
+new file mode 100644
+--- /dev/null
++++ b/drivers/AdrenoMetal/bridge/patches/0034-coachz-partial-passes-bounded-render-area.patch
+@@ -0,0 +1,192 @@
++diff --git a/crates/metal2vulkan-runtime/src/device/mod.rs b/crates/metal2vulkan-runtime/src/device/mod.rs
++index e7d11c0..2fe3908 100644
++--- a/crates/metal2vulkan-runtime/src/device/mod.rs
+++++ b/crates/metal2vulkan-runtime/src/device/mod.rs
++@@ -490,6 +490,8 @@ pub(super) struct DeviceShared {
++     pub(super) lowerings: crate::render::SpareLowerings,
++     /// The pass shapes whose first instance keeps out of inline recording (`render.rs`).
++     pub(super) memoryless_writers: crate::render::MemorylessWriters,
+++    /// The pass shapes whose draws last reached part of their attachments (`render.rs`).
+++    pub(super) partial_passes: crate::render::PartialPasses,
++     /// The rooms of the draws its render encoders kept for instances recorded inline after a
++     /// split, which the next such instances take (`render/inline_splits.rs`).
++     pub(super) kept_rooms: crate::render::SpareKept,
++@@ -1920,6 +1922,7 @@ impl Device {
++             bind_memos: Default::default(),
++             lowerings: Default::default(),
++             memoryless_writers: Default::default(),
+++            partial_passes: Default::default(),
++             kept_rooms: Default::default(),
++             counts: Default::default(),
++             parking: parking.map_or_else(OnceLock::new, OnceLock::from),
++diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
++index 97f40a8..76f93a7 100644
++--- a/crates/metal2vulkan-runtime/src/render.rs
+++++ b/crates/metal2vulkan-runtime/src/render.rs
++@@ -2104,6 +2104,74 @@ impl MemorylessWriters {
++     }
++ }
++ 
+++/// The fraction of its attachments' pixels under which a pass's draws reach "part" of them
+++/// ([`PartialPasses`]), in hundredths.
+++const PARTIAL_PERCENT: u64 = 60;
+++
+++/// The shapes ([`MemorylessWriters::shape`]) of passes whose draws last reached part of their
+++/// attachments: a pass of such a shape keeps its first instance out of inline recording, so the
+++/// pass begins at its end, over its draws' bounds (`end_pass`). Coachz: on Turnip a render pass
+++/// instance loads and stores every tile of its render area; the render server's full-screen
+++/// composite always began over the whole 2266x1488 frame, 54 tiles, and one of one or two draws
+++/// took 3.4 to 3.6 ms in k220 whatever it drew. Only a pass whose colors are each loaded (not
+++/// cleared) without a resolve, stand-in or sample planes, or memoryless, of one sample and layer
+++/// and no depth or stencil, is bounded: pixels outside the area keep their texels, as Metal's
+++/// loads and stores keep them where no draw reaches, and a memoryless color is neither loaded nor
+++/// stored. The bounds are its draws' Vulkan scissors (`DrawnArea`), widened to 32-pixel steps.
+++#[derive(Default)]
+++pub(crate) struct PartialPasses(Mutex<std::collections::HashSet<u64>>);
+++
+++impl PartialPasses {
+++    /// The area a pass of `layout` whose draws reached `drawn` may begin over: `None` where its
+++    /// colors or depth do not allow one, its draws are unbounded, or they reach most of it.
+++    fn area(layout: &PassLayout, drawn: &clear_reach::DrawnArea) -> Option<[u32; 4]> {
+++        if layout.depth_stencil.is_some()
+++            || layout.samples != 1
+++            || layout.layers != 1
+++            || layout.visibility.is_some()
+++            || !layout.sample_positions.is_empty()
+++        {
+++            return None;
+++        }
+++        let colors_allow = layout.colors.iter().flatten().all(|color| {
+++            color.memoryless
+++                || (color.load != LoadAction::Clear
+++                    && color.resolve.is_none()
+++                    && color.copied_resolve.is_none()
+++                    && color.stand_in.is_none()
+++                    && color.planes.is_none()
+++                    && !color.late_store)
+++        });
+++        if !colors_allow {
+++            return None;
+++        }
+++        let [width, height] = layout.extent;
+++        let [x0, y0, x1, y1] = drawn.bounds()?;
+++        let step = |v: u32| v / 32 * 32;
+++        let up = |v: u32, end: u32| v.div_ceil(32).saturating_mul(32).min(end);
+++        let [x0, y0, x1, y1] = [step(x0), step(y0), up(x1, width), up(y1, height)];
+++        if x1 <= x0 || y1 <= y0 {
+++            return None;
+++        }
+++        let reached = u64::from(x1 - x0) * u64::from(y1 - y0) * 100;
+++        (reached < u64::from(width) * u64::from(height) * PARTIAL_PERCENT).then_some([x0, y0, x1, y1])
+++    }
+++
+++    /// Whether passes of `layout`'s shape last reached part of their attachments.
+++    pub(super) fn holds(&self, layout: &PassLayout) -> bool {
+++        lock(&self.0).contains(&MemorylessWriters::shape(layout))
+++    }
+++
+++    /// A pass of `layout`'s shape reached `area`, part of its attachments.
+++    fn note(&self, layout: &PassLayout, _area: [u32; 4]) {
+++        let mut shapes = lock(&self.0);
+++        if shapes.len() >= MEMORYLESS_WRITER_SHAPES {
+++            shapes.clear();
+++        }
+++        shapes.insert(MemorylessWriters::shape(layout));
+++    }
+++}
+++
++ /// The most boxes of ended render encoders a device keeps for the next ones.
++ const SPARE_LOWERINGS: usize = 4;
++ 
++@@ -5127,9 +5195,45 @@ impl RenderLowering {
++             }
++         }
++         let [width, height] = layout.extent;
++-        let render_area = vk::Rect2D {
++-            offset: vk::Offset2D { x: 0, y: 0 },
++-            extent: vk::Extent2D { width, height },
+++        // Coachz: a pass whose draws reach part of its attachments, each loaded or memoryless
+++        // (`PartialPasses`), begins its instances over the draws' bounds alone, so a tiling device
+++        // loads and stores only the tiles they reach. Everywhere else, the whole attachment.
+++        let partial = (!inline
+++            && executions.is_empty()
+++            && pending.is_empty()
+++            && dispatches.is_empty()
+++            && reach_clears.is_none()
+++            && clears.is_none()
+++            && imageblock_clear.is_none()
+++            && hidden_clear.is_none()
+++            && scratch_edges.is_none()
+++            && merged.is_empty()
+++            && copy_in.is_none()
+++            && stand_ins_in.is_none()
+++            && first_texel_copies.is_none()
+++            && nan_depth.is_none()
+++            && grouped.is_none()
+++            && later_resolves.is_empty()
+++            && picked_resolve.is_none()
+++            && !resolve_after
+++            && planes.is_none())
+++        .then(|| PartialPasses::area(&layout, &drawn))
+++        .flatten();
+++        if let Some(area) = PartialPasses::area(&layout, &drawn) {
+++            core.device().shared().partial_passes.note(&layout, area);
+++        }
+++        let render_area = match partial {
+++            Some([x0, y0, x1, y1]) => {
+++                core.device().shared().counts.partial_render_area();
+++                vk::Rect2D {
+++                    offset: vk::Offset2D { x: x0 as i32, y: y0 as i32 },
+++                    extent: vk::Extent2D { width: x1 - x0, height: y1 - y0 },
+++                }
+++            }
+++            None => vk::Rect2D {
+++                offset: vk::Offset2D { x: 0, y: 0 },
+++                extent: vk::Extent2D { width, height },
+++            },
++         };
++         if let Some(first) = &first_texel_copies {
++             core.shadow_copies(first);
++diff --git a/crates/metal2vulkan-runtime/src/render/inline_first.rs b/crates/metal2vulkan-runtime/src/render/inline_first.rs
++index 44b8e5d..8214f27 100644
++--- a/crates/metal2vulkan-runtime/src/render/inline_first.rs
+++++ b/crates/metal2vulkan-runtime/src/render/inline_first.rs
++@@ -390,6 +390,12 @@ impl RenderLowering {
++             counts.pass_not_inline(NotInline::MemorylessWrites);
++             return Ok(None);
++         }
+++        // Coachz: a pass of a shape whose draws last reached part of its attachments begins at
+++        // its end, over their bounds (`PartialPasses`).
+++        if self.core.device().shared().partial_passes.holds(&self.layout) {
+++            counts.pass_not_inline(NotInline::Draws);
+++            return Ok(None);
+++        }
++         let plain = made
++             && !self.replaying
++             && !self.rerouting
++diff --git a/crates/metal2vulkan-runtime/src/work_counts.rs b/crates/metal2vulkan-runtime/src/work_counts.rs
++index 7283fc8..782ce3b 100644
++--- a/crates/metal2vulkan-runtime/src/work_counts.rs
+++++ b/crates/metal2vulkan-runtime/src/work_counts.rs
++@@ -119,6 +119,8 @@ pub(crate) struct Counters {
++     requirement_images_made: AtomicU64,
++     requirement_limits_asked: AtomicU64,
++     arena_pools_made: AtomicU64,
+++    /// Coachz: passes begun over their draws' bounds (`partial_render_area`).
+++    partial_render_areas: AtomicU64,
++     heap_texture_lossless_layouts: AtomicU64,
++     heap_texture_block_compressed_layouts: AtomicU64,
++     heap_texture_untiled_layouts: AtomicU64,
++@@ -2679,6 +2681,12 @@ impl Counters {
++             .fetch_add(1, Ordering::Relaxed);
++     }
++ 
+++    /// Coachz: a pass began its instances over its draws' bounds, part of its attachments
+++    /// (`render.rs`'s `PartialPasses`).
+++    pub(crate) fn partial_render_area(&self) {
+++        self.partial_render_areas.fetch_add(1, Ordering::Relaxed);
+++    }
+++
++     /// A descriptor arena made a pool, no spare having room (`descriptor_arena.rs`).
++     pub(crate) fn arena_pool_made(&self) {
++         self.arena_pools_made.fetch_add(1, Ordering::Relaxed);
+diff --git a/drivers/AdrenoMetal/bridge/patches/0035-coachz-converted-ycbcr-images-unzeroed.patch b/drivers/AdrenoMetal/bridge/patches/0035-coachz-converted-ycbcr-images-unzeroed.patch
+new file mode 100644
+--- /dev/null
++++ b/drivers/AdrenoMetal/bridge/patches/0035-coachz-converted-ycbcr-images-unzeroed.patch
+@@ -0,0 +1,20 @@
++diff --git a/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs b/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs
++index dd9aeaa..b33be52 100644
++--- a/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs
+++++ b/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs
++@@ -389,7 +389,14 @@ impl Device {
++             }
++         }
++         let hazard = texels.options().hazard_tracking_mode()?;
++-        let image = self.new_image(plan, layout, descriptor, hazard)?;
+++        // Coachz: its conversion writes every texel before any command reads it (the shadow's
+++        // copy in, `ShadowSource::Converted`), so it starts as its memory lies, as a two-plane
+++        // surface's shadow does (`surface_two_planes.rs`): k220's render server zeroed each video
+++        // picture's converted image on the host first, 4 % of its display thread tiling the zeros
+++        // and another 1 % freeing their buffer.
+++        let identity = crate::resource::Identity::new(hazard, false);
+++        let image =
+++            self.new_image_as_it_lies(plan, layout, descriptor, identity, Device::runtime_owner)?;
++         // The conversion's set holds it as long as the image (`Image::own_view`).
++         let view = image.own_view(&VkView {
++             view_type: ImageViewType::TYPE_2D,
 diff --git a/patches/mesa/coachz-port-ir3-fragment-consts.patch b/patches/mesa/coachz-port-ir3-fragment-consts.patch
 new file mode 100644
 --- /dev/null
@@ -2670,6 +3204,171 @@ new file mode 100644
 +       if (perf_pass_index != ~0) {
 +          struct tu_cs_entry *perf_cs_entry =
 +             &cmd_buffer->device->perfcntrs_pass_cs_entries[perf_pass_index];
+diff --git a/patches/mesa/coachz-turnip-cache-keeps-4m.patch b/patches/mesa/coachz-turnip-cache-keeps-4m.patch
+new file mode 100644
+--- /dev/null
++++ b/patches/mesa/coachz-turnip-cache-keeps-4m.patch
+@@ -0,0 +1,15 @@
++diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
++index 825e368..16142a4 100644
++--- a/src/freedreno/vulkan/tu_knl_darwin.cc
+++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
++@@ -856,7 +856,9 @@ darwin_cache_trim(struct tu_device *dev, struct darwin_retire_state *retire)
++     * first, up to 32 MiB of them; larger ones go after the second as before. After a pause the next frames otherwise allocated and
++     * mapped every chunk again: k219's cache reused 67-80 % with 243-716 evictions, and the render server's encoding and display
++     * threads spent about 8.6 s in the mapping of new BOs. A memory-pressure notification still empties the whole cache. */
++-   const uint64_t small = 1u << 20, kept_most = 32u << 20;
+++   /* Coachz: up to 4 MiB, not 1 MiB: the 4 MiB timestamp blocks of diagnostic boots and command stream chunks that grew past 1 MiB
+++    * went after their second and were allocated and mapped again (k220: 59 encoding-thread samples mapping new timestamp blocks). */
+++   const uint64_t small = 4u << 20, kept_most = 32u << 20;
++    uint64_t kept = 0;
++    for (unsigned i = retire->cache_count; i-- > 0;)
++       if (now - retire->cache[i].freed_s > 1 && retire->cache[i].size > small)
+diff --git a/patches/mesa/coachz-turnip-cs-chunks-kept.patch b/patches/mesa/coachz-turnip-cs-chunks-kept.patch
+new file mode 100644
+--- /dev/null
++++ b/patches/mesa/coachz-turnip-cs-chunks-kept.patch
+@@ -0,0 +1,140 @@
++diff --git a/src/freedreno/vulkan/tu_cs.cc b/src/freedreno/vulkan/tu_cs.cc
++index 47e1939..2df621d 100644
++--- a/src/freedreno/vulkan/tu_cs.cc
+++++ b/src/freedreno/vulkan/tu_cs.cc
++@@ -90,12 +90,67 @@ tu_cs_finish(struct tu_cs *cs)
++       tu_bo_finish(cs->device, cs->read_write.bos[i]);
++    }
++ 
+++   for (uint32_t i = 0; i < cs->spare_read_only.bo_count; ++i)
+++      tu_bo_finish(cs->device, cs->spare_read_only.bos[i]);
+++   for (uint32_t i = 0; i < cs->spare_read_write.bo_count; ++i)
+++      tu_bo_finish(cs->device, cs->spare_read_write.bos[i]);
+++
++    if (cs->refcount_bo)
++       tu_bo_finish(cs->device, cs->refcount_bo);
++ 
++    free(cs->entries);
++    free(cs->read_only.bos);
++    free(cs->read_write.bos);
+++   free(cs->spare_read_only.bos);
+++   free(cs->spare_read_write.bos);
+++}
+++
+++/* Coachz: a reset keeps a stream's chunks for its next recording instead of freeing all but the last, up to TU_CS_SPARE_CHUNKS and
+++ * TU_CS_SPARE_BYTES; past those a chunk is freed as before. A recording of about the size of the one before then allocates nothing: on
+++ * Darwin a new chunk is a kernel allocation, a GPU mapping and a CPU view, and k220's render server sometimes sat 20 to 90 ms in one
+++ * such CPU view while its encoding queue waited. The command buffer is not pending when it is reset (VkResetCommandBuffer,
+++ * vkBeginCommandBuffer, vkResetCommandPool), so nothing the GPU still reads is reused. */
+++#define TU_CS_SPARE_CHUNKS 8
+++#define TU_CS_SPARE_BYTES (2u << 20)
+++
+++static void
+++tu_cs_keep_spare(struct tu_cs *cs, struct tu_bo_array *spare, struct tu_bo *bo)
+++{
+++   uint64_t bytes = bo->size;
+++   for (uint32_t i = 0; i < spare->bo_count; ++i)
+++      bytes += spare->bos[i]->size;
+++   if (spare->bo_count >= TU_CS_SPARE_CHUNKS || bytes > TU_CS_SPARE_BYTES) {
+++      TU_RMV(resource_destroy, cs->device, bo);
+++      tu_bo_finish(cs->device, bo);
+++      return;
+++   }
+++   if (spare->bo_count == spare->bo_capacity) {
+++      uint32_t capacity = MAX2(4, 2 * spare->bo_capacity);
+++      struct tu_bo **bos = (struct tu_bo **) realloc(spare->bos, capacity * sizeof(*bos));
+++      if (!bos) {
+++         TU_RMV(resource_destroy, cs->device, bo);
+++         tu_bo_finish(cs->device, bo);
+++         return;
+++      }
+++      spare->bos = bos;
+++      spare->bo_capacity = capacity;
+++   }
+++   spare->bos[spare->bo_count++] = bo;
+++}
+++
+++/* The first kept chunk with room for `dwords`, taken off the spares. */
+++static struct tu_bo *
+++tu_cs_take_spare(struct tu_bo_array *spare, uint32_t dwords)
+++{
+++   for (uint32_t i = 0; i < spare->bo_count; ++i) {
+++      struct tu_bo *bo = spare->bos[i];
+++      if (bo->size / sizeof(uint32_t) >= dwords && bo->map) {
+++         memmove(&spare->bos[i], &spare->bos[i + 1], (spare->bo_count - i - 1) * sizeof(*spare->bos));
+++         --spare->bo_count;
+++         return bo;
+++      }
+++   }
+++   return NULL;
++ }
++ 
++ static struct tu_bo *
++@@ -138,7 +193,7 @@ tu_cs_get_cur_iova(const struct tu_cs *cs)
++  * be emitted to the new BO.
++  */
++ static VkResult
++-tu_cs_add_bo(struct tu_cs *cs, uint32_t size)
+++tu_cs_add_bo(struct tu_cs *cs, uint32_t size, uint32_t need)
++ {
++    /* no BO for TU_CS_MODE_EXTERNAL */
++    assert(cs->mode != TU_CS_MODE_EXTERNAL);
++@@ -162,7 +217,14 @@ tu_cs_add_bo(struct tu_cs *cs, uint32_t size)
++       bos->bos = new_bos;
++    }
++ 
++-   struct tu_bo *new_bo;
+++   struct tu_bo *new_bo =
+++      tu_cs_take_spare(cs->writeable ? &cs->spare_read_write : &cs->spare_read_only, need);
+++   if (new_bo) {
+++      bos->bos[bos->bo_count++] = new_bo;
+++      cs->start = cs->cur = cs->reserved_end = (uint32_t *) new_bo->map;
+++      cs->end = cs->start + tu_sanitize_ib_size(new_bo->size / sizeof(uint32_t));
+++      return VK_SUCCESS;
+++   }
++ 
++    VkResult result =
++       tu_bo_init_new(cs->device, NULL, &new_bo, size * sizeof(uint32_t),
++@@ -460,7 +522,7 @@ tu_cs_reserve_space(struct tu_cs *cs, uint32_t reserved_size)
++ 
++       /* switch to a new BO */
++       uint32_t new_size = MAX2(cs->next_bo_size, reserved_size);
++-      VkResult result = tu_cs_add_bo(cs, new_size);
+++      VkResult result = tu_cs_add_bo(cs, new_size, reserved_size);
++       if (result != VK_SUCCESS)
++          return result;
++ 
++@@ -510,15 +572,11 @@ tu_cs_reset(struct tu_cs *cs)
++       return;
++    }
++ 
++-   for (uint32_t i = 0; i + 1 < cs->read_only.bo_count; ++i) {
++-      TU_RMV(resource_destroy, cs->device, cs->read_only.bos[i]);
++-      tu_bo_finish(cs->device, cs->read_only.bos[i]);
++-   }
+++   for (uint32_t i = 0; i + 1 < cs->read_only.bo_count; ++i)
+++      tu_cs_keep_spare(cs, &cs->spare_read_only, cs->read_only.bos[i]);
++ 
++-   for (uint32_t i = 0; i + 1 < cs->read_write.bo_count; ++i) {
++-      TU_RMV(resource_destroy, cs->device, cs->read_write.bos[i]);
++-      tu_bo_finish(cs->device, cs->read_write.bos[i]);
++-   }
+++   for (uint32_t i = 0; i + 1 < cs->read_write.bo_count; ++i)
+++      tu_cs_keep_spare(cs, &cs->spare_read_write, cs->read_write.bos[i]);
++ 
++    assert(!cs->writeable);
++ 
++diff --git a/src/freedreno/vulkan/tu_cs.h b/src/freedreno/vulkan/tu_cs.h
++index 6a66de1..073867c 100644
++--- a/src/freedreno/vulkan/tu_cs.h
+++++ b/src/freedreno/vulkan/tu_cs.h
++@@ -102,6 +102,9 @@ struct tu_cs
++ 
++    struct tu_bo_array read_only, read_write;
++ 
+++   /* Coachz: the chunks a reset took off the stream, by mode, which its next recording fills before it allocates (tu_cs_add_bo). */
+++   struct tu_bo_array spare_read_only, spare_read_write;
+++
++    /* Optional BO that this CS is sub-allocated from for TU_CS_MODE_SUB_STREAM */
++    struct tu_bo *refcount_bo;
++ 
 diff --git a/patches/mesa/coachz-turnip-darwin-fence-waits.patch b/patches/mesa/coachz-turnip-darwin-fence-waits.patch
 new file mode 100644
 --- /dev/null
@@ -2778,6 +3477,110 @@ new file mode 100644
 +    for (uint32_t i = 0; i < wait_count; i++) {
 +       struct vk_darwin_sync *s = container_of(waits[i].sync, struct vk_darwin_sync, vk);
 +       VkResult result = darwin_sync_wait(device, s, abs_timeout_ns);
+diff --git a/patches/mesa/coachz-turnip-diagnostic-bo-stats-and-copy-once.patch b/patches/mesa/coachz-turnip-diagnostic-bo-stats-and-copy-once.patch
+new file mode 100644
+--- /dev/null
++++ b/patches/mesa/coachz-turnip-diagnostic-bo-stats-and-copy-once.patch
+@@ -0,0 +1,99 @@
++diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
++index 11a2b69..825e368 100644
++--- a/src/freedreno/vulkan/tu_knl_darwin.cc
+++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
++@@ -83,8 +83,13 @@ struct darwin_cached_bo {
++ };
++ struct darwin_bo_cache_stats {
++    uint64_t lookups, hits, inserts, evictions, flushes, bytes_peak;
+++   uint64_t misses[4];   /* Coachz: lookups that found nothing, by size: up to 64 KiB, 256 KiB, 1 MiB, larger */
++ };
++ 
+++/* Coachz: the CPU views darwin_bo_map makes (BoCpuMap and IOConnectMapMemory64): [0] count, [1] us in total, [2] the longest, [3] those over
+++ * 5 ms. k220's render server sometimes sat 20 to 90 ms in one, mapping a new command stream chunk. */
+++static volatile uint64_t darwin_map_stats[4];
+++
++ /* The GPU address space as two red-black trees over the free holes (Mesa's rb_tree, the same algorithm as XNU's libkern/tree.h): by
++  * address, to find a hole's neighbours when a range is freed and merge them, and by (size, address), to find the smallest hole that
++  * fits an allocation. Allocation, free and merge are all O(log n) in the number of holes; the heap it replaces (a list of holes) was
++@@ -740,6 +745,20 @@ darwin_cache_log(struct darwin_retire_state *retire)
++            (unsigned long long)(st->hits * 1000 / st->lookups % 10), (unsigned long long)retire->cache_count,
++            (unsigned long long)(retire->cache_bytes >> 20), (unsigned long long)st->evictions, (unsigned long long)st->flushes,
++            (unsigned long long)darwin_va_holes());
+++   /* Coachz: the same in the kernel's log (a text note), on diagnostic boots. */
+++   if (getenv("COACHZ_GPU_WORK_TRACE")) {
+++      char text[96] = {};
+++      const uint64_t maps = p_atomic_read(&darwin_map_stats[0]);
+++      snprintf(text, sizeof(text), "BOC h%llu/%llu miss %llu %llu %llu %llu c%lluM map n%llu mean%llu max%llu slow%llu",
+++               (unsigned long long)st->hits, (unsigned long long)st->lookups, (unsigned long long)st->misses[0],
+++               (unsigned long long)st->misses[1], (unsigned long long)st->misses[2], (unsigned long long)st->misses[3],
+++               (unsigned long long)(retire->cache_bytes >> 20), (unsigned long long)maps,
+++               (unsigned long long)(maps ? p_atomic_read(&darwin_map_stats[1]) / maps : 0),
+++               (unsigned long long)p_atomic_read(&darwin_map_stats[2]), (unsigned long long)p_atomic_read(&darwin_map_stats[3]));
+++      uint32_t words[NativeAdrenoNoteWords] = {};
+++      memcpy(words, text, MIN2(sizeof(text) - 1, sizeof(words)));
+++      tu_darwin_note(3, words, (uint32_t)MIN2((strlen(text) + 4) / 4, (size_t)NativeAdrenoNoteWords));
+++   }
++ }
++ 
++ /* Drops the cache entry at the index for real. VK_NOT_READY keeps it. */
++@@ -796,6 +815,8 @@ darwin_cache_get(struct darwin_retire_state *retire, uint64_t size, bool read_on
++       retire->cache_bytes -= out->size;
++       retire->cache[best] = retire->cache[--retire->cache_count];
++       ++retire->cache_stats.hits;
+++   } else {
+++      ++retire->cache_stats.misses[size <= (64u << 10) ? 0 : size <= (256u << 10) ? 1 : size <= (1u << 20) ? 2 : 3];
++    }
++    if (!(retire->cache_stats.lookups & 4095))
++       darwin_cache_log(retire);
++@@ -1161,6 +1182,7 @@ darwin_bo_export_dmabuf(struct tu_device *dev, struct tu_bo *bo)
++ static VkResult
++ darwin_bo_map(struct tu_device *dev, struct tu_bo *bo, void *placed_addr)
++ {
+++   const uint64_t map_began = os_time_get_nano();
++    NativeAdrenoAbiBoCpuMap req = {.handle = bo->darwin_handle};
++    NativeAdrenoAbiBoCpuMapReply reply = {};
++    kern_return_t kr = dw_call(NativeAdrenoMethodBoCpuMap, &req, sizeof(req), &reply, sizeof(reply));
++@@ -1185,6 +1207,15 @@ darwin_bo_map(struct tu_device *dev, struct tu_bo *bo, void *placed_addr)
++ 
++    bo->map = (void *)(uintptr_t)address;
++    bo->darwin_token = reply.token;
+++   {
+++      const uint64_t us = (os_time_get_nano() - map_began) / 1000;
+++      p_atomic_inc(&darwin_map_stats[0]);
+++      p_atomic_add(&darwin_map_stats[1], us);
+++      if (us > p_atomic_read(&darwin_map_stats[2]))
+++         p_atomic_set(&darwin_map_stats[2], us);
+++      if (us > 5000)
+++         p_atomic_inc(&darwin_map_stats[3]);
+++   }
++    /* The mapping belongs to the kernel descriptor; tu_bo_unmap() must not munmap() it. It goes away in bo_finish. */
++    bo->never_unmap = true;
++    TU_RMV(bo_map, dev, bo);
++diff --git a/src/freedreno/vulkan/tu_queue.cc b/src/freedreno/vulkan/tu_queue.cc
++index b021a46..d5d6f21 100644
++--- a/src/freedreno/vulkan/tu_queue.cc
+++++ b/src/freedreno/vulkan/tu_queue.cc
++@@ -509,13 +509,16 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
++ 
++       submit_add_entries(device, submit, &dump_cmds, cs->entries,
++                          cs->entry_count);
+++   }
++ 
++-      if (u_trace_submission_data &&
++-          u_trace_submission_data->timestamp_copy_data) {
++-         struct tu_cs *cs = &u_trace_submission_data->timestamp_copy_data->cs;
++-         submit_add_entries(device, submit, &dump_cmds, cs->entries,
++-                            cs->entry_count);
++-      }
+++   /* Coachz: the copy stream copies the timestamps of every command buffer of this submission (tu_create_copy_timestamp_cs), so it
+++    * runs once, after the last of them. Appended after each one, it ran with two CP_WAIT_FOR_IDLEs at every command buffer boundary,
+++    * and the copies before the last one carried timestamps the later command buffers had not written yet. */
+++   if (u_trace_submission_data &&
+++       u_trace_submission_data->timestamp_copy_data) {
+++      struct tu_cs *cs = &u_trace_submission_data->timestamp_copy_data->cs;
+++      submit_add_entries(device, submit, &dump_cmds, cs->entries,
+++                         cs->entry_count);
++    }
++ 
++    autotune_cs = device->autotune->on_submit(cmd_buffers, cmdbuf_count);
 diff --git a/patches/mesa/coachz-turnip-fewer-bo-maps.patch b/patches/mesa/coachz-turnip-fewer-bo-maps.patch
 new file mode 100644
 --- /dev/null
@@ -4115,7 +4918,7 @@ new file mode 100644
 diff --git a/scripts/build-adreno-metal-bridge.py b/scripts/build-adreno-metal-bridge.py
 --- a/scripts/build-adreno-metal-bridge.py
 +++ b/scripts/build-adreno-metal-bridge.py
-@@ -67,7 +67,11 @@ PATCHES = [ROOT / 'drivers/AdrenoMetal/bridge/patches' / name for name in [
+@@ -67,7 +67,17 @@ PATCHES = [ROOT / 'drivers/AdrenoMetal/bridge/patches' / name for name in [
      # keep nothing. The stage ring also marks the steps inside a batch's submission (SubmitStep: placed, gathered, vkQueueSubmit, changes).
      '0024-diagnostics-switch-and-submit-steps.patch',
      # Preserve specialized link names and source definitions; share large indexed constants and expose Vulkan allocation sizes.
@@ -4124,25 +4927,31 @@ diff --git a/scripts/build-adreno-metal-bridge.py b/scripts/build-adreno-metal-b
 +    # A compile the asking thread waits for at that thread's priority; two-plane pictures up to the plug-in's size kept as images;
 +    # the runtime's command buffer threads at the fixed priority of the thread that starts them.
 +    '0027-coachz-compile-at-the-asking-priority.patch', '0028-coachz-ycbcr-image-for-small-pictures.patch',
-+    '0029-coachz-runtime-threads-at-the-spawning-priority.patch', '0030-coachz-more-spare-descriptor-pools.patch']]
++    '0029-coachz-runtime-threads-at-the-spawning-priority.patch', '0030-coachz-more-spare-descriptor-pools.patch',
++    # A render encoder made in the box the last ended one left; spare descriptor pools taken inside sections too; a pass shape that
++    # split for a later memoryless write, or whose draws reached part of the frame, keeps its first instance out of inline recording,
++    # the latter begun over the draws' bounds; a video picture's converted image not zeroed on the host first.
++    '0031-coachz-render-encoder-boxes-reused.patch', '0032-coachz-sections-take-spare-descriptor-pools.patch',
++    '0033-coachz-memoryless-writers-keep-secondary.patch', '0034-coachz-partial-passes-bounded-render-area.patch',
++    '0035-coachz-converted-ycbcr-images-unzeroed.patch']]
  
  
  def git_tree(*steps):
 diff --git a/scripts/build-turnip-darwin.py b/scripts/build-turnip-darwin.py
 --- a/scripts/build-turnip-darwin.py
 +++ b/scripts/build-turnip-darwin.py
-@@ -99,8 +99,17 @@
+@@ -99,8 +99,17 @@ options += ['-Dtu-builtin-source-id=' + source_id, '-Dtu-builtin-pack-header=' +
  # The pipeline cache's identity (VkPhysicalDeviceProperties::pipelineCacheUUID) from the compiler's source alone, the same for every
  # target: Mesa's own on Darwin is the library file's mtime (disk_cache_get_function_timestamp), which differs per install and per build,
  # so the pipelines a boot compiled into the persistent Data cache would miss after every image rebuild of the same compiler.
 -build_id = hashlib.sha256(json.dumps(dict(mesa_revision=pins['mesa']['commit'], source_diff_sha256=profile['source_diff_sha256'],
 -                                          extra_sources=source_extras), sort_keys=True).encode()).hexdigest()[:40]
 +# Coachz: what a compiled pipeline is made of: the source diff without the kernel backends, the queue, command buffer recording, autotune
-+# and the tracepoints, and the untracked sources without the Darwin backend (tu_knl_darwin.cc). k219: each image rebuilt the backend, so the
++# and the tracepoints, the command stream's chunks (tu_cs), and the untracked sources without the Darwin backend (tu_knl_darwin.cc). k219: each image rebuilt the backend, so the
 +# first boot of every image compiled its 259 pipelines again (16.4 s, the longest 2.7 s), and almost every boot was such a first one.
 +cache_exclude = ['src/freedreno/vulkan/tu_knl*', 'src/freedreno/vulkan/tu_queue.*', 'src/freedreno/vulkan/tu_cmd_buffer.cc',
 +                 'src/freedreno/vulkan/tu_autotune.*', 'src/freedreno/vulkan/tu_tracepoints.py', 'src/freedreno/vulkan/tu_perfetto*',
-+                 'src/freedreno/vulkan/tu_dynamic_rendering.cc']
++                 'src/freedreno/vulkan/tu_dynamic_rendering.cc', 'src/freedreno/vulkan/tu_cs.*']
 +cache_diff = subprocess.check_output(['git', '-C', SOURCE, 'diff', 'HEAD', '--binary', '--', '.',
 +                                      *(':(exclude,glob)' + pattern for pattern in cache_exclude)])
 +cache_extras = {name: digest for name, digest in source_extras.items() if not name.startswith('src/freedreno/vulkan/tu_knl')}
@@ -4154,7 +4963,7 @@ diff --git a/scripts/build-turnip-darwin.py b/scripts/build-turnip-darwin.py
 diff --git a/scripts/data/adreno-compiler-inputs.json b/scripts/data/adreno-compiler-inputs.json
 --- a/scripts/data/adreno-compiler-inputs.json
 +++ b/scripts/data/adreno-compiler-inputs.json
-@@ -56,7 +56,17 @@
+@@ -56,7 +56,20 @@
      "patches/mesa/turnip-host-import-images.patch",
      "patches/mesa/turnip-render-mode-for-attachment-memory.patch",
      "patches/mesa/turnip-gmem-mutable-swap.patch",
@@ -4169,7 +4978,10 @@ diff --git a/scripts/data/adreno-compiler-inputs.json b/scripts/data/adreno-comp
 +    "patches/mesa/coachz-port-turnip-row-pitch.patch",
 +    "patches/mesa/coachz-port-turnip-submit-cuts.patch",
 +    "patches/mesa/coachz-turnip-darwin-fence-waits.patch",
-+    "patches/mesa/coachz-turnip-fewer-bo-maps.patch"
++    "patches/mesa/coachz-turnip-fewer-bo-maps.patch",
++    "patches/mesa/coachz-turnip-diagnostic-bo-stats-and-copy-once.patch",
++    "patches/mesa/coachz-turnip-cs-chunks-kept.patch",
++    "patches/mesa/coachz-turnip-cache-keeps-4m.patch"
    ],
    "integer_fma_reference": {
      "repository": "https://github.com/ucb-bar/berkeley-softfloat-3",

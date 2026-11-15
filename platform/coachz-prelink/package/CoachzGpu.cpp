@@ -49,6 +49,9 @@ extern volatile uint64_t native_adreno_submit_phase[7];
 extern volatile uint32_t native_adreno_ib_probe_request, native_adreno_ib_probe_fence, native_adreno_ib_probe_count, native_adreno_ib_probe_pid;
 extern volatile uint32_t native_adreno_ib_probe_dwords[36];
 extern volatile uint32_t native_adreno_ib_probe_small[16], native_adreno_ib_probe_small_at, native_adreno_ib_probe_small_count;
+extern volatile uint32_t native_adreno_lock_holder[2], native_adreno_lock_hold_max[32];
+extern volatile uint64_t native_adreno_view_lock[4];
+extern volatile uint32_t native_adreno_method_stats[20][4];
 }
 extern "C" unsigned NativeAdrenoGpuContextInputBits();
 // The framework's two weak board hooks. [1] of the first is the GPU's current level, which it notes per job. The second names a process still mapping a
@@ -625,6 +628,25 @@ void stampReport() {
         printf("COACHZ gpu submit phases: check %llu retire %llu hold %llu wc %llu publish %llu choose %llu ring %llu us over %llu\n", p[0] * 10 / 192 / s, p[1] * 10 / 192 / s,
             p[2] * 10 / 192 / s, p[3] * 10 / 192 / s, p[4] * 10 / 192 / s, p[5] * 10 / 192 / s, p[6] * 10 / 192 / s, s);
     }
+    // The publisher lock (NativeAdrenoPublish.cpp): BO view lookups that found it held, their wait, the longest and who held it then
+    // (method + 1, pid), and the longest hold of each method that held it (k220: a command stream chunk's mapping sat 20 to 90 ms).
+    {
+        const volatile uint64_t *v = native_adreno_view_lock;
+        char line[320];
+        size_t at = static_cast<size_t>(snprintf(line, sizeof(line), "COACHZ gpu lock: view waits %llu mean %llu max %llu us holder m%llu pid %llu; hold max",
+            v[0], v[0] ? v[1] / v[0] : 0, v[2], (v[3] & 0xffff) ? (v[3] & 0xffff) - 1 : 0, v[3] >> 16));
+        for (unsigned m = 0; m < 32 && at < sizeof(line); ++m)
+            if (const uint32_t held = native_adreno_lock_hold_max[m])
+                at += static_cast<size_t>(snprintf(line + at, sizeof(line) - at, " m%u %u", m, held));
+        printf("%s us\n", line);
+        // Each ABI method's calls, failures and mean time inside the core (NativeAdrenoUserClient::dispatch's tally, under the lock).
+        at = static_cast<size_t>(snprintf(line, sizeof(line), "COACHZ gpu methods:"));
+        for (unsigned m = 0; m < 20 && at < sizeof(line); ++m)
+            if (const uint32_t calls = native_adreno_method_stats[m][0])
+                at += static_cast<size_t>(snprintf(line + at, sizeof(line) - at, " m%u %u/%u %uus", m, calls, native_adreno_method_stats[m][1],
+                    native_adreno_method_stats[m][3] / calls));
+        printf("%s\n", line);
+    }
 }
 
 // sheng-diag=1: one render server submission of 2 to 36 IBs at a time carries the CP's and the RB's always-on counter before each IB and after the last
@@ -655,9 +677,9 @@ void ibProbeReport() {
                 printf("%s\n", line);
             }
             // The first IB of at most 16 dwords, word by word (k219: a 9-dword IB after each command buffer held the CP about 64 us).
-            if (const uint32_t words = native_adreno_ib_probe_small_count) {
-                at = static_cast<size_t>(snprintf(line, sizeof(line), "COACHZ gpu ibs small: ib %u dwords %u:", native_adreno_ib_probe_small_at, words));
-                for (uint32_t i = 0; i < words && i < 16 && at < sizeof(line); ++i)
+            if (const uint32_t smallWords = native_adreno_ib_probe_small_count) {
+                at = static_cast<size_t>(snprintf(line, sizeof(line), "COACHZ gpu ibs small: ib %u dwords %u:", native_adreno_ib_probe_small_at, smallWords));
+                for (uint32_t i = 0; i < smallWords && i < 16 && at < sizeof(line); ++i)
                     at += static_cast<size_t>(snprintf(line + at, sizeof(line) - at, " %08x", native_adreno_ib_probe_small[i]));
                 printf("%s\n", line);
             }
@@ -1189,6 +1211,19 @@ bool llccActivate(vm_offset_t broadcast, uint32_t id) {
     return false;
 }
 
+// The GPU speed bin, read only: sc7180.dtsi's gpu_speed_bin cell (qfprom corrected region at 0x00784000, reg <0x1d2 0x2>, bits <5 8>),
+// which a6xx_catalog.c's A618 entry maps to a bin (0 -> 0, 169 -> 1, 174 -> 2) and the GPU OPP table's opp-supported-hw to 825 MHz on
+// bin 2 alone (0x04). The USB PHY setup reads the same region (coachz_usb_soc.c, qusb2 trim).
+void speedBinReport() {
+    const vm_offset_t page = ml_io_map_unmappable(0x00784000, 0x1000, 0x7 /* VM_WIMG_IO */);
+    if (!page) {printf("COACHZ gpu speed bin: qfprom map failed\n"); return;}
+    const uint32_t word = *reinterpret_cast<volatile uint32_t *>(page + 0x1d0);
+    ml_io_unmap(page, 0x1000);
+    const uint32_t fuse = ((word >> 16) >> 5) & 0xff;
+    const unsigned bin = fuse == 174 ? 2 : fuse == 169 ? 1 : 0;
+    printf("COACHZ gpu speed bin: qfprom 0x1d0 0x%08x fuse %u bin %u (%s)\n", word, fuse, bin, bin == 2 ? "825 MHz allowed" : "800 MHz top");
+}
+
 void cacheSetup() {
     const vm_offset_t llcc = ml_io_map(0x09200000, 0x31000), broadcast = ml_io_map(0x09600000, 0x22000), misc = ml_io_map(0x0509e000, 0x1000);
     auto read = [](vm_offset_t at) {return *reinterpret_cast<volatile uint32_t *>(at);};
@@ -1482,6 +1517,7 @@ extern "C" int coachz_gpu_driver_start(volatile uint8_t *core, volatile uint8_t 
     printf("COACHZ gpu9: accelerator %d\n", accelerator);
     thread_t thread = THREAD_NULL;
     if (kernel_thread_start(reportThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
+    speedBinReport();
     cacheSetup();
     if (kernel_thread_start(rateThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
     native_adreno_power_get = pmGet;
