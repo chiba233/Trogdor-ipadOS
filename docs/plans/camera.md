@@ -119,8 +119,9 @@ Written and checked on the host (kernel flags, `-Werror` for the app, `tests/tes
 - `/chosen/coachz-camera` bit 0x100 (`--camera-front-probe`): before the rear run, a read-only chip ID probe of the front sensor on
   CCI0 master 0 (GPIO6 rails, MCLK0 on GPIO13 at 19.2 MHz from XO instead of the node's 24 MHz, which needs the Agera PLL2, reset
   GPIO30), at 0x36, 0x10 and 0x3c (OmniVision 0x300a), 0x20 (Hynix 0x0f16) and 0x37 (GalaxyCore 0xf0/0xf1, 8-bit registers),
-  each read with the register width of the candidates at that address, then powered off with the pins restored. The rear run also
-  makes one plain read at 0x0c on master 1.
+  each read with the register width of the candidates at that address, then powered off with the pins restored.
+- `/chosen/coachz-camera` bit 0x200 (`--camera-vcm-probe`, off unless asked for): one plain read at 0x0c on master 1 during the rear
+  run, no register address written, to see whether the rear VCM answers there.
 - `CoachzCamera.cpp`: the IOService CoachzCamera with NativeSandboxGrantProcess "*" and CoachzCameraUserClient (start, stop,
   status, exposure and gain, newest frame into a structure output). Frames are copied from their physical pages with
   `IOMemoryDescriptor::readBytes`, so neither a permanent kernel mapping nor a memory-mapping message is needed.
@@ -138,7 +139,7 @@ Written and checked on the host (kernel flags, `-Werror` for the app, `tests/tes
 - The rear VCM: sc7180-trogdor-mipi-camera.dtsi has actuator_rear on CCI0 master 1 supplied by pp2800_wf_cam (GPIO7), and
   ChromeOS's model.yaml says the rear camera supports autofocus, but no public source gives its model or address (camx reads them
   from the module's binary configuration). Kukui's OV8856 module has a dongwoon,dw9768 at 0x0c (mt8183-kukui-krane.dtsi), another
-  board. Until the 0x0c read and a source agree, the lens is not driven and stays where its spring holds it.
+  board. Until a 0x0c read (bit 0x200, only when approved) and a source agree, the lens is not driven and stays where its spring holds it.
 - OV8856's black level has no value in mainline ov8856.c or libcamera's sensor helpers; the viewer estimates it.
 - The camera LED: no node in the ChromeOS or mainline device trees, so it is wired to a rail; the boot log prints both enables as the
   firmware left them.
@@ -153,7 +154,12 @@ Written and checked on the host (kernel flags, `-Werror` for the app, `tests/tes
    This IPSW's built-in camera path is the A10X ISP: the kernelcache carries `com.apple.driver.AppleH9CameraInterface` (7.8.0), whose
    user client and ISP firmware protocol the capture stack above it speaks. UniXNU and the other ports record no camera work (umi:
    camera not implemented), so either that interface is answered for this sensor or a capture source is added where the capture stack
-   enumerates devices; which of the two is smaller is not yet read from the shared cache.
+   enumerates devices. The 21H461 shared cache settles the shape: CMCapture names the kernel services `AppleH6CamIn`,
+   `AppleH9CamIn`, `AppleH10CamIn`, `AppleH13CamIn` and `AppleH16CamIn` next to the frameworks `H9ISPServices` to `H16ISPServices`, and
+   the A10X device's capture plugin is `/System/Library/MediaCapture/H9ISP.mediacapture`. The smaller route is the one the video decoder
+   took: a kernel service that matches as `AppleH9CamIn`, and our own `H9ISP.mediacapture` plug-in, delivered the way
+   `AVD.videodecoder` is, that implements the plug-in's interface over the CoachzCamera user client instead of the ISP firmware
+   protocol. The plug-in interface still has to be read from the original bundle.
 
 ## On hardware
 
