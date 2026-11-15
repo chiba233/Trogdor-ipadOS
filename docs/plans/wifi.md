@@ -11,14 +11,16 @@
 | 阶段 | 当前实现 | 验收边界 |
 |---|---|---|
 | SMEM平台清点 | 已写：确认ADT范围与XNU内存窗口不重叠，解析公开partition table，仅读global/APPS-MODEM，读取incoming SMP2P及已有GLINK描述符 | 真机：global 和 apps-modem 分区读到，modem 启动后能看到它新建的条目 |
-| WLFW控制报文 | 已写：QMI/TLV、indication registration、CAP、SC7180 MSA-info请求、严格响应匹配、能力字段、QRTR服务增删 | 主机固定报文通过；没有实际发送或收到固件响应 |
+| WLFW控制报文 | 已写：QMI/TLV、indication registration、CAP、SC7180 MSA-info请求、严格响应匹配、能力字段、QRTR服务增删 | 真机：随 WLFW 握手一起收发，见下一行 |
 | MPSS 启动 | 已写（`coachz-wifi=4`，`coachz-prelink-wifi.patch`）：照主线 `qcom_q6v5_mss` 的 MBA 和 MPSS 加载、内存归属、IPA 供电和 rmtfs 共享；AP 侧 SMEM 分配（TCSR 互斥锁 3）和 SMP2P 条目 428 | 真机：modem 报告 ready 和 handover；约 40 s 后因初始化卡住报 fatal |
-| 传输 | 已写：GLINK（AP 的 FIFO 479、版本和通道握手、intent）、QRTR（节点 1，hello 后通告 rmtfs）、rmtfs（QMI 服务 14，EFS 在内存里） | 真机：modem 不再超时，通告了 WLFW（69）等服务；还没向 WLFW 发过 QMI 请求 |
+| 传输 | 已写：GLINK（AP 的 FIFO 479、版本和通道握手、intent）、QRTR（节点 1，hello 后通告 rmtfs）、rmtfs（QMI 服务 14，EFS 在内存里） | 真机：modem 不再超时，通告了 WLFW（69）等服务，WLFW 握手和 WMI 都经这条通道 |
 | WLFW 握手 | 已写：照 ath10k `qmi.c`，到板级数据下发和 FW ready | 真机：芯片 0x320、板 0x67，BDF 来自 `board-2.bin` 的 `bus=snoc,qmi-board-id=67`，收到 FW ready |
 | WLAN 和 WMI | 已写：WCN3990 供电、WLAN 模式、12 个 copy engine、HTC，`wmi-tlv.c` 的 service ready 和 WMI_INIT | 真机：固件报告 READY，status 0 |
 | 无线扫描 | 已写：HTT 初始化、vdev、被动扫描，beacon 和 probe response 记入 BSS 表 | 真机：约 70 帧、40 多个发射源，2.4 和 5 GHz 各半；重复扫描正常 |
 | 系统接入 | 已接入：`CoachzWifiNet.cpp`（改编自 UniXNU-sheng 的 `WifiNet.cpp`），`en0`、Apple80211 请求、IONetworkStack；`nw_wifi_*` 是它和无线电之间的边界 | 真机：`en0` 打开，wifid 扫描并取走结果，设置显示 Wi-Fi 和网络列表，网络可加入 |
 | 联网 | 已接入：peer、vdev 启动、关联、WPA2 四次握手和密钥、HTT 收发、DHCP 和 DNS；驱动自己 `bpf_attach` 并 tap 收发 | 真机：认证、关联和四次握手完成，DHCP 和路由正常，Safari 能打开 HTTPS，已保存网络开机自动加入 |
+| 能力和信道规则 | 已接入：HT/VHT 能力照 ath10k 从 service ready 的 ht_cap_info、vht_cap_info 算，发射链路掩码按 rf_chains；每个信道的功率、天线增益和 DFS、被动标志照 ath/regd.c 按固件报的 eeprom_rd 取 | 真机：能力和原来的常数一致，38 个信道规则逐行符合预期，加入和 DHCP 照常 |
+| 信号强度 | 已接入：照 ath10k 取每帧 RSSI（HTT 的 rssi_comb、管理帧的 snr），照 mac80211 做 EWMA 平均；39 号事件按 IO80211 的要求发 184 字节链路质量记录（短于 184 字节会被 __dispatchlqmChangedEvent 丢弃），每 5 秒一次 | 真机：平均值随信号变化，wifid 反复用它喂 LQM |
 
 加入后没有 IPv4 是驱动没有替 DHCP 客户端接 BPF：接口没有地址时 DHCP 只经过包过滤器，XNU 的 dlil 不会替驱动 tap。重复加入失败是 wifid 在 `PRIVATE_MAC_ADDRESS_VALUE` 为空时退出，镜像现在用 `--wifi-mac` 写 `/chosen/mac-address-wifi0`。
 
