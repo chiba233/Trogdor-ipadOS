@@ -278,7 +278,11 @@ void coachz_camera_start(void);
 #define OV8856_EXPOSURE_MAX_MARGIN 6u
 #define OV8856_ANAL_GAIN_MIN 128u
 #define OV8856_DGTL_GAIN_DEFAULT 1024u
-#define FRAME_STRIDE    ((OV8856_MODE_WIDTH * 10u + 7u) / 8u)   /* MIPI RAW10: five bytes carry four pixels */
+/* MIPI RAW10 (five bytes carry four pixels), written by the frame-based RDI write master with the PLAIN128 packer, which ends each
+ * line on a 16-byte word: mainline camss gives the SDM845 VFE 170 RDI (the same 0xff01 width and stride, packer 0, frame-based)
+ * bytesperline = roundup(width * bpp / 8, 16) (camss-video.c video_mbus_to_pix_mp, camss-vfe.c vfe_bpl_align_rdi). */
+#define LINE_BYTES      ((OV8856_MODE_WIDTH * 10u + 7u) / 8u)
+#define FRAME_STRIDE    ((LINE_BYTES + 15u) & ~15u)
 #define FRAME_BYTES     (FRAME_STRIDE * OV8856_MODE_HEIGHT)
 #define FILL            0xa5u
 
@@ -790,7 +794,7 @@ static void vfe_stop(void)
 /* ---- frames ---- */
 static uint32_t view_offset(unsigned which)
 {
-	return which == 0 ? 0 : which == 1 ? (OV8856_MODE_HEIGHT / 2) * FRAME_STRIDE : FRAME_BYTES - 1;
+	return which == 0 ? 0 : which == 1 ? (OV8856_MODE_HEIGHT / 2) * FRAME_STRIDE : FRAME_BYTES - FRAME_STRIDE;
 }
 
 static bool map_views(void)
@@ -807,22 +811,51 @@ static bool map_views(void)
 	return true;
 }
 
-/* The colour bar: rows far apart are identical, the row has several levels, and the frame ends exactly at its length. */
+/* Bytes of rows a and b (each LINE_BYTES long) that are equal. */
+static unsigned rows_equal(volatile uint8_t *a, volatile uint8_t *b)
+{
+	unsigned equal = 0;
+	for (unsigned i = 0; i < LINE_BYTES; i++) equal += a[i] == b[i];
+	return equal;
+}
+
+static void print_bytes(const char *what, volatile uint8_t *p, unsigned n)
+{
+	char text[3 * 16 + 1] = "";
+	for (unsigned i = 0; i < n && i < 16; i++) snprintf(text + 3 * i, 4, " %02x", p[i]);
+	printf("COACHZ camera: %s%s\n", what, text);
+}
+
+/* The colour bar: rows of one Bayer phase are identical down the frame, each line has several levels, the 14 bytes after each line
+ * are the write master's padding, and the frame ends exactly at FRAME_BYTES. The first rows are compared at the packed and the
+ * padded strides, so the log shows which one the hardware wrote. */
 static void check_frame(unsigned b)
 {
-	volatile uint8_t *top = cam_view[b][0], *mid = cam_view[b][1], *end = cam_view[b][2];
-	unsigned equal = 0, fill = 0, levels = 0;
+	volatile uint8_t *top = cam_view[b][0], *mid = cam_view[b][1], *last = cam_view[b][2];
+	unsigned fill = 0, levels = 0;
 	uint8_t seen[4] = {0};
-	for (unsigned i = 0; i < FRAME_STRIDE; i++) {
-		equal += top[FRAME_STRIDE * 2 + i] == mid[i];
+	for (unsigned i = 0; i < LINE_BYTES; i++) {
 		fill += mid[i] == FILL;
 		if (i % 5 == 0) {
 			uint8_t level = mid[i] >> 3;
 			if (!(seen[level >> 3] & (1u << (level & 7)))) { seen[level >> 3] |= (uint8_t)(1u << (level & 7)); levels++; }
 		}
 	}
-	printf("COACHZ camera: buffer %u: rows 2 and %u equal in %u of %u bytes, %u fill bytes, %u levels; last byte 0x%02x, next 0x%02x\n",
-	    b, OV8856_MODE_HEIGHT / 2, equal, FRAME_STRIDE, fill, levels, end[0], end[1]);
+	printf("COACHZ camera: buffer %u: line %u bytes, stride %u; rows 0/2 equal in %u at stride %u and %u at stride %u; rows 2/%u equal in %u, rows %u/%u in %u; %u fill bytes, %u levels\n",
+	    b, LINE_BYTES, FRAME_STRIDE, rows_equal(top, top + 2u * LINE_BYTES), LINE_BYTES, rows_equal(top, top + 2u * FRAME_STRIDE),
+	    FRAME_STRIDE, OV8856_MODE_HEIGHT / 2, rows_equal(top + 2u * FRAME_STRIDE, mid), OV8856_MODE_HEIGHT / 2,
+	    OV8856_MODE_HEIGHT / 2 + 1, rows_equal(mid, mid + FRAME_STRIDE), fill, levels);
+	char what[64];
+	for (unsigned r = 0; r < 4; r++) {
+		snprintf(what, sizeof(what), "buffer %u row %u:", b, r);
+		print_bytes(what, top + r * FRAME_STRIDE, 16);
+	}
+	for (unsigned r = 0; r < 2; r++) {
+		snprintf(what, sizeof(what), "buffer %u row %u bytes %u-%u:", b, r, LINE_BYTES - 2, LINE_BYTES + 13);
+		print_bytes(what, top + r * FRAME_STRIDE + LINE_BYTES - 2, 16);
+	}
+	snprintf(what, sizeof(what), "buffer %u last row padding, then past the frame:", b);
+	print_bytes(what, last + FRAME_STRIDE - 8, 16);
 }
 
 static void stream_and_count(void)
@@ -862,7 +895,7 @@ static void stream_and_count(void)
 }
 
 uint64_t coachz_camera_frame_pa(uint32_t index) { return RING_PA(index); }
-/* 0 width, 1 height, 2 stride (MIPI RAW10), 3 frame bytes, 4 ring count; SGRBG10 Bayer order (ov8856.c 0x3813). */
+/* 0 width, 1 height, 2 stride (MIPI RAW10 lines padded to 16 bytes), 3 frame bytes, 4 ring count; SGRBG10 Bayer order (ov8856.c 0x3813). */
 uint32_t coachz_camera_geometry(uint32_t which)
 {
 	switch (which) {

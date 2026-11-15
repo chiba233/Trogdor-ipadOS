@@ -11,7 +11,7 @@
 + * cfg80211's signal_avg. A frame's signal is ath10k's: over HTT, ATH10K_DEFAULT_NOISE_FLOOR (-95) plus rx_ppdu_start's rssi_comb, read on
 + * a PPDU's first MPDU and kept for the rest of it (htt_rx.c ath10k_htt_rx_h_ppdu, ath10k_htt_rx_h_signal); for management frames the SNR
 + * above that floor (wmi.c ath10k_wmi_event_mgmt_rx), here the joined BSS's beacons. nw_wifi_status_get reports it in place of the join's
-+ * strength, so the RSSI request and RSSI_CHANGED follow the link.
++ * strength, so the RSSI request and the link quality report follow the link.
 + */
 +static struct { uint64_t internal; int32_t ppdu; uint32_t frames, beacons; } wj_sig;   /* the Wi-Fi thread's */
 +static volatile int32_t wj_signal_avg;   /* dBm; 0 until a frame of this join was heard */

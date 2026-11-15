@@ -1,6 +1,13 @@
 --- a/NativeLegacyDisplay.cpp
 +++ b/NativeLegacyDisplay.cpp
-@@ -13,6 +13,13 @@
+@@ -7,12 +7,20 @@
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
++#include <IOKit/IOInterruptEventSource.h>
+ #include <kern/clock.h>
+ #include <IOKit/pwr_mgt/IOPM.h>
+ #include <IOKit/pwr_mgt/IOPMpowerState.h>
  #include <libkern/c++/OSData.h>
  #include <pexpert/pexpert.h>
  extern "C" __attribute__((noreturn)) void native_legacy_backend_guard(unsigned,void *,void *);
@@ -14,7 +21,7 @@
  extern "C" IOService *native_legacy_display_allocate(void);
  extern "C" bool native_legacy_gop_mapping_observed(IOService *,IOMemoryMap *,uint32_t,uint32_t);
  extern "C" void native_legacy_registration_observed(IOService *);
-@@ -32,6 +39,8 @@
+@@ -32,6 +40,8 @@
  extern "C" bool native_legacy_prepare_scanout(void);
  extern "C" void native_legacy_transfer_observed(IOReturn,const void *,uint64_t);
  extern "C" void native_legacy_copy_timing_observed(uint64_t ticks,uint64_t bytes);
@@ -23,7 +30,7 @@
  extern "C" void native_legacy_retirement_observed(IOService *);
  // GPU hand-off (boot-arg sheng-fb-gpu=1): the frame is offered to the privileged GPU client instead of being copied; the swap retires when the
  // client reports the GPU copy done (native_legacy_gpu_complete). A refused offer or a failed copy uses the CPU copy below and is counted.
-@@ -48,6 +57,32 @@
+@@ -48,6 +58,33 @@
  // The unchanged original setDisplayRefreshProperties: publishes IOMFBDisplayRefresh from slot 301 (getRefreshAttributes below).
  extern "C" bool native_legacy_set_refresh_properties(void *display);
  extern "C" void native_legacy_vsync_observed(unsigned event,unsigned hz);
@@ -39,8 +46,9 @@
 +// Coachz: where the render server's swap_end time goes. kern_SwapEnd held 3.7 % of backboardd's samples on k220, about 1.7 ms a call; the
 +// parts this driver runs on that path are timed here: [0] validateSwap calls, [1] their time, [2] kickSwapQueue calls, [3] their time, [4] GPU
 +// offers, [5] their time, [6] retirements (the family's completeCurrentSwap), [7] their time, [8] the longest kick, [9] the longest retirement;
-+// times in mach absolute units. The rest of a swap_end is the original family's.
-+extern "C" {volatile uint64_t coachz_swap_stats[10];}
++// times in mach absolute units, [10] retirements run on the work loop after the swap call returned and [11] deferred ones the GPU client's
++// completion had already handled. The rest of a swap_end is the original family's.
++extern "C" {volatile uint64_t coachz_swap_stats[12];}
 +static inline void coachz_swap_add(unsigned count,unsigned total,uint64_t began,unsigned longest=10) {
 +    const uint64_t spent=mach_absolute_time()-began;
 +    coachz_swap_stats[count]=coachz_swap_stats[count]+1;coachz_swap_stats[total]=coachz_swap_stats[total]+spent;
@@ -49,14 +57,14 @@
 +static void coachz_swap_report() {
 +    auto us=[](uint64_t ticks){uint64_t ns=0;absolutetime_to_nanoseconds(ticks,&ns);return ns/1000;};
 +    auto mean=[&](unsigned count,unsigned total){return coachz_swap_stats[count]?us(coachz_swap_stats[total])/coachz_swap_stats[count]:0;};
-+    printf("COACHZ swap path: %llu validates mean %llu us, %llu kicks mean %llu max %llu us, %llu offers mean %llu us, %llu retires mean %llu max %llu us\n",
++    printf("COACHZ swap path: %llu validates mean %llu us, %llu kicks mean %llu max %llu us, %llu offers mean %llu us, %llu retires mean %llu max %llu us, %llu after the call, %llu already done\n",
 +        coachz_swap_stats[0],mean(0,1),coachz_swap_stats[2],mean(2,3),us(coachz_swap_stats[8]),coachz_swap_stats[4],mean(4,5),
-+        coachz_swap_stats[6],mean(6,7),us(coachz_swap_stats[9]));
++        coachz_swap_stats[6],mean(6,7),us(coachz_swap_stats[9]),coachz_swap_stats[10],coachz_swap_stats[11]);
 +}
  extern "C" uint64_t mach_continuous_time(void);
  // 32-bit BGRA, plain ('BGRA') or in Apple's lossless-compressed spelling ('&BGA', one plane): the GPU that renders the surface here writes plain rows
  // either way (no compression is implemented), so the bytes are the same.
-@@ -57,7 +92,9 @@
+@@ -57,7 +94,9 @@
  class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
      OSDeclareDefaultStructors(NativeLegacyDisplay)
      IOMemoryMap *bootMapping=nullptr;
@@ -67,7 +75,7 @@
      void *shadow=nullptr;uint64_t shadowBytes=0;bool shadowValid=false;
      bool primary=false;
      bool logicalPM=false;
-@@ -88,6 +125,8 @@
+@@ -88,6 +127,8 @@
      uint64_t vsyncInterval=0,vsyncNext=0;
      unsigned vsyncHz=0;
      bool vsyncArmed=false;
@@ -76,7 +84,7 @@
      bool vsyncWanted() const {
          const void *head=nullptr;memcpy(&head,reinterpret_cast<const unsigned char *>(this)+5592,sizeof(head));return head;
      }
-@@ -95,6 +134,7 @@
+@@ -95,6 +136,7 @@
      // the last client is removed.
      void armVsync() {
          if(!vsyncTimer || vsyncArmed || !vsyncWanted())return;
@@ -84,7 +92,7 @@
          vsyncArmed=true;vsyncNext=mach_absolute_time()+vsyncInterval;
          vsyncTimer->wakeAtTime(vsyncNext);native_legacy_vsync_observed(0,vsyncHz);
      }
-@@ -110,6 +150,23 @@
+@@ -110,6 +152,23 @@
          if(vsyncNext<=now){vsyncNext=now+vsyncInterval;native_legacy_vsync_observed(3,vsyncHz);}
          vsyncArmed=true;vsyncTimer->wakeAtTime(vsyncNext);
      }
@@ -108,7 +116,7 @@
      void startVsync() {
          unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
          if(!hz || hz>240 || !primary || !bootMapping || vsyncTimer)return;
-@@ -120,6 +177,8 @@
+@@ -120,6 +179,8 @@
          if(loop->addEventSource(timer)!=kIOReturnSuccess){timer->release();return;}
          nanoseconds_to_absolutetime(1000000000ull/hz,&vsyncInterval);
          vsyncHz=hz;vsyncTimer=timer;native_legacy_vsync_observed(4,hz);
@@ -117,7 +125,28 @@
          // A client may already have registered: arm under the gate, like the registration does.
          loop->runAction([](OSObject *owner,void *,void *,void *,void *)->IOReturn {
              static_cast<NativeLegacyDisplay *>(owner)->armVsync();return kIOReturnSuccess;
-@@ -226,6 +285,7 @@
+@@ -141,9 +202,9 @@
+         };
+         if(loop)loop->runAction(action,this,&args);else finishGpuSwap(status);
+     }
+-    void free() override {stopVsync();if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
++    void free() override {stopVsync();stopRetireSource();if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
+     void stop(IOService *provider) override {
+-        stopVsync();
++        stopVsync();stopRetireSource();
+         transferred=false;for(auto &entry: validated)entry=nullptr;gpuRequest=nullptr;gpuRetired=false;
+         if(logicalPM){PMstop();logicalPM=false;}
+         primary=false;IOMobileFramebufferLegacy::stop(provider);OSSafeReleaseNULL(bootMapping);
+@@ -160,7 +221,7 @@
+     }
+     bool start(IOService *provider) override {
+         if(!startDisplay(provider))return false;
+-        startVsync();return true;
++        startRetireSource();startVsync();return true;
+     }
+     bool startDisplay(IOService *provider) {
+         if(!IOMobileFramebufferLegacy::start(provider))return false;
+@@ -226,6 +287,7 @@
      // previous frame until the user touched it again). A retirement inside a kick only asks the running kick to loop.
      bool kicking=false,rekick=false;
      void kickSwapQueue() override {
@@ -125,7 +154,7 @@
          armVsync();
          if(kicking){rekick=true;return;}
          kicking=true;
-@@ -235,9 +295,11 @@
+@@ -235,9 +297,11 @@
              gpuBypass=false;
          } while(rekick && !transferred);
          kicking=false;
@@ -138,7 +167,7 @@
          if(enabled!=1 || transferred || !logicalPM || !bootMapping || !primary)return;
          const OriginalLegacySwapRequest *request=pendingSwapRequest();
          if(!request || !isValidated(request))return;
-@@ -253,10 +315,11 @@
+@@ -253,10 +317,11 @@
          if(!surface) {
              // Validated blank swap (all layers disabled over black): solid-fill the actual GOP.
              PE_Video blank={};
@@ -153,7 +182,7 @@
                 !native_legacy_surface_bounds(bw,bh,blank.v_rowBytes,bootMapping->getLength(),bootMapping->getLength())) {
                  native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
              }
-@@ -285,16 +348,21 @@
+@@ -285,16 +350,21 @@
             native_legacy_surface_width(surface)<width || native_legacy_surface_height(surface)<height ||
             !nativeBgra(native_legacy_surface_format(surface),native_legacy_surface_planes(surface)) ||
             PE_current_console(&video) || video.v_baseAddr!=bootMapping->getPhysicalAddress() ||
@@ -178,13 +207,20 @@
              // The GPU writes the scanout memory behind the CPU's back: the differential copy's picture of it is stale from now on.
              native_legacy_swap_stage(1);
              shadowValid=false;gpuRequest=request;gpuLength=length;transferred=true;
-@@ -302,12 +370,19 @@
+@@ -302,12 +372,25 @@
              // copy (int-243: about 4.4 ms render then about 3 ms copy per frame). Retire now: the presenter holds its own reference to this
              // frame's memory, the previous frame's copy has finished (transferred held this one back), and the next swap still waits for
              // the copy because transferred stays set until finishGpuSwap.
 -            unsigned early=1;PE_parse_boot_argn("sheng-early-retire",&early,sizeof(early));
+-            if(early==1 && retireSwap(request,true)) {
 +            static volatile int cachedEarly=-1;const unsigned early=legacy_boot_arg("sheng-early-retire",1,cachedEarly);
-             if(early==1 && retireSwap(request,true)) {
++            // Coachz: the family's completion (completeCurrentSwap) took 435 us on average and up to 1.7 ms a frame on k221, and it ran here,
++            // inside the render server's swap_submit (slot 178) on the render server's own thread. The work loop now runs it as soon as
++            // that call releases the gate (coachz-async-retire=0 keeps the old in-call retirement).
++            static volatile int cachedAsync=-1;const unsigned async=legacy_boot_arg("coachz-async-retire",1,cachedAsync);
++            if(early==1 && async==1 && retireSource) {
++                earlyRequest=request;retireSource->interruptOccurred(nullptr,this,0);
++            } else if(early==1 && retireSwap(request,true)) {
                  gpuRetired=true;native_legacy_early_retires=native_legacy_early_retires+1;
              }
              return;
@@ -199,7 +235,7 @@
          IOMemoryMap *source=memory->map(kIOMapAnywhere|kIOMapReadOnly);
          if(!source || !source->getVirtualAddress() || source->getLength()<allocation) {
              OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNoMemory,request,0);return;
-@@ -318,6 +393,7 @@
+@@ -318,6 +401,7 @@
              OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
          }
          // The two content scans read every pixel again; they only describe the first frames (the probe keeps 32).
@@ -207,7 +243,7 @@
          if(scanBudget) {
              --scanBudget;
              uint64_t scan[5];
-@@ -327,6 +403,8 @@
+@@ -327,6 +411,8 @@
              if(native_legacy_frame_colors(reinterpret_cast<const void *>(source->getVirtualAddress()),source->getLength(),sourceStride,width,height,colors,counts,&other))
                  native_legacy_frame_colors_observed(colors,counts,other);
          }
@@ -216,8 +252,35 @@
          if(!native_legacy_prepare_scanout()) {
              OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
          }
-@@ -384,13 +462,15 @@
+@@ -382,15 +468,42 @@
+         native_legacy_gpu_fallback_observed(status);
+         transferred=false;gpuBypass=true;kickSwapQueue();
      }
++    // Coachz: the deferred early retirement, on the work loop with the gate held, after the swap_submit that offered the frame returned.
++    // The GPU client may have finished or failed in between (finishGpuSwap then retired or recopied it and cleared gpuRequest): nothing to do.
++    IOInterruptEventSource *retireSource=nullptr;
++    const OriginalLegacySwapRequest *earlyRequest=nullptr;
++    static void earlyRetireFired(OSObject *owner,IOInterruptEventSource *,int) {static_cast<NativeLegacyDisplay *>(owner)->earlyRetire();}
++    void earlyRetire() {
++        const OriginalLegacySwapRequest *request=earlyRequest;earlyRequest=nullptr;
++        if(!request || request!=gpuRequest || gpuRetired){coachz_swap_stats[11]=coachz_swap_stats[11]+1;return;}
++        if(retireSwap(request,true)) {
++            gpuRetired=true;native_legacy_early_retires=native_legacy_early_retires+1;coachz_swap_stats[10]=coachz_swap_stats[10]+1;
++        }
++    }
++    void startRetireSource() {
++        IOWorkLoop *loop=getWorkLoop();
++        if(!loop || retireSource)return;
++        IOInterruptEventSource *source=IOInterruptEventSource::interruptEventSource(this,&NativeLegacyDisplay::earlyRetireFired);
++        if(!source)return;
++        if(loop->addEventSource(source)!=kIOReturnSuccess){source->release();return;}
++        retireSource=source;
++    }
++    void stopRetireSource() {
++        if(!retireSource)return;
++        if(IOWorkLoop *loop=getWorkLoop())loop->removeEventSource(retireSource);
++        OSSafeReleaseNULL(retireSource);earlyRequest=nullptr;
++    }
      // Hands the pending head to the unchanged family's completion. Leaves transferred alone: the callers decide when the next frame may go.
      bool retireSwap(const OriginalLegacySwapRequest *request,bool force) {
 -        unsigned retire=0,cpuPresent=0;
@@ -235,7 +298,7 @@
          native_legacy_retirement_observed(this);
          return true;
      }
-@@ -411,6 +491,12 @@
+@@ -411,6 +524,12 @@
          return kIOReturnUnsupported;
      }
      bool validateSwap(const OriginalLegacySwapRequest *request) override {
@@ -248,7 +311,7 @@
          // Qualified original request fields are packed; use memcpy for each
          // access. Accept only one full-frame, untransformed, nonplanar BGRA
          // surface with real original backing memory. No generic capability
-@@ -418,7 +504,7 @@
+@@ -418,7 +537,7 @@
          auto bytes=reinterpret_cast<const unsigned char *>(request);
          auto word=[&](unsigned offset){uint32_t value=0;memcpy(&value,bytes+offset,4);return value;};
          OSObject *surface=nullptr;unsigned reason=1;bool accepted=false;
@@ -257,7 +320,7 @@
          if(enabled==1 && logicalPM && primary && bootMapping && request) {
              reason=2;OSObject *surfaces[4]={};memcpy(surfaces,bytes+2624,sizeof(surfaces));surface=surfaces[0];
              uint32_t width=0,height=0;getDisplayDimensions(&width,&height);
-@@ -495,17 +581,19 @@
+@@ -495,17 +614,19 @@
             !video.v_width || !video.v_height || video.v_depth!=32 || video.v_rotate ||
             video.v_width>16384 || video.v_height>16384 || video.v_rowBytes<video.v_width*4 ||
             video.v_rowBytes>UINT64_MAX/video.v_height)return false;
@@ -281,7 +344,7 @@
              }
          }
          OSSafeReleaseNULL(mapping);return valid;
-@@ -517,8 +605,13 @@
+@@ -517,8 +638,13 @@
      LEAF(306)
      LEAF(307)
      LEAF(338)
