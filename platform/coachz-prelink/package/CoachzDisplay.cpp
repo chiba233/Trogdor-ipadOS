@@ -45,7 +45,7 @@ void native_legacy_registration_observed(IOService *) {
 }
 void native_legacy_vsync_observed(unsigned event,unsigned hz) {
     if(event==1) vsyncs++;
-    else if(event==4 || event==5) kprintf("COACHZ display: refresh event %u timer %u Hz\n",event,hz);
+    else if(event==4 || event==5 || event==6) kprintf("COACHZ display: refresh event %u timer %u Hz%s\n",event,hz,event==6?", panel vsync interrupt":"");
 }
 bool native_legacy_gop_mapping_observed(IOService *,IOMemoryMap *map,uint32_t width,uint32_t height) {
     PE_Video video={};

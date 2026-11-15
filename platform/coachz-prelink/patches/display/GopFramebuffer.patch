@@ -23,7 +23,23 @@
  extern "C" void native_legacy_retirement_observed(IOService *);
  // GPU hand-off (boot-arg sheng-fb-gpu=1): the frame is offered to the privileged GPU client instead of being copied; the swap retires when the
  // client reports the GPU copy done (native_legacy_gpu_complete). A refused offer or a failed copy uses the CPU copy below and is counted.
-@@ -57,7 +66,9 @@
+@@ -48,6 +57,15 @@
+ // The unchanged original setDisplayRefreshProperties: publishes IOMFBDisplayRefresh from slot 301 (getRefreshAttributes below).
+ extern "C" bool native_legacy_set_refresh_properties(void *display);
+ extern "C" void native_legacy_vsync_observed(unsigned event,unsigned hz);
++// Coachz: the panel's own vsync (INTF_1's interrupt, drivers/RamBlock/vsync/coachz_vsync.c) instead of the tick when it is available;
++// the callback runs in a thread with the interrupt's mach_absolute_time. Event 6: hardware vsync in use.
++extern "C" int coachz_hw_vsync_register(void (*callback)(void *,uint64_t),void *context);
++// Coachz: the boot-args a swap consults, parsed once (they cannot change after boot; the command line is over 1000 bytes and every
++// swap used to walk it several times). `fallback` is what an absent argument leaves, as the old local default did.
++static unsigned legacy_boot_arg(const char *name,unsigned fallback,volatile int &cache) {
++    if(cache<0){unsigned value=fallback;PE_parse_boot_argn(name,&value,sizeof(value));cache=(int)value;}
++    return (unsigned)cache;
++}
+ extern "C" uint64_t mach_continuous_time(void);
+ // 32-bit BGRA, plain ('BGRA') or in Apple's lossless-compressed spelling ('&BGA', one plane): the GPU that renders the surface here writes plain rows
+ // either way (no compression is implemented), so the bytes are the same.
+@@ -57,7 +75,9 @@
  class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
      OSDeclareDefaultStructors(NativeLegacyDisplay)
      IOMemoryMap *bootMapping=nullptr;
@@ -34,7 +50,66 @@
      void *shadow=nullptr;uint64_t shadowBytes=0;bool shadowValid=false;
      bool primary=false;
      bool logicalPM=false;
-@@ -253,10 +264,11 @@
+@@ -88,6 +108,8 @@
+     uint64_t vsyncInterval=0,vsyncNext=0;
+     unsigned vsyncHz=0;
+     bool vsyncArmed=false;
++    bool vsyncHardware=false;
++    uint64_t vsyncStamp=0;
+     bool vsyncWanted() const {
+         const void *head=nullptr;memcpy(&head,reinterpret_cast<const unsigned char *>(this)+5592,sizeof(head));return head;
+     }
+@@ -95,6 +117,7 @@
+     // the last client is removed.
+     void armVsync() {
+         if(!vsyncTimer || vsyncArmed || !vsyncWanted())return;
++        if(vsyncHardware){vsyncArmed=true;native_legacy_vsync_observed(0,vsyncHz);return;}
+         vsyncArmed=true;vsyncNext=mach_absolute_time()+vsyncInterval;
+         vsyncTimer->wakeAtTime(vsyncNext);native_legacy_vsync_observed(0,vsyncHz);
+     }
+@@ -110,6 +133,23 @@
+         if(vsyncNext<=now){vsyncNext=now+vsyncInterval;native_legacy_vsync_observed(3,vsyncHz);}
+         vsyncArmed=true;vsyncTimer->wakeAtTime(vsyncNext);
+     }
++    static void hardwareVsync(void *context,uint64_t stamp) {
++        NativeLegacyDisplay *display=static_cast<NativeLegacyDisplay *>(context);
++        IOWorkLoop *loop=display->getWorkLoop();
++        if(!loop)return;
++        loop->runAction([](OSObject *owner,void *a0,void *,void *,void *)->IOReturn {
++            static_cast<NativeLegacyDisplay *>(owner)->hardwareTick(*static_cast<uint64_t *>(a0));return kIOReturnSuccess;
++        },display,&stamp);
++    }
++    // On the work loop, like the tick: one notification per panel vsync while a client wants them.
++    void hardwareTick(uint64_t stamp) {
++        if(!vsyncTimer || !vsyncArmed)return;
++        if(!vsyncWanted()){vsyncArmed=false;native_legacy_vsync_observed(2,vsyncHz);return;}
++        const uint64_t now=mach_absolute_time(),late=now>stamp?now-stamp:0;
++        vsyncStamp=stamp;
++        native_legacy_vsync_notify(this,stamp,mach_continuous_time()-late,vsyncInterval);
++        native_legacy_vsync_observed(1,vsyncHz);
++    }
+     void startVsync() {
+         unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
+         if(!hz || hz>240 || !primary || !bootMapping || vsyncTimer)return;
+@@ -120,6 +160,8 @@
+         if(loop->addEventSource(timer)!=kIOReturnSuccess){timer->release();return;}
+         nanoseconds_to_absolutetime(1000000000ull/hz,&vsyncInterval);
+         vsyncHz=hz;vsyncTimer=timer;native_legacy_vsync_observed(4,hz);
++        vsyncHardware=coachz_hw_vsync_register(&NativeLegacyDisplay::hardwareVsync,this)==0;
++        if(vsyncHardware)native_legacy_vsync_observed(6,hz);
+         // A client may already have registered: arm under the gate, like the registration does.
+         loop->runAction([](OSObject *owner,void *,void *,void *,void *)->IOReturn {
+             static_cast<NativeLegacyDisplay *>(owner)->armVsync();return kIOReturnSuccess;
+@@ -237,7 +279,7 @@
+         kicking=false;
+     }
+     void kickOnce() {
+-        unsigned enabled=0;PE_parse_boot_argn("offline-legacy-transfer",&enabled,sizeof(enabled));
++        static volatile int cachedTransfer=-1;const unsigned enabled=legacy_boot_arg("offline-legacy-transfer",0,cachedTransfer);
+         if(enabled!=1 || transferred || !logicalPM || !bootMapping || !primary)return;
+         const OriginalLegacySwapRequest *request=pendingSwapRequest();
+         if(!request || !isValidated(request))return;
+@@ -253,10 +295,11 @@
          if(!surface) {
              // Validated blank swap (all layers disabled over black): solid-fill the actual GOP.
              PE_Video blank={};
@@ -49,7 +124,7 @@
                 !native_legacy_surface_bounds(bw,bh,blank.v_rowBytes,bootMapping->getLength(),bootMapping->getLength())) {
                  native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
              }
-@@ -285,10 +297,12 @@
+@@ -285,10 +328,12 @@
             native_legacy_surface_width(surface)<width || native_legacy_surface_height(surface)<height ||
             !nativeBgra(native_legacy_surface_format(surface),native_legacy_surface_planes(surface)) ||
             PE_current_console(&video) || video.v_baseAddr!=bootMapping->getPhysicalAddress() ||
@@ -64,7 +139,14 @@
          // The diagnostic renderer repaints the page over the scanout until it is told the system owns the display; the GPU path needs that as much
          // as the CPU copy (int-093: accepted swaps were GPU-copied under a page that kept drawing).
          if(!gpuBypass) {
-@@ -308,6 +322,13 @@
+@@ -302,12 +347,19 @@
+             // copy (int-243: about 4.4 ms render then about 3 ms copy per frame). Retire now: the presenter holds its own reference to this
+             // frame's memory, the previous frame's copy has finished (transferred held this one back), and the next swap still waits for
+             // the copy because transferred stays set until finishGpuSwap.
+-            unsigned early=1;PE_parse_boot_argn("sheng-early-retire",&early,sizeof(early));
++            static volatile int cachedEarly=-1;const unsigned early=legacy_boot_arg("sheng-early-retire",1,cachedEarly);
+             if(early==1 && retireSwap(request,true)) {
+                 gpuRetired=true;native_legacy_early_retires=native_legacy_early_retires+1;
              }
              return;
          }
@@ -78,7 +160,7 @@
          IOMemoryMap *source=memory->map(kIOMapAnywhere|kIOMapReadOnly);
          if(!source || !source->getVirtualAddress() || source->getLength()<allocation) {
              OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNoMemory,request,0);return;
-@@ -318,6 +339,7 @@
+@@ -318,6 +370,7 @@
              OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
          }
          // The two content scans read every pixel again; they only describe the first frames (the probe keeps 32).
@@ -86,7 +168,7 @@
          if(scanBudget) {
              --scanBudget;
              uint64_t scan[5];
-@@ -327,6 +349,8 @@
+@@ -327,6 +380,8 @@
              if(native_legacy_frame_colors(reinterpret_cast<const void *>(source->getVirtualAddress()),source->getLength(),sourceStride,width,height,colors,counts,&other))
                  native_legacy_frame_colors_observed(colors,counts,other);
          }
@@ -95,7 +177,29 @@
          if(!native_legacy_prepare_scanout()) {
              OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
          }
-@@ -495,17 +519,19 @@
+@@ -384,9 +439,9 @@
+     }
+     // Hands the pending head to the unchanged family's completion. Leaves transferred alone: the callers decide when the next frame may go.
+     bool retireSwap(const OriginalLegacySwapRequest *request,bool force) {
+-        unsigned retire=0,cpuPresent=0;
+-        PE_parse_boot_argn("offline-legacy-retire",&retire,sizeof(retire));
+-        PE_parse_boot_argn("offline-legacy-cpu-present",&cpuPresent,sizeof(cpuPresent));
++        static volatile int cachedRetire=-1,cachedCpuPresent=-1;
++        const unsigned retire=legacy_boot_arg("offline-legacy-retire",0,cachedRetire);
++        const unsigned cpuPresent=legacy_boot_arg("offline-legacy-cpu-present",0,cachedCpuPresent);
+         if(!(retire==1 || cpuPresent==1 || force))return false;
+         if(!activateOnlyPendingSwap(request))return false;
+         removeValidated(request);
+@@ -418,7 +473,7 @@
+         auto bytes=reinterpret_cast<const unsigned char *>(request);
+         auto word=[&](unsigned offset){uint32_t value=0;memcpy(&value,bytes+offset,4);return value;};
+         OSObject *surface=nullptr;unsigned reason=1;bool accepted=false;
+-        unsigned enabled=0;PE_parse_boot_argn("offline-legacy-validate",&enabled,sizeof(enabled));
++        static volatile int cachedValidate=-1;const unsigned enabled=legacy_boot_arg("offline-legacy-validate",0,cachedValidate);
+         if(enabled==1 && logicalPM && primary && bootMapping && request) {
+             reason=2;OSObject *surfaces[4]={};memcpy(surfaces,bytes+2624,sizeof(surfaces));surface=surfaces[0];
+             uint32_t width=0,height=0;getDisplayDimensions(&width,&height);
+@@ -495,17 +550,19 @@
             !video.v_width || !video.v_height || video.v_depth!=32 || video.v_rotate ||
             video.v_width>16384 || video.v_height>16384 || video.v_rowBytes<video.v_width*4 ||
             video.v_rowBytes>UINT64_MAX/video.v_height)return false;
@@ -119,7 +223,7 @@
              }
          }
          OSSafeReleaseNULL(mapping);return valid;
-@@ -517,8 +543,13 @@
+@@ -517,8 +574,13 @@
      LEAF(306)
      LEAF(307)
      LEAF(338)

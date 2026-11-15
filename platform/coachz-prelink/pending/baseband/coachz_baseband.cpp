@@ -70,6 +70,10 @@ static struct cbp_client bb_pdp_clients[CBQ_MAX_CLIENTS];
 static uint32_t bb_pdp_owners[CBQ_MAX_CLIENTS];
 static struct cbd_setup bb_data;         // the data port setup ModemManager runs for IPA (coachz_bb_data.h)
 static int bb_data_slot[2] = { -1, -1 }; // the bridge's own DPM and WDA clients
+// The operating mode after each baseband boot the bridge stands for (bb_lpm_* below).
+static int bb_dms_slot = -1;
+static uint8_t bb_lpm_pending, bb_lpm_step;
+static uint32_t bb_lpm_txn = 0x4c00;
 static uint32_t bb_endpoint_fixes, bb_activations;
 static uint8_t bb_fix[2048];
 static struct cbe bb_esim;
@@ -244,6 +248,8 @@ static void bb_sahara_restart(void)
   cbs_init(&bb_sahara, bb_sahara_images, sizeof bb_sahara_images / sizeof bb_sahara_images[0], 0x10000);
   cbs_start(&bb_sahara, &o);
   for (uint32_t i = 0; i < o.count; i++) bb_push(CBH_SAHARA, o.data[i], o.len[i]);
+  bb_lpm_pending = 1;
+  bb_lpm_step = 0;
   printf("COACHZ baseband: sahara hello\n");
 }
 
@@ -285,6 +291,52 @@ static void bb_data_start(void)
   bb_data.has_dpm = cbq_server_find(&bb_qmux, CBD_SVC_DPM) != nullptr;
   bb_data.has_wda = cbq_server_find(&bb_qmux, CBD_SVC_WDA) != nullptr;
   bb_data_step();
+}
+
+// ------------------------------------------------------------------ operating mode after a boot (bb_lock held)
+// ABM power-cycles the baseband at every start ("Previous shutdown was not clean") and after each reset; the bridge stands for that
+// boot (bb_sahara_restart) while the modem keeps running, so it also keeps whatever operating mode it had. A baseband ABM just booted
+// comes up in low power: CommCenter logs "Baseband booted in airplane mode", and its subscription switch (DataSubscriptionController)
+// waits for /cc/props/radio_state to reach Offline, which only the modem's low-power report gives. On k217b the modem never left the
+// mode CommCenter reads as Shutdown, the switch never went on (no "[4] Switch State kSwitching"), its assertions stayed held and the
+// SIM stayed unknown: no service. So after each such boot the bridge's own DMS client reads the mode and puts the modem in low power
+// (QMI DMS Get/Set Operating Mode 0x002d/0x002e, TLV 0x01 u8: 0 online, 1 low power), as a freshly booted baseband is; CommCenter
+// then takes it online itself. Layouts are libqmi's (qmi-service-dms).
+static const uint32_t BB_DMS = 0x02u, BB_DMS_GET_MODE = 0x002du, BB_DMS_SET_MODE = 0x002eu;
+static void bb_lpm_send(void)
+{
+  const struct cbq_server *server = cbq_server_find(&bb_qmux, BB_DMS);
+  if (!server) { if (bb_lpm_step == 0) bb_lpm_pending = 1; return; }   // DMS not announced yet: try again on the next frame
+  if (bb_dms_slot < 0) bb_dms_slot = cbq_client_alloc(&bb_qmux, CBQ_INTERNAL, BB_DMS);
+  if (bb_dms_slot < 0) { printf("COACHZ baseband: operating mode: no DMS client\n"); bb_lpm_pending = 0; return; }
+  uint8_t sdu[16];
+  uint32_t n;
+  bb_lpm_txn++;
+  if (bb_lpm_step == 0) {
+    n = cbd_request(sdu, bb_lpm_txn, BB_DMS_GET_MODE, 0);
+  } else {
+    const uint8_t low_power = 1;
+    n = cbd_request(sdu, bb_lpm_txn, BB_DMS_SET_MODE, cbd_tlv(sdu + 7, sizeof sdu - 7u, 0x01, &low_power, 1));
+  }
+  bb_queue_tx(CBQ_PORT_BASE + (uint32_t)bb_dms_slot, server->node, server->port, sdu, n);
+}
+// An answer on the bridge's DMS client: 1 when it was one.
+static int bb_lpm_answer(uint32_t dst_port, const uint8_t *sdu, uint32_t n)
+{
+  if (bb_dms_slot < 0 || dst_port != CBQ_PORT_BASE + (uint32_t)bb_dms_slot) return 0;
+  if (n < 7u || sdu[0] != 0x02 || cbd_rd16(sdu + 1) != bb_lpm_txn) return 1;
+  const uint32_t error = cbd_error(sdu, n);
+  if (bb_lpm_step == 0) {
+    uint32_t len = 0;
+    const uint8_t *mode = cbd_find(sdu, n, 0x01, &len);
+    printf("COACHZ baseband: operating mode after the boot: %d (error 0x%x), setting low power\n", mode && len >= 1 ? (int)mode[0] : -1, error);
+    bb_lpm_step = 1;
+    bb_lpm_send();
+  } else {
+    printf("COACHZ baseband: operating mode set to low power: error 0x%x\n", error);
+    bb_lpm_pending = 0;
+  }
+  return 1;
 }
 
 // WDS is still entirely owned by CommCenter. Observe only wire lifecycle facts, never credentials or addresses.
@@ -638,6 +690,8 @@ static void bb_host_write(uint32_t channel, const uint8_t *data, uint32_t len)
   if (channel != CBH_QMUX1 && channel != CBH_QMUX2) return;   // counted above, nothing behind it yet
   const uint32_t qmux = channel == CBH_QMUX1 ? 0 : 1;
   bb_trace_frame("host", qmux + 1u, data, len);
+  // The first QMUX traffic after a boot: the operating mode a booted baseband has, before ABM reads it.
+  if (bb_lpm_pending == 1) { bb_lpm_pending = 2; bb_lpm_send(); }
   const struct cbq_result r = cbq_from_host(&bb_qmux, qmux, data, len, bb_out, sizeof bb_out);
   switch (r.kind) {
   case CBQ_TO_HOST:
@@ -1305,6 +1359,7 @@ extern "C" int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32
     bb_trace("int-rx", 0, r.service, r.cid, static_cast<const uint8_t *>(body), size);
     if (bb_esim_slot >= 0 && dst_port == CBQ_PORT_BASE + (uint32_t)bb_esim_slot) {
       cbe_answer(&bb_esim, static_cast<const uint8_t *>(body), size, bb_now_ms());
+    } else if (bb_lpm_answer(dst_port, static_cast<const uint8_t *>(body), size)) {
     } else if (cbd_answer(&bb_data, r.service, static_cast<const uint8_t *>(body), size)) bb_data_step();
   } else if (r.kind == CBQ_TO_HOST) {
     if (r.service == CBD_SVC_WDS) bb_pdp_note(dst_port, r.cid, r.channel, static_cast<const uint8_t *>(body), size);
