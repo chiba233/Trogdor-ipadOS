@@ -1,0 +1,90 @@
+--- a/bsd/dev/coachz_wifi.c
++++ b/bsd/dev/coachz_wifi.c
+@@ -3732,10 +3732,38 @@
+ } wj;
+ static struct { uint8_t kind, ssid[32], ssid_len, bssid[6], has_bssid, has_pass, pass_len; char pass[65]; } wj_req;   /* under ws_lock */
+ static struct nw_wifi_status wj_pub;   /* under ws_lock */
++
++/*
++ * The access point's signal while joined, kept as mac80211 keeps a station's: every frame from the peer adds -signal to an EWMA
++ * (net/mac80211/rx.c ieee80211_rx_h_sta_process; sta_info.h DECLARE_EWMA(signal, 10, 8), include/linux/average.h), whose negated value is
++ * cfg80211's signal_avg. A frame's signal is ath10k's: over HTT, ATH10K_DEFAULT_NOISE_FLOOR (-95) plus rx_ppdu_start's rssi_comb, read on
++ * a PPDU's first MPDU and kept for the rest of it (htt_rx.c ath10k_htt_rx_h_ppdu, ath10k_htt_rx_h_signal); for management frames the SNR
++ * above that floor (wmi.c ath10k_wmi_event_mgmt_rx), here the joined BSS's beacons. nw_wifi_status_get reports it in place of the join's
++ * strength, so the RSSI request and RSSI_CHANGED follow the link.
++ */
++static struct { uint64_t internal; int32_t ppdu; uint32_t frames, beacons; } wj_sig;   /* the Wi-Fi thread's */
++static volatile int32_t wj_signal_avg;   /* dBm; 0 until a frame of this join was heard */
++static void
++wj_signal_reset(void)
++{
++    wj_sig.internal = 0;
++    wj_sig.ppdu = 0;
++    wj_sig.frames = wj_sig.beacons = 0;
++    __atomic_store_n(&wj_signal_avg, 0, __ATOMIC_RELAXED);
++}
++static void
++wj_signal_add(int32_t dbm)
++{
++    if (dbm >= 0 || dbm < -127) return;
++    const uint64_t val = (uint64_t)(-dbm);   /* ewma_signal_add(..., -signal): precision 10, weight 1/8 */
++    wj_sig.internal = wj_sig.internal ? (((wj_sig.internal << 3) - wj_sig.internal) + (val << 10)) >> 3 : val << 10;
++    __atomic_store_n(&wj_signal_avg, -(int32_t)(wj_sig.internal >> 10), __ATOMIC_RELAXED);
++}
+ 
+ static void
+ wj_publish(unsigned state, int result)
+ {
++    if (state != NW_STA_UP) wj_signal_reset();   /* a new join, or none: its frames start the average again */
+     lck_mtx_lock(ws_lock);
+     wj_pub.state = state;
+     wj_pub.result = result;
+@@ -4490,6 +4518,8 @@
+     memcpy(&start, buf + 36, 4);
+     const uint32_t decap = (start >> 8) & 3u;
+     if (!(attention & (1u << 31))) { wj.rx_undone++; return; }
++    /* RX_ATTENTION_FLAGS_FIRST_MPDU: a new PPDU, whose signal is -95 + rssi_comb (htt_rx_desc_v2: rx_ppdu_start at 108, rssi_comb at 124). */
++    if (attention & 1u) wj_sig.ppdu = -95 + (int32_t)buf[124];
+     if (attention & (1u << 28 | 1u << 29 | 1u << 30 | 1u << 16 | 1u << 17 | 1u << 27)) { wj.rx_bad++; return; }
+     if (len < 14u || len > WS_RX_BUF - 360u || wj.state < WJ_KEYS || wj.state > WJ_UP) { wj.rx_bad++; return; }
+     memcpy(frame, buf + 360, len);
+@@ -4514,6 +4544,7 @@
+     }
+     wj.rx_frames++;
+     wj.rx_bytes += bytes;
++    if (wj.state == WJ_UP && wj_sig.ppdu) { wj_sig.frames++; wj_signal_add(wj_sig.ppdu); }
+     if (eth[12] == 0x88 && eth[13] == 0x8e) {
+         wj.rx_eapol++;
+         wj_eapol(eth + 14, bytes - 14u);
+@@ -5034,6 +5065,9 @@
+         printf("COACHZ join: state %u, rx %u frames %u bytes (%u key, %u bad, %u not done; %u ind, %u in order), tx %u frames, %u acked %u no ack %u discarded %u no slot, mgmt %u/%u/%u, roam %u kickout %u\n",
+             wj.state, wj.rx_frames, wj.rx_bytes, wj.rx_eapol, wj.rx_bad, wj.rx_undone, wj.rx_ind, wj.rx_in_ord, wj.tx_frames, wj.tx_acked, wj.tx_noack, wj.tx_discard, wj.tx_full,
+             wj.mgmt_tx, wj.mgmt_ok, wj.mgmt_fail, wj.roam, wj.kickout);
++        if (wj.state == WJ_UP)
++            printf("COACHZ wifi rssi: signal_avg %d dBm over %u frames and %u beacons this join, last PPDU %d dBm, joined at %d dBm\n",
++                (int)__atomic_load_n(&wj_signal_avg, __ATOMIC_RELAXED), wj_sig.frames, wj_sig.beacons, (int)wj_sig.ppdu, (int)wj.ap.signal_dbm);
+         printf("COACHZ join: tx group %u unicast %u, source not ours %u; arp %u (request %u reply %u) ip4 %u (icmp %u tcp %u) ip6 %u other %u; dhcp discover %u request %u decline %u release %u inform %u\n",
+             wj_txc.group, wj_txc.to_other, wj_txc.sa_other, wj_txc.arp, wj_txc.arp_request, wj_txc.arp_reply, wj_txc.ip4, wj_txc.icmp, wj_txc.tcp, wj_txc.ip6, wj_txc.other, wj_txc.dhcp[1], wj_txc.dhcp[3], wj_txc.dhcp[4], wj_txc.dhcp[7], wj_txc.dhcp[8]);
+         printf("COACHZ join: rx group %u to us %u to others %u, our own source %u; arp %u (request %u reply %u) ip4 %u (icmp %u tcp %u) ip6 %u other %u; dhcp offer %u ack %u nak %u untyped %u\n",
+@@ -5093,6 +5127,10 @@
+         *st = wj_pub;
+         lck_mtx_unlock(ws_lock);
+     }
++    if (st->state == NW_STA_UP) {
++        const int32_t avg = __atomic_load_n(&wj_signal_avg, __ATOMIC_RELAXED);
++        if (avg) st->signal_dbm = (int8_t)avg;
++    }
+     if (st->state < NW_STA_AUTH) st->state = wl.state == 24 ? NW_STA_SCANNING : NW_STA_IDLE;
+     memcpy(st->mac, ws.mac, 6);
+ }
+@@ -5125,6 +5163,10 @@
+         return;
+     }
+     ws.beacons++;
++    if (type == 0x80 && wj.state == WJ_UP && !memcmp(f + 16, wj.ap.bssid, 6) && !wm_u32(h, 5)) {
++        wj_sig.beacons++;
++        wj_signal_add((int32_t)wm_u32(h, 1) - 95);
++    }
+     /* The header's channel is the IEEE number: ath10k_wmi_event_mgmt_rx takes 1..14 as 2.4 GHz. */
+     if (wm_u32(h, 0) <= 14) ws.band2++; else ws.band5++;
+     if (wm_u32(h, 1) > ws.snr_best) ws.snr_best = wm_u32(h, 1);

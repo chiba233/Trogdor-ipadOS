@@ -1,0 +1,187 @@
+--- a/bsd/dev/coachz_wifi.c
++++ b/bsd/dev/coachz_wifi.c
+@@ -571,10 +571,18 @@
+     return db ? wifi_bcm_send(db, "venus bus", bcms, 2) : -1;
+ }
+ 
+-/* CN0 is shared by the IPA configuration path and Venus cpu-cfg. Aggregate these consumers before programming the BCM,
+- * as qcom_icc_aggregate does: sum average bandwidth, maximum peak. Keep the vote update and RPMh send in the same critical section. */
+-static volatile uint32_t coachz_cn0_busy;
+-static uint64_t coachz_cn0_external_avg, coachz_cn0_external_peak, coachz_cn0_venus_avg, coachz_cn0_venus_peak;
++/*
++ * Every consumer's standing request on every BCM node, so that a BCM several drivers use carries all of them (CN0: IPA and Venus
++ * config; SN0: IPA and the eMMC; MC0, SH0, SH4: DDR, eMMC). As mainline: qcom_icc_aggregate sums the average and keeps the highest
++ * peak of the requests on one node, and bcm-voter.c bcm_aggregate takes, per BCM, the highest of its nodes after scaling each by its
++ * own buswidth and channels; a mask BCM (ACV) votes the OR of the masks asked for. A node is told apart by its BCM, buswidth and
++ * channels (two consumers of equal-width nodes in one BCM are summed, at least what either asks). A consumer's call replaces its
++ * earlier request on the nodes it names. Updated and sent under one lock.
++ */
++#define WIFI_BCM_VOTES 64
++static struct { const char *tag; const char *bcm; uint32_t buswidth, channels, mask; uint64_t avg, peak; } wifi_bcm_votes[WIFI_BCM_VOTES];
++static unsigned wifi_bcm_vote_count;
++static volatile uint32_t wifi_bcm_busy;
+ 
+ int coachz_venus_config_vote(int enable);
+ int
+@@ -607,47 +615,80 @@
+ static int
+ wifi_bcm_send(vm_offset_t db, const char *tag, const struct wifi_bcm *bcms, unsigned count)
+ {
+-    uint32_t address[8], data[8], vcd[8], sorted_address[8], sorted_data[8], status[8] = {0};
+-    unsigned n = 0;
+-    if (count > 8) return -5;
+-    bool cn0 = false;
+-    uint64_t cfg_avg = 0, cfg_peak = 0;
+-    for (unsigned i = 0; i < count; ++i) if (!strcmp(bcms[i].name, "CN0")) { cn0 = true; cfg_avg = bcms[i].avg; cfg_peak = bcms[i].peak; }
+-    if (cn0) {
+-        unsigned waited = 0;
+-        while (__sync_lock_test_and_set(&coachz_cn0_busy, 1)) { if (++waited >= 500000) return -6; delay(1); }
+-    }
+-    const bool venus_cfg = !strcmp(tag, "venus config");
+-    bool cn0_encoded = false;
++    enum { MAX = 16 };
++    uint32_t address[MAX], data[MAX], vcd[MAX], sorted_address[MAX], sorted_data[MAX], status[MAX] = {0};
++    const char *names[MAX];
++    unsigned n = 0, named = 0;
++    if (count > MAX) return -5;
++    unsigned waited = 0;
++    while (__sync_lock_test_and_set(&wifi_bcm_busy, 1)) { if (++waited >= 500000) return -6; delay(1); }
++    /* This consumer's requests replace its earlier ones on the same nodes. */
+     for (unsigned i = 0; i < count; i++) {
++        unsigned k = 0;
++        while (k < wifi_bcm_vote_count && !(!strcmp(wifi_bcm_votes[k].tag, tag) && !strcmp(wifi_bcm_votes[k].bcm, bcms[i].name) &&
++            wifi_bcm_votes[k].buswidth == bcms[i].buswidth && wifi_bcm_votes[k].channels == bcms[i].channels)) k++;
++        if (k == wifi_bcm_vote_count) {
++            if (k == WIFI_BCM_VOTES) { printf("COACHZ %s: vote table full, %s not recorded\n", tag, bcms[i].name); continue; }
++            wifi_bcm_vote_count++;
++            wifi_bcm_votes[k].tag = tag; wifi_bcm_votes[k].bcm = bcms[i].name;
++            wifi_bcm_votes[k].buswidth = bcms[i].buswidth; wifi_bcm_votes[k].channels = bcms[i].channels;
++        }
++        wifi_bcm_votes[k].mask = bcms[i].mask; wifi_bcm_votes[k].avg = bcms[i].avg; wifi_bcm_votes[k].peak = bcms[i].peak;
++        unsigned j = 0;
++        while (j < named && strcmp(names[j], bcms[i].name)) j++;
++        if (j == named) names[named++] = bcms[i].name;
++    }
++    /* Each BCM this call touched, with every consumer's requests on it. */
++    for (unsigned b = 0; b < named; b++) {
+         uint32_t addr = 0, aux = 0, len = 0;
+-        if (!wifi_db_find(db, bcms[i].name, &addr, &aux, &len) || len < 8) { printf("COACHZ %s: %s not in cmd-db\n", tag, bcms[i].name); continue; }
++        if (!wifi_db_find(db, names[b], &addr, &aux, &len) || len < 8) { printf("COACHZ %s: %s not in cmd-db\n", tag, names[b]); continue; }
+         const uint32_t unit = wifi_db_u16(db, aux) | wifi_db_u16(db, aux + 2u) << 16, width = wifi_db_u16(db, aux + 4u), v = wifi_db_u16(db, aux + 6u) & 0xffu;
+-        if (!unit || !width) { printf("COACHZ %s: %s has unit %u width %u, skipped\n", tag, bcms[i].name, unit, width); continue; }
+-        uint64_t avg = bcms[i].avg, peak = bcms[i].peak;
+-        if (cn0 && !strcmp(bcms[i].name, "CN0")) {
+-            cn0_encoded = true;
+-            avg += venus_cfg ? coachz_cn0_external_avg : coachz_cn0_venus_avg;
+-            const uint64_t other = venus_cfg ? coachz_cn0_external_peak : coachz_cn0_venus_peak;
+-            if (other > peak) peak = other;
+-        }
+-        uint64_t x = 0, y = bcms[i].mask;
+-        if (!y) {
+-            x = wifi_bcm_div(wifi_bcm_div(avg * width, (uint64_t)bcms[i].buswidth * bcms[i].channels) * 1000, unit);
+-            y = wifi_bcm_div(wifi_bcm_div(peak * width, bcms[i].buswidth) * 1000, unit);
++        /* A mask BCM (ACV) votes its enable mask: mainline's bcm_aggregate_mask never uses its width or unit (ACV's are 0 and 1 here),
++         * and qcom_icc_bcm_init does not check them. */
++        uint64_t asked_mask = 0;
++        for (unsigned k = 0; k < wifi_bcm_vote_count; k++)
++            if (!strcmp(wifi_bcm_votes[k].bcm, names[b])) asked_mask |= wifi_bcm_votes[k].mask;
++        if (!asked_mask && (!unit || !width)) { printf("COACHZ %s: %s has unit %u width %u, skipped\n", tag, names[b], unit, width); continue; }
++        uint64_t x = 0, y = 0, mask = 0, top_avg = 0, top_peak = 0;
++        unsigned consumers = 0;
++        for (unsigned k = 0; k < wifi_bcm_vote_count; k++) {
++            if (strcmp(wifi_bcm_votes[k].bcm, names[b])) continue;
++            consumers++;
++            mask |= wifi_bcm_votes[k].mask;
++            /* The node's sum of averages and highest peak over every consumer on it, once per node. */
++            bool first = true;
++            for (unsigned e = 0; e < k; e++)
++                if (!strcmp(wifi_bcm_votes[e].bcm, names[b]) && wifi_bcm_votes[e].buswidth == wifi_bcm_votes[k].buswidth &&
++                    wifi_bcm_votes[e].channels == wifi_bcm_votes[k].channels) first = false;
++            if (!first) continue;
++            uint64_t avg = 0, peak = 0;
++            for (unsigned e = k; e < wifi_bcm_vote_count; e++) {
++                if (strcmp(wifi_bcm_votes[e].bcm, names[b]) || wifi_bcm_votes[e].buswidth != wifi_bcm_votes[k].buswidth ||
++                    wifi_bcm_votes[e].channels != wifi_bcm_votes[k].channels) continue;
++                avg += wifi_bcm_votes[e].avg;
++                if (wifi_bcm_votes[e].peak > peak) peak = wifi_bcm_votes[e].peak;
++            }
++            const uint64_t nx = wifi_bcm_div(wifi_bcm_div(avg * width, (uint64_t)wifi_bcm_votes[k].buswidth * wifi_bcm_votes[k].channels) * 1000, unit);
++            const uint64_t ny = wifi_bcm_div(wifi_bcm_div(peak * width, wifi_bcm_votes[k].buswidth) * 1000, unit);
++            if (nx > x) x = nx;
++            if (ny > y) y = ny;
++            if (avg > top_avg) top_avg = avg;
++            if (peak > top_peak) top_peak = peak;
+         }
++        if (mask) { x = 0; y = mask; }
+         /* sc7180.c bcm_cn0.keepalive; bcm-voter.c bcm_aggregate retains a minimum active vote with no consumers. */
+-        if (!strcmp(bcms[i].name, "CN0") && !x && !y) x = y = 1;
++        if (!strcmp(names[b], "CN0") && !x && !y) x = y = 1;
+         if (x > 0x3fff) x = 0x3fff;
+         if (y > 0x3fff) y = 0x3fff;
+-        printf("COACHZ %s: %s address 0x%x unit %u width %u vcd %u vote x %llu y %llu\n", tag, bcms[i].name, addr, unit, width, v,
++        printf("COACHZ %s: %s address 0x%x unit %u width %u vcd %u, %u requests, node avg %llu peak %llu kBps, vote x %llu y %llu\n", tag,
++            names[b], addr, unit, width, v, consumers, (unsigned long long)top_avg, (unsigned long long)top_peak,
+             (unsigned long long)x, (unsigned long long)y);
+         address[n] = addr;
+         data[n] = (uint32_t)(x << 14 | y) | (x || y ? 1u << 29 : 0);
+         vcd[n] = v;
+         n++;
+     }
+-    unsigned order[8], sorted = 0;
++    unsigned order[MAX], sorted = 0;
+     for (uint32_t want = 0; want < 256 && sorted < n; want++)
+         for (unsigned i = 0; i < n; i++)
+             if (vcd[i] == want) order[sorted++] = i;
+@@ -657,17 +698,10 @@
+         if (i + 1 == sorted || vcd[order[i + 1]] != vcd[order[i]]) sorted_data[i] |= 1u << 30;
+     }
+     int sent = sorted ? wifi_rpmh_send(sorted_address, sorted_data, sorted, status) : -4;
+-    if (cn0 && !cn0_encoded && sent >= 0) sent = -7;
++    __sync_lock_release(&wifi_bcm_busy);
+     printf("COACHZ %s: %u BCMs sent, result %d\n", tag, sorted, sent);
+     for (unsigned i = 0; i < sorted; i++)
+         printf("COACHZ %s: command %u address 0x%x data 0x%x status 0x%x\n", tag, i, sorted_address[i], sorted_data[i], status[i]);
+-    if (cn0) {
+-        if (sent >= 0) {
+-            if (venus_cfg) { coachz_cn0_venus_avg = cfg_avg; coachz_cn0_venus_peak = cfg_peak; }
+-            else { coachz_cn0_external_avg = cfg_avg; coachz_cn0_external_peak = cfg_peak; }
+-        }
+-        __sync_lock_release(&coachz_cn0_busy);
+-    }
+     return sent;
+ }
+ 
+@@ -676,10 +710,19 @@
+ {
+     static const struct wifi_bcm bcms[] = {
+         {"MC0", 4, 2, 0, 0, 8532000}, {"ACV", 4, 2, 8, 0, 0}, {"SH0", 16, 1, 0, 0, 8532000}, {"SH4", 16, 1, 0, 0, 8532000},
+-        /* sdhc-ddr at sc7180.dtsi sdhc_1 opp-384000000 (its sdhc-ddr peak, the value below; its average 390000 kBps and cpu-sdhc's 1600000 kBps peak are not sent): xm_emmc
+-         * (CN1), qnm_aggre1_noc (SN7), qns_gemnoc_sf (SN0), the BCMs sc7180.c puts on that path. Without them sequential reads stayed near 50 MB/s. */
+-        {"CN1", 8, 1, 0, 0, 5400000}, {"SN7", 16, 1, 0, 0, 5400000}, {"SN0", 16, 1, 0, 0, 5400000},
+     };
++    /*
++     * The eMMC at HS400, as sdhci-msm asks through its OPP (sc7180.dtsi sdhc_1 opp-384000000: opp-peak-kBps <5400000 1600000>,
++     * opp-avg-kBps <390000 0>, for its interconnects sdhc-ddr and cpu-sdhc), on every node sc7180.c puts on each path:
++     * sdhc-ddr, MASTER_EMMC to SLAVE_EBI1: xm_emmc (CN1, 8 bytes), qnm_aggre1_noc (SN7, 16), qns_gemnoc_sf (SN0, 16), qns_llcc (SH0, 16),
++     * ebi (MC0, 4 bytes on 2 channels, and ACV's apps bit 3); cpu-sdhc, MASTER_APPSS_PROC to SLAVE_EMMC_CFG: acm_apps0 (SH4, 16),
++     * qnm_gemnoc (SN12, 8), qnm_snoc (CN0, 8), qhs_emmc_cfg (CN1, 4). Its own consumer, aggregated with the DDR vote and the IPA.
++     */
++    static const struct wifi_bcm emmc[] = {
++        {"CN1", 8, 1, 0, 390000, 5400000}, {"SN7", 16, 1, 0, 390000, 5400000}, {"SN0", 16, 1, 0, 390000, 5400000},
++        {"SH0", 16, 1, 0, 390000, 5400000}, {"MC0", 4, 2, 0, 390000, 5400000}, {"ACV", 4, 2, 8, 0, 0},
++        {"SH4", 16, 1, 0, 0, 1600000}, {"SN12", 8, 1, 0, 0, 1600000}, {"CN0", 8, 1, 0, 0, 1600000}, {"CN1", 4, 1, 0, 0, 1600000},
++    };
+     uint64_t now;
+     absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+     unsigned mode = 0;
+@@ -687,7 +730,9 @@
+     if (mode == 2 && now < 150ull * NSEC_PER_SEC) delay((int)((150ull * NSEC_PER_SEC - now) / 1000));
+     const vm_offset_t db = wifi_cmd_db();
+     if (!db) { printf("COACHZ ddr: cmd-db map failed\n"); coachz_ddr_voted = 2; return; }
+-    coachz_ddr_voted = wifi_bcm_send(db, "ddr", bcms, sizeof(bcms) / sizeof(bcms[0])) >= 0 ? 1 : 2;
++    const int ddr = wifi_bcm_send(db, "ddr", bcms, sizeof(bcms) / sizeof(bcms[0]));
++    const int sdhc = wifi_bcm_send(db, "emmc", emmc, sizeof(emmc) / sizeof(emmc[0]));
++    coachz_ddr_voted = ddr >= 0 && sdhc >= 0 ? 1 : 2;
+ }
+ 
+ /*

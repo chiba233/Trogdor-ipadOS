@@ -163,6 +163,12 @@ coachz-prelink-video-cache.patch
 coachz-prelink-video-audit.patch
 # /chosen/coachz-camera: the rear camera's step-1 run (drivers/RamBlock/camera/coachz_camera.c), its cx consumer and its MM0 bus vote.
 coachz-prelink-camera.patch
+# Every BCM vote aggregated across its consumers as qcom_icc_aggregate and bcm_aggregate do (bsd/dev/coachz_wifi.c wifi_bcm_send), and the eMMC's own vote at sdhc_1's opp-384000000 on both its paths.
+coachz-prelink-bus-aggregate.patch
+# Wi-Fi HT/VHT capability from service ready (ath10k_get_ht_cap, ath10k_create_vht_cap), the chain mask from its rf chains, and each channel's power, antenna gain and flags from ath/regd.c's rules for the reported eeprom_rd.
+coachz-prelink-wifi-caps.patch
+# The joined access point's signal as mac80211 averages it (EWMA 10/8 of ath10k's per-PPDU rssi_comb and the BSS's beacons), reported by nw_wifi_status_get to the RSSI request and RSSI_CHANGED.
+coachz-prelink-wifi-rssi.patch
 # /chosen/coachz-baseband: the cellular bridge (pending/baseband): QRTR hooks in the Wi-Fi thread, its firmware on the Data volume, CommCenter running.
 coachz-prelink-baseband.patch
 # The VideoToolbox decoder for the video codec (package/CoachzVideoDecoder.c) on the Data volume, shown in /System/Library/VideoDecoders through a bindfs union.

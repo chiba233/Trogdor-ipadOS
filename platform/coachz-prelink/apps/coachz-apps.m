@@ -283,14 +283,17 @@ static int bootstrap(void)
         fprintf(stderr,"COACHZ apps: extraction finished status %d\n",r);if(r)return r;
         if(![revision writeToFile:extracted atomically:YES encoding:NSUTF8StringEncoding error:nil])return EIO;
     }
+    /* The camera viewer (apps/camera) ships beside the environment, not in it: copied into place on every start so a later image
+     * replaces it without touching the extracted environment's revision. First, before anything that waits on other daemons: the
+     * kernel writes the new build to owner-apps before launchd, and until this copy /var/jb/Applications still holds the previous
+     * image's binary, whose cdhash the new trust cache no longer has (k220: four launches at 16:45:54-57 rejected by AMFI as adhoc,
+     * the copy came at 16:45:59, after enableSystemAppVisibility's preferences sync). */
+    int camera=installCameraApp();
+    fprintf(stderr,"COACHZ apps: camera app %d at %ld\n",camera,(long)time(NULL));
     BOOL visibilityChanged=NO;
     int r=enableSystemAppVisibility(&visibilityChanged);if(r)return r;
     NSString *uiMarker=@"/private/var/db/coachz-apps-ui-ready";
     NSString *uiRevision=[@"3\n" stringByAppendingString:revision];
-    /* The camera viewer (apps/camera) ships beside the environment, not in it: copied into place on every start so a later image
-     * replaces it without touching the extracted environment's revision. */
-    int camera=installCameraApp();
-    fprintf(stderr,"COACHZ apps: camera app %d\n",camera);
     BOOL registerApps=fresh || visibilityChanged ||
         ![uiRevision isEqual:[NSString stringWithContentsOfFile:uiMarker encoding:NSUTF8StringEncoding error:nil]];
     /* The delivered static cache covers the two applications and all bootstrap tools. */

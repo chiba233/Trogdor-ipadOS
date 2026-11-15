@@ -1,0 +1,310 @@
+--- a/bsd/dev/coachz_wifi.c
++++ b/bsd/dev/coachz_wifi.c
+@@ -2637,6 +2637,7 @@
+     uint32_t chan_infos, htt_types[32], wmi_ids[12], wmi_counts[12];
+     int32_t noise_low, noise_high;
+     uint32_t busy_most;
++    int reg_listed;   /* the channel list's regulatory values were printed */
+ } ws;
+ 
+ /* ath10k_ce_per_engine_service: the copy complete and watermark status cleared, completed receives handed to HTC and their entries
+@@ -2957,6 +2958,10 @@
+ static struct {
+     uint32_t chunks, chunk_id[16], chunk_pa[16], chunk_bytes[16];
+     int rx_full_reorder, ack_rssi, extend_address;
++    /* SERVICE_READY_EVENT words 7, 9, 10 and 11 (phy_capability, num_rf_chains, ht_cap_info, vht_cap_info) and HAL_REG_CAPABILITIES
++     * word 0 (eeprom_rd), which ath10k keeps as ar->phy_capability, num_rf_chains, ht_cap_info, vht_cap_info and hw_eeprom_rd. */
++    uint32_t phy_capability, rf_chains, ht_cap_info, vht_cap_info, eeprom_rd;
++    int caps_valid;
+ } wm;
+ 
+ /* ath10k_wmi_tlv_op_pull_svc_rdy_ev and ath10k_wmi_event_service_ready_work: the ABI check, the service map (four services per
+@@ -2990,6 +2995,12 @@
+         wm_u32(ev, 19), wm_u32(ev, 20), wm_u32(reg, 0), wm_u32(reg, 5), wm_u32(reg, 6), wm_u32(reg, 7), wm_u32(reg, 8), svc_words,
+         wm.rx_full_reorder);
+     if (!abi) return -2;
++    wm.phy_capability = wm_u32(ev, 7);
++    wm.rf_chains = wm_u32(ev, 9);
++    wm.ht_cap_info = wm_u32(ev, 10);
++    wm.vht_cap_info = wm_u32(ev, 11);
++    wm.eeprom_rd = wm_u32(reg, 0);
++    wm.caps_valid = 1;
+     /* Extended services (128 and up) from SERVICE_AVAILABLE, 32 a word: TX_DATA_MGMT_ACK_RSSI 174, SUPPORT_EXTEND_ADDRESS 179. */
+     if (wh.service_available && wh.svc_avail_len >= 8) {
+         /* Its one TLV (SERVICE_AVAILABLE_EVENT): the word count, then the words. */
+@@ -3069,6 +3080,64 @@
+     return wh_send((unsigned)wh.wmi, m, at);
+ }
+ 
++/*
++ * The radio's chains: ath10k_wmi_event_service_ready_work sets cfg_tx_chainmask and cfg_rx_chainmask to (1 << num_rf_chains) - 1
++ * (wmi.c); two chains if service ready has not said.
++ */
++static uint32_t
++ws_chainmask(void)
++{
++    const uint32_t n = wm.caps_valid && wm.rf_chains >= 1 && wm.rf_chains <= 8 ? wm.rf_chains : 2;
++    return (1u << n) - 1u;
++}
++
++/*
++ * The regulatory rules ath10k's channels get, from the eeprom_rd the firmware reports (ath10k_mac_register: current_rd =
++ * hw_eeprom_rd, then ath/regd.c ath_regd_init). Without WORLDWIDE_ROAMING_FLAG (0x4000) and without COUNTRY_ERD_FLAG (0x8000), a value
++ * whose WORLD_SKU_MASK (0xf0) is 0x60 is a world SKU (is_wwr_sku): the wiphy is REGULATORY_CUSTOM_REG with ath_world_regdomain's
++ * rules, applied by wiphy_apply_custom_regulatory (handle_channel_custom: max_power and max_reg_power the rule's EIRP, max_antenna_gain
++ * the rule's gain), and reg.c ignore_reg_update keeps cfg80211's core world domain off it. ath_reg_apply_radar_flags then marks
++ * 5260-5700 MHz RADAR and NO_IR. All of ath's world rules have antenna gain 0: 2402-2472 MHz 20 dBm (CH01_11), 2457-2482 MHz 20 dBm
++ * NO_IR (CH12_13), 2474-2494 MHz 20 dBm NO_IR (CH14), 5140-5360 MHz, 5460-5860 MHz and 5715-5860 MHz 30 dBm NO_IR. A country SKU takes
++ * cfg80211's regulatory database, which this kernel does not have: ath_default_world_regdomain's 0x64 rules, the most restrictive.
++ */
++enum { WS_R_CH01_11 = 1, WS_R_CH12_13 = 2, WS_R_CH14 = 4, WS_R_5150_5350 = 8, WS_R_5470_5850 = 16, WS_R_5725_5850 = 32 };
++static const struct { uint16_t lo, hi; uint8_t dbm, no_ir; } ws_rules[] = {
++    {2402, 2472, 20, 0}, {2457, 2482, 20, 1}, {2474, 2494, 20, 1}, {5140, 5360, 30, 1}, {5460, 5860, 30, 1}, {5715, 5860, 30, 1},
++};
++struct ws_reg { unsigned rd, world, rules; };
++static struct ws_reg
++ws_regdomain(void)
++{
++    struct ws_reg r = {0x64, 0, 0};
++    const uint32_t rd = (wm.caps_valid ? wm.eeprom_rd : 0) & ~0x4000u;
++    r.world = !(rd & 0x8000u) && (rd & 0xf0u) == 0x60u;
++    if (r.world) r.rd = rd & 0xffu;
++    switch (r.rd) {
++    case 0x60: case 0x61: case 0x62: r.rules = WS_R_CH01_11 | WS_R_CH12_13 | WS_R_CH14 | WS_R_5150_5350 | WS_R_5470_5850; break;
++    case 0x63: case 0x65: r.rules = WS_R_CH01_11 | WS_R_CH12_13 | WS_R_5150_5350 | WS_R_5725_5850; break;
++    case 0x66: case 0x69: r.rules = WS_R_CH01_11 | WS_R_5150_5350 | WS_R_5470_5850; break;
++    case 0x67: case 0x68: case 0x6a: case 0x6c: r.rules = WS_R_CH01_11 | WS_R_CH12_13 | WS_R_5150_5350 | WS_R_5470_5850; break;
++    default: r.rd = 0x64; r.rules = WS_R_CH01_11 | WS_R_5150_5350 | WS_R_5725_5850; break;   /* 0x64, and ath_world_regdomain's default */
++    }
++    return r;
++}
++/* A channel under those rules, as freq_reg_info finds its first rule a 20 MHz channel fits in: 0 when none (IEEE80211_CHAN_DISABLED,
++ * left out of the channel list as ath10k_update_channel_list does). */
++static int
++ws_channel_rule(const struct ws_reg *r, uint32_t mhz, unsigned *dbm, unsigned *gain, int *passive, int *radar)
++{
++    for (unsigned i = 0; i < sizeof(ws_rules) / sizeof(ws_rules[0]); i++) {
++        if (!(r->rules & (1u << i)) || mhz < ws_rules[i].lo + 10u || mhz + 10u > ws_rules[i].hi) continue;
++        *dbm = ws_rules[i].dbm;
++        *gain = 0;
++        *radar = mhz >= 5260 && mhz <= 5700;
++        *passive = ws_rules[i].no_ir || *radar;
++        return 1;
++    }
++    return 0;
++}
++
+ /* ath10k_start's order past ath10k_core_start, ath10k_regd_update, ath10k_update_channel_list, ath10k_add_interface and
+  * ath10k_hw_scan. With no SSID the scan is passive and every channel is marked passive, so the radio only listens. */
+ static const uint16_t ws_mhz[] = {2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472,
+@@ -3179,8 +3248,8 @@
+         {0x22, 1},   /* PMF_QOS */
+         {0x0a, 1},   /* DYNAMIC_BW */
+         {0x2c, 1},   /* IDLE_PS_CONFIG */
+-        {0x01, 3},   /* TX_CHAIN_MASK: __ath10k_set_antenna, the two chains service ready reports */
+-        {0x02, 3},   /* RX_CHAIN_MASK */
++        {0x01, 0},   /* TX_CHAIN_MASK: __ath10k_set_antenna with cfg_tx_chainmask (ws_chainmask) */
++        {0x02, 0},   /* RX_CHAIN_MASK: cfg_rx_chainmask */
+         {0x23, 0},   /* ARP_AC_OVERRIDE */
+         {0x25, 1},   /* ANI_ENABLE */
+     };
+@@ -3192,35 +3261,47 @@
+         WS_TLV(0x52, 12);
+         WS_PUT32(0);
+         WS_PUT32(param[command].id);
+-        WS_PUT32(param[command].value);
++        WS_PUT32(param[command].id == 0x01 || param[command].id == 0x02 ? ws_chainmask() : param[command].value);
+     } else if (command == params) {
+-        /* ath10k_regd_update: service ready's 0x406c is the world SKU pair 0x6c, without a conformance test limit (NO_CTL). */
++        /* ath10k_regd_update: the regpair's domain three times and its CTLs; every world pair has NO_CTL (regd_common.h). */
++        const struct ws_reg reg = ws_regdomain();
++        printf("COACHZ wifi reg: eeprom_rd 0x%x, %s, rules 0x%x (ath/regd.c), regdomain command 0x%x\n", wm.eeprom_rd,
++            reg.world ? "world SKU" : "not a world SKU: ath_default_world_regdomain", reg.rules, reg.rd);
+         WS_PUT32(0x4001);   /* WMI_TLV_PDEV_SET_REGDOMAIN_CMDID */
+         WS_TLV(0x51, 24);
+         WS_PUT32(0);
+-        WS_PUT32(0x6c);
+-        WS_PUT32(0x6c);
+-        WS_PUT32(0x6c);
++        WS_PUT32(reg.rd);
++        WS_PUT32(reg.rd);
++        WS_PUT32(reg.rd);
+         WS_PUT32(0xff);
+         WS_PUT32(0xff);
+     } else if (command == params + 1) {
+         WS_PUT32(0x3003);   /* WMI_TLV_SCAN_CHAN_LIST_CMDID */
++        const struct ws_reg reg = ws_regdomain();
++        unsigned count = 0, dbm = 0, gain = 0;
++        int passive = 0, radar = 0;
++        for (unsigned c = 0; c < WS_CHANS; c++) count += ws_channel_rule(&reg, ws_mhz[c], &dbm, &gain, &passive, &radar);
+         WS_TLV(0x4f, 4);
+-        WS_PUT32(WS_CHANS);
+-        WS_TLV(0x12, WS_CHANS * 28);
++        WS_PUT32(count);
++        WS_TLV(0x12, count * 28);
+         for (unsigned c = 0; c < WS_CHANS; c++) {
+-            WS_TLV(0x50, 24);
+-            WS_PUT32(ws_mhz[c]);
+-            WS_PUT32(ws_mhz[c]);
+-            WS_PUT32(0);
+-            /* ath10k_update_channel_list on cfg80211's world domain (reg.c world_regdom) through ath10k_wmi_put_wmi_channel: the mode (11G 1, 11A 0) in
+-             * the low bits, PASSIVE bit 7 where it asks for a passive scan (all of 5 GHz, channels 12 and 13), DFS bit 10, ALLOW_HT bit 11, ALLOW_VHT
+-             * bit 12. The scans themselves stay passive. */
+             const uint32_t mhz = ws_mhz[c];
+-            WS_PUT32((mhz < 3000 ? 1u : 0u) | (mhz > 2462 ? 1u << 7 : 0) | ((mhz >= 5260 && mhz <= 5720) ? 1u << 10 : 0) | 1u << 11 | 1u << 12);
+-            WS_PUT32(40u << 8 | 40u << 16);   /* min 0, max and regulatory 20 dBm in half dB: reg.c world_regdom */
+-            WS_PUT32(6u | 40u << 8);          /* antenna 6 dBi (world_regdom's rule; ath10k's channels start at 0, see the source list), max tx */
++            if (!ws_channel_rule(&reg, mhz, &dbm, &gain, &passive, &radar)) continue;
++            WS_TLV(0x50, 24);
++            WS_PUT32(mhz);
++            WS_PUT32(mhz);
++            WS_PUT32(0);
++            /* ath10k_update_channel_list through ath10k_wmi_put_wmi_channel: the mode (11G 1, 11A 0) in the low bits, PASSIVE bit 7 for
++             * NO_IR or radar, ADHOC_ALLOWED bit 8 without NO_IR, DFS bit 10 for radar, ALLOW_HT bit 11, ALLOW_VHT bit 12; min 0, max and
++             * regulatory power in half dB, antenna gain, max tx. HT40_PLUS (bit 6, cfg80211's reg_process_ht_flags) is not set here. The
++             * scans themselves stay passive. */
++            WS_PUT32((mhz < 3000 ? 1u : 0u) | (passive ? 1u << 7 : 0) | (passive ? 0 : 1u << 8) | (radar ? 1u << 10 : 0) | 1u << 11 | 1u << 12);
++            WS_PUT32((2u * dbm) << 8 | (2u * dbm) << 16);
++            WS_PUT32(gain | (2u * dbm) << 8);
++            if (!ws.reg_listed) printf("COACHZ wifi reg: %u MHz max %u dBm reg %u dBm antenna %u dBi%s%s\n", mhz, dbm, dbm, gain,
++                passive ? " passive" : "", radar ? " dfs" : "");
+         }
++        ws.reg_listed = 1;
+     } else if (command == params + 2) {
+         WS_PUT32(0x5001);   /* WMI_TLV_VDEV_CREATE_CMDID */
+         WS_TLV(0x56, 20);
+@@ -3262,15 +3343,21 @@
+     /* PASSIVE, CHAN_STAT_EVENT, and WMI-TLV inverts FILTER_PROBE_REQ. */
+     WS_PUT32(0x01u | 0x10u | 0x20u);
+     WS_PUT32(0);             /* burst duration */
+-    WS_PUT32(WS_CHANS);
++    /* mac80211 hands ath10k_hw_scan only enabled channels: those the regulatory rules allow. */
++    const struct ws_reg reg = ws_regdomain();
++    unsigned count = 0, dbm = 0, gain = 0;
++    int passive = 0, radar = 0;
++    for (unsigned c = 0; c < WS_CHANS; c++) count += ws_channel_rule(&reg, ws_mhz[c], &dbm, &gain, &passive, &radar);
++    WS_PUT32(count);
+     WS_PUT32(1);             /* bssids */
+     WS_PUT32(0);             /* ssids */
+     WS_PUT32(0);             /* ie length */
+     WS_PUT32(3);             /* probes */
+     memset(m + at, 0, 16);   /* no random address: mac and mask */
+     at += 16;
+-    WS_TLV(0x10, WS_CHANS * 4);
+-    for (unsigned c = 0; c < WS_CHANS; c++) WS_PUT32(ws_mhz[c]);
++    WS_TLV(0x10, count * 4);
++    for (unsigned c = 0; c < WS_CHANS; c++)
++        if (ws_channel_rule(&reg, ws_mhz[c], &dbm, &gain, &passive, &radar)) WS_PUT32(ws_mhz[c]);
+     WS_TLV(0x13, 0);
+     WS_TLV(0x13, 8);
+     memset(m + at, 0xff, 6);
+@@ -3641,6 +3728,7 @@
+     /* What came and went, for the once-a-ten-seconds line. */
+     uint32_t rx_frames, rx_bytes, rx_eapol, rx_bad, rx_undone, tx_frames, tx_acked, tx_noack, tx_discard, tx_full, roam, kickout, mgmt_tx, mgmt_ok, mgmt_fail;
+     uint32_t bmiss_rx, bmiss_ms, bmiss_on, rx_ind, rx_in_ord;
++    int caps_printed;   /* the capability line was printed */
+ } wj;
+ static struct { uint8_t kind, ssid[32], ssid_len, bssid[6], has_bssid, has_pass, pass_len; char pass[65]; } wj_req;   /* under ws_lock */
+ static struct nw_wifi_status wj_pub;   /* under ws_lock */
+@@ -3847,9 +3935,50 @@
+     return 0;
+ }
+ 
+-/* Our HT and VHT capability as constants (mainline: the firmware's service-ready ht_cap_info and vht_cap_info through mac.c ath10k_get_ht_cap and ath10k_create_vht_cap); A-MPDU 64K and 8 us density are mac.c's fixed values, two streams. */
+-#define WJ_HT_CAP 0x19efu
+-#define WJ_VHT_CAP (0x739139b2u & ~(1u << 11 | 1u << 12 | 7u << 13 | 7u << 16 | 1u << 19 | 1u << 20))   /* no sounding is set up: no beamforming */
++/*
++ * Our HT capability as mac.c ath10k_get_ht_cap builds it from service ready's ht_cap_info (WMI_HT_CAP_* in wmi.h) and vht_cap_info:
++ * 20/40 MHz, DSSS/CCK in 40 MHz and SM power save disabled always, then SGI 20 and 40, dynamic SMPS (OR'd onto the disabled value, as
++ * mainline does), TX STBC with more than one chain, the RX STBC streams, LDPC, L-SIG TXOP protection and max A-MSDU from vht_cap_info's
++ * MPDU length. 0 when ht_cap_info does not have WMI_HT_CAP_ENABLED. A-MPDU 64K and 8 us density are its fixed values.
++ */
++static uint16_t
++wj_ht_cap(void)
++{
++    const uint32_t ht = wm.ht_cap_info, vht = wm.vht_cap_info;
++    if (!wm.caps_valid || !(ht & 0x0001u)) return 0;
++    uint16_t cap = 0x0002u | 0x1000u | 3u << 2;
++    if (ht & 0x0002u) cap |= 0x0020u;
++    if (ht & 0x0800u) cap |= 0x0040u;
++    if (ht & 0x0004u) cap |= 1u << 2;
++    if ((ht & 0x0008u) && ws_chainmask() > 1) cap |= 0x0080u;
++    if (ht & 0x0030u) cap |= (uint16_t)((((ht & 0x0030u) >> 4) << 8) & 0x0300u);
++    if ((ht & 0x0040u) || ((ht & 0x1000u) && (ht & 0x2000u))) cap |= 0x0001u;
++    if (ht & 0x0080u) cap |= 0x8000u;
++    if (vht & 0x3u) cap |= 0x0800u;
++    return cap;
++}
++/*
++ * Our VHT capability as ath10k_create_vht_cap builds it: vht_cap_info itself, the beamformee STS (3 when not reported) and sounding
++ * dimensions (1) filled in where it claims beamforming, TX STBC dropped with one chain. Then the beamforming bits are cleared: this
++ * driver sets up no sounding (ath10k's txbf vdev parameters are not written), so it does not claim it.
++ */
++static uint32_t
++wj_vht_cap(void)
++{
++    uint32_t vht = wm.caps_valid ? wm.vht_cap_info : 0;
++    if (vht & (1u << 12 | 1u << 20)) vht |= (((vht >> 13) & 7u) ? ((vht >> 13) & 7u) : 3u) << 13;
++    if (vht & (1u << 11 | 1u << 19)) vht |= (((vht >> 16) & 7u) ? ((vht >> 16) & 7u) : 1u) << 16;
++    if (ws_chainmask() <= 1) vht &= ~(1u << 7);
++    return vht & ~(1u << 11 | 1u << 12 | 7u << 13 | 7u << 16 | 1u << 19 | 1u << 20);
++}
++/* ath10k_create_vht_cap's MCS map: MCS 0-9 (2) for each of the chains, not supported (3) above them. */
++static uint16_t
++wj_vht_mcs_map(void)
++{
++    uint16_t map = 0;
++    for (unsigned i = 0; i < 8; i++) map |= (uint16_t)((ws_chainmask() & (1u << i) ? 2u : 3u) << (2 * i));
++    return map;
++}
+ 
+ /* What the access point's beacon says about the link: 20, 40 or 80 MHz, the centre, and the mode of chan_to_phymode. */
+ static void
+@@ -3981,28 +4110,36 @@
+         memcpy(f + at, wj.rsn, sizeof(wj.rsn));
+         at += sizeof(wj.rsn);
+     }
+-    if (wj.ht) {
+-        const uint16_t ht = wj.width >= 40 ? WJ_HT_CAP : WJ_HT_CAP & ~0x42u;   /* no 40 MHz claim on a 20 MHz link */
++    const uint16_t ht_cap = wj_ht_cap();
++    const uint32_t vht_cap = wj_vht_cap();
++    if (!wj.caps_printed) {
++        wj.caps_printed = 1;
++        printf("COACHZ wifi caps: ht_cap_info 0x%x vht_cap_info 0x%x rf chains %u -> chainmask 0x%x, HT cap 0x%04x, VHT cap 0x%08x, VHT MCS map 0x%04x\n",
++            wm.ht_cap_info, wm.vht_cap_info, wm.rf_chains, ws_chainmask(), ht_cap, vht_cap, wj_vht_mcs_map());
++    }
++    if (wj.ht && ht_cap) {
++        const uint16_t ht = wj.width >= 40 ? ht_cap : ht_cap & ~0x42u;   /* no 40 MHz claim on a 20 MHz link */
+         f[at++] = 45;
+         f[at++] = 26;
+         memset(f + at, 0, 26);
+         f[at] = (uint8_t)ht;
+         f[at + 1] = (uint8_t)(ht >> 8);
+-        f[at + 2] = 0x1b;
+-        f[at + 3] = f[at + 4] = 0xff;
++        f[at + 2] = 0x1b;   /* A-MPDU 64K (3), density 8 us (6) */
++        for (unsigned i = 0; i < 4; i++)
++            if (ws_chainmask() & (1u << i)) f[at + 3 + i] = 0xff;   /* rx_mask[i] for each rx chain */
+         f[at + 15] = 1;   /* transmit MCS set defined */
+         at += 26;
+     }
+-    if (wj.vht) {
+-        const uint32_t vht = WJ_VHT_CAP;
++    if (wj.vht && ht_cap) {
++        const uint16_t map = wj_vht_mcs_map();
+         f[at++] = 191;
+         f[at++] = 12;
+-        memcpy(f + at, &vht, 4);
+-        f[at + 4] = 0xfa;
+-        f[at + 5] = 0xff;
++        memcpy(f + at, &vht_cap, 4);
++        f[at + 4] = (uint8_t)map;
++        f[at + 5] = (uint8_t)(map >> 8);
+         f[at + 6] = f[at + 7] = 0;
+-        f[at + 8] = 0xfa;
+-        f[at + 9] = 0xff;
++        f[at + 8] = (uint8_t)map;
++        f[at + 9] = (uint8_t)(map >> 8);
+         f[at + 10] = f[at + 11] = 0;
+         at += 12;
+     }

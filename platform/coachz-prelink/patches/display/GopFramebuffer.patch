@@ -23,7 +23,7 @@
  extern "C" void native_legacy_retirement_observed(IOService *);
  // GPU hand-off (boot-arg sheng-fb-gpu=1): the frame is offered to the privileged GPU client instead of being copied; the swap retires when the
  // client reports the GPU copy done (native_legacy_gpu_complete). A refused offer or a failed copy uses the CPU copy below and is counted.
-@@ -48,6 +57,15 @@
+@@ -48,6 +57,32 @@
  // The unchanged original setDisplayRefreshProperties: publishes IOMFBDisplayRefresh from slot 301 (getRefreshAttributes below).
  extern "C" bool native_legacy_set_refresh_properties(void *display);
  extern "C" void native_legacy_vsync_observed(unsigned event,unsigned hz);
@@ -36,10 +36,27 @@
 +    if(cache<0){unsigned value=fallback;PE_parse_boot_argn(name,&value,sizeof(value));cache=(int)value;}
 +    return (unsigned)cache;
 +}
++// Coachz: where the render server's swap_end time goes. kern_SwapEnd held 3.7 % of backboardd's samples on k220, about 1.7 ms a call; the
++// parts this driver runs on that path are timed here: [0] validateSwap calls, [1] their time, [2] kickSwapQueue calls, [3] their time, [4] GPU
++// offers, [5] their time, [6] retirements (the family's completeCurrentSwap), [7] their time, [8] the longest kick, [9] the longest retirement;
++// times in mach absolute units. The rest of a swap_end is the original family's.
++extern "C" {volatile uint64_t coachz_swap_stats[10];}
++static inline void coachz_swap_add(unsigned count,unsigned total,uint64_t began,unsigned longest=10) {
++    const uint64_t spent=mach_absolute_time()-began;
++    coachz_swap_stats[count]=coachz_swap_stats[count]+1;coachz_swap_stats[total]=coachz_swap_stats[total]+spent;
++    if(longest<10 && spent>coachz_swap_stats[longest])coachz_swap_stats[longest]=spent;
++}
++static void coachz_swap_report() {
++    auto us=[](uint64_t ticks){uint64_t ns=0;absolutetime_to_nanoseconds(ticks,&ns);return ns/1000;};
++    auto mean=[&](unsigned count,unsigned total){return coachz_swap_stats[count]?us(coachz_swap_stats[total])/coachz_swap_stats[count]:0;};
++    printf("COACHZ swap path: %llu validates mean %llu us, %llu kicks mean %llu max %llu us, %llu offers mean %llu us, %llu retires mean %llu max %llu us\n",
++        coachz_swap_stats[0],mean(0,1),coachz_swap_stats[2],mean(2,3),us(coachz_swap_stats[8]),coachz_swap_stats[4],mean(4,5),
++        coachz_swap_stats[6],mean(6,7),us(coachz_swap_stats[9]));
++}
  extern "C" uint64_t mach_continuous_time(void);
  // 32-bit BGRA, plain ('BGRA') or in Apple's lossless-compressed spelling ('&BGA', one plane): the GPU that renders the surface here writes plain rows
  // either way (no compression is implemented), so the bytes are the same.
-@@ -57,7 +75,9 @@
+@@ -57,7 +92,9 @@
  class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
      OSDeclareDefaultStructors(NativeLegacyDisplay)
      IOMemoryMap *bootMapping=nullptr;
@@ -50,7 +67,7 @@
      void *shadow=nullptr;uint64_t shadowBytes=0;bool shadowValid=false;
      bool primary=false;
      bool logicalPM=false;
-@@ -88,6 +108,8 @@
+@@ -88,6 +125,8 @@
      uint64_t vsyncInterval=0,vsyncNext=0;
      unsigned vsyncHz=0;
      bool vsyncArmed=false;
@@ -59,7 +76,7 @@
      bool vsyncWanted() const {
          const void *head=nullptr;memcpy(&head,reinterpret_cast<const unsigned char *>(this)+5592,sizeof(head));return head;
      }
-@@ -95,6 +117,7 @@
+@@ -95,6 +134,7 @@
      // the last client is removed.
      void armVsync() {
          if(!vsyncTimer || vsyncArmed || !vsyncWanted())return;
@@ -67,7 +84,7 @@
          vsyncArmed=true;vsyncNext=mach_absolute_time()+vsyncInterval;
          vsyncTimer->wakeAtTime(vsyncNext);native_legacy_vsync_observed(0,vsyncHz);
      }
-@@ -110,6 +133,23 @@
+@@ -110,6 +150,23 @@
          if(vsyncNext<=now){vsyncNext=now+vsyncInterval;native_legacy_vsync_observed(3,vsyncHz);}
          vsyncArmed=true;vsyncTimer->wakeAtTime(vsyncNext);
      }
@@ -91,7 +108,7 @@
      void startVsync() {
          unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
          if(!hz || hz>240 || !primary || !bootMapping || vsyncTimer)return;
-@@ -120,6 +160,8 @@
+@@ -120,6 +177,8 @@
          if(loop->addEventSource(timer)!=kIOReturnSuccess){timer->release();return;}
          nanoseconds_to_absolutetime(1000000000ull/hz,&vsyncInterval);
          vsyncHz=hz;vsyncTimer=timer;native_legacy_vsync_observed(4,hz);
@@ -100,8 +117,20 @@
          // A client may already have registered: arm under the gate, like the registration does.
          loop->runAction([](OSObject *owner,void *,void *,void *,void *)->IOReturn {
              static_cast<NativeLegacyDisplay *>(owner)->armVsync();return kIOReturnSuccess;
-@@ -237,7 +279,7 @@
+@@ -226,6 +285,7 @@
+     // previous frame until the user touched it again). A retirement inside a kick only asks the running kick to loop.
+     bool kicking=false,rekick=false;
+     void kickSwapQueue() override {
++        const uint64_t began=mach_absolute_time();
+         armVsync();
+         if(kicking){rekick=true;return;}
+         kicking=true;
+@@ -235,9 +295,11 @@
+             gpuBypass=false;
+         } while(rekick && !transferred);
          kicking=false;
++        coachz_swap_add(2,3,began,8);
++        if(!(coachz_swap_stats[2]%600))coachz_swap_report();
      }
      void kickOnce() {
 -        unsigned enabled=0;PE_parse_boot_argn("offline-legacy-transfer",&enabled,sizeof(enabled));
@@ -109,7 +138,7 @@
          if(enabled!=1 || transferred || !logicalPM || !bootMapping || !primary)return;
          const OriginalLegacySwapRequest *request=pendingSwapRequest();
          if(!request || !isValidated(request))return;
-@@ -253,10 +295,11 @@
+@@ -253,10 +315,11 @@
          if(!surface) {
              // Validated blank swap (all layers disabled over black): solid-fill the actual GOP.
              PE_Video blank={};
@@ -124,7 +153,7 @@
                 !native_legacy_surface_bounds(bw,bh,blank.v_rowBytes,bootMapping->getLength(),bootMapping->getLength())) {
                  native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
              }
-@@ -285,10 +328,12 @@
+@@ -285,16 +348,21 @@
             native_legacy_surface_width(surface)<width || native_legacy_surface_height(surface)<height ||
             !nativeBgra(native_legacy_surface_format(surface),native_legacy_surface_planes(surface)) ||
             PE_current_console(&video) || video.v_baseAddr!=bootMapping->getPhysicalAddress() ||
@@ -139,7 +168,17 @@
          // The diagnostic renderer repaints the page over the scanout until it is told the system owns the display; the GPU path needs that as much
          // as the CPU copy (int-093: accepted swaps were GPU-copied under a page that kept drawing).
          if(!gpuBypass) {
-@@ -302,12 +347,19 @@
+             if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
+         }
+-        if(!gpuBypass && native_legacy_gpu_offer(this,memory,sourceStride,width,height)) {
++        const uint64_t offerBegan=mach_absolute_time();
++        const bool offered=!gpuBypass && native_legacy_gpu_offer(this,memory,sourceStride,width,height);
++        if(!gpuBypass)coachz_swap_add(4,5,offerBegan);
++        if(offered) {
+             // The GPU writes the scanout memory behind the CPU's back: the differential copy's picture of it is stale from now on.
+             native_legacy_swap_stage(1);
+             shadowValid=false;gpuRequest=request;gpuLength=length;transferred=true;
+@@ -302,12 +370,19 @@
              // copy (int-243: about 4.4 ms render then about 3 ms copy per frame). Retire now: the presenter holds its own reference to this
              // frame's memory, the previous frame's copy has finished (transferred held this one back), and the next swap still waits for
              // the copy because transferred stays set until finishGpuSwap.
@@ -160,7 +199,7 @@
          IOMemoryMap *source=memory->map(kIOMapAnywhere|kIOMapReadOnly);
          if(!source || !source->getVirtualAddress() || source->getLength()<allocation) {
              OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNoMemory,request,0);return;
-@@ -318,6 +370,7 @@
+@@ -318,6 +393,7 @@
              OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
          }
          // The two content scans read every pixel again; they only describe the first frames (the probe keeps 32).
@@ -168,7 +207,7 @@
          if(scanBudget) {
              --scanBudget;
              uint64_t scan[5];
-@@ -327,6 +380,8 @@
+@@ -327,6 +403,8 @@
              if(native_legacy_frame_colors(reinterpret_cast<const void *>(source->getVirtualAddress()),source->getLength(),sourceStride,width,height,colors,counts,&other))
                  native_legacy_frame_colors_observed(colors,counts,other);
          }
@@ -177,7 +216,7 @@
          if(!native_legacy_prepare_scanout()) {
              OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
          }
-@@ -384,9 +439,9 @@
+@@ -384,13 +462,15 @@
      }
      // Hands the pending head to the unchanged family's completion. Leaves transferred alone: the callers decide when the next frame may go.
      bool retireSwap(const OriginalLegacySwapRequest *request,bool force) {
@@ -190,7 +229,26 @@
          if(!(retire==1 || cpuPresent==1 || force))return false;
          if(!activateOnlyPendingSwap(request))return false;
          removeValidated(request);
-@@ -418,7 +473,7 @@
++        const uint64_t retireBegan=mach_absolute_time();
+         IOMobileFramebufferLegacy::completeCurrentSwap();
++        coachz_swap_add(6,7,retireBegan,9);
+         native_legacy_retirement_observed(this);
+         return true;
+     }
+@@ -411,6 +491,12 @@
+         return kIOReturnUnsupported;
+     }
+     bool validateSwap(const OriginalLegacySwapRequest *request) override {
++        const uint64_t began=mach_absolute_time();
++        const bool accepted=validateSwapChecked(request);
++        coachz_swap_add(0,1,began);
++        return accepted;
++    }
++    bool validateSwapChecked(const OriginalLegacySwapRequest *request) {
+         // Qualified original request fields are packed; use memcpy for each
+         // access. Accept only one full-frame, untransformed, nonplanar BGRA
+         // surface with real original backing memory. No generic capability
+@@ -418,7 +504,7 @@
          auto bytes=reinterpret_cast<const unsigned char *>(request);
          auto word=[&](unsigned offset){uint32_t value=0;memcpy(&value,bytes+offset,4);return value;};
          OSObject *surface=nullptr;unsigned reason=1;bool accepted=false;
@@ -199,7 +257,7 @@
          if(enabled==1 && logicalPM && primary && bootMapping && request) {
              reason=2;OSObject *surfaces[4]={};memcpy(surfaces,bytes+2624,sizeof(surfaces));surface=surfaces[0];
              uint32_t width=0,height=0;getDisplayDimensions(&width,&height);
-@@ -495,17 +550,19 @@
+@@ -495,17 +581,19 @@
             !video.v_width || !video.v_height || video.v_depth!=32 || video.v_rotate ||
             video.v_width>16384 || video.v_height>16384 || video.v_rowBytes<video.v_width*4 ||
             video.v_rowBytes>UINT64_MAX/video.v_height)return false;
@@ -223,7 +281,7 @@
              }
          }
          OSSafeReleaseNULL(mapping);return valid;
-@@ -517,8 +574,13 @@
+@@ -517,8 +605,13 @@
      LEAF(306)
      LEAF(307)
      LEAF(338)
@@ -273,7 +331,23 @@
      online=true;native_gop_ready=1;if(gpuMode)gHandoff=this;registerService();return true;
  }
  void NativeGOPPresenter::stop(IOService *provider) {
-@@ -164,6 +176,9 @@
+@@ -136,9 +148,13 @@
+         memory->retain();
+         swap={true,false,++swapSequence,display,memory,nullptr,stride,width,height};
+         native_gop_gpu_offers=native_gop_gpu_offers+1;
+-        IOLockWakeup(gate,&swap,false);
+     }
+-    IOLockUnlock(gate);return accepted;
++    IOLockUnlock(gate);
++    // Coachz: wake the client after letting go of the gate (IOLockWakeup is thread_wakeup_prim and needs no lock; waitSwap's
++    // IOLockSleepDeadline asserts its wait under the gate, so the wakeup cannot be lost). Woken under the gate, the client's first act is to
++    // take the gate, which the render server's swap_end still held.
++    if(accepted)IOLockWakeup(gate,&swap,false);
++    return accepted;
+ }
+ IOReturn NativeGOPPresenter::waitSwap(task_t task,uint64_t timeoutMs,NGPSwap *out) {
+     if(!gpuMode)return kIOReturnUnsupported;
+@@ -164,6 +180,9 @@
      IOMemoryDescriptor *memory=swap.memory;memory->retain();
      const uint64_t sequence=swap.sequence,stride=swap.stride;const uint32_t width=swap.width,height=swap.height;
      IOLockUnlock(gate);
@@ -283,7 +357,7 @@
      // The frame's pages go into the client's task here, writable like any import (the GPU maps them for reading; the kernel pins and maintains them).
      IOMemoryMap *map=memory->createMappingInTask(task,0,kIOMapAnywhere);
      memory->release();
-@@ -193,6 +208,7 @@
+@@ -193,6 +212,7 @@
      gpuClient=false;
      auto done=swap;swap={};
      IOLockUnlock(gate);
@@ -291,7 +365,7 @@
      if(!done.offered)return;
      OSSafeReleaseNULL(done.map);if(done.memory)done.memory->release();
      __atomic_fetch_add(&native_gop_gpu_abandoned,1,__ATOMIC_RELAXED);
-@@ -224,6 +240,9 @@
+@@ -224,6 +244,9 @@
      case NGP_METHOD_COMPLETE_SWAP: {
          if(!in || inSize!=sizeof(NGPComplete) || outSize)return kIOReturnBadArgument;
          NGPComplete q={};memcpy(&q,in,sizeof(q));
@@ -301,7 +375,7 @@
          return p->completeSwap(q.sequence,(int)q.status);
      }
      default:return kIOReturnUnsupported;
-@@ -233,7 +252,7 @@
+@@ -233,7 +256,7 @@
  IOMemoryDescriptor *NativeGOPPresenter::handoffMemory() {
      NativeGOPPresenter *p=gHandoff;
      if(!p || !p->gpuMode || !p->online || !p->mapping)return nullptr;
