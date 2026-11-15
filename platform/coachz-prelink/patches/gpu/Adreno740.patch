@@ -50,6 +50,16 @@
              NativeAdrenoNotePhase(NativeAdrenoPhaseAllocate,bytes);
          }
          if(status!=kIOReturnSuccess) {write_combined_=false;(void)release();}
+--- a/NativeAdrenoMemory.h
++++ b/NativeAdrenoMemory.h
+@@ -111,6 +111,7 @@
+     IOReturn reassertWriteCombined(uint32_t *reset) const
+     {return write_combined_ && span_count_ && !system_?NativeAdrenoReassertWriteCombined(spans_,span_count_,reset):kIOReturnSuccess;}
+     bool backed() const {return descriptor_ || imported_ || borrowed_;}
++    bool prepared() const {return prepared_;}   /* Coachz: for NativeAdrenoVm::refreshWalks */
+     /* Refuses device references/quarantine; only clears ownership after real
+      * descriptor complete() succeeds. No automatic reset or resource recycling. */
+     IOReturn release();
 --- a/NativeAdrenoPublish.cpp
 +++ b/NativeAdrenoPublish.cpp
 @@ -42,6 +42,25 @@
@@ -518,7 +528,7 @@
  /* How long fences stayed pending from their first timed-out wait to their last: [i] under 1 << i ms for i < 7, [7] 64 ms or more. */
  extern "C" {volatile uint32_t native_adreno_fence_pending[8];}
  /* What the stall handler tried: [0] attempts, [1] the fence of the last attempt, [2] attempts after which that fence completed, [3] the
-@@ -56,10 +61,35 @@
+@@ -56,10 +61,38 @@
  /* [4] bus drains, [5] client halt acknowledge, [6] arbiter halt acknowledge, [7] the fence of the last drain, [8] drains after which that fence completed */
  extern "C" {volatile uint32_t native_adreno_unstick[15];}
  /* The IBs of the last submissions: [slot] fence, iova low/high, bytes, then the first 28 dwords of the first IB (read as the kernel maps it). */
@@ -533,7 +543,10 @@
 + * CP_EVENT_WRITE RB_DONE_TS (when the work before it has left the RB), into the fence page from NativeAdrenoIbProbeOffset. k217b: the
 + * render server's command buffers in one submission were 0.1-1.3 ms apart, a time that no command buffer's own stamps cover. */
 +extern "C" {volatile uint32_t native_adreno_ib_probe_request,native_adreno_ib_probe_fence,native_adreno_ib_probe_count,native_adreno_ib_probe_pid;
-+volatile uint32_t native_adreno_ib_probe_dwords[36];}
++volatile uint32_t native_adreno_ib_probe_dwords[36];
++/* The words of the probed submission's first IB of at most 16 dwords and its index (k219: each command buffer ended in a 9-dword IB that
++ * held the CP for about 64 us). */
++volatile uint32_t native_adreno_ib_probe_small[16],native_adreno_ib_probe_small_at,native_adreno_ib_probe_small_count;}
 +enum : uint32_t {NativeAdrenoIbProbeOffset=2048,NativeAdrenoIbProbeMost=36,SubmitRbDoneTs=0x16,SubmitEventWrite=0x46,SubmitRegToMem=0x3e,
 +    SubmitAlwaysOn=0x0980};
 +static size_t coachzProbeStamps(uint32_t *words,size_t at,uint64_t page,uint32_t boundary)
@@ -555,7 +568,7 @@
  /* The jobs' timeline (the newest native_adreno_tl_cap retired, allocated at attach): [0] fence | indirect buffers << 32 | ring status << 58, [1] submit
   * time (us), [2] the CP's always-on counter before the job's buffers, [3] after them (19.2 MHz ticks; 0 when not stamped), [4] GPU level at submit |
   * the submitting pid << 32, [5] when the driver saw the job retired (us, the submission clock), [6] ring | (priority + 1) << 4 | GPU role << 8 |
-@@ -127,6 +157,14 @@
+@@ -127,6 +160,14 @@
      if(vm==table_vm_)return kIOReturnSuccess;
      if(!clock)return kIOReturnBadArgument;
      IOReturn status=waitAll(clock,2000000);
@@ -570,7 +583,7 @@
      if(status)return status;
      status=write_table_(table_cookie_,vm->ttbr0());
      if(status)return poison();
-@@ -367,6 +405,7 @@
+@@ -367,6 +408,7 @@
      uint64_t queue,uint32_t *fence,const NativeAdrenoRingClock *clock)
  {
      if(!fence)return kIOReturnBadArgument;*fence=0;
@@ -578,7 +591,7 @@
      if(!vm)vm=vm_;
      NativeAdrenoVm *const vm_=vm;   /* this submission's VM: every vm_ below is the job's own */
      if(!attached_ || poisoned_)return kIOReturnNotReady;
-@@ -400,8 +439,21 @@
+@@ -400,8 +442,21 @@
          for(size_t j=0;j<handle_count;++j)if(handles[j]==buffer.handle) {known=true;break;}
          if(!known)handles[handle_count++]=buffer.handle;
      }
@@ -601,7 +614,7 @@
      Job *job=free();
      if(!job)return kIOReturnNoMemory;
      for(size_t i=0;i<handle_count;++i) {
-@@ -412,6 +464,8 @@
+@@ -412,6 +467,8 @@
          }
          ++stats_.references_held;
      }
@@ -610,7 +623,7 @@
      uint32_t value=0;
      /* int-070: the first IB word as the kernel's cacheable alias and DRAM see it before any maintenance, then DRAM after the CPU
       * caches over every mapped BO are cleaned and invalidated. The board shows the last submission's record on a stall. */
-@@ -451,10 +505,13 @@
+@@ -451,10 +508,13 @@
              native_adreno_wc_distrusted=native_adreno_coherence[0]+1;
          }
      }
@@ -625,7 +638,7 @@
      if(sample)(void)vm_->sampleWord(buffers[0].iova,&cached,&before);
      IOReturn status=vm_->publishMapped();
      if(!status && sample) {
-@@ -472,9 +529,11 @@
+@@ -472,9 +532,11 @@
       * its own pages before it returns, and the tables above the leaves never change. The TLBIALL here emptied the GPU's TLB on every
       * submission (10944 in i568), so each frame began with page walks. A stalled fence still invalidates (below). */
      if(status) {
@@ -637,7 +650,7 @@
      /* The ring this job goes to (the first ring alone unless the board turned the switch on). */
      unsigned index=preemption()?ringForPriority():0;
      /* A priority change cannot overtake this queue's earlier submissions. It moves
-@@ -482,17 +541,20 @@
+@@ -482,17 +544,20 @@
      for(const auto &earlier:jobs_)
          if(earlier.active && earlier.queue==queue) {index=earlier.ring;break;}
      NativeAdrenoRing *const target=ring(index);
@@ -662,7 +675,7 @@
          for(size_t i=0;i<handle_count;++i) {vm_->retireJobAfterCompletion(handles[i]);++stats_.references_retired;}
          return status;
      }
-@@ -502,8 +564,32 @@
+@@ -502,8 +567,41 @@
      uint32_t base=fence_issued_;
      for(unsigned i=0;i<ring_count_;++i)if((int32_t)(ring(i)->lastSubmitted()-base)>0)base=ring(i)->lastSubmitted();
      const uint32_t number=(value=base)+1;
@@ -687,6 +700,15 @@
 +        if(built) {
 +            ring_words=coachz_words;ring_count=n;coachz_probed=true;
 +            for(size_t i=0;i<count;++i)native_adreno_ib_probe_dwords[i]=(uint32_t)(buffers[i].bytes/4);
++            native_adreno_ib_probe_small_count=0;
++            for(size_t i=0;i<count;++i)if(buffers[i].bytes/4<=16) {
++                uint32_t small[16]={};
++                if(vm_->peekWords(buffers[i].iova,small,buffers[i].bytes/4)==kIOReturnSuccess) {
++                    for(unsigned w=0;w<16;++w)native_adreno_ib_probe_small[w]=small[w];
++                    native_adreno_ib_probe_small_at=(uint32_t)i;native_adreno_ib_probe_small_count=(uint32_t)(buffers[i].bytes/4);
++                }
++                break;
++            }
 +        }
 +    }
 +    const uint64_t coachz_chosen=mach_absolute_time();
@@ -696,7 +718,7 @@
          if(!value)fence_issued_=base;
          /* A poisoned ring may already have consumed the WPTR write, so the
           * referenced buffers cannot be retired here. */
-@@ -517,6 +603,24 @@
+@@ -517,6 +615,24 @@
          /* No room in the ring yet: the caller waits for an earlier job and submits again. */
          return status==kIOReturnNoResources?kIOReturnBusy:status;
      }
@@ -721,7 +743,7 @@
      for(size_t i=0;i<handle_count;++i)job->handles[i]=handles[i];
      job->count=handle_count;job->fence=value;job->queue=queue;job->active=true;job->vm_next=vm_->nextHandle();job->vm=vm;
      job->context=target->context();job->word_count=word_count;job->ring=uint8_t(index);
-@@ -584,6 +688,7 @@
+@@ -584,6 +700,7 @@
              if(stall_last_us-stall_began_us>=1000)log(stall_fence,0,stall_last_us-stall_began_us,0,0);   /* shorter ends are ordinary jobs */
          }
          stall_began_us=now;stall_snapshots=0;
@@ -729,7 +751,7 @@
          /* The CP moved on: what the stall that just ended took to clear. [9] first-stage recoveries, [10] second, [11] third, [12] timeouts of the longest. */
          if(stall_stage && stall_timeouts) {
              native_adreno_unstick[8+stall_stage]=native_adreno_unstick[8+stall_stage]+1;
-@@ -592,7 +697,27 @@
+@@ -592,7 +709,27 @@
          stall_fence=next;stall_timeouts=0;stall_stage=0;
      }
      stall_last_us=now;
@@ -758,7 +780,7 @@
      /* A fence that stops while the CP sits idle with work in the ring (int-317 hung with RBBM idle, RPTR short of WPTR, both threads at the same
       * cache clean) is nearly always a write pointer the CP never took: giving it again after a few waits ends it in a couple of milliseconds
       * (i343: 206 of 213 stalls ended at the second stage, 60 to 85 ms each, most of it the 100 waits before the write). After 10 waits now:
-@@ -813,7 +938,12 @@
+@@ -813,7 +950,12 @@
      } else {
          const IOReturn fr=ring(0)->fenceValue(&fence);
          native_adreno_recover_trace[2]=fence;native_adreno_recover_trace[3]=last;
@@ -772,7 +794,7 @@
          /* What already completed retires as usual. */
          for(auto &job:jobs_)if(job.active && job.fence<=fence) {
              IOReturn status=release(job);if(status)return status;
-@@ -823,6 +953,12 @@
+@@ -823,6 +965,12 @@
      const uint32_t hung=fence<last?fence+1:fence;
      Job *guilty=(!stranded && fence<last)?find(hung):nullptr;
      out->fence=hung;
@@ -785,7 +807,7 @@
      if(guilty) {
          NativeAdrenoVm *vm=guilty->vm?guilty->vm:vm_;
          vm->noteHang(vm!=vm_);out->guilty=vm;
-@@ -861,7 +997,19 @@
+@@ -861,7 +1009,19 @@
          Job *job=find(next);
          NativeAdrenoVm *vm=job && job->vm?job->vm:vm_;
          const bool run=job && !vm->unusable() && job->word_count;
@@ -832,3 +854,117 @@
      }
      NativeAdrenoSubmitBuffer *buffers=submit_buffers_;
      for(uint32_t i=0;i<request->buffer_count;++i) {
+--- a/NativeAdrenoVm.cpp
++++ b/NativeAdrenoVm.cpp
+@@ -107,7 +107,7 @@
+     capacity_=first;mapping_capacity_=64;
+     if(!changes_ || !alias_scratch_ || !mappings_ || !order_ || !index_.allocate()) {freeTables();return kIOReturnNoMemory;}
+     memset(mappings_,0,sizeof(Mapping)*64);
+-    free_hint_=0;high_=0;memset(class_spans_,0,sizeof(class_spans_));order_count_[0]=order_count_[1]=0;
++    free_hint_=0;high_=0;memset(class_spans_,0,sizeof(class_spans_));order_count_[0]=order_count_[1]=0;++map_epoch_;
+     io_=*io;context_=context;streams_=streams;budget_=budget;
+     if(lower)regions_[0]=*lower;if(upper)regions_[1]=*upper;
+     for(unsigned i=0;i<2;++i)if(regions_[i].arena) {
+@@ -318,7 +318,7 @@
+         if(record || !growMappings())break;
+     }
+     if(!record) {memory->quarantine();return fail(ArmSmmu4KStateMismatch);}
+-    *record={memory,0,iova,memory->spanCount(),0,permissions,writeback,shareability,0,upper};++objects_;
++    *record={memory,0,iova,memory->spanCount(),0,permissions,writeback,shareability,0,upper};++objects_;++map_epoch_;
+     if(coherentMapping(writeback))native_adreno_coherent_skips[0]=native_adreno_coherent_skips[0]+1;
+     else {
+         checked=memory->publishForDevice(0,memory->bytes(),permissions&ArmSmmu4KWrite,distrust_write_combined_);
+@@ -342,7 +342,7 @@
+     if(status==ArmSmmu4KCapacity) {
+         /* No table page could be had: the kit linked only empty tables and wrote no leaf, so the map is undone and the VM stays usable,
+          * as a failed io-pgtable map returns -ENOMEM. */
+-        const size_t slot=size_t(record-mappings_);*record={};--objects_;if(slot<free_hint_)free_hint_=slot;
++        const size_t slot=size_t(record-mappings_);*record={};--objects_;++map_epoch_;if(slot<free_hint_)free_hint_=slot;
+         if(memory->retireAfterQuiescence()!=kIOReturnSuccess)return fail(ArmSmmu4KStateMismatch);
+         result_.operation=status;
+         return kIOReturnNoMemory;
+@@ -410,7 +410,7 @@
+     }
+     index_.erase(record->handle);
+     const size_t slot=(size_t)(record-mappings_);if(slot<free_hint_)free_hint_=slot;
+-    *record={};--objects_;
++    *record={};--objects_;++map_epoch_;
+     while(high_ && !mappings_[high_-1].memory)--high_;result_.complete=true;return kIOReturnSuccess;
+ }
+ IOReturn NativeAdrenoVm::describe(uint64_t handle,uint64_t *iova,size_t *bytes,
+@@ -435,10 +435,38 @@
+     const ArmSmmu4KStatus status=offset?ArmSmmu4KSyncContextTlb(&io_,offset,context_->asid,1,budget_,&r):
+         ArmSmmu4KInvalidateAllOwnedContext(&io_,streams_->bank,context_,budget_,&r);
+     return status?fail(status):kIOReturnSuccess;
++}
++void NativeAdrenoVm::refreshWalks() const
++{
++    if(walk_epoch_==map_epoch_ && walk_distrust_==distrust_write_combined_ && walk_coherent_==native_adreno_io_coherent)return;
++    bool publish=false,acquire=false,reassert=false;
++    uint64_t publish_skips=0,acquire_skips=0;
++    for(size_t i=0;i<high_;++i) {
++        const Mapping &m=mappings_[i];
++        const NativeAdrenoMemory *memory=m.memory;
++        if(!memory)continue;
++        const bool skipped=coherentMapping(m.writeback) || importedUntouched(memory);
++        const bool ready=memory->backed() && memory->prepared() && !memory->quarantined();
++        /* publishForDevice does nothing for an import every CPU mapping holds non-cacheable, nor for a trusted write-combined BO. */
++        if(skipped)++publish_skips;
++        else if(!ready || !((memory->imported() && memory->ownerUncached()) ||
++            (!memory->imported() && memory->writeCombined() && !distrust_write_combined_)))publish=true;
++        /* acquireDeviceWrites visits GPU-writable imports alone and does nothing for one held non-cacheable. */
++        if(memory->imported() && (m.permissions&ArmSmmu4KWrite)) {
++            if(skipped)++acquire_skips;
++            else if(!ready || !memory->ownerUncached())acquire=true;
++        }
++        if(memory->writeCombined() && memory->spanCount() && !memory->system())reassert=true;
++    }
++    walk_publish_=publish;walk_acquire_=acquire;walk_reassert_=reassert;
++    walk_publish_skips_=publish_skips;walk_acquire_skips_=acquire_skips;
++    walk_epoch_=map_epoch_;walk_distrust_=distrust_write_combined_;walk_coherent_=native_adreno_io_coherent;
+ }
+ IOReturn NativeAdrenoVm::publishMapped()
+ {
+     if(!attached_ || poisoned_)return kIOReturnNotReady;
++    refreshWalks();
++    if(!walk_publish_) {native_adreno_coherent_skips[2]=native_adreno_coherent_skips[2]+walk_publish_skips_;return kIOReturnSuccess;}
+     for(size_t i=0;i<high_;++i) {
+         const Mapping &m=mappings_[i];
+         if(!m.memory)continue;
+@@ -450,6 +478,8 @@
+ IOReturn NativeAdrenoVm::acquireImported()
+ {
+     if(!attached_ || poisoned_)return kIOReturnNotReady;
++    refreshWalks();
++    if(!walk_acquire_) {native_adreno_coherent_skips[3]=native_adreno_coherent_skips[3]+walk_acquire_skips_;return kIOReturnSuccess;}
+     for(size_t i=0;i<high_;++i) {
+         const Mapping &m=mappings_[i];
+         if(!m.memory || !m.memory->imported() || !(m.permissions&ArmSmmu4KWrite))continue;
+@@ -487,6 +517,8 @@
+ {
+     if(!reset)return kIOReturnBadArgument;
+     if(!attached_ || poisoned_)return kIOReturnNotReady;
++    refreshWalks();
++    if(!walk_reassert_)return kIOReturnSuccess;   /* no write-combined BO of its own pages here */
+     for(size_t i=0;i<high_;++i) {
+         const Mapping &m=mappings_[i];
+         if(!m.memory)continue;
+--- a/NativeAdrenoVm.h
++++ b/NativeAdrenoVm.h
+@@ -72,6 +72,16 @@
+     unsigned budget_=0;
+     uint64_t next_handle_=1;
+     bool attached_=false,poisoned_=false,distrust_write_combined_=false,unusable_=false;
++    /* Coachz: what the walks over every mapping around each submission (publishMapped, acquireImported, reassertWriteCombined) find
++     * to do depends only on the mappings, the write-combine trust and the board's IO coherence, so it is worked out again only when one
++     * of them changed (map_epoch_ counts every change of mappings_). k219: the walks took 0.8 and 0.1 ms of the 0.93 ms the kernel
++     * spent in each submission, with about 274 mappings skipped each time and none maintained. A mapping that needs maintenance (or
++     * whose object is not ready) keeps the whole walk on every submission, as before. */
++    uint64_t map_epoch_=1;
++    mutable uint64_t walk_epoch_=0,walk_publish_skips_=0,walk_acquire_skips_=0;
++    mutable uint32_t walk_coherent_=UINT32_MAX;
++    mutable bool walk_distrust_=false,walk_publish_=true,walk_acquire_=true,walk_reassert_=true;
++    void refreshWalks() const;
+     uint64_t faults_=0,hangs_=0;
+     bool fault_streams_=true;   /* a failure faults the bank's streams; off for a process table, whose streams are the kernel table's too */
+     NativeAdrenoVmResult result_{};

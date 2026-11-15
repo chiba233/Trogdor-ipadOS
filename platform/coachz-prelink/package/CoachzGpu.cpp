@@ -48,6 +48,7 @@ extern volatile uint64_t native_adreno_submit_ticks[64], native_adreno_submit_co
 extern volatile uint64_t native_adreno_submit_phase[7];
 extern volatile uint32_t native_adreno_ib_probe_request, native_adreno_ib_probe_fence, native_adreno_ib_probe_count, native_adreno_ib_probe_pid;
 extern volatile uint32_t native_adreno_ib_probe_dwords[36];
+extern volatile uint32_t native_adreno_ib_probe_small[16], native_adreno_ib_probe_small_at, native_adreno_ib_probe_small_count;
 }
 extern "C" unsigned NativeAdrenoGpuContextInputBits();
 // The framework's two weak board hooks. [1] of the first is the GPU's current level, which it notes per job. The second names a process still mapping a
@@ -651,6 +652,13 @@ void ibProbeReport() {
                     const uint64_t a = which ? rb(i - 1) : cp(i - 1), b = which ? rb(i) : cp(i);
                     at += static_cast<size_t>(snprintf(line + at, sizeof(line) - at, " %lld", static_cast<long long>(b - a)));
                 }
+                printf("%s\n", line);
+            }
+            // The first IB of at most 16 dwords, word by word (k219: a 9-dword IB after each command buffer held the CP about 64 us).
+            if (const uint32_t words = native_adreno_ib_probe_small_count) {
+                at = static_cast<size_t>(snprintf(line, sizeof(line), "COACHZ gpu ibs small: ib %u dwords %u:", native_adreno_ib_probe_small_at, words));
+                for (uint32_t i = 0; i < words && i < 16 && at < sizeof(line); ++i)
+                    at += static_cast<size_t>(snprintf(line + at, sizeof(line) - at, " %08x", native_adreno_ib_probe_small[i]));
                 printf("%s\n", line);
             }
         }

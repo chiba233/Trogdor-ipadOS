@@ -2230,6 +2230,47 @@ new file mode 100644
 + /// A test's step between the guard's two counts, run once: between a section's end and its
 + /// making's ([`Busy`]'s drop), or between [`Guard::close`]'s read of the sections and its read of
 + /// the makings, whichever this thread reaches first (`tests::exit_guard`).
+diff --git a/drivers/AdrenoMetal/bridge/patches/0030-coachz-more-spare-descriptor-pools.patch b/drivers/AdrenoMetal/bridge/patches/0030-coachz-more-spare-descriptor-pools.patch
+new file mode 100644
+--- /dev/null
++++ b/drivers/AdrenoMetal/bridge/patches/0030-coachz-more-spare-descriptor-pools.patch
+@@ -0,0 +1,36 @@
++diff --git a/crates/metal2vulkan-runtime/src/spares.rs b/crates/metal2vulkan-runtime/src/spares.rs
++--- a/crates/metal2vulkan-runtime/src/spares.rs
+++++ b/crates/metal2vulkan-runtime/src/spares.rs
++@@ -110,11 +110,13 @@
++ use std::sync::Mutex;
++ 
++ /// The most spare descriptor pools a device keeps (of each list, a command buffer's arenas' and
++-/// the fitted arenas'): a few frames' worth of a window server's (the module docs).
++-pub(super) const DESCRIPTOR_POOLS: usize = 256;
+++/// the fitted arenas'): a few frames' worth of a window server's (the module docs). Coachz: twice
+++/// the runtime's: on Turnip a new pool is a BO the kernel driver allocates, maps into the GPU and
+++/// into the process, and k219's render server spent about 1.9 s of its display thread there.
+++pub(super) const DESCRIPTOR_POOLS: usize = 512;
++ 
++-/// The most descriptors the spare descriptor pools hold together.
++-pub(super) const DESCRIPTORS: u64 = 1 << 18;
+++/// The most descriptors the spare descriptor pools hold together (Coachz: twice the runtime's).
+++pub(super) const DESCRIPTORS: u64 = 1 << 19;
++ 
++ /// The index of `level`'s list in a [`CommandPool`]: primary 0, secondary 1.
++ fn level_index(level: vk::CommandBufferLevel) -> usize {
++diff --git a/crates/metal2vulkan-runtime/src/descriptor_arena.rs b/crates/metal2vulkan-runtime/src/descriptor_arena.rs
++--- a/crates/metal2vulkan-runtime/src/descriptor_arena.rs
+++++ b/crates/metal2vulkan-runtime/src/descriptor_arena.rs
++@@ -37,8 +37,9 @@
++ use ash::vk;
++ use std::sync::{Arc, Mutex};
++ 
++-/// The sets of a command buffer's first pool.
++-pub(super) const FIRST: u32 = 16;
+++/// The sets of a command buffer's first pool. Coachz: 64, not 16: a window server's command buffer
+++/// takes a few dozen sets, and each further pool it opens is one more (see `spares.rs`).
+++pub(super) const FIRST: u32 = 64;
++ 
++ /// The most sets a pool is opened for.
++ pub(super) const MOST: u32 = 1024;
 diff --git a/patches/mesa/coachz-port-ir3-fragment-consts.patch b/patches/mesa/coachz-port-ir3-fragment-consts.patch
 new file mode 100644
 --- /dev/null
@@ -2737,6 +2778,97 @@ new file mode 100644
 +    for (uint32_t i = 0; i < wait_count; i++) {
 +       struct vk_darwin_sync *s = container_of(waits[i].sync, struct vk_darwin_sync, vk);
 +       VkResult result = darwin_sync_wait(device, s, abs_timeout_ns);
+diff --git a/patches/mesa/coachz-turnip-fewer-bo-maps.patch b/patches/mesa/coachz-turnip-fewer-bo-maps.patch
+new file mode 100644
+--- /dev/null
++++ b/patches/mesa/coachz-turnip-fewer-bo-maps.patch
+@@ -0,0 +1,86 @@
++diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
++--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
+++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
++@@ -4384,11 +4384,13 @@ tu_create_cmd_buffer(struct vk_command_pool *pool,
++       }
++    }
++ 
++-   tu_cs_init(&cmd_buffer->cs, device, TU_CS_MODE_GROW, 4096, "cmd cs");
++-   tu_cs_init(&cmd_buffer->draw_cs, device, TU_CS_MODE_GROW, 4096, "draw cs");
+++   /* Coachz: twice Mesa's first chunk. A full-screen composite's command stream is about 4800 dwords, so with 4096 it took a second
+++    * BO, which the Darwin backend allocates and maps (k219: about 1330 of the encoding thread's samples in tu_cs_reserve_space). */
+++   tu_cs_init(&cmd_buffer->cs, device, TU_CS_MODE_GROW, 8192, "cmd cs");
+++   tu_cs_init(&cmd_buffer->draw_cs, device, TU_CS_MODE_GROW, 8192, "draw cs");
++    tu_cs_init(&cmd_buffer->tile_store_cs, device, TU_CS_MODE_GROW, 2048, "tile store cs");
++    tu_cs_init(&cmd_buffer->draw_epilogue_cs, device, TU_CS_MODE_GROW, 4096, "draw epilogue cs");
++-   tu_cs_init(&cmd_buffer->sub_cs, device, TU_CS_MODE_SUB_STREAM, 2048, "draw sub cs");
+++   tu_cs_init(&cmd_buffer->sub_cs, device, TU_CS_MODE_SUB_STREAM, 4096, "draw sub cs");
++    tu_cs_init(&cmd_buffer->pre_chain.draw_cs, device, TU_CS_MODE_GROW, 4096, "prechain draw cs");
++    tu_cs_init(&cmd_buffer->pre_chain.draw_epilogue_cs, device, TU_CS_MODE_GROW, 4096, "prechain draw epiligoue cs");
++ 
++@@ -5582,10 +5584,14 @@ tu_EndCommandBuffer(VkCommandBuffer commandBuffer)
++ 
++    if (cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
++       struct u_trace_address addr_preempt_latency = {};
++-      addr_preempt_latency.offset = global_iova(cmd_buffer, max_preemption_latency);
+++      /* Coachz: only where the device preempts, which tracks the latency; elsewhere the two captures are two CP_MEMCPYs at the end of
+++       * every command buffer for values nothing writes (k219's work trace: preempt_latency 0 on every command buffer). */
+++      if (cmd_buffer->device->physical_device->has_preemption)
+++         addr_preempt_latency.offset = global_iova(cmd_buffer, max_preemption_latency);
++ 
++       struct u_trace_address addr_preempt_latency_rp_hash = {};
++-      addr_preempt_latency_rp_hash.offset = global_iova(cmd_buffer, max_preemption_latency_rp_hash);
+++      if (cmd_buffer->device->physical_device->has_preemption)
+++         addr_preempt_latency_rp_hash.offset = global_iova(cmd_buffer, max_preemption_latency_rp_hash);
++ 
++       trace_end_cmd_buffer(&cmd_buffer->trace, &cmd_buffer->cs, cmd_buffer, addr_preempt_latency, addr_preempt_latency_rp_hash);
++ 
++diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
++--- a/src/freedreno/vulkan/tu_device.cc
+++++ b/src/freedreno/vulkan/tu_device.cc
++@@ -2237,7 +2237,9 @@ tu_trace_create_buffer(struct u_trace_context *utctx, uint64_t size_B)
++          &device->vk.alloc, sizeof(struct tu_suballocator), 8,
++          VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
++ 
++-      tu_bo_suballocator_init(device->trace_suballoc, device, 512 * 1024,
+++      /* Coachz: 4 MiB blocks. Each new block is a BO the Darwin backend allocates, maps into the GPU and into this process (k219: the
+++       * render server's encoding thread spent 820 of its samples, about 4 s, mapping 512 KiB timestamp blocks). */
+++      tu_bo_suballocator_init(device->trace_suballoc, device, 4 * 1024 * 1024,
++                               TU_BO_ALLOC_INTERNAL_RESOURCE, "utrace");
++    }
++ 
++diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
++--- a/src/freedreno/vulkan/tu_knl_darwin.cc
+++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
++@@ -831,9 +831,30 @@ darwin_cache_trim(struct tu_device *dev, struct darwin_retire_state *retire)
++    if (now == retire->cache_cleaned_s)
++       return;
++    retire->cache_cleaned_s = now;
+++   /* Coachz: small BOs (up to 1 MiB: command stream chunks, descriptor pools, timestamp blocks) stay past the second, the newest
+++    * first, up to 32 MiB of them; larger ones go after the second as before. After a pause the next frames otherwise allocated and
+++    * mapped every chunk again: k219's cache reused 67-80 % with 243-716 evictions, and the render server's encoding and display
+++    * threads spent about 8.6 s in the mapping of new BOs. A memory-pressure notification still empties the whole cache. */
+++   const uint64_t small = 1u << 20, kept_most = 32u << 20;
+++   uint64_t kept = 0;
++    for (unsigned i = retire->cache_count; i-- > 0;)
++-      if (now - retire->cache[i].freed_s > 1)
+++      if (now - retire->cache[i].freed_s > 1 && retire->cache[i].size > small)
++          darwin_cache_evict(dev, retire, i);
+++   for (unsigned i = 0; i < retire->cache_count; ++i)
+++      if (now - retire->cache[i].freed_s > 1)
+++         kept += retire->cache[i].size;
+++   while (kept > kept_most) {
+++      int oldest = -1;
+++      for (unsigned i = 0; i < retire->cache_count; ++i)
+++         if (now - retire->cache[i].freed_s > 1 && (oldest < 0 || retire->cache[i].stamp < retire->cache[oldest].stamp))
+++            oldest = (int)i;
+++      if (oldest < 0)
+++         break;
+++      const uint64_t size = retire->cache[oldest].size;
+++      if (darwin_cache_evict(dev, retire, (unsigned)oldest) != VK_SUCCESS)
+++         break;
+++      kept -= size;
+++   }
++ }
++ 
++ /* The process's memory-pressure source, made once: libdispatch delivers the kernel's memorystatus levels to it. */
 diff --git a/patches/mesa/turnip-coachz-diagnostics.patch b/patches/mesa/turnip-coachz-diagnostics.patch
 new file mode 100644
 --- /dev/null
@@ -3992,14 +4124,37 @@ diff --git a/scripts/build-adreno-metal-bridge.py b/scripts/build-adreno-metal-b
 +    # A compile the asking thread waits for at that thread's priority; two-plane pictures up to the plug-in's size kept as images;
 +    # the runtime's command buffer threads at the fixed priority of the thread that starts them.
 +    '0027-coachz-compile-at-the-asking-priority.patch', '0028-coachz-ycbcr-image-for-small-pictures.patch',
-+    '0029-coachz-runtime-threads-at-the-spawning-priority.patch']]
++    '0029-coachz-runtime-threads-at-the-spawning-priority.patch', '0030-coachz-more-spare-descriptor-pools.patch']]
  
  
  def git_tree(*steps):
+diff --git a/scripts/build-turnip-darwin.py b/scripts/build-turnip-darwin.py
+--- a/scripts/build-turnip-darwin.py
++++ b/scripts/build-turnip-darwin.py
+@@ -99,8 +99,17 @@
+ # The pipeline cache's identity (VkPhysicalDeviceProperties::pipelineCacheUUID) from the compiler's source alone, the same for every
+ # target: Mesa's own on Darwin is the library file's mtime (disk_cache_get_function_timestamp), which differs per install and per build,
+ # so the pipelines a boot compiled into the persistent Data cache would miss after every image rebuild of the same compiler.
+-build_id = hashlib.sha256(json.dumps(dict(mesa_revision=pins['mesa']['commit'], source_diff_sha256=profile['source_diff_sha256'],
+-                                          extra_sources=source_extras), sort_keys=True).encode()).hexdigest()[:40]
++# Coachz: what a compiled pipeline is made of: the source diff without the kernel backends, the queue, command buffer recording, autotune
++# and the tracepoints, and the untracked sources without the Darwin backend (tu_knl_darwin.cc). k219: each image rebuilt the backend, so the
++# first boot of every image compiled its 259 pipelines again (16.4 s, the longest 2.7 s), and almost every boot was such a first one.
++cache_exclude = ['src/freedreno/vulkan/tu_knl*', 'src/freedreno/vulkan/tu_queue.*', 'src/freedreno/vulkan/tu_cmd_buffer.cc',
++                 'src/freedreno/vulkan/tu_autotune.*', 'src/freedreno/vulkan/tu_tracepoints.py', 'src/freedreno/vulkan/tu_perfetto*',
++                 'src/freedreno/vulkan/tu_dynamic_rendering.cc']
++cache_diff = subprocess.check_output(['git', '-C', SOURCE, 'diff', 'HEAD', '--binary', '--', '.',
++                                      *(':(exclude,glob)' + pattern for pattern in cache_exclude)])
++cache_extras = {name: digest for name, digest in source_extras.items() if not name.startswith('src/freedreno/vulkan/tu_knl')}
++build_id = hashlib.sha256(json.dumps(dict(mesa_revision=pins['mesa']['commit'], cache_diff_sha256=hashlib.sha256(cache_diff).hexdigest(),
++                                          extra_sources=cache_extras), sort_keys=True).encode()).hexdigest()[:40]
+ options += ['-Dtu-build-id=' + build_id]
+ log = LOGS / ('mesa-tu-%s-configure.log' % args.target)
+ with log.open('w') as stream:
 diff --git a/scripts/data/adreno-compiler-inputs.json b/scripts/data/adreno-compiler-inputs.json
 --- a/scripts/data/adreno-compiler-inputs.json
 +++ b/scripts/data/adreno-compiler-inputs.json
-@@ -56,7 +56,16 @@
+@@ -56,7 +56,17 @@
      "patches/mesa/turnip-host-import-images.patch",
      "patches/mesa/turnip-render-mode-for-attachment-memory.patch",
      "patches/mesa/turnip-gmem-mutable-swap.patch",
@@ -4013,7 +4168,8 @@ diff --git a/scripts/data/adreno-compiler-inputs.json b/scripts/data/adreno-comp
 +    "patches/mesa/coachz-port-turnip-keep-device.patch",
 +    "patches/mesa/coachz-port-turnip-row-pitch.patch",
 +    "patches/mesa/coachz-port-turnip-submit-cuts.patch",
-+    "patches/mesa/coachz-turnip-darwin-fence-waits.patch"
++    "patches/mesa/coachz-turnip-darwin-fence-waits.patch",
++    "patches/mesa/coachz-turnip-fewer-bo-maps.patch"
    ],
    "integer_fma_reference": {
      "repository": "https://github.com/ucb-bar/berkeley-softfloat-3",
