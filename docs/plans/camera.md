@@ -159,7 +159,21 @@ Written and checked on the host (kernel flags, `-Werror` for the app, `tests/tes
    the A10X device's capture plugin is `/System/Library/MediaCapture/H9ISP.mediacapture`. The smaller route is the one the video decoder
    took: a kernel service that matches as `AppleH9CamIn`, and our own `H9ISP.mediacapture` plug-in, delivered the way
    `AVD.videodecoder` is, that implements the plug-in's interface over the CoachzCamera user client instead of the ISP firmware
-   protocol. The plug-in interface still has to be read from the original bundle.
+   protocol.
+
+   The original plug-in's interface (21H461 shared cache): CMCapture's `FigCaptureGetCaptureDeviceCreateFunction` dlopens the bundle of
+   the `AppleH*CamIn` service present and looks up `H9ISPCaptureDeviceCreate(allocator, ?, &device)`, which makes the device with
+   `CMDerivedObjectCreate` and `FigCaptureDeviceGetClassID()`. Its class tables:
+
+   | Object | Table | Entries |
+   | --- | --- | --- |
+   | FigCaptureDevice | base, version 1, storage 0xf0 | Invalidate, Finalize, CopyProperty, SetProperty |
+   | FigCaptureDevice | class, version 1 | ProcessingSessionCreate |
+   | FigCaptureStream | base, version 1, storage 0x580 | Finalize, CopyProperty, SetProperty |
+   | FigCaptureStream | class, version 2 | Start, Stop, AddAttachmentsToSampleBuffer |
+
+   The streams are handed out through the device's CopyProperty; which property keys CMCapture asks for, and how frames reach it, is
+   the next thing to read.
 
 ## On hardware
 
