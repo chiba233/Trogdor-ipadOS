@@ -30,7 +30,7 @@ mainline function it follows. Runtime data from Linux on this machine is not a r
 | Boot self-test through the engine (one I_PCM IDR picture, compared sample by sample) | Runs on hardware: 0 of 16384 luma and 0 of 8192 chroma samples differ |
 | IOKit service `CoachzVenus` and user client, ABI `CoachzVideoAbi.h` | Runs on hardware |
 | VideoToolbox decoder `AVD.videodecoder` (`avc1`, `hvc1`, `hev1`, `vp09`) and its delivery (bindfs union, trust cache, kobject map grant) | Runs on hardware: HEVC 640x360 and H.264 playback produce frames; the horizontal green lines are gone since k213 (`coachz-prelink-video-cache.patch`); VP9 and larger sizes are unverified |
-| Idle power collapse (`venus_suspend_3xx`/4xx) and retained resume | Compiled, opt-in with `--venus-runtime-pm`; not exercised on hardware; whole-system sleep is not integrated |
+| Idle power collapse (`venus_suspend_3xx`/4xx) and retained resume | Opt-in with `--venus-runtime-pm`; on hardware the core collapses after the last session is released and resumes with retained firmware and HFI queues when playback starts; whole-system sleep is not integrated |
 | `cpu-cfg` vote and system-error recovery (`venus_sys_error_handler`) | Compiled: CN0 aggregation with IPA; fail sessions, quiesce DMA, reload firmware/HFI; not exercised on hardware |
 | 10-bit output (P010) | Compiled for HEVC/VP9, negotiated with the client; TP10 UBWC DPB, linear P010 output and x420 pool; not exercised on hardware |
 

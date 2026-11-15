@@ -66,7 +66,7 @@ enum {
   kRadioInfo = 54, kScanReqMultiple = 86, kScanCacheClear = 90, kCurrentNetwork = 103, kRssiBounds = 106, kChannelsInfo = 207, kHwSupportedChannels = 254,
 };
 // events
-enum { kEvPowerChanged = 1, kEvSsidChanged = 2, kEvBssidChanged = 3, kEvLinkChanged = 4, kEvAssocDone = 9, kEvScanDone = 10, kEvRssiChanged = 39 };
+enum { kEvPowerChanged = 1, kEvSsidChanged = 2, kEvBssidChanged = 3, kEvLinkChanged = 4, kEvAssocDone = 9, kEvScanDone = 10, kEvRssiChanged = 39 /* the link quality report */ };
 // results of an association, as the framework numbers them
 enum { kAssocOk = 1, kAssocFailed = 2, kAssocTimeout = 9, kAssocBadKey = 21 };
 
@@ -122,8 +122,10 @@ void log(int, const char *fmt, ...) {
 }
 
 // ---- events to the framework: class IEEE 802.11 (6), subclass 1, data starting with the interface name ----
+// 16 bytes of interface name and up to the 184-byte link quality record: kev_post_msg refuses more than MLEN (224 bytes with the
+// 24-byte header), so this is also the largest event the kernel takes.
 void post_event(uint32_t code, const void *payload, size_t length) {
-  uint8_t data[128]; if (length > sizeof data - 16) length = sizeof data - 16;
+  uint8_t data[16 + 0xb8]; if (length > sizeof data - 16) length = sizeof data - 16;
   memset(data, 0, 16); snprintf(reinterpret_cast<char *>(data), 16, "en0"); if (length) memcpy(data + 16, payload, length);
   struct kev_msg msg; memset(&msg, 0, sizeof msg);
   msg.vendor_code = KEV_VENDOR_APPLE; msg.kev_class = 6; msg.kev_subclass = 1; msg.event_code = code;
@@ -180,16 +182,23 @@ void visible_status(nw_wifi_status &st) {
 // ---- what the module tells us ----
 void on_scan_done() { __atomic_store_n(&gScanning, 0u, __ATOMIC_RELEASE); gScanCursor = 0; post_event(kEvScanDone, nullptr, 0); }
 // A scan answered from the cache finishes after the time a short scan takes: answered at once, the daemon asks again straight away.
-// wifid's APPLE80211_M_RSSI_CHANGED (39, from its monitoring table): nothing else tells it the signal once joined, and the status
-// bar then shows no bars. The same {version, radios, unit (0: dBm), per chain[4], aggregate, extension per chain[4], its aggregate}
-// as the kRssi request. The value is the access point's strength when the join began; the data path does not measure it yet.
+// Event 39 is the link quality report, not a bare RSSI: IO80211's __eventRead hands it to __dispatchlqmChangedEvent, which drops
+// anything shorter than 0xb8 bytes and otherwise builds the dictionary wifid's __WiFiDeviceProcessRSSIEvent feeds to LQM ("Feeding
+// RSSI data to LQM"; it needs the RSSI key, and its history ignores reports less than a second apart). The 52-byte RSSI record sent
+// here before was dropped there, so after the join's link event wifid never heard the signal again (k221: one feed, bars fixed).
+// The record as that function reads it: valid byte 0x00 and RSSI (s32) 0x04; per-core RSSI 0x08/0x09/0x0a; SNR valid 0x0b, s16 0x0c;
+// noise valid 0x0e, s16 0x10; CCA valid 0x12, value 0x13; then counters from 0x14 that are always read (zero here, as the join's link
+// event reports none either), per-core noise valid 0xb4. Only RSSI, SNR and noise are filled, with the noise floor the link event uses.
 thread_call_t gRssiCall;
 void post_rssi(thread_call_param_t, thread_call_param_t) {
   nw_wifi_status st; nw_wifi_status_get(&st);
   if (st.state != NW_STA_UP) return;
-  const uint32_t v = static_cast<uint32_t>(static_cast<int32_t>(st.signal_dbm));
-  const uint32_t w[13] = {1, 1, 0, v, v, v, v, v, v, v, v, v, v};
-  post_event(kEvRssiChanged, w, sizeof w);
+  uint8_t lqm[0xb8] = {};
+  const int32_t rssi = st.signal_dbm; const int16_t snr = static_cast<int16_t>(st.signal_dbm > -95 ? st.signal_dbm + 95 : 0), noise = -95;
+  lqm[0x00] = 1; memcpy(lqm + 0x04, &rssi, sizeof rssi);
+  lqm[0x0b] = 1; memcpy(lqm + 0x0c, &snr, sizeof snr);
+  lqm[0x0e] = 1; memcpy(lqm + 0x10, &noise, sizeof noise);
+  post_event(kEvRssiChanged, lqm, sizeof lqm);
   uint64_t at; clock_interval_to_deadline(5000, kMillisecondScale, &at); thread_call_enter_delayed(gRssiCall, at);
 }
 thread_call_t gCachedScan;
