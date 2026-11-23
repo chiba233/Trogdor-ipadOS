@@ -903,3 +903,102 @@ k221 跑了 249 s，期间播放了 k216 的同一段视频。backboardd 的采�
 画面：
 - 原生路径比对 `verify8 bad0`，没有新的降级种类，没有 DeviceLost 或挂起。
 
+
+## k221 之后的一批（下一次整编上机）
+
+依据是 k221 backboardd 的线程采样（约 141 s）。显示、编码、scanout 三个线程的非空闲采样分别是 4066、3714、11807 个。
+
+九项改动：
+1. 编码线程忙的时间里，33.8% 是 xzone 分配器的 `madvise`（`__xzm_free+1128`，1255 个采样）。显示和 scanout 线程上各有约 130 个。反汇编 iOS 17.7 的 libsystem_malloc（libmalloc-521.120.7）得到它的规则：tiny chunk 清空时，如果它所在 slot 上一次清空已经过去不少于 `MallocXzoneTinyThrashThreshold` 毫秒，就标成空块并立刻 `madvise`；不到这个时间就留着。这个阈值在 `_xzm_main_malloc_zone_create` 里从进程环境变量读，默认 1 ms。render server 每隔几毫秒才清空一个 chunk，所以每次都会 `madvise`。新的 xnu 补丁 `coachz-prelink-gpu-malloc.patch` 照 `coachz-prelink-oslog.patch` 的写法，在 `exec_extract_strings` 里只给 backboardd 加 `MallocXzoneTinyThrashThreshold=1000`。`coachz-xzone-thrash=0` 保持默认。延迟回收（`MallocDeferredReclaim`）要内核开 `CONFIG_DEFERRED_RECLAIM`，这里的 BCM2837 配置没开，所以不走这条路。
+2. bridge 的编码器句柄有 1872 字节（计算编码器把参数表内联存放），原来每个编码器单独分配一次，结束时释放，`madvise` 的 766 个采样就在这次释放下面。现在结束和丢弃的句柄把内存留给下一个编码器，最多留 16 个。
+3. Turnip 的小描述符池（64 KiB 以内）改从设备级的 256 KiB 子分配器取内存，那块 BO 只映射一次。k221 显示线程在 `tu_CreateDescriptorPool` 的 CPU 映射里有 552 个采样。
+4. Turnip 命令缓冲的命令流，reset 时留不住的块、以及 finish 时的块，交给设备级的块池（按读写方式分开，最多 64 块、16 MiB），任何命令流在新分配之前先从池里取。metal2vulkan 每个 Metal 命令缓冲用自己的命令池，所以各命令流自己留的块只能给自己用。k221 编码和 scanout 线程在 `tu_cs_reserve_space` 下的 BO 映射合计约 620 个采样。只有命令缓冲的命令流会交块，Vulkan 规定命令缓冲 reset 或释放时不在执行中。
+5. Turnip darwin 的 BO 缓存命中时，先挑已有 CPU 映射的条目。映射跟着 BO 走，不需要它的调用方拿到也没有代价；需要映射的调用方（命令流块、描述符池、子分配器）就省了新建一次。k221 新建一次 CPU 映射平均 2.4 ms，最长 97.6 ms。
+6. 回收扫描时放掉的 BO（不进缓存、也不在执行中），以及每秒一次缓存修剪淘汰的 BO，先排进队列。CPU 解映射、租约释放、`BoFree` 和 IOVA 释放都放到 `retire->lock` 解开之后再做；内核说还在用的放回队列，下次再试。内存压力和内存不足时的整缓存清空仍是同步的，同时也会把队列清掉。k221 的 `BoFree` 平均 421 µs，原来在这把锁里做，三个线程分配和释放 BO 时都在这把锁上等过。
+7. metal2vulkan（0036）：绑定的纹理都没有地址模式映射时，只有管线用句柄采样才需要看常驻纹理（`resolve`）。所以布局不采样句柄时直接不算 sampler maps，不再每次绘制都建一遍配对和 slot 树。CA 编码器的常驻集里有旋转后的显示帧。k221 编码线程在这个函数、它的分配和释放上约 100 个采样。
+8. metal2vulkan（0037）：渲染编码器结束时，pass-start 记录（三个哈希表和一个列表）清空后随它的 Box 一起留给下一个编码器，表的空间不用重新分配、清零（k221 约 50 个采样）。
+9. bridge 的 no-copy：自上次清空记录以来没建过 buffer 的范围，钉页前不再走一遍 `mach_vm_region_recurse`。设了 `forgot` 时它不管页面如何都按重映射报告；否则没有活的导入持有这些页面（钉过的页面一定有对象）。每个 buffer 钉页后仍走一遍并记下。k221 显示线程在这些遍历里有 611 个采样（2605 个范围，重映射 153 个），第一次见到的范围原来要走两遍。
+
+诊断：
+- 导出 A/B：诊断启动里每 4 次导出直接写一次，两个专用管线的耗时可以并排比。
+- `COACHZ gpu maintenance` 行：缓存维护按阶段计，提交阶段再按内存种类（导入、不信任写合并的 BO、系统内存、有内核映射的 BO）分开，用来找出每次提交 854 µs 维护的是哪类内存。
+- `COACHZ gpu vm` 行：map 和 unmap 各阶段的耗时、最慢一次、映射总量，以及按种类的次数和耗时。这些计时从 k221 起就由方法计数用的时钟在算，只是一直没有打印。
+- `BOC` 记录加 `um`：命中但条目没有 CPU 映射的次数。
+- `CZ nocopy` 行：页表遍历次数、走过的映射条目数、钉页前省掉的遍历数，用来看一个范围是不是跨了很多条目。
+
+上机前的检查：Turnip 在 scratch 里用 iOS 正式选项完整编译、链接通过；内核文件 `-fsyntax-only` 通过；xnu 补丁在 k221 的树上 dry-run 通过；bridge 和运行时 `cargo check` 通过；前端 iOS `-fsyntax-only` 通过。`tu_device.*` 和 `tu_descriptor_set.*` 有改动，管线缓存的身份会变，首次开机要重编一遍管线（k219 约 16 s），测量从那之后算。
+
+没做的：
+- 私有帧按需写回 IOSurface：快照和外部读取依赖这些像素。
+- VkFramebuffer 缓存：创建点多，还牵涉视图的生命周期。
+- 合成 pass 里没写到的 memoryless 附件不占 GMEM：合成通道全在 GMEM，是因为第二个 memoryless 附件没有内存，`sheng-tu-debug=sysmem` 管不到它。要在 sysmem 下丢掉这个附件，得同时跳过它的清除和 MRT。只画一次的合成（685 次，中位 3.43 ms）主要是整帧 load 和 store。硬件分 bin 本来就能跳过空 bin 的 load 和 store，所以这类合成多半是全屏绘制，要省 load 得先判断整屏被不透明内容覆盖。
+
+## k222 实机结果（上面九项）
+
+k222 第一张镜像开机就 panic，原因是新加的 `COACHZ gpu vm` 那一行：25 个 `%llu` 撑爆了内核 printf 的 os_log 编码（`log_encode.c:120 log_fits_cmd`）。重编版改成先 `snprintf` 再打印一个字符串。boot 99 跑了 272 s，backboardd 的采集约 134 s，其中有一段视频。下面的数字都是线程采样数，k221 在括号里。
+
+起了作用的：
+- 编码线程非空闲采样 2190（3714），少了 41%。xzone tiny chunk 的 `madvise` 189（1255，第 4 项）；`nmb_encoder_end` 下面的 `madvise` 5（766，第 2、4 项）；`tu_cs_reserve_space` 下的 BO 映射 232（487）；`sampler_maps` 36（96，第 7 项）；`pass_start_reads` 5（53，第 8 项）。
+- 显示线程非空闲采样 2794（4066），少了 31%。`tu_CreateDescriptorPool` 的映射 0（552，第 3 项）；no-copy 的页表遍历 193（611，第 9 项）；`CZ nocopy walks2953 entries2953 skipped1362`，每个范围只有一个映射条目，第一次见到的范围占 46%；retire 锁等待 6（32，第 6 项）。
+- 导出 A/B：比较模式 1239 次，平均 3.98 ms；直接写 509 次，平均 3.57 ms。直接写快约 10%。
+
+新诊断看到的：
+- `COACHZ gpu maintenance`：4092 次提交，提交阶段维护了 45012 次、34,978,416 KiB，全部属于“有内核映射的 BO”。每次提交 8.35 MiB，正好是内核自己的 11 块 GPU 缓冲（两块 4192 KiB 的抢占记录、SQE、两条 ring 等）。每个进程的页表都映射了这 11 块，每次提交都要整块清理、失效。publish 773 µs。
+- `COACHZ gpu vm map`：4215 次，preflight 合计 1.29 s，页表事务 1.05 s，发布 35 ms。按种类：自有 BO 2211 次平均 346 µs，不需要别名检查的导入 29 次，需要别名检查的导入 1998 次平均 800 µs。BoMap 平均 598 µs。
+
+hang（fence 4104，DeviceLost）：
+- 那次提交是编码线程的一帧普通合成，23 个命令缓冲。CP 已取到 5797 字的主命令流中第 3840 字，大约是 54 个 bin 中的第 36 个；它调用的 876 字绘制命令流只取了前 80 字，停在开头那个 15 组的 SET_DRAW_STATE。RBBM 0xc30d15：CP、UCHE、VPC、CCU、LRZ、VBIF 忙，SP 不忙。没有 opcode 错误，也没有 SMMU 故障（`fsr 0x400` 是 FSR 的格式位）。快照完整（`COACHZ gpu hang snapshot`，997 行）。
+- 同一段绘制命令流前面的 bin 都执行过了，是在中途卡住的。第 2 项（设备级命令流块池）把块交出时不再经过 darwin 的回收队列，不等 fence 就复用。如果有命令缓冲在执行中被 reset 或释放，它的块（包括 sub_cs 里的 draw state）就可能在执行途中被别的命令缓冲改写。metal2vulkan 的命令池、屏障命令缓冲、staging 和内部提交，源码上都是执行完才回收，所以这一点没有证实，也没有排除。这批的其他项不会让 GPU 卡住。
+- 恢复失败：复位时的 slumber 用了 127 ms（平时约 1 ms），之后 HFI 队列起不来（`resume -2`），设备于是丢失。GPU 复位路径还没在真机上成功过。
+
+处理：第 2 项不撤，改为给命令流块加 fence（下一批第 2 项）：交出的块记下最新一次提交的 fence，GPU 过了这个 fence 才再写，命令流自留的块和设备级池都一样，池省下的映射保留。这批等下一张镜像不再 hang、CPU 侧的效果仍在时再提交。
+- 恢复失败的经过（日志环）：slumber 里一次 GBIF 停机应答把 100 ms 的轮询等满了，说明总线上有请求一直没回来；之后 GMU 固件照常回 0xbabeface，但 HFI 队列起不来。HFI 要 GMU 经 GBIF/SMMU 读内存。主线这时走 `a6xx_gmu_force_off` 并让 CX GDSC 真正塌缩，GBIF 和 GPU SMMU 一起复位；我们为了保住 SMMU 设定从不塌缩 CX。
+
+## k222 之后的一批（下一次整编上机）
+
+八项实质改动，文件在 `.tools/handoff/gpu-k223/`，README 里逐项有依据和上机看点。
+
+1. 内核自己的 11 块 GPU 缓冲（SQE、两条 ring、memptrs、pwrup、scratch、两块 4192 KiB 的抢占记录、两页 SMMU 信息，共 8.5 MiB）分配后清理、失效一次，标记为只供设备使用；每次提交的 publish/acquire 遍历跳过它们。k222 的 maintenance 行：提交阶段 45012 次、34,978,416 KiB，全是这类“有内核映射的 BO”，每次提交 8.35 MiB。
+2. 命令流块加 fence（见上）。
+3. 导出一律直接写：k222 同帧 A/B，比较模式 3.98 ms，直接写 3.57 ms。
+4. 运行时 0038：内联首实例的 memoryless 颜色在 Vulkan render pass 里改为 DontCare 载入；布局里仍记着清零，供拆分时带来的后备图像用。内联实例里没有绘制写它（写就拆分），这批让读它的绘制（输入附件）也拆分，所以这次清零谁都看不到。k222：2266×1488 的合成 pass 54 个 bin，每个 bin 都清它（clearCPP=4），3933 次，占 GPU 时间 64%。
+5. 复位照主线 `a6xx_recover`：hang 时 `a6xx_gmu_force_off`（keepalive 关、HFI 停、SPTP 关、RSC 的四个 TCS 空闲、AHB fence 清零并放行、CM3 停、GX 关时排空 GBIF、核心复位），然后关 GX、关 GMU 时钟、让 CX GDSC 塌缩；恢复时先开 CX，按 `arm_smmu_device_reset` 的顺序把 GPU SMMU 的寄存器写回，再冷启动 GMU，之后写回 CX_MISC 的系统缓存设定。`coachz-gpu-recover=0` 保留 k222 的 slumber，`=2` 强制断电但不塌缩 CX，默认 1。诊断：`coachz-gpu-hang-test=N`，驱动起来 N 秒后提交一条永远等不到的 `CP_WAIT_REG_MEM`（轮询 CP_SCRATCH_REG(7)），在完好的 GPU 上跑一次复位。
+6. 运行时 0039 和 Turnip：运行时用一个私有结构告诉 Turnip 内联首实例里哪些 memoryless 颜色没有绘制碰过；Turnip 把它们的子通道引用当作未使用，不分 GMEM、不载入、不清除、不写回，MRT 用零格式（Turnip 实现 `VK_EXT_dynamic_rendering_unused_attachments` 的同一条路）。应用给的子通道不变，管线仍按该形状的兼容 pass 编译。合成 pass 从两个 4 字节附件变成一个，bin 数应从 54 降到约 27；每个绘制在它覆盖的每个 bin 里都要重放（k222 每个绘制约 0.11 ms）。
+7. 内核导入映射的别名检查：每个别名类别维护一份按物理地址排序的导入区间表，新导入排序后与它线性归并一次，代替逐个查找。k222：需要别名检查的导入 1998 次，平均 800 µs。
+8. Turnip：带“没人碰”附件的 pass 只有一次绘制时允许走 sysmem。单次绘制时 sysmem 只写覆盖到的地方一次，GMEM 要载入并写回每个碰到的 bin。k222：一次绘制的 54-bin 合成中位 3.34–3.47 ms（496 次），同类的单次绘制全屏 sysmem pass 约 2.1 ms；另有 6327 个 1-bin 的 GMEM pass，中位 82 µs。
+
+首次开机：`tu_pass.*` 改了，管线缓存身份会变，要重编一遍管线（k219 约 16 s），测量从那之后算。
+
+候选（k222 数据）：导出和呈现合并，或用 DPU 的 VIG 缩放替代呈现 pass（2056 次 × 2.14 ms，10.5%；SSPP 地址是 32 位而 IOSurface 在 4 GiB 以上，直接扫描输出要先启用 apps SMMU）；导出改成片元写（计算着色器 3.57 ms 写 13.5 MB，片元写的呈现 pass 2.14 ms 写 12.4 MB）；canonical 写回只在有读者时做（1331 次 × 1.25 ms GPU，外加每次约 0.8 ms 编码线程 CPU）；UBWC 扫描输出。
+
+## k223 之后的一批：DPU 直接扫描输出（下一次整编上机，`/chosen coachz-dpu-scanout = 1` 才生效）
+
+显示管线直接取渲染服务器画好的那一帧，用 VIG0 的 QSEED3 缩放到面板，代替呈现器每帧在 GPU 上缩放、拷进低 DRAM 那对翻页缓冲（k222：2056 次 × 2.14 ms，约占 GPU 时间 10.5%）。按主线 `drivers/gpu/drm/msm/disp/dpu1` 的做法写：`dpu_plane.c` 算缩放参数，`dpu_hw_sspp.c` 写格式、矩形、地址、像素扩展，`dpu_hw_util.c` 写 QSEED3，`msm_mdss.c` 写 UBWC。文件在 `.tools/handoff/gpu-k224/`。
+
+1. Turnip 导出 `tu_darwin_image_scanout`：给出图像的内核 BO 句柄，以及第 0 级第 0 层的布局：颜色平面和 UBWC 标志平面相对 BO 起点的偏移、行距、平铺方式、是否 UBWC，还有按 `fd6_color_swap` 定的字节顺序（平铺、不可变格式的图像一律按 WZYX 存，即 R,G,B,A）。
+2. 桥接层 `nmb_texture_vk_image`：从运行时纹理取 VkImage。
+3. 插件：一帧的 native 纹理是面板方向、最近一次写已完成（不是只封存），而且布局 DPU 读得了（线性，或 GPU 存出来的 UBWC）时，以 64 字节的 NGPDirect 记录交给内核；内核拒绝就退回拷贝路径，回答 Unsupported 就整段关掉。只用物理方向的 native 纹理，不走 rotation 3 的规范纹理，metal2vulkan rotated 路径和 IOSurface 行距的问题碰不到。
+4. 插件的扫描保护：DPU 可能还在取的纹理由三个引用（翻页中、已锁存、翻缓冲后待锁存）留着；在它所属的帧上开始新的写入时，先把帧换到备用 native 纹理上，nativeValid 置否，下一个 native pass 从规范纹理整帧补种。
+5. 呈现器：COMPLETE_SWAP 带 NGPDirect 时让显示管线显示该帧，锁存后才完成交换；sequence 为 0 用来探询内核是否接受直扫帧；`waitSwap` 等到锁存后放掉不再被取的帧；客户端放弃时先回固件帧缓冲再放。
+6. GPU 框架：`native_adreno_scanout_hold/release`，按调用任务和 BO 句柄找到 BO，只拷出图像那一段窗口的物理页（运行时可能把纹理分在更大的分配里），持住期间不让释放；连接关闭前先请板级放手。
+7. apps SMMU 给显示流 0x800/掩码 0x2 开 bank 2（照 `arm-smmu.c`，先 S2CR 后 SMR）。路由前固件帧缓冲和翻页缓冲按 IOVA = PA 映射好，所以缓冲翻页和 panic 路径不变。
+8. 四个 32 MiB 的 IOVA 槽装持住的图像窗口；页没变就复用映射；之后的翻页锁存了才放掉。
+9. VIG0 读 XBGR/XRGB 线性帧或 UBWC 2.0 帧：格式、解包、op mode、fetch config、UBWC 静态控制、矩形、平面地址和行距、像素扩展。固件留下的寄存器开机时存下，缓冲翻页和 panic 返回之前写回。
+10. QSEED3 3.0 双线性缩放 2266×1488 到 2160×1440：相位步长 2^21 × 源/目标，预载用 QSEED4 的 4/2。
+11. MDSS 的 UBWC_STATIC/CTRL_2/PREDICTION_MODE 按 `msm_mdss_6x_setup_ubwc` 写，UBWC 2.0、最高 bank 位 14，与 GPU 一致。
+
+诊断（不计数）：Turnip 每 64 个 render pass 采样一次绘制 tracepoint（`gpu-k224/draws.py`）；导出的 2D 引擎 A/B；`COACHZ scanout`、`COACHZ flip … direct` 和插件 `CZ direct` 三行计数；`coachz-gpu-hang-test` 改成从 `/chosen` 读（命令行已满，boot-arg 仍作后备）。
+
+主机检查：XNU 的 `coachz_bridge.c` 用内核编译记录 `-fsyntax-only`，没有新增警告；`CoachzGpu.cpp` 严格选项 rc 0；框架和呈现器 `-fsyntax-only` rc 0；Turnip 编译链接通过；插件两个源文件按构建选项 `-Wall -Wextra -Werror` rc 0；各补丁能在固定版本上重现草稿树。
+
+上机看点：`/chosen coachz-dpu-scanout = 1`；`gpu-k224/direct.py` 读日志环。attach 行（bank 2、SMR、两个恒等窗口）；第一帧行（2266x1488 to 2160x1440，UBWC，order 1）；MDP 核心时钟（源和分频，缩放约需 215 MHz）；bank 故障为 0；画面颜色不反、不花、不拉伸、无撕裂；直扫占插件所看帧的比例；GPU-WORK 里 2160×1440 的呈现 pass 按直扫的比例减少：只有 native 纹理已完成的帧走直扫（k222：显示的 1525 帧里 435 帧，约 28%；已封存未完成的 196 帧和方向本来就对的规范帧 809 帧仍走拷贝），所以省下约 3% 的 GPU 时间，不是全部的 10.5%。首次开机：Mesa 有改动，管线缓存身份变了，要重编一遍管线。
+
+## 直接扫描输出的实机结果（上面十一项，后来又带了五项）
+
+第一次上机（186 秒，第 150 秒左右因 CPU5 下线测试 panic，与 GPU 无关）：apps SMMU 的 bank 2 接上，SMR 0x80020800，固件帧缓冲和翻转缓冲按 IOVA = PA 映射；230 帧 UBWC 帧从 2266×1488 缩到 2160×1440 直接扫描，内核没有拒绝，第一帧锁存 8.65 ms。只占 19% 的帧：没直接扫描的帧里 373 帧的 native pass 已封存未完成，514 帧是方向本来就对的规范帧（它们没有 native 纹理，native 路径只截获画进 IOSurface 纹理的 pass），76 帧是旋转过的规范帧。日志里的 4 次“bank 故障”是 FSR.FORMAT（[10:9] = 0b10），不含故障位。每次直接扫描平均有 0.74 次写入撞上屏上那一帧，每次都把备用纹理整帧补种（补种 222 次，之前约 55 次），省下的呈现拷贝基本又花回去了。导出 A/B：2D 引擎（copy_image_to_buffer）中位 1.93 ms，计算着色器 3.71 ms。合成 pass 仍是 54 块、每块清 memoryless 颜色：只在第一个实例就地录制时生效的 0038/0039 没打到它们；有 10 条合成管线写第二个颜色。
+
+随后一批五项：直接扫描帧照主线设 QoS LUT 和 CDP（UBWC：danger 0xffff、safe 0xff00、CREQ 0x0011223344556677、CDP 0xf）；已封存未完成的 native pass 等它完成（最多 50 ms）再直接扫描；换到备用纹理时只补从它的版本到屏上那张之间的损伤区，从屏上那张块拷贝；方向不变的导出一律走 2D 引擎；`native_adreno_scanout_hold` 查找的连接表从 32 扩到 512。另有 FSR 只认故障位、`CZ inline` 计数两项诊断。
+
+第二次上机（281 秒，4393 次提交，没有挂起）：直接扫描 1375 帧，占 51%，0 次拒绝，0 次 SMMU 故障，锁存平均 13.5 ms；封存帧等待 848 次、平均 10.9 ms，只有 16 次超时，还走拷贝的封存帧剩 10 帧；按损伤区补种 1220 次，块拷贝平均 0.71 ms，但合成每帧的损伤基本覆盖全屏（平均 3.37 Mpix），整帧补种降到 121 次；导出全部走 2D 引擎，中位 1.57 ms；呈现拷贝的 GPU 占比从 9.6% 降到 5.0%。`CZ inline`：没在主命令缓冲里就地录制的 pass 中，第一次绘制写 memoryless 颜色的 5016 个、其余绘制原因 2710 个、动作 207 个、memoryless 87 个。GPU 时间 46.2 s 里 2266×1488 的 54 块合成约 29 s（64%），是现在最大的一块；单次绘制的合成在系统内存里 1.67 ms，在 GMEM 里 6.85 ms。
+
+下一步：方向本来就对的规范帧（约 43% 的拷贝帧）要直接扫描，需要先让它们有自己的 native 纹理；合成 pass 的 memoryless 暂存确实被写，不能去掉，下一项是让多次绘制的合成也能走系统内存（给暂存分配内存、开 UBWC），避开 54 块的重放。

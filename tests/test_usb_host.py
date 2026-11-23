@@ -74,7 +74,7 @@ class UsbHostTests(unittest.TestCase):
         series = [line for line in (ROOT / 'platform/coachz-prelink/patches/xnu/series').read_text().splitlines()
                   if line and not line.startswith('#')]
         self.assertIn('coachz-prelink-usb-host.patch', series)
-        self.assertEqual(series[-3:], ['coachz-prelink-baseband.patch', 'coachz-prelink-video-decoder.patch', 'coachz-prelink-early-log.patch'])
+        self.assertEqual(series[-4:], ['coachz-prelink-baseband.patch', 'coachz-prelink-video-decoder.patch', 'coachz-prelink-early-log.patch', 'coachz-prelink-gpu-malloc.patch'])
         patch = (ROOT / 'platform/coachz-prelink/patches/xnu/coachz-prelink-usb-host.patch').read_text()
         self.assertIn('+++ b/iokit/Kernel/IOCatalogue.cpp', patch)
         self.assertIn('PE_parse_boot_argn("coachz-usb-host"', patch)

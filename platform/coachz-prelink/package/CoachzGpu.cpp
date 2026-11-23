@@ -24,6 +24,8 @@
 #include "CoachzGpuHang.h"
 #include "NativeAdrenoTimer.h"
 #include "AdrenoPM4.h"
+#include "ArmSmmu4KLive.h"
+#include <pexpert/device_tree.h>
 
 extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *, NativeAdrenoSubmit *, NativeAdrenoRing *, const NativeAdrenoRingClock *,
     const NativeAdrenoTimer *, const NativeAdrenoAbiDeviceInfo *, uint32_t, uint32_t);
@@ -52,6 +54,8 @@ extern volatile uint32_t native_adreno_ib_probe_small[16], native_adreno_ib_prob
 extern volatile uint32_t native_adreno_lock_holder[2], native_adreno_lock_hold_max[32];
 extern volatile uint64_t native_adreno_view_lock[4];
 extern volatile uint32_t native_adreno_method_stats[20][4];
+extern volatile uint64_t native_adreno_maint_phase[8][2], native_adreno_publish_kinds[4][2];
+extern volatile uint64_t native_adreno_vm_phase_us[2][8], native_adreno_vm_kind_us[5][3];
 }
 extern "C" unsigned NativeAdrenoGpuContextInputBits();
 // The framework's two weak board hooks. [1] of the first is the GPU's current level, which it notes per job. The second names a process still mapping a
@@ -61,6 +65,7 @@ extern "C" unsigned int native_pmap_user_mappings(unsigned int, void **, uint64_
 extern "C" void (*volatile native_adreno_power_get)(void);
 extern "C" int coachz_gpu_pm_suspend(void);
 extern "C" int coachz_gpu_pm_resume(void);
+extern "C" int coachz_gpu_pm_force_off(int collapse);
 extern "C" void coachz_gpu_pm_arm(void);
 // NativeAdrenoPublish.cpp's per-process table (first eight process names that opened the plug-in type) and its latest mount failure:
 // [0] 1 no free slot, 2 the core's open, 3 the window scope; [1] IOReturn; [2] slot; [3] failures so far.
@@ -80,7 +85,7 @@ extern "C" int boot_log_export_put(uint32_t, uint32_t, uint32_t, const void *, u
 namespace {
 enum : uint32_t {
     CpSqeCntl = 0x0808, CpSqeInstrBase = 0x0830, RbbmSecvidTrustCntl = 0xf400, RbbmStatus = 0x0210, RbbmInt0Status = 0x0201, CpHwFault = 0x0821,
-    CpProtectStatus = 0x0824, Pm4MeInit = 0x48, SmmuScr0 = 0, SmmuSgfsr = 0x48,
+    CpProtectStatus = 0x0824, Pm4MeInit = 0x48, Pm4WaitRegMem = 0x3c, CpScratch7 = 0x088a, SmmuScr0 = 0, SmmuSgfsr = 0x48,
     // What the kit requires of the global configuration before it routes a stream: global fault interrupt and reports on, an unmatched stream faults.
     SmmuKitGlobal = (1u << 2) | (1u << 10), SmmuS2cr = 0xc00, SmmuS2crFault = 2u << 16, SmmuGroups = 6, SmmuGmuGroup = 1
 };
@@ -646,6 +651,35 @@ void stampReport() {
                 at += static_cast<size_t>(snprintf(line + at, sizeof(line) - at, " m%u %u/%u %uus", m, calls, native_adreno_method_stats[m][1],
                     native_adreno_method_stats[m][3] / calls));
         printf("%s\n", line);
+        // Cache maintenance by phase (NativeAdrenoNotePhase: allocate, map, submit, unmap, complete, table, diagnostic), calls and KiB, and the
+        // submission phase's by kind of memory (imports, write-combined BOs maintained because write combine is distrusted, system memory,
+        // BOs of a kernel mapping). k221: the walk before each submission still took 854 us.
+        // Formatted here and printed as one string: the kernel's printf encodes its arguments for os_log, and 25 of them overran the
+        // encoder (k222: log_encode.c "log_fits_cmd" panic right after this row).
+        char wide[512];
+        const volatile uint64_t (*m)[2] = native_adreno_maint_phase;
+        const volatile uint64_t (*k)[2] = native_adreno_publish_kinds;
+        snprintf(wide, sizeof(wide), "COACHZ gpu maintenance: alloc %llu/%llu map %llu/%llu submit %llu/%llu unmap %llu/%llu complete %llu/%llu "
+                 "table %llu/%llu KiB; submit import %llu/%llu wc %llu/%llu system %llu/%llu mapped %llu/%llu KiB",
+            m[1][0], m[1][1], m[2][0], m[2][1], m[3][0], m[3][1], m[4][0], m[4][1], m[5][0], m[5][1], m[6][0], m[6][1],
+            k[0][0], k[0][1], k[1][0], k[1][1], k[2][0], k[2][1], k[3][0], k[3][1]);
+        printf("%s\n", wide);
+        // The VM's table transactions (NativeAdrenoVm::map and unmap), us in total per phase: map preflight, observe, publish, tables, insert;
+        // unmap observe, acquire, tables, erase, retire; the slowest call and the MiB mapped; then by kind {calls, us} (own BOs, imports without
+        // and with the alias pass, unmaps by page TLBIs and by ASID). The method tally's clock times them (NativeAdrenoUserClient), and nothing
+        // printed them before. k221: BoMap 517 us and BoFree 421 us on average.
+        // Two rows, each formatted here and printed as one string (see the maintenance row).
+        const volatile uint64_t (*vp)[8] = native_adreno_vm_phase_us;
+        const volatile uint64_t (*kv)[3] = native_adreno_vm_kind_us;
+        snprintf(wide, sizeof(wide), "COACHZ gpu vm map: %llu pre %llu obs %llu pub %llu tab %llu ins %llu max %llu us %llu MiB; own %llu/%llu "
+                 "import %llu/%llu alias %llu/%llu us",
+            vp[0][0], vp[0][5], vp[0][1], vp[0][2], vp[0][3], vp[0][4], vp[0][6], vp[0][7] >> 20, kv[0][0], kv[0][1], kv[1][0], kv[1][1],
+            kv[2][0], kv[2][1]);
+        printf("%s\n", wide);
+        snprintf(wide, sizeof(wide), "COACHZ gpu vm unmap: %llu obs %llu acq %llu tab %llu erase %llu ret %llu max %llu us; pages %llu/%llu "
+                 "asid %llu/%llu us",
+            vp[1][0], vp[1][1], vp[1][2], vp[1][3], vp[1][4], vp[1][5], vp[1][6], kv[3][0], kv[3][1], kv[4][0], kv[4][1]);
+        printf("%s\n", wide);
     }
 }
 
@@ -989,6 +1023,9 @@ unsigned governorTarget(unsigned level, uint64_t dBusy, uint64_t dAlways, bool t
 // Runtime power for A618 (no IFPC): 66 ms after the last work retires the GMU slumbers, and the next submission
 // brings it back through the whole start. Armed by the power button (coachz_gpu_pm_arm), so a failure can only follow that press.
 volatile uint32_t gPmArmed;
+// CX_MISC (sc7180.dtsi's cx_mem), mapped by cacheSetup: it lies in the CX domain, so a restart that collapses CX writes its system cache
+// control back (a6xx_pm_resume's a6xx_llc_activate).
+vm_offset_t gCxMisc;
 volatile uint64_t gPmLastSubmit, gPmLastBusy;
 uint32_t gPmRetireHolds, gPmBusyHolds;
 uint32_t gPmSleeps, gPmWakes;
@@ -1003,6 +1040,19 @@ void pmSleep() {
     const int status = coachz_gpu_pm_suspend();
     gPmSleeps = gPmSleeps + 1;
     printf("COACHZ gpu pm: slumber %u status %d in %llu us\n", gPmSleeps, status, (mach_absolute_time() - began) / 19);
+}
+// a6xx_recover's power-off of a hung GPU (coachz_gpu_pm_force_off, a6xx_gmu_force_off and with collapse the CX collapse), entered as pmSleep
+// enters the slumber: the GMU's and the core's interrupts masked, the core's users waited out.
+void pmForceOff(int collapse) {
+    const uint64_t began = mach_absolute_time();
+    *reinterpret_cast<volatile uint32_t *>(gGmu + GmuAoMask) = ~0u;   // a6xx_gmu_irq_disable
+    *reinterpret_cast<volatile uint32_t *>(gGmu + GmuHfiMask) = ~0u;
+    coreWrite(RbbmInt0Mask, 0);
+    __atomic_store_n(&gPmAsleep, 1u, __ATOMIC_SEQ_CST);
+    while (__atomic_load_n(&gPmUsers, __ATOMIC_SEQ_CST)) IODelay(1);
+    profilePowerPut();
+    const int status = coachz_gpu_pm_force_off(collapse);
+    printf("COACHZ gpu recover: force off status %d collapse %d in %llu us\n", status, collapse, (mach_absolute_time() - began) / 19);
 }
 // Under the publisher's lock, before a submission: the firmware and hw_init again, then what startCp does after them.
 void pmGet() {
@@ -1044,13 +1094,25 @@ void pmGet() {
 // GX collapsed), then the cold start and hw_init of a resume (msm_gpu_hw_init). Between the reset and the CP init the ring restarts at the
 // hung fence (NativeAdrenoRing::restart), and the CP init goes without a fence and is waited for with a6xx_idle, so the submissions the
 // framework replays keep their numbers. Without this hook a hang was only counted and every client waited on the stuck fence forever.
+// The power-off is a6xx_recover's for a hung GPU (gRecoverMode 1, coachz-gpu-recover): a6xx_gmu_force_off, then GX and CX collapsed, which
+// resets the GBIF and the GPU SMMU; the SMMU's registers and CX_MISC's system cache control are written back before the cold start.
+// k222 took the runtime slumber instead (coachz-gpu-recover=0): its GBIF halt waited 100 ms in vain, and the start after it stopped where
+// the HFI queues start. 2 forces off with CX left on.
 uint32_t gRestarts, gRestartFailures;
+unsigned gRecoverMode = 1;
 IOReturn gpuRestart(void *, NativeAdrenoRing *ring, uint32_t completed) {
     const uint64_t began = mach_absolute_time();
-    const uint32_t rbbm = __atomic_load_n(&gPmAsleep, __ATOMIC_SEQ_CST) ? 0 : coreRead(0x0210);
-    if (!__atomic_load_n(&gPmAsleep, __ATOMIC_SEQ_CST)) {
+    const bool awake = !__atomic_load_n(&gPmAsleep, __ATOMIC_SEQ_CST);
+    const uint32_t rbbm = awake ? coreRead(0x0210) : 0;
+    uint32_t misc[2] = {};
+    if (awake && gCxMisc) {
+        misc[0] = *reinterpret_cast<volatile uint32_t *>(gCxMisc + 4);
+        misc[1] = *reinterpret_cast<volatile uint32_t *>(gCxMisc + 8);
+    }
+    if (awake) {
         coreWrite(CpSqeCntl, 3);
-        pmSleep();
+        if (gRecoverMode == 1 || gRecoverMode == 2) pmForceOff(gRecoverMode == 1);
+        else pmSleep();
     }
     const int status = coachz_gpu_pm_resume();
     if (status) {
@@ -1060,6 +1122,13 @@ IOReturn gpuRestart(void *, NativeAdrenoRing *ring, uint32_t completed) {
         return kIOReturnNotResponding;
     }
     __atomic_store_n(&gPmAsleep, 0u, __ATOMIC_SEQ_CST);
+    if (awake && gCxMisc && (gRecoverMode == 1 || gRecoverMode == 2)) {
+        // a6xx_llc_activate's order: SYSTEM_CACHE_CNTL_1, then CNTL_0.
+        *reinterpret_cast<volatile uint32_t *>(gCxMisc + 8) = misc[1];
+        __asm__ volatile("dsb sy" ::: "memory");
+        *reinterpret_cast<volatile uint32_t *>(gCxMisc + 4) = misc[0];
+        __asm__ volatile("dsb sy" ::: "memory");
+    }
     coreWrite(CpSqeInstrBase, uint32_t(gBuffers[0].iova));
     coreWrite(CpSqeInstrBase + 1, uint32_t(gBuffers[0].iova >> 32));
     const IOReturn restarted = ring->restart(completed);
@@ -1226,6 +1295,7 @@ void speedBinReport() {
 
 void cacheSetup() {
     const vm_offset_t llcc = ml_io_map(0x09200000, 0x31000), broadcast = ml_io_map(0x09600000, 0x22000), misc = ml_io_map(0x0509e000, 0x1000);
+    gCxMisc = misc;
     auto read = [](vm_offset_t at) {return *reinterpret_cast<volatile uint32_t *>(at);};
     auto write = [](vm_offset_t at, uint32_t value) {
         *reinterpret_cast<volatile uint32_t *>(at) = value;
@@ -1489,7 +1559,454 @@ void appsSmmuProbe() {
         page == 0x1000 ? "" : " (64 KiB pages: CBARs not read)");
 }
 
+// ---- Direct scanout (/chosen coachz-dpu-scanout = 1) ----
+// The display pipe fetches the render server's frame where the GPU rendered it and its scaler fits it to the panel, instead of the
+// presenter's scaled GPU copy into the flip buffers (k221: presentation about 10.5 % of GPU time). Mainline does the same for a plane
+// (dpu_plane.c over dpu_hw_sspp.c; the pipe itself in bsd/dev/coachz_bridge.c, coachz_scanout_direct). The plug-in names the frame by its
+// BO handle and Turnip's layout of it (tu_darwin_image_scanout); the framework holds the BO's pages (native_adreno_scanout_hold); the pipe
+// reads them through a context of the apps SMMU of its own, as arm-smmu.c attaches mdss_mdp (sc7180.dtsi: iommus = <&apps_smmu 0x800 0x2>)
+// and as CoachzVenus.cpp attaches the codec: the BOs lie above 4 GiB and the pipe's addresses have 32 bits. Until the stream is routed
+// the pipe scans physical addresses, so the firmware framebuffer and the flip buffers are mapped at IOVA = PA for good, before the SMR is
+// written: the buffer flips and the panic path's return work unchanged. A frame stays held until a later flip has latched.
+namespace {
+// NativeGOPWire.h NGPDirect, the record COMPLETE_SWAP carries for a direct frame.
+struct DirectRequest {
+    uint64_t sequence;
+    uint32_t status, reserved;
+    uint64_t handle;
+    uint32_t color_offset, meta_offset, meta_bytes, color_pitch, meta_pitch, width, height, ubwc, order, pad;
+};
+static_assert(sizeof(DirectRequest) == 64, "NGPDirect");
+}  // namespace
+extern "C" {
+// bsd/dev/coachz_bridge.c, which declares the same record.
+struct coachz_scanout_frame {uint32_t color, meta, color_pitch, meta_pitch, width, height, ubwc, order, tag;};
+int coachz_scanout_direct(const struct coachz_scanout_frame *frame);
+uint32_t coachz_scanout_busy(void);
+void coachz_scanout_flip_wait(void);
+void coachz_scanout_home(void);
+uint64_t coachz_scanout_display_window(uint64_t *bytes);
+IOReturn native_adreno_scanout_hold(task_t task, uint64_t handle, uint64_t offset, uint64_t length, NativeAdrenoPhysicalSpan *spans, size_t capacity,
+    size_t *count, uint64_t *bytes, void **connection);
+void native_adreno_scanout_release(void *connection, uint64_t handle);
+extern void (*native_adreno_scanout_closing)(void *connection);
+vm_offset_t ml_io_map(vm_offset_t physical, vm_size_t size);
+void dcache_incoherent_io_flush64(addr64_t pa, unsigned int count, unsigned int remaining, unsigned int *res);
+// [0] direct frames shown, [1] slot mappings made, [2] reused, [3] refused (any reason), [4] the last refusal's code, [5] SMMU attach
+// state (0 not tried, 1 up, 2 failed), [6] releases, [7] closing connections let go, [8] mapping time total (us), [9] the longest (us),
+// [10] spans of the last mapping, [11] latch time total (us), [12] the longest latch (us), [13] bank faults seen (FSR nonzero).
+volatile uint64_t coachz_gpu_direct[14];
+}
+namespace {
+constexpr uint64_t kAppsSmmu = 0x15000000, kAppsSmmuBytes = 0x100000;
+constexpr uint32_t kMdpStream = 0x800, kMdpStreamMask = 0x2;
+constexpr unsigned kDirectSlots = 4, kDirectAsid = 3, kDirectPoll = 1000000;
+constexpr uint64_t kDirectSlotIova = 0x10000000, kDirectSlotBytes = 32ull << 20, kDirectArenaBytes = 0xfff00000;
+constexpr size_t kDirectSpans = 8192, kDirectTablePages = 192, kTablePage = 4096;
+unsigned gDirectEnabled;
+IOLock *gDirectLock;
+// The SMMU as three mapped pages, as CoachzVenus.cpp has it: GR0, GR1 and the bank's own page.
+struct DirectWindow {volatile uint8_t *gr0, *gr1, *cb; uint64_t cb_offset;};
+DirectWindow gDirectSmmu;
+volatile uint8_t *directAt(void *c, size_t at, size_t width) {
+    const DirectWindow *w = static_cast<DirectWindow *>(c);
+    if (at & (width - 1)) return nullptr;
+    if (at + width <= 0x1000) return w->gr0 ? w->gr0 + at : nullptr;
+    if (at >= 0x1000 && at + width <= 0x2000) return w->gr1 ? w->gr1 + (at - 0x1000) : nullptr;
+    if (w->cb && at >= w->cb_offset && at + width <= w->cb_offset + 0x1000) return w->cb + (at - w->cb_offset);
+    return nullptr;
+}
+int directRead32(void *c, size_t at, uint32_t *v) {volatile uint8_t *p = directAt(c, at, 4); if (!p) return 1; *v = *reinterpret_cast<volatile uint32_t *>(p); return 0;}
+int directRead64(void *c, size_t at, uint64_t *v) {volatile uint8_t *p = directAt(c, at, 8); if (!p) return 1; *v = *reinterpret_cast<volatile uint64_t *>(p); return 0;}
+int directWrite32(void *c, size_t at, uint32_t v) {volatile uint8_t *p = directAt(c, at, 4); if (!p) return 1; *reinterpret_cast<volatile uint32_t *>(p) = v; return 0;}
+int directWrite64(void *c, size_t at, uint64_t v) {volatile uint8_t *p = directAt(c, at, 8); if (!p) return 1; *reinterpret_cast<volatile uint64_t *>(p) = v; return 0;}
+int directBarrier(void *) {__asm__ volatile("dsb sy" ::: "memory"); return 0;}
+const ArmSmmu4KIo gDirectIo = {&gDirectSmmu, kAppsSmmuBytes, directRead32, directRead64, directWrite32, directWrite64, directBarrier};
+uint32_t directGr0(size_t at) {uint32_t v = 0; directRead32(&gDirectSmmu, at, &v); return v;}
+void directGr0Write(size_t at, uint32_t v) {directWrite32(&gDirectSmmu, at, v); directBarrier(nullptr);}
+// The table pool: contiguous cacheable pages, cleaned to memory for the SMMU's walks (coherent_walk 0).
+struct DirectPool {IOBufferMemoryDescriptor *md; uint8_t *va; uint64_t pa; size_t used;};
+DirectPool gDirectPool;
+void directClean(uint64_t physical, uint64_t bytes) {unsigned int result = 0; dcache_incoherent_io_flush64(physical, static_cast<unsigned>(bytes), 0, &result);}
+int directAllocate(void *, uint64_t *physical, volatile uint64_t **mapping) {
+    if (gDirectPool.used >= kDirectTablePages) return 1;
+    uint8_t *page = gDirectPool.va + gDirectPool.used * kTablePage;
+    bzero(page, kTablePage);
+    directClean(gDirectPool.pa + gDirectPool.used * kTablePage, kTablePage);
+    *physical = gDirectPool.pa + gDirectPool.used * kTablePage;
+    *mapping = reinterpret_cast<volatile uint64_t *>(page);
+    ++gDirectPool.used;
+    return 0;
+}
+volatile uint64_t *directFind(void *, uint64_t physical) {
+    if (physical < gDirectPool.pa || physical >= gDirectPool.pa + gDirectPool.used * kTablePage || (physical & (kTablePage - 1))) return nullptr;
+    return reinterpret_cast<volatile uint64_t *>(gDirectPool.va + (physical - gDirectPool.pa));
+}
+int directOverlaps(void *, uint64_t physical, uint64_t bytes) {
+    return physical < gDirectPool.pa + kDirectTablePages * kTablePage && gDirectPool.pa < physical + bytes;
+}
+int directPublish(void *, volatile uint64_t *page, size_t bytes) {
+    const uint8_t *at = reinterpret_cast<const uint8_t *>(const_cast<uint64_t *>(page));
+    if (at < gDirectPool.va || at + bytes > gDirectPool.va + kDirectTablePages * kTablePage) return 1;
+    directClean(gDirectPool.pa + static_cast<uint64_t>(at - gDirectPool.va), bytes);
+    directBarrier(nullptr);
+    return 0;
+}
+const ArmSmmu4KTablePages gDirectPages = {nullptr, directAllocate, directFind, directOverlaps};
+const ArmSmmu4KLiveVisibility gDirectVisibility = {nullptr, directPublish};
+ArmSmmu4KLiveArena gDirectArena;
+ArmSmmu4KLiveState gDirectState;
+ArmSmmu4KContextConfig gDirectContext;
+unsigned gDirectBank;
+uint64_t gDirectCbOffset;
+// The mapped ranges, sorted by IOVA as the kit wants them: each slot's at its own window, then the two fixed windows (flip buffers,
+// firmware framebuffer) at IOVA = PA, which lie above every slot.
+struct DirectSlot {
+    void *connection;              // non-null while held: the pipe may fetch it
+    task_t task;
+    uint64_t handle, start, bytes;  // the object and the window of it (an image inside a larger allocation) the slot maps
+    ArmSmmu4KRange *ranges;        // what the slot's window maps now (kept after a release, for reuse)
+    size_t count;
+    uint64_t used;
+};
+DirectSlot gSlots[kDirectSlots];
+ArmSmmu4KRange gFixed[2];
+size_t gFixedCount;
+ArmSmmu4KRange *gAllRanges;        // the composed list handed to the kit
+NativeAdrenoPhysicalSpan *gHeldSpans;
+uint64_t gDirectClock;
+
+size_t directCompose() {
+    size_t n = 0;
+    for (const DirectSlot &slot : gSlots) for (size_t i = 0; i < slot.count; ++i) gAllRanges[n++] = slot.ranges[i];
+    for (size_t i = 0; i < gFixedCount; ++i) gAllRanges[n++] = gFixed[i];
+    return n;
+}
+bool directChange(const ArmSmmu4KRange *changes, size_t count, unsigned map) {
+    const ArmSmmu4KLiveRegion lower = {&gDirectArena, &gDirectState, gAllRanges, directCompose()};
+    ArmSmmu4KLiveResult done = {};
+    const ArmSmmu4KStatus status = ArmSmmu4KLiveUpdateContextBatch(&gDirectIo, gDirectBank, &gDirectContext, &lower, nullptr, 0, &gDirectVisibility,
+        changes, count, map, kDirectPoll, &done);
+    if (status != ArmSmmu4KSuccess) {
+        printf("COACHZ scanout: SMMU %s of %zu ranges failed: %d (complete %u), %zu table pages\n", map ? "map" : "unmap", count, status,
+            done.complete, gDirectPool.used);
+        return false;
+    }
+    return true;
+}
+// Attaches the display's streams to a bank of their own (arm_smmu_attach_dev, then arm_smmu_write_sme: S2CR before SMR). Needs the apps
+// SMMU enabled (the USB host does it, CoachzUsbHost.cpp; with CLIENTPD every master bypasses it and the BOs above 4 GiB are out of reach).
+bool directAttach() {
+    gDirectSmmu.gr0 = reinterpret_cast<volatile uint8_t *>(ml_io_map(kAppsSmmu, 0x1000));
+    gDirectSmmu.gr1 = reinterpret_cast<volatile uint8_t *>(ml_io_map(kAppsSmmu + 0x1000, 0x1000));
+    if (!gDirectSmmu.gr0 || !gDirectSmmu.gr1) {printf("COACHZ scanout: no SMMU window\n"); return false;}
+    const uint32_t scr0 = directGr0(0x0), idr0 = directGr0(0x20), idr1 = directGr0(0x24), idr2 = directGr0(0x28);
+    const unsigned smrs = idr0 & 0xff, banks = idr1 & 0xff, pagesize = (idr1 >> 31) ? 0x10000 : 0x1000;
+    const unsigned numpage = 1u << (((idr1 >> 28) & 7) + 1);
+    if (scr0 & 1u) {printf("COACHZ scanout: the apps SMMU is not enabled (sCR0 0x%x)\n", scr0); return false;}
+    if (pagesize != 0x1000 || !smrs || banks <= 2) {printf("COACHZ scanout: unexpected SMMU layout\n"); return false;}
+    // The display's streams must still bypass (no SMR of theirs), and a stream match must be free.
+    unsigned freeSmr = smrs;
+    for (unsigned i = 0; i < smrs; ++i) {
+        const uint32_t smr = directGr0(0x800 + 4 * i);
+        const uint32_t id = smr & 0xffff, mask = (smr >> 16) & 0x7fff;
+        if ((smr >> 31) && !((kMdpStream ^ id) & ~(mask | kMdpStreamMask))) {printf("COACHZ scanout: SMR %u 0x%x already matches the display\n", i, smr); return false;}
+        if (!(smr >> 31) && freeSmr == smrs) freeSmr = i;
+    }
+    if (freeSmr == smrs) {printf("COACHZ scanout: no free stream match\n"); return false;}
+    // Bank 2: the USB host has bank 0 and the codec bank 1 (CoachzVenus.cpp). It must not be routed to or enabled.
+    gDirectBank = 2;
+    bool routed = false;
+    for (unsigned i = 0; i < smrs && !routed; ++i) routed = (directGr0(0x800 + 4 * i) >> 31) && (directGr0(0xc00 + 4 * i) & 0xff) == gDirectBank;
+    gDirectCbOffset = static_cast<uint64_t>(numpage) * pagesize + static_cast<uint64_t>(gDirectBank) * pagesize;
+    if (gDirectCbOffset + 0x1000 > kAppsSmmuBytes) {printf("COACHZ scanout: bank page outside the SMMU\n"); return false;}
+    gDirectSmmu.cb = reinterpret_cast<volatile uint8_t *>(ml_io_map(kAppsSmmu + gDirectCbOffset, 0x1000));
+    gDirectSmmu.cb_offset = gDirectCbOffset;
+    uint32_t sctlr = 0;
+    if (!gDirectSmmu.cb || directRead32(&gDirectSmmu, gDirectCbOffset, &sctlr) || routed || (sctlr & 1)) {
+        printf("COACHZ scanout: context bank %u not free (routed %d SCTLR 0x%x)\n", gDirectBank, routed, sctlr);
+        return false;
+    }
+    uint64_t oneBuffer = 0;
+    const uint64_t home = coachz_scanout_display_window(&oneBuffer);
+    if (!home || !oneBuffer) {printf("COACHZ scanout: the flip buffers are not prepared\n"); return false;}
+    gDirectPool.md = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+        static_cast<IOOptionBits>(kIODirectionInOut) | static_cast<IOOptionBits>(kIOMemoryPhysicallyContiguous), kDirectTablePages * kTablePage,
+        0x0000000ffffff000ULL);
+    if (!gDirectPool.md || gDirectPool.md->prepare() != kIOReturnSuccess) {printf("COACHZ scanout: no table pool\n"); return false;}
+    gDirectPool.va = static_cast<uint8_t *>(gDirectPool.md->getBytesNoCopy());
+    gDirectPool.pa = gDirectPool.md->getPhysicalAddress();
+    gAllRanges = static_cast<ArmSmmu4KRange *>(IOMallocData((kDirectSlots * kDirectSpans + 2) * sizeof(ArmSmmu4KRange)));
+    gHeldSpans = static_cast<NativeAdrenoPhysicalSpan *>(IOMallocData(kDirectSpans * sizeof(NativeAdrenoPhysicalSpan)));
+    for (DirectSlot &slot : gSlots) slot.ranges = static_cast<ArmSmmu4KRange *>(IOMallocData(kDirectSpans * sizeof(ArmSmmu4KRange)));
+    for (const DirectSlot &slot : gSlots) if (!slot.ranges) return false;
+    if (!gAllRanges || !gHeldSpans) return false;
+    uint64_t root = 0;
+    volatile uint64_t *rootMapping = nullptr;
+    if (directAllocate(nullptr, &root, &rootMapping)) return false;
+    gDirectArena.config = {32, 36, root, static_cast<size_t>(kDirectArenaBytes / kTablePage)};
+    gDirectArena.iova = 0;
+    gDirectArena.bytes = kDirectArenaBytes;
+    gDirectArena.upper_region = 0;
+    gDirectArena.pages = &gDirectPages;
+    ArmSmmu4KStatus status = ArmSmmu4KLivePrepare(&gDirectArena, &gDirectState);
+    if (status != ArmSmmu4KSuccess) {printf("COACHZ scanout: arena not prepared: %d\n", status); return false;}
+    directPublish(nullptr, rootMapping, kTablePage);
+    gDirectContext.lower = &gDirectArena.config;
+    gDirectContext.lower_tables = &gDirectState.tables;
+    gDirectContext.upper = nullptr;
+    gDirectContext.upper_tables = nullptr;
+    gDirectContext.id0 = idr0;
+    gDirectContext.id2 = idr2;
+    gDirectContext.asid = kDirectAsid;
+    gDirectContext.coherent_walk = 0;
+    gDirectContext.stall_on_fault = 0;
+    gDirectContext.continue_after_fault = 0;
+    gDirectContext.ttbr0_switched = 0;
+    ArmSmmu4KProgramResult programmed = {};
+    status = ArmSmmu4KProgramDisabledContext(&gDirectIo, gDirectBank, &gDirectContext, kDirectPoll, &programmed);
+    if (status != ArmSmmu4KSuccess) {printf("COACHZ scanout: context bank %u not programmed: %d (phase %u)\n", gDirectBank, status, programmed.phase); return false;}
+    // What the pipe scans before any direct frame, at IOVA = PA: the flip buffers (low memory) and the firmware framebuffer. Read only,
+    // normal non-cacheable, outer shareable, as io-pgtable-arm maps for a master that does not snoop.
+    const uint64_t flipBytes = (2 * oneBuffer + kTablePage - 1) & ~(kTablePage - 1), homeBytes = (oneBuffer + kTablePage - 1) & ~(kTablePage - 1);
+    const uint64_t flipBase = 0x82400000ull;
+    if (flipBase + flipBytes > home && home + homeBytes > flipBase) {printf("COACHZ scanout: fixed windows overlap\n"); return false;}
+    const ArmSmmu4KRange low = {flipBase, flipBase, flipBytes, ArmSmmu4KRead, 0, 2}, high = {home, home, homeBytes, ArmSmmu4KRead, 0, 2};
+    gFixed[0] = flipBase < home ? low : high;
+    gFixed[1] = flipBase < home ? high : low;
+    if (gFixed[0].iova < kDirectSlotIova + kDirectSlots * kDirectSlotBytes || gFixed[1].iova + gFixed[1].bytes > kDirectArenaBytes) {
+        printf("COACHZ scanout: fixed windows at 0x%llx and 0x%llx outside the arena's room\n", gFixed[0].iova, gFixed[1].iova);
+        return false;
+    }
+    if (!directChange(gFixed, 2, 1)) return false;
+    gFixedCount = 2;
+    directGr0Write(0xc00 + 4 * freeSmr, gDirectBank);
+    directGr0Write(0x800 + 4 * freeSmr, (1u << 31) | kMdpStreamMask << 16 | kMdpStream);
+    directGr0Write(0x68, 0);   // TLBIALLNSNH
+    directGr0Write(0x70, 0);   // TLBGSYNC
+    unsigned polls = 0;
+    while ((directGr0(0x74) & 1) && ++polls < kDirectPoll) {}
+    printf("COACHZ scanout: apps SMMU bank %u, SMR %u 0x%x, windows 0x%llx+0x%llx and 0x%llx+0x%llx at IOVA = PA, %zu table pages\n", gDirectBank,
+        freeSmr, directGr0(0x800 + 4 * freeSmr), gFixed[0].iova, gFixed[0].bytes, gFixed[1].iova, gFixed[1].bytes, gDirectPool.used);
+    return true;
+}
+void directRelease(DirectSlot &slot) {
+    if (!slot.connection) return;
+    native_adreno_scanout_release(slot.connection, slot.handle);
+    slot.connection = nullptr;
+    coachz_gpu_direct[6] = coachz_gpu_direct[6] + 1;
+}
+// Lets go of every held frame the pipe no longer fetches (coachz_scanout_busy: bit n for slot n - 1). Under gDirectLock.
+void directReleaseIdle() {
+    const uint32_t busy = coachz_scanout_busy();
+    for (unsigned k = 0; k < kDirectSlots; ++k) if (!(busy & (1u << (k + 1)))) directRelease(gSlots[k]);
+}
+uint64_t directNowUs() {uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time(), &ns); return ns / 1000;}
+// The slot for this window of an object: the one already holding it, or a free one (not fetched, not held), the least recently used
+// unless another still maps the same pages; its old mapping is replaced. The object is held on return. The slot maps the window at its
+// own start: IOVA = slot + (offset - start).
+bool directSameMapping(const DirectSlot &slot, uint64_t base, task_t task, uint64_t handle, uint64_t start, uint64_t bytes, size_t count) {
+    if (slot.task != task || slot.handle != handle || slot.start != start || slot.bytes != bytes || slot.count != count) return false;
+    for (size_t i = 0; i < count; ++i)
+        if (slot.ranges[i].physical != gHeldSpans[i].physical || slot.ranges[i].bytes != gHeldSpans[i].bytes ||
+            slot.ranges[i].iova != base + (gHeldSpans[i].offset - start))
+            return false;
+    return true;
+}
+int directSlotFor(task_t task, uint64_t handle, uint64_t start, uint64_t bytes) {
+    ++gDirectClock;
+    for (unsigned k = 0; k < kDirectSlots; ++k) {
+        DirectSlot &slot = gSlots[k];
+        if (slot.connection && slot.task == task && slot.handle == handle && slot.start == start && slot.bytes == bytes) {slot.used = gDirectClock; return int(k);}
+    }
+    size_t count = 0;
+    uint64_t objectBytes = 0;
+    void *connection = nullptr;
+    const IOReturn held = native_adreno_scanout_hold(task, handle, start, bytes, gHeldSpans, kDirectSpans, &count, &objectBytes, &connection);
+    if (held) {coachz_gpu_direct[4] = uint32_t(held); return -1;}
+    const uint32_t busy = coachz_scanout_busy();
+    int pick = -1;
+    for (unsigned k = 0; k < kDirectSlots; ++k) {
+        const DirectSlot &slot = gSlots[k];
+        if (slot.connection || (busy & (1u << (k + 1)))) continue;
+        if (directSameMapping(slot, kDirectSlotIova + k * kDirectSlotBytes, task, handle, start, bytes, count)) {pick = int(k); break;}
+        if (pick < 0 || slot.used < gSlots[pick].used) pick = int(k);
+    }
+    if (pick < 0) {native_adreno_scanout_release(connection, handle); coachz_gpu_direct[4] = 0x11; return -1;}
+    DirectSlot &slot = gSlots[pick];
+    const uint64_t base = kDirectSlotIova + uint64_t(pick) * kDirectSlotBytes;
+    if (directSameMapping(slot, base, task, handle, start, bytes, count)) {
+        coachz_gpu_direct[2] = coachz_gpu_direct[2] + 1;
+    } else {
+        const uint64_t began = directNowUs();
+        if (slot.count) {
+            // The kit checks the unmap against the composed list, which still holds the slot's ranges.
+            if (!directChange(slot.ranges, slot.count, 0)) {native_adreno_scanout_release(connection, handle); coachz_gpu_direct[4] = 0x12; return -1;}
+            slot.count = 0;
+        }
+        slot.task = nullptr; slot.handle = 0; slot.start = 0; slot.bytes = 0;
+        bool ordered = true;
+        for (size_t i = 0; i < count; ++i) {
+            const NativeAdrenoPhysicalSpan &span = gHeldSpans[i];
+            ordered = ordered && span.bytes && !(span.bytes & (kTablePage - 1)) && !(span.physical & (kTablePage - 1)) &&
+                      !(span.offset & (kTablePage - 1)) && span.offset >= start && span.offset + span.bytes <= start + bytes &&
+                      (!i || span.offset >= gHeldSpans[i - 1].offset + gHeldSpans[i - 1].bytes);
+            slot.ranges[i] = {base + (span.offset - start), span.physical, span.bytes, ArmSmmu4KRead, 0, 2};
+        }
+        if (!ordered || !directChange(slot.ranges, count, 1)) {native_adreno_scanout_release(connection, handle); coachz_gpu_direct[4] = 0x13; return -1;}
+        slot.count = count;
+        slot.task = task; slot.handle = handle; slot.start = start; slot.bytes = bytes;
+        const uint64_t us = directNowUs() - began;
+        coachz_gpu_direct[1] = coachz_gpu_direct[1] + 1;
+        coachz_gpu_direct[8] = coachz_gpu_direct[8] + us;
+        if (us > coachz_gpu_direct[9]) coachz_gpu_direct[9] = us;
+        coachz_gpu_direct[10] = count;
+    }
+    slot.connection = connection;
+    slot.used = gDirectClock;
+    return pick;
+}
+// A connection closing with a held frame: the pipe returns to the firmware framebuffer and, once that latched, every frame of the
+// connection is let go (the teardown would find it held). Called by the framework without its lock.
+void directClosing(void *connection) {
+    if (!gDirectLock) return;
+    IOLockLock(gDirectLock);
+    bool mine = false;
+    for (const DirectSlot &slot : gSlots) mine = mine || slot.connection == connection;
+    if (mine) {
+        coachz_scanout_home();
+        coachz_scanout_flip_wait();
+        for (DirectSlot &slot : gSlots) if (slot.connection == connection) directRelease(slot);
+        coachz_gpu_direct[7] = coachz_gpu_direct[7] + 1;
+    }
+    IOLockUnlock(gDirectLock);
+}
+}  // namespace
+
+// The presenter's COMPLETE_SWAP with a direct frame (NativeGOPPresenter.cpp): shows it and returns once the pipe latched it, the earlier
+// frames let go. Any refusal leaves the pipe as it was; the plug-in then completes the swap with its copy.
+extern "C" IOReturn coachz_gpu_scanout_direct(task_t task, const void *request, size_t bytes) {
+    if (!gDirectEnabled || !gDirectLock) return kIOReturnUnsupported;
+    DirectRequest q = {};
+    if (!task || !request || bytes != sizeof q) return kIOReturnBadArgument;
+    memcpy(&q, request, sizeof q);
+    const uint64_t rows = q.ubwc ? (uint64_t(q.height) + 15) & ~15ull : q.height;   // a UBWC plane holds whole 16-row tiles
+    const uint64_t flagRows = (uint64_t(q.height) + 3) / 4;                          // a flag byte covers 16x4 pixels
+    const bool valid = q.width && q.height && q.width <= 4096 && q.height <= 4096 && (q.order == 1 || q.order == 2) && q.ubwc <= 1 &&
+        q.color_pitch >= q.width * 4 && !(q.color_offset & 0xfff) &&
+        (!q.ubwc || (q.order == 1 && q.meta_pitch >= (q.width + 15) / 16 && q.meta_bytes >= q.meta_pitch * flagRows && !(q.meta_offset & 0xfff)));
+    if (!valid) {coachz_gpu_direct[3] = coachz_gpu_direct[3] + 1; coachz_gpu_direct[4] = 0x20; return kIOReturnBadArgument;}
+    // The window of the object the pipe reads: both planes, in whole pages.
+    const uint64_t colorEnd = q.ubwc ? q.color_offset + q.color_pitch * rows : q.color_offset + q.color_pitch * (rows - 1) + uint64_t(q.width) * 4;
+    const uint64_t metaEnd = uint64_t(q.meta_offset) + q.meta_bytes;
+    const uint64_t start = (q.ubwc && q.meta_offset < q.color_offset ? q.meta_offset : q.color_offset) & ~0xfffull;
+    const uint64_t end = ((q.ubwc && metaEnd > colorEnd ? metaEnd : colorEnd) + 0xfff) & ~0xfffull;
+    if (end - start > kDirectSlotBytes) {coachz_gpu_direct[3] = coachz_gpu_direct[3] + 1; coachz_gpu_direct[4] = 0x22; return kIOReturnNoSpace;}
+    IOLockLock(gDirectLock);
+    if (coachz_gpu_direct[5] == 0) coachz_gpu_direct[5] = directAttach() ? 1 : 2;
+    if (coachz_gpu_direct[5] != 1) {
+        IOLockUnlock(gDirectLock);
+        coachz_gpu_direct[3] = coachz_gpu_direct[3] + 1;
+        coachz_gpu_direct[4] = 0x21;
+        return kIOReturnUnsupported;
+    }
+    const int k = directSlotFor(task, q.handle, start, end - start);
+    IOReturn status = k < 0 ? kIOReturnNoResources : kIOReturnSuccess;
+    if (!status) {
+        const uint64_t window = kDirectSlotIova + uint64_t(k) * kDirectSlotBytes;   // maps the object from start on
+        const coachz_scanout_frame frame = {uint32_t(window + (q.color_offset - start)), q.ubwc ? uint32_t(window + (q.meta_offset - start)) : 0u,
+                                            q.color_pitch, q.ubwc ? q.meta_pitch : 0u, q.width, q.height, q.ubwc, q.order, uint32_t(k) + 1};
+        const uint64_t began = directNowUs();
+        const int shown = coachz_scanout_direct(&frame);
+        if (shown) {
+            coachz_gpu_direct[4] = 0x100 | uint32_t(shown);
+            status = kIOReturnError;
+        } else {
+            coachz_scanout_flip_wait();
+            const uint64_t us = directNowUs() - began;
+            coachz_gpu_direct[0] = coachz_gpu_direct[0] + 1;
+            coachz_gpu_direct[11] = coachz_gpu_direct[11] + us;
+            if (us > coachz_gpu_direct[12]) coachz_gpu_direct[12] = us;
+            // Only the fault bits count (arm-smmu.h ARM_SMMU_CB_FSR_FAULT: MULTI, SS, UUT, ASF, TLBLKF, TLBMCF, EF, PF, AFF, TF): FSR.FORMAT
+            // [10:9] reads 0b10 on this bank at all times (k224b: FSR 0x400 with a stale FAR was counted as a fault).
+            constexpr uint32_t kCbFsrFault = 0xc00001feu;
+            uint32_t fsr = 0;
+            if (!directRead32(&gDirectSmmu, gDirectCbOffset + 0x58, &fsr) && (fsr & kCbFsrFault)) {
+                coachz_gpu_direct[13] = coachz_gpu_direct[13] + 1;
+                uint64_t far = 0;
+                directRead64(&gDirectSmmu, gDirectCbOffset + 0x60, &far);
+                if (coachz_gpu_direct[13] <= 4) printf("COACHZ scanout: bank %u fault FSR 0x%x FAR 0x%llx\n", gDirectBank, fsr, far);
+                directWrite32(&gDirectSmmu, gDirectCbOffset + 0x58, fsr & kCbFsrFault);
+            }
+        }
+    }
+    directReleaseIdle();
+    IOLockUnlock(gDirectLock);
+    if (status) coachz_gpu_direct[3] = coachz_gpu_direct[3] + 1;
+    const uint64_t shown = coachz_gpu_direct[0];
+    if (!status && (shown == 1 || shown % 600 == 0)) {
+        char row[256];
+        snprintf(row, sizeof row, "COACHZ scanout: %llu direct, %llu mapped (mean %llu us, max %llu, %llu spans), %llu reused, %llu refused (last 0x%llx), "
+            "latch mean %llu max %llu us, %llu faults",
+            shown, coachz_gpu_direct[1], coachz_gpu_direct[1] ? coachz_gpu_direct[8] / coachz_gpu_direct[1] : 0, coachz_gpu_direct[9],
+            coachz_gpu_direct[10], coachz_gpu_direct[2], coachz_gpu_direct[3], coachz_gpu_direct[4], coachz_gpu_direct[11] / shown,
+            coachz_gpu_direct[12], coachz_gpu_direct[13]);
+        printf("%s\n", row);
+    }
+    return status;
+}
+// Before the presenter draws into a flip buffer (waitSwap, after the latch): frames the pipe no longer fetches are let go.
+extern "C" void coachz_gpu_scanout_idle(void) {
+    if (!gDirectEnabled || !gDirectLock || coachz_gpu_direct[5] != 1) return;
+    IOLockLock(gDirectLock);
+    directReleaseIdle();
+    IOLockUnlock(gDirectLock);
+}
+// The plug-in went away (abandonSwap): back to the firmware framebuffer, then every frame let go once that latched.
+extern "C" void coachz_gpu_scanout_abandon(void) {
+    if (!gDirectEnabled || !gDirectLock || coachz_gpu_direct[5] != 1) {coachz_scanout_home(); return;}
+    IOLockLock(gDirectLock);
+    coachz_scanout_home();
+    coachz_scanout_flip_wait();
+    for (DirectSlot &slot : gSlots) directRelease(slot);
+    IOLockUnlock(gDirectLock);
+}
+// Whether the plug-in may send direct frames (the presenter's mode reply).
+extern "C" int coachz_gpu_scanout_enabled(void) {return gDirectEnabled != 0;}
+
+// A 32-bit switch from /chosen (tools/xnu_screen.py writes it there: the boot command line is full).
+static bool chosenWord(const char *name, uint32_t *out) {
+    DTEntry chosen;
+    const void *value = nullptr;
+    unsigned bytes = 0;
+    if (SecureDTLookupEntry(nullptr, "/chosen", &chosen) != kSuccess || SecureDTGetProperty(chosen, name, &value, &bytes) != kSuccess ||
+        bytes != sizeof *out)
+        return false;
+    memcpy(out, value, sizeof *out);
+    return true;
+}
+
 // Called once from coachz_gpu_start with the windows it mapped; the seq left the GMU up. Nonzero when the driver is serving.
+// /chosen coachz-gpu-hang-test = N (or the boot-arg of that name): N seconds after the driver starts, one kernel submission that never ends, a CP_WAIT_REG_MEM on CP_SCRATCH_REG(7),
+// which nothing else writes, for a value it never holds. The framework's hangcheck then restarts the GPU once through gpuRestart on a GPU
+// that is otherwise sound: a test of the restart. NativeAdrenoSubmit::recover finds no job for that fence and replays the jobs after it.
+unsigned gHangTest;
+void hangTestThread(void *, wait_result_t) {
+    IOSleep(gHangTest * 1000);
+    native_adreno_publisher_lock(1);
+    pmGet();
+    IOReturn sent = kIOReturnNotReady;
+    uint32_t fence = 0;
+    if (!__atomic_load_n(&gPmAsleep, __ATOMIC_SEQ_CST)) {
+        coreWrite(CpScratch7, 0);
+        // CP_WAIT_REG_MEM: WRITE_EQ, POLL_REGISTER; the register; the value; every bit; 16 cycles between reads.
+        uint32_t words[7] = {0, 3u, CpScratch7, 0, 0x600dfeedu, ~0u, 16u};
+        sent = AdrenoPM4Type7(Pm4WaitRegMem, 6, &words[0]) == AdrenoPM4Success ? gRing.submit(words, 7, &fence) : kIOReturnError;
+    }
+    native_adreno_publisher_lock(0);
+    printf("COACHZ gpu hang test: submitted 0x%x at fence %u, recover mode %u\n", sent, fence, gRecoverMode);
+}
+
 extern "C" int coachz_gpu_driver_start(volatile uint8_t *core, volatile uint8_t *gmu, volatile uint8_t *smmu, size_t smmuBytes, const uint32_t *sqe, uint32_t sqeBytes) {
     gCore = core;
     gGmu = gmu;
@@ -1525,6 +2042,16 @@ extern "C" int coachz_gpu_driver_start(volatile uint8_t *core, volatile uint8_t 
     native_adreno_capture_hang = gpuHangSnapshot;
     printf("COACHZ gpu hang capture: armed, before reset and BO release; 2 snapshots, IB 64 KiB, ring 32 KiB, memptrs 4 KiB\n");
     if (kernel_thread_start(pmThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
+    PE_parse_boot_argn("coachz-gpu-recover", &gRecoverMode, sizeof(gRecoverMode));
+    uint32_t hang = 0;
+    if (chosenWord("coachz-gpu-hang-test", &hang) || PE_parse_boot_argn("coachz-gpu-hang-test", &hang, sizeof(hang))) gHangTest = hang;
+    if (gHangTest && kernel_thread_start(hangTestThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
+    uint32_t direct = 0;
+    if (chosenWord("coachz-dpu-scanout", &direct) && direct == 1 && (gDirectLock = IOLockAlloc())) {
+        gDirectEnabled = 1;
+        native_adreno_scanout_closing = directClosing;
+    }
+    printf("COACHZ scanout: direct %s\n", gDirectEnabled ? "on (/chosen coachz-dpu-scanout)" : "off");
     coachz_gpu_trace_start();
     return accelerator;
 }

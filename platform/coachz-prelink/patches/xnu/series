@@ -181,3 +181,5 @@ coachz-prelink-baseband.patch
 coachz-prelink-video-decoder.patch
 # The early log mirrored into depthcharge's ramoops buffer (drivers/RamBlock/earlylog/coachz_early_log.c): arm_init reads the probe's note, kernel_bootstrap_thread starts it, coachz_early.c mirrors every byte.
 coachz-prelink-early-log.patch
+# backboardd's environment gets MallocXzoneTinyThrashThreshold=1000 at exec: a tiny malloc chunk that empties again within a second of its slot's last one stays resident instead of being madvised (libmalloc's xzone default is 1 ms); coachz-xzone-thrash=0 leaves the default.
+coachz-prelink-gpu-malloc.patch

@@ -1,3 +1,27 @@
+--- a/NativeAdrenoGpuContext.cpp
++++ b/NativeAdrenoGpuContext.cpp
+@@ -34,6 +34,12 @@
+     }
+     for(unsigned i=0;!status && i<GpuBufferCount;++i)
+         status=buffers_[i].allocate(kBytes[i],report->output_bits,true,kBytes[i]);
++    /* Coachz: no line of the allocation's cacheable view stays to be evicted over what the board then writes through its write-combined
++     * views (the SQE image, the ring); after this the per-submission walks leave these buffers out (NativeAdrenoMemory::markDeviceOnly). */
++    for(unsigned i=0;!status && i<GpuBufferCount;++i) {
++        status=buffers_[i].publishForDevice(0,kBytes[i],true,true,NativeAdrenoPhaseAllocate);
++        if(!status)buffers_[i].markDeviceOnly();
++    }
+     if(!status) {
+         step(Prepare);
+         const uint64_t aperture=UINT64_C(1)<<input_bits_;
+@@ -222,6 +228,8 @@
+     uint32_t nop=0;
+     if(AdrenoPM4Type7(0x10,0,&nop)!=AdrenoPM4Success)return kIOReturnInternalError;   /* CP_NOP */
+     scratch[0xF00/4]=nop;
++    /* Coachz: written through the cacheable view, which the per-submission walks no longer clean (markDeviceOnly). */
++    if(IOReturn published=buffers_[4].publishForDevice(0,GpuPageBytes,true,true,NativeAdrenoPhaseDiagnostic))return published;
+     *handle=p->handles_[4];*iova=GpuScratchIova+0xF00;*bytes=4;
+     return kIOReturnSuccess;
+ }
 --- a/NativeAdrenoGpuContext.h
 +++ b/NativeAdrenoGpuContext.h
 @@ -14,8 +14,9 @@
@@ -50,9 +74,72 @@
              NativeAdrenoNotePhase(NativeAdrenoPhaseAllocate,bytes);
          }
          if(status!=kIOReturnSuccess) {write_combined_=false;(void)release();}
+@@ -358,7 +361,7 @@
+     if(system_) {noteSystem(-(int64_t)bytes_);system_=false;}
+     if(borrowed_) {borrowed_=false;prepared_=false;}
+     if(spans_)IODeleteData(spans_,NativeAdrenoPhysicalSpan,span_capacity_);
+-    mapping_=nullptr;spans_=nullptr;bytes_=span_count_=span_capacity_=0;read_only_=false;owner_uncached_=false;
++    mapping_=nullptr;spans_=nullptr;bytes_=span_count_=span_capacity_=0;read_only_=false;owner_uncached_=false;device_only_=false;
+     return kIOReturnSuccess;
+ }
+ IOReturn NativeAdrenoMemory::releaseSystemInto(NativeAdrenoSystemPages *out)
+@@ -381,19 +384,29 @@
+     if(quarantined_)return kIOReturnNotReady;
+     --device_references_;return kIOReturnSuccess;
+ }
++/* Coachz: what publishForDevice maintains in the submission phase, by kind: [0] imports, [1] write-combined BOs (write-combine distrusted),
++ * [2] system memory, [3] BOs of a kernel mapping; each [count, KiB]. k221: the walk before each submission still took 854 us, so some
++ * mapping is maintained every time. */
++extern "C" {volatile uint64_t native_adreno_publish_kinds[4][2];}
++static void notePublishKind(unsigned phase,unsigned kind,size_t bytes)
++{
++    if(phase!=NativeAdrenoPhaseSubmit)return;
++    __atomic_fetch_add(&native_adreno_publish_kinds[kind][0],1,__ATOMIC_RELAXED);
++    __atomic_fetch_add(&native_adreno_publish_kinds[kind][1],(bytes+1023)>>10,__ATOMIC_RELAXED);
++}
+ IOReturn NativeAdrenoMemory::publishForDevice(size_t offset,size_t bytes,bool writes,bool include_write_combined,unsigned phase)
+ {
+     if(!backed() || !prepared_ || quarantined_)return kIOReturnNotReady;
+     if(!bytes || ((offset|bytes)&4095) || offset>bytes_ || bytes>bytes_-offset)return kIOReturnBadArgument;
+     /* Pages every CPU mapping holds non-cacheable carry no line to clean. */
+     if(imported_ && owner_uncached_)return kIOReturnSuccess;
+-    if(imported_) {NativeAdrenoNotePhase(phase,bytes);return maintainImported(offset,bytes,writes?NativeAdrenoCleanInvalidate:NativeAdrenoClean);}
++    if(imported_) {NativeAdrenoNotePhase(phase,bytes);notePublishKind(phase,0,bytes);return maintainImported(offset,bytes,writes?NativeAdrenoCleanInvalidate:NativeAdrenoClean);}
+     if(write_combined_) {  /* no CPU mapping should cache these pages; if one does, reach its lines through the physical pages */
+         if(!include_write_combined)return kIOReturnSuccess;
+-        NativeAdrenoNotePhase(phase,bytes);
++        NativeAdrenoNotePhase(phase,bytes);notePublishKind(phase,1,bytes);
+         return maintainImported(offset,bytes,writes?NativeAdrenoCleanInvalidate:NativeAdrenoClean);
+     }
+-    NativeAdrenoNotePhase(phase,bytes);
++    NativeAdrenoNotePhase(phase,bytes);notePublishKind(phase,mapping_?3:2,bytes);
+     if(!mapping_)return maintainImported(offset,bytes,writes?NativeAdrenoCleanInvalidate:NativeAdrenoClean);   /* system memory */
+     return NativeAdrenoMaintainOwnedPages(static_cast<unsigned char *>(mapping_)+offset,bytes,
+         writes?NativeAdrenoCleanInvalidate:NativeAdrenoClean);
 --- a/NativeAdrenoMemory.h
 +++ b/NativeAdrenoMemory.h
-@@ -111,6 +111,7 @@
+@@ -53,6 +53,7 @@
+     size_t bytes_=0,span_count_=0,span_capacity_=0;
+     uint32_t device_references_=0;
+     bool prepared_=false,quarantined_=false,write_combined_=false,system_=false,borrowed_=false,owned_=false;
++    bool device_only_=false;   /* Coachz: markDeviceOnly */
+     IOReturn takeSegments(IOBufferMemoryDescriptor *,size_t bytes,uint64_t limit,bool contiguous);
+     IOReturn maintainImported(size_t offset,size_t bytes,NativeAdrenoCacheOperation);
+ public:
+@@ -104,6 +105,12 @@
+      * write-combined, so publishForDevice/acquireDeviceWrites have nothing left to do. release() restores the default attribute. */
+     IOReturn makeWriteCombined();
+     bool writeCombined() const {return write_combined_;}
++    /* Coachz: the kernel's own GPU buffers (NativeAdrenoGpuContext): cleaned and invalidated once after allocate(), then reached by the CPU
++     * only through write-combined views of their physical pages (the board's), so the walks before and after each submission leave them
++     * out. Every process table maps them, and each submission cleaned and invalidated all eleven, 8.5 MiB with the two preemption records
++     * A618 never uses (k222: the submission phase's maintenance was all such memory, 99 calls and 76932 KiB in its first 9 submissions). */
++    void markDeviceOnly() {device_only_=true;}
++    bool deviceOnly() const {return device_only_;}
+     /* NativeAdrenoReassertWriteCombined over this object's pages; nothing for an object that is not write-combined, nor for system memory:
+      * XNU set the pages of BOs whose views mapped their physical pages back to the default attribute as it tore a device-pager view down
+      * (int-160: 123847 pages; untagged-2319cf3e5: 685208 pages, 3.8 s of submissions), while a view of a VM object maps it with the
+@@ -111,6 +118,7 @@
      IOReturn reassertWriteCombined(uint32_t *reset) const
      {return write_combined_ && span_count_ && !system_?NativeAdrenoReassertWriteCombined(spans_,span_count_,reset):kIOReturnSuccess;}
      bool backed() const {return descriptor_ || imported_ || borrowed_;}
@@ -88,7 +175,18 @@
  extern "C" {volatile uint32_t native_adreno_view_diag[6],native_adreno_view_kept;}   /* kept: BoCpuUnmap calls that left the view for another lease */
  }
  
-@@ -91,6 +110,7 @@
+@@ -78,6 +97,10 @@
+ class AGXDeviceUserClient;
+ /* The render server's connection serves the mailbox; it is retained while set (under g.lock), so the poller never runs on a freed object. */
+ static AGXDeviceUserClient *gMailboxOwner=nullptr;
++/* Coachz: the mounted user connections, for the display's direct scanout (native_adreno_scanout_hold), under g.lock. Every process that
++ * runs the Metal plug-in has one (apps, extensions, widgets), and a render server that restarts late must still be listed. */
++static AGXDeviceUserClient *gLiveConnections[512];
++static unsigned gLiveConnectionCount;
+ void nativeAdrenoMailboxPoller(void *,wait_result_t);
+ static IOReturn runCore(AGXDeviceUserClient *,uint32_t method,const void *input,size_t input_size,void *output,size_t output_size,uint64_t *lockWait);
+ /* Every call into a connection, for the boot export (kernel.gpucalls.bin): when it came in (mach units), microseconds in the driver and
+@@ -91,6 +114,7 @@
  enum {LockWaited,LockHeld,LockSince,LockClockWords};
  static void lockTimed(uint64_t *clock);
  static void unlockTimed(uint64_t *clock);
@@ -96,7 +194,7 @@
  /* A large BoAlloc's phases for the boot export (kernel.boalloc.bin, the board fills it with the caller's user stack): microseconds waiting
   * for the lock before the client's limit was read, making the descriptor, wiring its pages, cleaning them, waiting for the lock again,
   * the allocation under the lock, and giving back pages it did not take. flags: 1 write-combined, 2 the prepared pages were taken, 4 they
-@@ -133,7 +153,7 @@
+@@ -133,7 +157,7 @@
   * the kernel buffers' fixed addresses and the GMEM window that each address space also maps, as msm's per-process VM
   * (adreno_private_vm_size: BIT(ias) - ADRENO_VM_START). A kernel connection (the board's self-test) maps where it likes. */
  static uint64_t clientWindowBytes(uint32_t input_bits)
@@ -105,7 +203,7 @@
  /* The board's qcom_scm_set_gpu_smmu_aperture result ([0] availability, [1] the call's x0: 0 is success); [2] the CP switch check's
   * status, [3] the table mode in use. */
  extern "C" {volatile uint32_t native_adreno_cp_aperture[4];
-@@ -181,7 +201,102 @@
+@@ -181,7 +205,102 @@
      NativeAdrenoRestart restart=nullptr;
      void *restart_cookie=nullptr;
  } g;
@@ -208,7 +306,56 @@
  /* GPU hangs (msm hangcheck, NativeAdrenoSubmit::hangCheck) and restarts: [0] hangs, [1] restarts, [2] failed restarts, [3] the last hung
   * fence, [4] the last restart's IOReturn, [5] submissions replayed so far, [6] hangs with a guilty job, [7] hangs of the kernel's own VM. */
  extern "C" {volatile uint32_t native_adreno_recovery[8];}
-@@ -485,7 +600,7 @@
+@@ -253,6 +372,7 @@
+     NativeAdrenoProcessVm *space_=nullptr;   /* a user connection's own address space */
+     unsigned row_=4;
+     char name_[20]{};
++    task_t task_=nullptr;   /* Coachz: the opener, compared only (native_adreno_scanout_hold); a closed task's connections are not listed */
+     /* One user-view descriptor per BO token, reused by every clientMemoryForType call. IOConnectUnmapMemory64 asks clientMemoryForType for
+      * the descriptor again and unmaps only a mapping that belongs to THAT descriptor (kIOMapReference); a fresh descriptor per call made the
+      * unmap a silent no-op, the user PTEs outlived BoCpuUnmap, and BoFree handed pages with a live user mapping to the VM:
+@@ -272,6 +392,9 @@
+     IOReturn runTimed(uint32_t method,const void *input,size_t input_size,void *output,size_t output_size,uint64_t *lockWait);
+ public:
+     void setHandoffOnly() {handoffOnly_=true;}
++    void setTask(task_t task) {task_=task;}
++    friend IOReturn native_adreno_scanout_hold_locked(task_t,uint64_t,uint64_t,uint64_t,NativeAdrenoPhysicalSpan *,size_t,size_t *,uint64_t *,void **);
++    friend void native_adreno_scanout_release_locked(void *,uint64_t);
+     bool mount(bool kernel);
+     friend IOReturn runCore(AGXDeviceUserClient *,uint32_t,const void *,size_t,void *,size_t,uint64_t *);
+     friend void nativeAdrenoMailboxPoller(void *,wait_result_t);
+@@ -362,6 +485,7 @@
+             if(kernel)g.kernel_client=true;
+             ++g.opened;
+             if(NativeAdrenoClientRecord *record=clientRecord(name_))record->slot=row;
++            if(!kernel && gLiveConnectionCount<sizeof gLiveConnections/sizeof gLiveConnections[0])gLiveConnections[gLiveConnectionCount++]=this;
+         } else {
+             native_adreno_mount_fail[0]=3;native_adreno_mount_fail[1]=uint32_t(scoped);native_adreno_mount_fail[2]=uint32_t(base>>32);native_adreno_mount_fail[3]=native_adreno_mount_fail[3]+1;
+             core->releaseAll(&g.clock,0);
+@@ -420,8 +544,12 @@
+     views_=made;view_capacity_=size;
+     return true;
+ }
++/* Coachz: the board's hook for a closing connection whose objects the display may still fetch (CoachzGpu.cpp): it returns the pipe to its
++ * own memory and lets go of them, so the teardown does not find them held. Called without g.lock. */
++extern "C" {void (*native_adreno_scanout_closing)(void *connection)=nullptr;}
+ IOReturn AGXDeviceUserClient::clientClose()
+ {
++    if(native_adreno_scanout_closing && !kernel_ && !handoffOnly_)native_adreno_scanout_closing(this);
+     dropViews(0);
+     IOLockLock(g.lock);
+     IOReturn status=kIOReturnSuccess;
+@@ -436,6 +564,9 @@
+         /* A failed teardown leaves the objects (and the address space) live: nothing is forced or reused. */
+         if(!status) {
+             live_=false;
++            for(unsigned i=0;i<gLiveConnectionCount;++i)if(gLiveConnections[i]==this) {
++                gLiveConnections[i]=gLiveConnections[--gLiveConnectionCount];gLiveConnections[gLiveConnectionCount]=nullptr;break;
++            }
+             if(kernel_)g.kernel_client=false;
+             if(row_<4)g.rows[row_]=false;
+             row_=4;
+@@ -485,7 +616,7 @@
      native_adreno_view_diag[0]=native_adreno_view_diag[0]+1;
      /* [5]: threads inside this function right now (a thread stuck here, on the gate or in a mapping, shows as a non-zero count that stays). */
      struct Inside {Inside() {__atomic_fetch_add(&native_adreno_view_diag[5],1,__ATOMIC_RELAXED);} ~Inside() {__atomic_fetch_sub(&native_adreno_view_diag[5],1,__ATOMIC_RELAXED);}} inside;
@@ -217,7 +364,7 @@
      if(!growViews(type)) {IOLockUnlock(g.lock);return kIOReturnNoMemory;}
      View *v=viewSlot(type);
      if(v && v->descriptor && v->token==type) {
-@@ -548,6 +663,13 @@
+@@ -548,6 +679,13 @@
  /* Fence waits as the callers see them (int-147; method 6's own statistics count every poll): [0] waits, [1] us waited in total, [2] pauses
   * taken outside the connection lock, [3] the longest wait in us, [4] polls answered without the lock. */
  extern "C" {volatile uint64_t native_adreno_wait_outer[5];}
@@ -231,7 +378,7 @@
  static void lockTimed(uint64_t *clock)
  {
      if(!clock) {IOLockLock(g.lock);return;}
-@@ -558,11 +680,37 @@
+@@ -558,12 +696,38 @@
      }
      clock[LockSince]=mach_absolute_time();
  }
@@ -254,7 +401,7 @@
 +            if(held>native_adreno_lock_hold_max[holder-1])native_adreno_lock_hold_max[holder-1]=held;
 +        }
 +    }
-+}
+ }
 +/* The view lookup's lock, timed when another call holds it (native_adreno_view_lock). */
 +static void lockForView()
 +{
@@ -267,10 +414,11 @@
 +    if(waited>native_adreno_view_lock[2]) {
 +        native_adreno_view_lock[2]=waited;native_adreno_view_lock[3]=(uint64_t)holder|(uint64_t)(pid&0xffff)<<16;
 +    }
- }
++}
  static uint32_t microseconds(uint64_t from,uint64_t to)
  {
-@@ -614,7 +762,7 @@
+     uint64_t ns=0;
+@@ -614,7 +778,7 @@
              bool polled=false;
              if(waited>=timeout_us || !fencePending(poll.fence)) {
                  /* The connection's own core while it is live; a close that ran between two polls ends the wait. */
@@ -279,7 +427,7 @@
                  status=connection->live_?connection->core_->dispatch(method,&poll,sizeof(poll),output,output_size,&g.clock):kIOReturnNotReady;
                  unlockTimed(lockWait);
                  polled=true;
-@@ -624,7 +772,7 @@
+@@ -624,7 +788,7 @@
              native_adreno_wait_outer[2]=native_adreno_wait_outer[2]+1;
              if(!g.clock.idle || g.clock.idle(g.clock.cookie)) {
                  if(!polled) {
@@ -288,7 +436,7 @@
                      status=connection->live_?connection->core_->dispatch(method,&poll,sizeof(poll),output,output_size,&g.clock):kIOReturnNotReady;
                      unlockTimed(lockWait);
                      waited=g.clock.now_us(g.clock.cookie)-began;
-@@ -647,7 +795,7 @@
+@@ -647,7 +811,7 @@
          if(alloc) {
              memcpy(&request,input,sizeof(request));
              began=mach_absolute_time();
@@ -297,7 +445,7 @@
              const uint64_t limit=connection->live_?connection->core_->boLimit():0;
              unlockTimed(lockWait);
              limited=mach_absolute_time();
-@@ -659,14 +807,31 @@
+@@ -659,14 +823,31 @@
          /* i e38a0b1eb: a BoFree held the lock up to 38 ms, unwiring and freeing a large BO's pages; they now go after the lock. */
          NativeAdrenoSystemPages freed{};
          const bool freeing=method==NativeAdrenoMethodBoFree;
@@ -330,7 +478,7 @@
          if(method==NativeAdrenoMethodBoMap && !status && connection->live_ && !connection->kernel_)
              if(NativeAdrenoClientRecord *record=clientRecord(connection->name_))
                  if(connection->core_->windowPeak()>>20>record->peak_mib)record->peak_mib=uint32_t(connection->core_->windowPeak()>>20);
-@@ -767,7 +932,16 @@
+@@ -767,7 +948,16 @@
          if(!input || input_size!=sizeof(NativeAdrenoAbiNote) || output_size)return kIOReturnBadArgument;
          NativeAdrenoAbiNote note{};
          memcpy(&note,input,sizeof(note));
@@ -348,8 +496,77 @@
          const bool pass=note.kind==NativeAdrenoNotePass;
          volatile uint32_t *count=pass?&native_adreno_pass_count:&native_adreno_pipe_count;
          volatile uint32_t *rows=noteRows(pass?&native_adreno_pass_log:&native_adreno_pipe_log);
-@@ -1144,6 +1318,12 @@
+@@ -935,7 +1125,8 @@
+     shiftName(native_adreno_metal_diag.opener);
+     AGXDeviceUserClient *connection=new AGXDeviceUserClient;
+     if(!connection)return kIOReturnNoMemory;
+-    if(!connection->initWithTask(owningTask,securityID,type,properties)) {
++    if(connection->initWithTask(owningTask,securityID,type,properties))connection->setTask(owningTask);
++    else {
+         connection->release();
+         native_adreno_metal_diag.bad=native_adreno_metal_diag.bad+1;
+         return kIOReturnNoResources;
+@@ -1142,8 +1333,71 @@
+     const bool known=g.submit->fenceProgress(submitted,retired);
+     IOLockUnlock(g.lock);return known;
  }
++/* Coachz: the display's direct scanout (CoachzGpu.cpp) fetches a GPU object of the render server while the pipe shows it. The object is
++ * named as its Vulkan driver names it, by the calling task and the handle: the one mounted connection of that task that has the handle
++ * owns it (two such connections refuse, the name being ambiguous). The physical spans of [offset, offset + length) of it (an image inside
++ * a larger allocation) are copied out, clipped to that window, in the object's order, and it is held against release (holdForDevice: a
++ * free while held is refused) until native_adreno_scanout_release; the connection stays retained meanwhile. bytes is the object's size. */
++IOReturn native_adreno_scanout_hold_locked(task_t task,uint64_t handle,uint64_t offset,uint64_t length,NativeAdrenoPhysicalSpan *spans,size_t capacity,
++    size_t *count,uint64_t *bytes,void **connection)
++{
++    AGXDeviceUserClient *owner=nullptr;NativeAdrenoMemory *memory=nullptr;unsigned found=0;
++    for(unsigned i=0;i<gLiveConnectionCount;++i) {
++        AGXDeviceUserClient *c=gLiveConnections[i];
++        if(!c || c->task_!=task || !c->live_ || c->kernel_ || !c->core_)continue;
++        if(NativeAdrenoMemory *m=c->core_->memoryOf(handle)) {owner=c;memory=m;++found;}
++    }
++    if(found!=1)return found?kIOReturnNotPermitted:kIOReturnNotFound;
++    const uint64_t end=offset+length;
++    if(!length || end<offset || end>memory->bytes())return kIOReturnBadArgument;
++    size_t n=0;
++    for(size_t i=0;i<memory->spanCount();++i) {
++        const NativeAdrenoPhysicalSpan &span=memory->spans()[i];
++        const uint64_t from=span.offset>offset?span.offset:offset,to=span.offset+span.bytes<end?span.offset+span.bytes:end;
++        if(from>=to)continue;
++        if(n==capacity)return kIOReturnNoSpace;
++        spans[n++]={from,span.physical+(from-span.offset),to-from};
++    }
++    if(!n)return kIOReturnNotFound;
++    IOReturn status=memory->holdForDevice();
++    if(status)return status;
++    *count=n;*bytes=memory->bytes();
++    owner->retain();*connection=owner;
++    return kIOReturnSuccess;
++}
++void native_adreno_scanout_release_locked(void *connection,uint64_t handle)
++{
++    AGXDeviceUserClient *owner=static_cast<AGXDeviceUserClient *>(connection);
++    /* Held, so never freed: the same handle still names the same object. */
++    if(NativeAdrenoMemory *memory=owner->core_?owner->core_->memoryOf(handle):nullptr)memory->retireAfterQuiescence();
++}
++extern "C" IOReturn native_adreno_scanout_hold(task_t task,uint64_t handle,uint64_t offset,uint64_t length,NativeAdrenoPhysicalSpan *spans,size_t capacity,
++    size_t *count,uint64_t *bytes,void **connection)
++{
++    if(!task || !spans || !count || !bytes || !connection)return kIOReturnBadArgument;
++    *count=0;*bytes=0;*connection=nullptr;
++    if(!g.published)return kIOReturnNotReady;
++    IOLockLock(g.lock);
++    const IOReturn status=native_adreno_scanout_hold_locked(task,handle,offset,length,spans,capacity,count,bytes,connection);
++    IOLockUnlock(g.lock);
++    return status;
++}
++extern "C" void native_adreno_scanout_release(void *connection,uint64_t handle)
++{
++    if(!connection)return;
++    IOLockLock(g.lock);
++    native_adreno_scanout_release_locked(connection,handle);
++    IOLockUnlock(g.lock);
++    static_cast<AGXDeviceUserClient *>(connection)->release();
++}
  /* Publishes the service once. Everything passed in must outlive the system (the board probe keeps them in statics) and
   * the VM, submit object and ring must already be attached to the live GPU context. The core must not be open. */
 +extern "C" void native_adreno_publisher_lock(int locked)
@@ -361,7 +578,7 @@
  extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit *submit,NativeAdrenoRing *ring,
      const NativeAdrenoRingClock *clock,const NativeAdrenoTimer *timer,const NativeAdrenoAbiDeviceInfo *info,
      uint32_t input_bits,uint32_t output_bits)
-@@ -1172,6 +1352,7 @@
+@@ -1172,6 +1426,7 @@
              [](void *cookie,uint64_t ttbr0)->IOReturn {return static_cast<NativeAdrenoGpuContext *>(cookie)->writeTtbr0(ttbr0);},g.context);
      }
      native_adreno_cp_aperture[3]=submit->tableMode();
@@ -475,19 +692,10 @@
 -            if(n)n=packet(words,n,RingThreadControl,&br,1);
 -        }
 -        if(n)n=packet(words,n,RingFenceOpcode,&invalidate,1);
+-        const uint32_t sram[6]={RingWaitWriteEq,RingPerfctrSramInitStatus,0,1,1,0};
+-        if(n)n=packet(words,n,RingWaitRegMem,sram,6);
 +        const uint32_t update[4]={(uint32_t)table_,(uint32_t)(table_>>32),0,0};
 +        if(n)n=packet(words,n,RingSmmuTableUpdate,update,4);
-+        if(!n)return poison();
-+    }
-+    if(reset) {
-+        n=packet(words,n,RingFenceOpcode,&invalidate,1);
-+        if(!n)return poison();
-+    }
-+    if(table) {
-         const uint32_t sram[6]={RingWaitWriteEq,RingPerfctrSramInitStatus,0,1,1,0};
--        if(n)n=packet(words,n,RingWaitRegMem,sram,6);
-+        n=packet(words,n,RingWaitRegMem,sram,6);
-+        if(n)n=packet(words,n,RingSetProtectedMode,&on,1);
 +        if(!n)return poison();
      }
 -    const uint32_t flush=RingCacheFlush7,invalidate7=RingCacheInvalidate7;
@@ -502,9 +710,18 @@
 -        const uint64_t address=fence_iova_+RingPostambleOffset;
 -        const uint32_t amble[3]={(uint32_t)address,(uint32_t)(address>>32),RingPostambleWords|(3u<<20)};
 -        if(n)n=packet(words,n,RingSetAmble,amble,3);
--    }
++    if(reset) {
++        n=packet(words,n,RingFenceOpcode,&invalidate,1);
++        if(!n)return poison();
+     }
 -    if(n)n=packet(words,n,RingThreadControl,&both,1);
 -    if(n)n=packet(words,n,RingSetMarker,&marker,1);
++    if(table) {
++        const uint32_t sram[6]={RingWaitWriteEq,RingPerfctrSramInitStatus,0,1,1,0};
++        n=packet(words,n,RingWaitRegMem,sram,6);
++        if(n)n=packet(words,n,RingSetProtectedMode,&on,1);
++        if(!n)return poison();
++    }
 +    n=packet(words,n,RingFenceOpcode,&depth,1);
 +    if(n)n=packet(words,n,RingFenceOpcode,&color,1);
      if(n!=count)return poison();
@@ -567,11 +784,10 @@
      IOReturn status=program();
      if(status)return status;
      seqno_=0;completed_=0;submissions_=0;
-@@ -464,6 +435,14 @@
-     const volatile uint32_t *slot=fence_+(RingStampOffset+(fence&63)*16)/4;
+@@ -465,6 +436,14 @@
      *start=(uint64_t)slot[1]<<32|slot[0];*end=(uint64_t)slot[3]<<32|slot[2];
      return status|16;   /* the raw words: the caller judges them */
-+}
+ }
 +IOReturn NativeAdrenoRing::readFenceWords(size_t offset,uint32_t *out,size_t count)
 +{
 +    if(!out || (offset&3) || offset>fence_bytes_ || count>(fence_bytes_-offset)/4)return kIOReturnBadArgument;
@@ -579,9 +795,10 @@
 +    if(cache_.acquire(cache_.cookie,fence_,fence_bytes_))return kIOReturnIOError;
 +    for(size_t i=0;i<count;++i)out[i]=fence_[offset/4+i];
 +    return kIOReturnSuccess;
- }
++}
  IOReturn NativeAdrenoRing::fenceValue(uint32_t *value)
  {
+     if(!value)return kIOReturnBadArgument;*value=0;
 @@ -572,7 +551,7 @@
      const bool reset=framed && reset_pending_,table=reset && table_pending_;
      /* A plain (kernel) submission cannot carry the switch: a pending table waits for the next framed one. */
@@ -954,15 +1171,93 @@
      for(uint32_t i=0;i<request->buffer_count;++i) {
 --- a/NativeAdrenoVm.cpp
 +++ b/NativeAdrenoVm.cpp
-@@ -108,6 +108,7 @@
+@@ -108,6 +108,8 @@
      if(!changes_ || !alias_scratch_ || !mappings_ || !order_ || !index_.allocate()) {freeTables();return kIOReturnNoMemory;}
      memset(mappings_,0,sizeof(Mapping)*64);
      free_hint_=0;high_=0;memset(class_spans_,0,sizeof(class_spans_));order_count_[0]=order_count_[1]=0;
++    importFree();
 +    memset(walk_counts_,0,sizeof(walk_counts_));walk_distrust_=distrust_write_combined_;walk_coherent_=native_adreno_io_coherent;
      io_=*io;context_=context;streams_=streams;budget_=budget;
      if(lower)regions_[0]=*lower;if(upper)regions_[1]=*upper;
      for(unsigned i=0;i<2;++i)if(regions_[i].arena) {
-@@ -319,6 +320,7 @@
+@@ -136,8 +138,53 @@
+     if(mappings_)IODeleteData(mappings_,Mapping,mapping_capacity_);
+     if(order_)IODeleteData(order_,uint32_t,mapping_capacity_);
+     index_.release();
++    importFree();
+     changes_=nullptr;alias_scratch_=nullptr;mappings_=nullptr;order_=nullptr;capacity_=mapping_capacity_=0;
+ }
++void NativeAdrenoVm::importFree()
++{
++    for(unsigned k=0;k<16;++k) {
++        if(import_index_[k])IODeleteData(import_index_[k],ImportSpan,import_capacity_[k]);
++        import_index_[k]=nullptr;import_count_[k]=import_capacity_[k]=0;
++    }
++    import_index_lost_=false;
++}
++/* A mapped import's spans into its class, in physical order: sorted in the alias scratch (free again once the table transaction is
++ * done), then merged from the back. false (nothing changed) where the class cannot grow. */
++bool NativeAdrenoVm::importAdd(unsigned cls,const NativeAdrenoMemory *memory,uint32_t slot)
++{
++    cls&=15;
++    const size_t n=memory->spanCount(),count=import_count_[cls];
++    if(!n)return true;
++    if(!alias_scratch_ || n>capacity_ || n>SIZE_MAX/2/sizeof(ImportSpan)-count)return false;
++    if(count+n>import_capacity_[cls]) {
++        size_t size=import_capacity_[cls]?import_capacity_[cls]:1024;
++        while(size<count+n)size*=2;
++        ImportSpan *made=IONewData(ImportSpan,size);
++        if(!made)return false;
++        if(count)memcpy(made,import_index_[cls],sizeof(ImportSpan)*count);
++        if(import_index_[cls])IODeleteData(import_index_[cls],ImportSpan,import_capacity_[cls]);
++        import_index_[cls]=made;import_capacity_[cls]=size;
++    }
++    for(size_t i=0;i<n;++i)alias_scratch_[i]=(uint32_t)i;
++    NativeAdrenoPhysicalIndex<NativeAdrenoPhysicalSpan> sorted(memory->spans(),alias_scratch_,n);
++    ImportSpan *e=import_index_[cls];
++    size_t i=count,j=sorted.count(),k=count+j;
++    while(j) {
++        const auto &span=sorted.at(j-1);
++        if(i && e[i-1].physical>span.physical) {e[--k]=e[--i];continue;}
++        e[--k]={span.physical,span.physical+span.bytes,slot};--j;
++    }
++    import_count_[cls]=count+sorted.count();
++    return true;
++}
++void NativeAdrenoVm::importRemove(unsigned cls,uint32_t slot)
++{
++    cls&=15;
++    ImportSpan *e=import_index_[cls];size_t kept=0;
++    for(size_t i=0;i<import_count_[cls];++i)if(e[i].slot!=slot)e[kept++]=e[i];
++    import_count_[cls]=kept;
++}
+ bool NativeAdrenoVm::growScratch(size_t needed)
+ {
+     if(needed<=capacity_)return true;
+@@ -234,6 +281,22 @@
+     const bool importsOnly=memory->imported() && !NativeAdrenoMemory::ownsAnyPage(memory->spans(),memory->spanCount());
+     for(size_t i=0;i<memory->spanCount();++i)alias_scratch_[i]=(uint32_t)i;
+     NativeAdrenoPhysicalIndex<NativeAdrenoPhysicalSpan> index(memory->spans(),alias_scratch_,memory->spanCount());
++    /* Coachz: against each other class's imports in one merge of two physically sorted lists (the import index). Both are sorted by
++     * start; an entry whose end is at or below a new span's start can overlap no later new span, so it is passed for good, and the
++     * first entry left either overlaps the new span or starts at or past its end, as every later entry then does. */
++    if(importsOnly && !import_index_lost_) {
++        for(unsigned k=0;k<16;++k) {
++            if(k==(mine&15) || !import_count_[k])continue;
++            const ImportSpan *e=import_index_[k];const size_t n=import_count_[k];
++            size_t j=0;
++            for(size_t i=0;i<index.count() && j<n;++i) {
++                const auto &span=index.at(i);
++                while(j<n && e[j].end<=span.physical)++j;
++                if(j<n && e[j].physical<span.physical+span.bytes)return kIOReturnBadArgument;
++            }
++        }
++        return kIOReturnSuccess;
++    }
+     for(size_t k=0;k<high_;++k) {
+         const Mapping &m=mappings_[k];
+         if(!m.memory || !m.mapped_spans || aliasClass(m.permissions,m.writeback,m.shareability)==mine)continue;
+@@ -319,6 +382,7 @@
      }
      if(!record) {memory->quarantine();return fail(ArmSmmu4KStateMismatch);}
      *record={memory,0,iova,memory->spanCount(),0,permissions,writeback,shareability,0,upper};++objects_;
@@ -970,7 +1265,7 @@
      if(coherentMapping(writeback))native_adreno_coherent_skips[0]=native_adreno_coherent_skips[0]+1;
      else {
          checked=memory->publishForDevice(0,memory->bytes(),permissions&ArmSmmu4KWrite,distrust_write_combined_);
-@@ -342,7 +344,7 @@
+@@ -342,7 +406,7 @@
      if(status==ArmSmmu4KCapacity) {
          /* No table page could be had: the kit linked only empty tables and wrote no leaf, so the map is undone and the VM stays usable,
           * as a failed io-pgtable map returns -ENOMEM. */
@@ -979,7 +1274,24 @@
          if(memory->retireAfterQuiescence()!=kIOReturnSuccess)return fail(ArmSmmu4KStateMismatch);
          result_.operation=status;
          return kIOReturnNoMemory;
-@@ -410,7 +412,7 @@
+@@ -351,6 +415,7 @@
+     clock.lap(0,3);
+     insert(record);record->mapped_spans=spans;result_.completed_spans=spans;
+     if(memory->imported())import_spans_[cls]+=spans;
++    if(memory->imported() && !import_index_lost_ && !importAdd(cls,memory,uint32_t(record-mappings_)))import_index_lost_=true;
+     clock.lap(0,4);clock.done(0,memory->bytes());
+     {
+         const unsigned kind=!memory->imported()?0:exclusive?1:2;
+@@ -402,6 +467,8 @@
+     if(record->memory->retireAfterQuiescence()!=kIOReturnSuccess)return fail(ArmSmmu4KStateMismatch);
+     clock.lap(1,5);clock.done(1,record->memory->bytes());
+     if(record->memory->imported())import_spans_[aliasClass(record->permissions,record->writeback,record->shareability)&15]-=spans;
++    if(record->memory->imported() && !import_index_lost_)
++        importRemove(aliasClass(record->permissions,record->writeback,record->shareability),uint32_t(record-mappings_));
+     {
+         const unsigned kind=record->memory->bytes()<=(size_t)ArmSmmu4KTlbPageLimit*4096?3:4;   /* page TLBIs, else the ASID */
+         native_adreno_vm_kind_us[kind][0]=native_adreno_vm_kind_us[kind][0]+1;
+@@ -410,7 +477,7 @@
      }
      index_.erase(record->handle);
      const size_t slot=(size_t)(record-mappings_);if(slot<free_hint_)free_hint_=slot;
@@ -988,17 +1300,16 @@
      while(high_ && !mappings_[high_-1].memory)--high_;result_.complete=true;return kIOReturnSuccess;
  }
  IOReturn NativeAdrenoVm::describe(uint64_t handle,uint64_t *iova,size_t *bytes,
-@@ -435,10 +437,52 @@
-     const ArmSmmu4KStatus status=offset?ArmSmmu4KSyncContextTlb(&io_,offset,context_->asid,1,budget_,&r):
+@@ -436,13 +503,55 @@
          ArmSmmu4KInvalidateAllOwnedContext(&io_,streams_->bank,context_,budget_,&r);
      return status?fail(status):kIOReturnSuccess;
-+}
+ }
 +unsigned NativeAdrenoVm::walkBits(const Mapping &m) const
 +{
 +    const NativeAdrenoMemory *memory=m.memory;
 +    if(!memory)return 0;
 +    unsigned bits=0;
-+    const bool skipped=coherentMapping(m.writeback) || importedUntouched(memory);
++    const bool skipped=coherentMapping(m.writeback) || importedUntouched(memory) || memory->deviceOnly();
 +    const bool ready=memory->backed() && memory->prepared() && !memory->quarantined();
 +    /* publishForDevice does nothing for an import every CPU mapping holds non-cacheable, nor for a trusted write-combined BO. */
 +    if(skipped)bits|=WalkPublishSkip;
@@ -1018,7 +1329,7 @@
 +        if(add)++walk_counts_[i];
 +        else if(walk_counts_[i])--walk_counts_[i];
 +    }
- }
++}
 +void NativeAdrenoVm::recountWalks()
 +{
 +    memset(walk_counts_,0,sizeof(walk_counts_));
@@ -1041,7 +1352,12 @@
      for(size_t i=0;i<high_;++i) {
          const Mapping &m=mappings_[i];
          if(!m.memory)continue;
-@@ -450,6 +494,8 @@
+-        if(coherentMapping(m.writeback) || importedUntouched(m.memory)) {native_adreno_coherent_skips[2]=native_adreno_coherent_skips[2]+1;continue;}
++        if(coherentMapping(m.writeback) || importedUntouched(m.memory) || m.memory->deviceOnly()) {native_adreno_coherent_skips[2]=native_adreno_coherent_skips[2]+1;continue;}
+         if(m.memory->publishForDevice(0,m.memory->bytes(),true,distrust_write_combined_,NativeAdrenoPhaseSubmit))return fail(ArmSmmu4KIoError);
+     }
+     return kIOReturnSuccess;
+@@ -450,10 +559,12 @@
  IOReturn NativeAdrenoVm::acquireImported()
  {
      if(!attached_ || poisoned_)return kIOReturnNotReady;
@@ -1050,7 +1366,12 @@
      for(size_t i=0;i<high_;++i) {
          const Mapping &m=mappings_[i];
          if(!m.memory || !m.memory->imported() || !(m.permissions&ArmSmmu4KWrite))continue;
-@@ -483,10 +529,12 @@
+-        if(coherentMapping(m.writeback) || importedUntouched(m.memory)) {native_adreno_coherent_skips[3]=native_adreno_coherent_skips[3]+1;continue;}
++        if(coherentMapping(m.writeback) || importedUntouched(m.memory) || m.memory->deviceOnly()) {native_adreno_coherent_skips[3]=native_adreno_coherent_skips[3]+1;continue;}
+         if(m.memory->acquireDeviceWrites(0,m.memory->bytes(),NativeAdrenoPhaseComplete))return fail(ArmSmmu4KIoError);
+     }
+     return kIOReturnSuccess;
+@@ -483,10 +594,12 @@
      }
      return kIOReturnBadArgument;
  }
@@ -1074,7 +1395,27 @@
      };
      Mapping *mappings_=nullptr;
      NativeAdrenoHandleIndex index_;   /* live handle -> its mappings_ slot */
-@@ -72,6 +73,22 @@
+@@ -48,6 +49,19 @@
+     size_t high_=0;   /* no live mappings_ slot at or above it: the walks over every mapping stop there */
+     size_t class_spans_[16]{};   /* mapped spans per alias class, so a map counts the other classes without a walk */
+     size_t import_spans_[16]{};   /* the imported mappings' ranges per alias class */
++    /* Coachz: every mapped import's spans per alias class, by physical address, with the mappings_ slot each came from, so an import
++     * that needs the alias pass is checked against each other class in one merge of two sorted lists (importConflict) instead of every
++     * other-class span being looked up in the new import's index. k222: 1998 such imports took 800 us each, about 600 of them in that
++     * pass (preflight 1.29 s of the 1.6 s); surface imports carry thousands of spans. A class grows as imports come (importAdd, a
++     * backward merge); an unmap drops its slot's entries (importRemove). If a class cannot grow, import_index_lost_ sends every later
++     * check of this VM back to the full pass. */
++    struct ImportSpan {uint64_t physical,end;uint32_t slot;};
++    ImportSpan *import_index_[16]{};
++    size_t import_count_[16]{},import_capacity_[16]{};
++    bool import_index_lost_=false;
++    bool importAdd(unsigned cls,const NativeAdrenoMemory *,uint32_t slot);
++    void importRemove(unsigned cls,uint32_t slot);
++    void importFree();
+     NativeAdrenoVmRegion regions_[2]{};
+     ArmSmmu4KLiveVisibility visibility_[2]{};
+     ArmSmmu4KIo io_{};
+@@ -72,6 +86,22 @@
      unsigned budget_=0;
      uint64_t next_handle_=1;
      bool attached_=false,poisoned_=false,distrust_write_combined_=false,unusable_=false;
@@ -1097,7 +1438,7 @@
      uint64_t faults_=0,hangs_=0;
      bool fault_streams_=true;   /* a failure faults the bank's streams; off for a process table, whose streams are the kernel table's too */
      NativeAdrenoVmResult result_{};
-@@ -136,7 +153,7 @@
+@@ -136,7 +166,7 @@
       * before reading DRAM, so it could never see a dirty line. */
      /* Before a submission while write-combined BOs are trusted: every page of every mapped write-combined BO that XNU set back to the
       * default attribute is write-combined again (and its lines written back); *reset counts the pages. */
@@ -1106,3 +1447,15 @@
      IOReturn auditRange(uint64_t iova,size_t bytes,uint32_t *lines,uint32_t *dirty,uint32_t *stale) const;
      /* Read-only description of a live mapping; never pins or extends it. */
      IOReturn describe(uint64_t handle,uint64_t *iova,size_t *bytes,unsigned *permissions) const;
+--- a/NativeAdrenoVmAlias.h
++++ b/NativeAdrenoVmAlias.h
+@@ -39,6 +39,9 @@
+         }
+         count_=kept;
+     }
++    /* The kept intervals in physical order (Coachz: NativeAdrenoVm's import index merges with them). */
++    size_t count() const {return count_;}
++    const Range &at(size_t i) const {return ranges_[order_[i]];}
+     bool overlaps(uint64_t physical,uint64_t bytes) const {
+         size_t lo=0,hi=count_;
+         while(lo<hi) {size_t mid=lo+(hi-lo)/2;if(end(order_[mid])<=physical)lo=mid+1;else hi=mid;}

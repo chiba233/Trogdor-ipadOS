@@ -71,7 +71,7 @@ class VenusTests(unittest.TestCase):
 
     def test_delivery(self):
         series = [line for line in (PATCHES / 'series').read_text().splitlines() if line and not line.startswith('#')]
-        self.assertEqual(series[-2:], ['coachz-prelink-video-decoder.patch', 'coachz-prelink-early-log.patch'])
+        self.assertEqual(series[-3:], ['coachz-prelink-video-decoder.patch', 'coachz-prelink-early-log.patch', 'coachz-prelink-gpu-malloc.patch'])
         patch = (PATCHES / 'coachz-prelink-video-decoder.patch').read_text()
         self.assertIn('"/System/Library/VideoDecoders"', patch)
         self.assertIn('+		coachz_video_prepare(p, scratch);', patch)

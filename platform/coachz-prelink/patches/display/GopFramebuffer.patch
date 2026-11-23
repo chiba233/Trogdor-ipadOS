@@ -361,7 +361,7 @@
  IOService *native_legacy_display_allocate(void) {return new NativeLegacyDisplay;}
 --- a/NativeGOPPresenter.cpp
 +++ b/NativeGOPPresenter.cpp
-@@ -17,6 +17,11 @@
+@@ -17,6 +17,16 @@
   * and [5] the longest such wait (ns), [6] total ns waited in timed-out calls. A timed wait that returns long before its deadline shows here. */
  volatile uint64_t native_gop_wait_stats[7];
  IOService *native_gop_presenter_create(void);
@@ -370,10 +370,15 @@
 +void coachz_scanout_flip(uint32_t buffer);
 +void coachz_scanout_flip_wait(void);
 +void coachz_scanout_home(void);
++// Coachz: direct scanout of the GPU's own frame (CoachzGpu.cpp, /chosen coachz-dpu-scanout).
++IOReturn coachz_gpu_scanout_direct(task_t task,const void *request,size_t bytes);
++void coachz_gpu_scanout_idle(void);
++void coachz_gpu_scanout_abandon(void);
++int coachz_gpu_scanout_enabled(void);
  bool native_gop_gpu_offer(IOService *,void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height);
  void native_gop_presenter_set_source(IOService *presenter,IOService *nub);
  // Provided by the display driver: finishes (status 0) or fails the swap that was offered.
-@@ -29,6 +34,7 @@
+@@ -29,6 +39,7 @@
      OSDeclareDefaultStructors(NativeGOPPresenter)
      friend class NativeGOPClient;
      IOMemoryMap *mapping=nullptr;
@@ -381,7 +386,15 @@
      IOLock *gate=nullptr;
      IOService *owner=nullptr;
      NGPMode mode={};
-@@ -94,6 +100,12 @@
+@@ -41,6 +52,7 @@
+     uint64_t swapSequence=0;
+     IOReturn waitSwap(task_t,uint64_t timeoutMs,NGPSwap *);
+     IOReturn completeSwap(uint64_t sequence,int status);
++    bool delivered(uint64_t sequence) {IOLockLock(gate);const bool is=swap.offered && swap.delivered && swap.sequence==sequence;IOLockUnlock(gate);return is;}
+     void abandonSwap();
+ public:
+     void setMemorySource(IOService *source) {memorySource=source;}
+@@ -94,6 +106,12 @@
      {unsigned v=0;PE_parse_boot_argn("sheng-fb-gpu",&v,sizeof v);gpuMode=(v==1);}
      mode={NGP_VERSION,NGP_BGRX8888,video.v_width,video.v_height,video.v_rowBytes,mapping->getLength()};
      native_gop_physical=mapping->getPhysicalAddress();native_gop_virtual=mapping->getVirtualAddress();
@@ -394,7 +407,7 @@
      online=true;native_gop_ready=1;if(gpuMode)gHandoff=this;registerService();return true;
  }
  void NativeGOPPresenter::stop(IOService *provider) {
-@@ -136,9 +148,13 @@
+@@ -136,9 +154,13 @@
          memory->retain();
          swap={true,false,++swapSequence,display,memory,nullptr,stride,width,height};
          native_gop_gpu_offers=native_gop_gpu_offers+1;
@@ -410,26 +423,38 @@
  }
  IOReturn NativeGOPPresenter::waitSwap(task_t task,uint64_t timeoutMs,NGPSwap *out) {
      if(!gpuMode)return kIOReturnUnsupported;
-@@ -164,6 +180,9 @@
+@@ -164,6 +186,9 @@
      IOMemoryDescriptor *memory=swap.memory;memory->retain();
      const uint64_t sequence=swap.sequence,stride=swap.stride;const uint32_t width=swap.width,height=swap.height;
      IOLockUnlock(gate);
 +    // Coachz: the client draws this frame into the buffer the pipe scanned until the last flip latched; wait for that latch here, outside the
 +    // gate, instead of in COMPLETE_SWAP, so the render server got its buffer back while the flip was pending.
-+    if(flipMemory)coachz_scanout_flip_wait();
++    if(flipMemory) {coachz_scanout_flip_wait();coachz_gpu_scanout_idle();}
      // The frame's pages go into the client's task here, writable like any import (the GPU maps them for reading; the kernel pins and maintains them).
      IOMemoryMap *map=memory->createMappingInTask(task,0,kIOMapAnywhere);
      memory->release();
-@@ -193,6 +212,7 @@
+@@ -193,6 +218,7 @@
      gpuClient=false;
      auto done=swap;swap={};
      IOLockUnlock(gate);
-+    coachz_scanout_home();
++    coachz_gpu_scanout_abandon();
      if(!done.offered)return;
      OSSafeReleaseNULL(done.map);if(done.memory)done.memory->release();
      __atomic_fetch_add(&native_gop_gpu_abandoned,1,__ATOMIC_RELAXED);
-@@ -224,6 +244,9 @@
+@@ -222,8 +248,21 @@
+         if(status==kIOReturnSuccess)memcpy(out,&swap,sizeof(swap));return status;
+     }
      case NGP_METHOD_COMPLETE_SWAP: {
++        if(in && inSize==sizeof(NGPDirect) && !outSize) {
++            // Coachz: the frame where the GPU rendered it, shown by the pipe itself (CoachzGpu.cpp); the swap retires once it is shown.
++            NGPDirect q={};memcpy(&q,in,sizeof(q));
++            if(q.reserved!=NGP_DIRECT || q.status)return kIOReturnBadArgument;
++            if(!q.sequence)return coachz_gpu_scanout_enabled() && p->flipMemory?kIOReturnSuccess:kIOReturnUnsupported;
++            if(!p->flipMemory || !p->delivered(q.sequence))return kIOReturnBadArgument;
++            const IOReturn shown=coachz_gpu_scanout_direct(task,&q,sizeof(q));
++            if(shown)return shown;
++            return p->completeSwap(q.sequence,0);
++        }
          if(!in || inSize!=sizeof(NGPComplete) || outSize)return kIOReturnBadArgument;
          NGPComplete q={};memcpy(&q,in,sizeof(q));
 +        // Coachz: the frame is finished (the GPU's fence) and copied into the scanout buffer, so the render server's buffer is free: the flip is
@@ -438,7 +463,7 @@
          return p->completeSwap(q.sequence,(int)q.status);
      }
      default:return kIOReturnUnsupported;
-@@ -233,7 +256,7 @@
+@@ -233,7 +272,7 @@
  IOMemoryDescriptor *NativeGOPPresenter::handoffMemory() {
      NativeGOPPresenter *p=gHandoff;
      if(!p || !p->gpuMode || !p->online || !p->mapping)return nullptr;
@@ -447,3 +472,18 @@
      if(memory)memory->retain();
      return memory;
  }
+--- a/NativeGOPWire.h
++++ b/NativeGOPWire.h
+@@ -14,4 +14,12 @@
+ struct NGPSwap {uint64_t sequence,address,bytes,stride;uint32_t width,height,format,reserved;};
+ struct NGPComplete {uint64_t sequence;uint32_t status,reserved;};
+ static_assert(sizeof(NGPWait)==8 && sizeof(NGPSwap)==48 && sizeof(NGPComplete)==16,"GOP hand-off ABI");
++// Coachz: COMPLETE_SWAP with the frame scanned out where the GPU rendered it (reserved NGP_DIRECT): handle names the BO in the caller's
++// GPU connection, the rest is Turnip's layout of the image in it (tu_darwin_image_scanout: offsets from the BO's start, UBWC flags plane,
++// order 1 for bytes R,G,B,A, 2 for B,G,R,A). The swap completes only when the pipe shows the frame; any refusal leaves the swap delivered,
++// for a COMPLETE_SWAP with the copy. Sequence 0 only asks whether direct frames are taken.
++enum { NGP_DIRECT=0x44 };
++struct NGPDirect {uint64_t sequence;uint32_t status,reserved;uint64_t handle;
++                  uint32_t color_offset,meta_offset,meta_bytes,color_pitch,meta_pitch,width,height,ubwc,order,pad;};
++static_assert(sizeof(NGPDirect)==64,"GOP direct ABI");
+ static_assert(sizeof(NGPMode)==40 && sizeof(NGPPresent)==32 && sizeof(NGPTransfer)==16,"GOP transfer ABI");

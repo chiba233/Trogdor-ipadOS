@@ -70,7 +70,12 @@ def gpu_stack_overlay():
     # d76f17d long submissions cut where a command buffer begins; then this connection's completed fences answered without a kernel call and
     # a wait for any of several submitted syncs as one kernel wait for the first; then small BOs kept past a second, larger first command
     # stream chunks, 4 MiB timestamp blocks and no preemption-latency captures on a GPU that does not preempt; then the diagnostics'
-    # timestamp copy once a submission and BO cache notes, command stream chunks kept across resets, and BOs up to 4 MiB kept cached.
+    # timestamp copy once a submission and BO cache notes, command stream chunks kept across resets, and BOs up to 4 MiB kept cached;
+    # small descriptor pools suballocated, command stream chunks shared through a device pool, cached BOs with a CPU view chosen first,
+    # and BOs released to the kernel outside the retirement lock; command stream chunks written again only once the GPU passed their
+    # last submission's fence, attachments the runtime names as touched by no draw left out of tile memory, and a pass of one draw
+    # with such an attachment let into system memory; then rasterization order kept only for pipelines whose fragment shader reads an
+    # input attachment.
     mesa_patches = [UNIXNU / 'patches/mesa' / name for name in ('turnip-transient-attachments-in-gmem.patch',
                                                                  'turnip-gmem-memory-side-swap.patch', 'turnip-coachz-diagnostics.patch',
                                                                  'coachz-port-ir3-fragment-consts.patch', 'coachz-port-turnip-one-va.patch',
@@ -78,13 +83,24 @@ def gpu_stack_overlay():
                                                                  'coachz-port-turnip-submit-cuts.patch', 'coachz-turnip-darwin-fence-waits.patch',
                                                                  'coachz-turnip-fewer-bo-maps.patch',
                                                                  'coachz-turnip-diagnostic-bo-stats-and-copy-once.patch',
-                                                                 'coachz-turnip-cs-chunks-kept.patch', 'coachz-turnip-cache-keeps-4m.patch')]
+                                                                 'coachz-turnip-cs-chunks-kept.patch', 'coachz-turnip-cache-keeps-4m.patch',
+                                                                 'coachz-turnip-descriptor-pools-suballocated.patch',
+                                                                 'coachz-turnip-cs-chunks-device-pool.patch', 'coachz-turnip-cache-mapped-first.patch',
+                                                                 'coachz-turnip-releases-outside-lock.patch', 'coachz-turnip-cs-chunk-fences.patch',
+                                                                 'coachz-turnip-unaccessed-attachments.patch',
+                                                                 'coachz-turnip-unaccessed-single-draw-sysmem.patch',
+                                                                 'coachz-turnip-draw-trace-sampling.patch',
+                                                                 'coachz-turnip-scanout-export.patch',
+                                                                 'coachz-turnip-raster-order-readers.patch')]
     # The overlay's runtime patches, which the bridge builder applies after its recorded ones: the copy profile, the compile thread at the
     # asking thread's priority, two-plane pictures up to the plug-in's size kept as images, and the runtime's command buffer threads at the
     # fixed priority of the thread that starts them, and twice the spare descriptor pools with 64 sets in a command buffer's first;
     # render encoders made in the last one's box, spare descriptor pools taken inside sections, passes that split for a memoryless
     # write or reach part of the frame kept out of inline recording (the latter over their draws' bounds), and converted video pictures
-    # not zeroed on the host.
+    # not zeroed on the host; no sampler maps for a draw of unmapped bound textures that samples no handles, and pass-start notes that
+    # keep their room for the next render encoder; an inline first instance's memoryless colors begun DontCare (split before a draw that
+    # reads one) and named to Turnip as touched by no draw; an instance lowered at its pass's end names the memoryless colors none of
+    # its draws touched.
     runtime_patches = [UNIXNU / 'drivers/AdrenoMetal/bridge/patches' / name for name in ('0026-coachz-copy-profile.patch',
                                                                                          '0027-coachz-compile-at-the-asking-priority.patch',
                                                                                          '0028-coachz-ycbcr-image-for-small-pictures.patch',
@@ -94,7 +110,12 @@ def gpu_stack_overlay():
                                                                                          '0032-coachz-sections-take-spare-descriptor-pools.patch',
                                                                                          '0033-coachz-memoryless-writers-keep-secondary.patch',
                                                                                          '0034-coachz-partial-passes-bounded-render-area.patch',
-                                                                                         '0035-coachz-converted-ycbcr-images-unzeroed.patch')]
+                                                                                         '0035-coachz-converted-ycbcr-images-unzeroed.patch',
+                                                                                         '0036-coachz-sampler-maps-without-handles.patch',
+                                                                                         '0037-coachz-pass-start-notes-kept.patch',
+                                                                                         '0038-coachz-inline-memoryless-unloaded.patch',
+                                                                                         '0039-coachz-inline-memoryless-unaccessed.patch',
+                                                                                         '0040-coachz-final-memoryless-unaccessed.patch')]
     def apply(tree, patch, reverse=False, check=False):
         command = ['git', '-C', str(tree), 'apply']
         if reverse:

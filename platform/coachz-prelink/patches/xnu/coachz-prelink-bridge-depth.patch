@@ -10,7 +10,7 @@
  bsd/dev/coachz_wifi.c		standard
 --- a/bsd/dev/coachz_bridge.c
 +++ b/bsd/dev/coachz_bridge.c
-@@ -0,0 +1,499 @@
+@@ -0,0 +1,794 @@
 +/*
 + * The SN65DSI86 eDP bridge's output depth. Coreboot's sn65dsi86_bridge_configure writes SN_DATA_FORMAT_REG 1 (18 bpp) whatever
 + * the panel says, and XNU keeps the firmware's display, so every channel reached the panel with 6 bits: white scenes and
@@ -303,6 +303,102 @@
 +static volatile int flip_pending;
 +extern void IOSleep(unsigned int);
 +
++/*
++ * Direct scanout (CoachzGpu.cpp, coachz_gpu_scanout_direct): VIG0 fetches a frame the GPU rendered, of another size, and its QSEED3 scaler fits
++ * it to the panel, as mainline's DPU programs a plane: dpu_hw_sspp.c (dpu_hw_sspp_setup_format, setup_rects, setup_sourceaddress,
++ * setup_pe_config), dpu_hw_util.c dpu_hw_setup_scaler3, dpu_plane.c _dpu_plane_setup_scaler3 and _dpu_plane_setup_pixel_ext, msm_mdss.c
++ * msm_mdss_6x_setup_ubwc. sc7180 (dpu_6_2_sc7180.h): VIG0 at 0x4000 of the MDP with QSEED3 3.0 at +0xa00, whose preloads are QSEED4's (4
++ * across, 2 down); UBWC 2.0 with highest bank bit 14 and swizzle levels 2 and 3 (ubwc_config.c, the values the GPU writes with). The pipe
++ * reads apps SMMU addresses once the display's stream is routed (CoachzGpu.cpp). The registers below, as the firmware left them, are written
++ * back before a buffer flip or the panic path's return: those scan the firmware's linear format at the panel's own size.
++ */
++#define SSPP 0x5000u
++#define SSPP_SRC_SIZE 0x00u
++#define SSPP_SRC_XY 0x08u
++#define SSPP_OUT_SIZE 0x0cu
++#define SSPP_OUT_XY 0x10u
++#define SSPP_SRC0_ADDR 0x14u
++#define SSPP_SRC1_ADDR 0x18u
++#define SSPP_SRC2_ADDR 0x1cu
++#define SSPP_SRC3_ADDR 0x20u
++#define SSPP_SRC_YSTRIDE0 0x24u
++#define SSPP_SRC_YSTRIDE1 0x28u
++#define SSPP_SRC_FORMAT 0x30u
++#define SSPP_SRC_UNPACK_PATTERN 0x34u
++#define SSPP_SRC_OP_MODE 0x38u
++#define SSPP_UBWC_STATIC_CTRL 0x44u
++#define SSPP_FETCH_CONFIG 0x48u
++#define SSPP_DANGER_LUT 0x60u
++#define SSPP_SAFE_LUT 0x64u
++#define SSPP_QOS_CTRL 0x6cu
++#define SSPP_CREQ_LUT_0 0x74u
++#define SSPP_CREQ_LUT_1 0x78u
++#define SSPP_CDP_CNTL 0x134u
++#define SSPP_PE_C0_LR 0x100u
++#define SSPP_PE_C0_TB 0x104u
++#define SSPP_PE_C0_REQ 0x108u
++#define SSPP_PE_C1C2_LR 0x110u
++#define SSPP_PE_C1C2_TB 0x114u
++#define SSPP_PE_C1C2_REQ 0x118u
++#define SSPP_PE_C3_LR 0x120u
++#define SSPP_PE_C3_TB 0x124u
++#define SSPP_PE_C3_REQ 0x128u
++#define SSPP_UBWC_ERROR_STATUS 0x138u
++#define QSEED3 0xa00u
++#define QSEED3_OP_MODE 0x04u
++#define QSEED3_PHASE_STEP_Y_H 0x10u
++#define QSEED3_PHASE_STEP_Y_V 0x14u
++#define QSEED3_PHASE_STEP_UV_H 0x18u
++#define QSEED3_PHASE_STEP_UV_V 0x1cu
++#define QSEED3_PRELOAD 0x20u
++#define QSEED3_SRC_SIZE_Y_RGB_A 0x40u
++#define QSEED3_SRC_SIZE_UV 0x44u
++#define QSEED3_DST_SIZE 0x48u
++#define QSEED3_PHASE_INIT_Y_H 0x90u
++#define QSEED3_PHASE_INIT_Y_V 0x94u
++#define QSEED3_PHASE_INIT_UV_H 0x98u
++#define QSEED3_PHASE_INIT_UV_V 0x9cu
++#define MDSS_HW_VERSION 0x0u
++#define MDSS_UBWC_STATIC 0x144u
++#define MDSS_UBWC_CTRL_2 0x150u
++#define MDSS_UBWC_PREDICTION_MODE 0x154u
++#define OP_BWC_EN (1u << 0)
++#define OP_FLIP_LR (1u << 13)
++#define OP_FLIP_UD (1u << 14)
++#define OP_PE_OVERRIDE (1u << 31)
++#define DISPCC_PA 0x0af00000u
++#define DISPCC_MDP_CMD_RCGR 0x20c8u
++
++/* The SSPP registers a direct frame changes, with the scaler's mode last. */
++static const uint16_t direct_kept[] = {
++	SSPP_SRC_SIZE, SSPP_SRC_XY, SSPP_OUT_SIZE, SSPP_OUT_XY, SSPP_SRC0_ADDR, SSPP_SRC1_ADDR, SSPP_SRC2_ADDR, SSPP_SRC3_ADDR,
++	SSPP_SRC_YSTRIDE0, SSPP_SRC_YSTRIDE1, SSPP_SRC_FORMAT, SSPP_SRC_UNPACK_PATTERN, SSPP_SRC_OP_MODE, SSPP_UBWC_STATIC_CTRL,
++	SSPP_FETCH_CONFIG, SSPP_PE_C0_LR, SSPP_PE_C0_TB, SSPP_PE_C0_REQ, SSPP_PE_C1C2_LR, SSPP_PE_C1C2_TB, SSPP_PE_C1C2_REQ, SSPP_PE_C3_LR,
++	SSPP_PE_C3_TB, SSPP_PE_C3_REQ, QSEED3 + QSEED3_OP_MODE, SSPP_DANGER_LUT, SSPP_SAFE_LUT, SSPP_QOS_CTRL, SSPP_CREQ_LUT_0,
++	SSPP_CREQ_LUT_1, SSPP_CDP_CNTL,
++};
++#define DIRECT_KEPT (sizeof(direct_kept) / sizeof(direct_kept[0]))
++static uint32_t direct_saved[DIRECT_KEPT];
++/* direct_on: the pipe holds a direct frame's configuration (also from the panic path, so plain stores only). The tags name what the pipe
++ * scans, 0 for the buffers and the firmware framebuffer: shown has latched, pending waits for the next vsync. */
++static volatile int direct_on;
++static volatile uint32_t direct_shown, direct_pending;
++static int direct_ubwc_ready;
++static uint32_t direct_count, direct_ubwc_count, direct_scaled_count;
++
++/* Both sides declare this record (CoachzGpu.cpp): the display addresses of a frame and its layout. */
++struct coachz_scanout_frame {
++	uint32_t color, meta;          /* apps SMMU addresses of the color and UBWC flag planes (meta 0 for a linear frame) */
++	uint32_t color_pitch, meta_pitch;
++	uint32_t width, height;
++	uint32_t ubwc, order;          /* order: the bytes in memory, 1 R,G,B,A (XBGR8888), 2 B,G,R,A (XRGB8888) */
++	uint32_t tag;                  /* 1 to 31: the caller's name for the frame, reported by coachz_scanout_busy */
++};
++_Static_assert(sizeof(struct coachz_scanout_frame) == 36, "coachz_scanout_frame is shared with CoachzGpu.cpp");
++int coachz_scanout_direct(const struct coachz_scanout_frame *frame);
++uint32_t coachz_scanout_busy(void);
++uint64_t coachz_scanout_display_window(uint64_t *bytes);
++
 +bool
 +coachz_scanout_prepare(uint64_t firmware, uint64_t oneBuffer, uint64_t *base)
 +{
@@ -325,12 +421,40 @@
 +	if (ctl == 3 || shown != (uint32_t)firmware) {
 +		return false;
 +	}
++	for (unsigned i = 0; i < DIRECT_KEPT; ++i) {
++		direct_saved[i] = rd(flip_mdp, SSPP + direct_kept[i]);
++	}
 +	flip_ctl = FLIP_CTL(ctl);
 +	flip_home_pa = (uint32_t)firmware;
 +	flip_buffers[0] = (uint32_t)FLIP_BASE;
 +	flip_buffers[1] = (uint32_t)(FLIP_BASE + oneBuffer);
 +	*base = FLIP_BASE;
 +	return true;
++}
++
++/* The physical memory the pipe scans before a direct frame: the firmware framebuffer and the two buffers, which CoachzGpu.cpp keeps at
++ * IOVA = PA once the display's stream is translated. Returns the firmware framebuffer's address and the length of one buffer. */
++uint64_t
++coachz_scanout_display_window(uint64_t *bytes)
++{
++	if (!flip_ctl) {
++		return 0;
++	}
++	*bytes = flip_buffers[1] - flip_buffers[0];
++	return flip_home_pa;
++}
++
++/* The firmware's linear configuration again, before the pipe scans one of its own memories (plain stores: the panic path uses it). */
++static void
++direct_restore(void)
++{
++	if (!direct_on) {
++		return;
++	}
++	for (unsigned i = 0; i < DIRECT_KEPT; ++i) {
++		wr(flip_mdp, SSPP + direct_kept[i], direct_saved[i]);
++	}
++	direct_on = 0;
 +}
 +
 +/*
@@ -360,6 +484,10 @@
 +	absolutetime_to_nanoseconds(now - flip_requested, &latch);
 +	const uint32_t us = (uint32_t)(ns / 1000);
 +	flip_pending = 0;
++	/* A flush that did not clear in 34 ms leaves both configurations possible: neither is reported free. */
++	if (waited < 34) {
++		direct_shown = direct_pending;
++	}
 +	flip_total_us += us;
 +	flip_latch_us += latch / 1000;
 +	if (us > flip_max_us) {
@@ -369,8 +497,12 @@
 +		++flip_timeouts;
 +	}
 +	if (++flip_count % 600 == 1) {
-+		printf("COACHZ flip: %u flips, %u timeouts, %u still pending at the next frame, wait mean %llu max %u us, request to seen latched mean %llu us\n",
-+		    flip_count, flip_timeouts, flip_late, flip_total_us / flip_count, flip_max_us, flip_latch_us / flip_count);
++		/* formatted here: the kernel's printf encodes every argument for os_log and a long row overflows it */
++		char row[256];
++		snprintf(row, sizeof(row), "COACHZ flip: %u flips, %u timeouts, %u still pending at the next frame, wait mean %llu max %u us, "
++		    "request to seen latched mean %llu us; direct %u (UBWC %u, scaled %u)", flip_count, flip_timeouts, flip_late,
++		    flip_total_us / flip_count, flip_max_us, flip_latch_us / flip_count, direct_count, direct_ubwc_count, direct_scaled_count);
++		printf("%s\n", row);
 +		flip_max_us = 0;
 +	}
 +}
@@ -383,23 +515,186 @@
 +		return;
 +	}
 +	coachz_scanout_flip_wait();
++	direct_restore();
 +	flip_away = 1;
 +	wr(flip_mdp, FLIP_SSPP_SRC0, flip_buffers[buffer]);
 +	wr(flip_mdp, flip_ctl + FLIP_CTL_FLUSH, 1u);
 +	flip_requested = mach_absolute_time();
++	direct_pending = 0;
 +	flip_pending = 1;
 +}
 +
-+/* Also from the panic path: registers only, no lock and no wait. */
++/* Also from the panic path: registers only, no lock and no wait. A later coachz_scanout_flip_wait sees the return latch, after which
++ * the pipe no longer fetches a direct frame. */
 +void
 +coachz_scanout_home(void)
 +{
-+	if (flip_ctl && flip_away) {
++	if (flip_ctl && (flip_away || direct_on)) {
 +		flip_away = 0;
++		direct_restore();
 +		wr(flip_mdp, FLIP_SSPP_SRC0, flip_home_pa);
 +		wr(flip_mdp, flip_ctl + FLIP_CTL_FLUSH, 1u);
++		direct_pending = 0;
++		flip_requested = mach_absolute_time();
++		flip_pending = 1;
 +	}
 +}
++
++/* The tags the pipe may still fetch from (bit n for tag n; bit 0 the buffers and the firmware framebuffer): the latched one and, while a
++ * flush waits for its vsync, the pending one. */
++uint32_t
++coachz_scanout_busy(void)
++{
++	if (!flip_ctl) {
++		return 0;
++	}
++	const bool waiting = flip_pending || (rd(flip_mdp, flip_ctl + FLIP_CTL_FLUSH) & 1u);
++	return (1u << (direct_shown & 31)) | (waiting ? 1u << (direct_pending & 31) : 0u);
++}
++
++/* MDSS UBWC parameters for 6.x (msm_mdss_6x_setup_ubwc with sc7180's UBWC 2.0, highest bank bit 14), and what the firmware left for the
++ * MDP's core clock (dispcc-sc7180.c: RCG at 0x20c8; source 0 XO, 1 disp_cc_pll0, 4 GPLL0 at 600 MHz; a half divider): the scaler fetches
++ * 1488 rows in 1440 rows' time, about 3 % more pixels per line time than the firmware's own frame. Read only, except the UBWC words. */
++static bool
++direct_ubwc_setup(void)
++{
++	const uint32_t hw = rd(flip_mdp, MDSS_HW_VERSION);
++	const vm_offset_t dispcc = ml_io_map(DISPCC_PA, 0x3000);
++	const uint32_t cmd = dispcc ? rd(dispcc, DISPCC_MDP_CMD_RCGR) : 0, cfg = dispcc ? rd(dispcc, DISPCC_MDP_CMD_RCGR + 4) : 0;
++	const uint32_t before = rd(flip_mdp, MDSS_UBWC_STATIC);
++	if (hw >> 28 < 6) {
++		printf("COACHZ scanout: MDSS version 0x%x before 6.0, UBWC left alone\n", hw);
++		return false;
++	}
++	wr(flip_mdp, MDSS_UBWC_STATIC, 6u | (1u << 3) | ((14u - 13u) << 4));   /* swizzle levels 2 and 3, bank spread, highest bank bit 14 */
++	wr(flip_mdp, MDSS_UBWC_CTRL_2, 0);                                     /* qcom_ubwc_version_tag: 0 below UBWC 3.0 */
++	wr(flip_mdp, MDSS_UBWC_PREDICTION_MODE, 0);                            /* 0 below UBWC 4.0 */
++	printf("COACHZ scanout: MDSS 0x%x UBWC_STATIC 0x%x -> 0x%x; MDP clock RCG cmd 0x%x cfg 0x%x (source %u, half divider %u)\n", hw,
++	    before, rd(flip_mdp, MDSS_UBWC_STATIC), cmd, cfg, (cfg >> 8) & 7u, cfg & 0x1fu);
++	return true;
++}
++
++/*
++ * One frame through VIG0, then the flush (the caller waits for the latch with coachz_scanout_flip_wait). The output rectangle stays the
++ * firmware's (the panel), the source is the frame; a frame of another size goes through the scaler with the bilinear filter, as
++ * _dpu_plane_setup_scaler3 sets it for RGB, with the pixel extension the scaler then needs (no extra rows or columns). The format is
++ * XBGR8888 or XRGB8888 without alpha, as the firmware's SRC_FORMAT 0x236ff: the compositor's alpha is not opacity on the base plane.
++ */
++int
++coachz_scanout_direct(const struct coachz_scanout_frame *frame)
++{
++	if (!flip_ctl || !frame || !frame->tag || frame->tag > 31 || !frame->color || !frame->width || !frame->height ||
++	    frame->width > 4096 || frame->height > 4096 || frame->color_pitch < frame->width * 4 || frame->color_pitch > 0xffffu ||
++	    (frame->order != 1 && frame->order != 2) || (frame->ubwc && (frame->order != 1 || !frame->meta || !frame->meta_pitch ||
++	    frame->meta_pitch > 0xffffu))) {
++		return EINVAL;
++	}
++	if (frame->ubwc && !direct_ubwc_ready) {
++		if (!direct_ubwc_setup()) {
++			return ENOTSUP;
++		}
++		direct_ubwc_ready = 1;
++	}
++	const uint32_t out = direct_saved[2];   /* SSPP_OUT_SIZE: height << 16 | width */
++	const uint32_t dst_w = out & 0xffffu, dst_h = out >> 16, w = frame->width, h = frame->height;
++	if (!dst_w || !dst_h || w > 4 * dst_w || h > 4 * dst_h || dst_w > 4 * w || dst_h > 4 * h) {
++		return EINVAL;
++	}
++	const bool scaled = w != dst_w || h != dst_h;
++	coachz_scanout_flip_wait();
++	const vm_offset_t pipe = flip_mdp + SSPP, scaler = flip_mdp + SSPP + QSEED3;
++	uint32_t op = direct_saved[12] & ~(OP_FLIP_LR | OP_FLIP_UD | OP_BWC_EN | OP_PE_OVERRIDE);   /* the firmware's SSPP_SRC_OP_MODE */
++	if (frame->ubwc) {
++		op |= OP_BWC_EN;
++	}
++	op |= OP_PE_OVERRIDE;
++	/* dpu_hw_setup_format_impl: 8 bits a channel, no alpha, 4 bytes, unpack 4 tight; UBWC is fetch mode 2 at bit 30 with its own
++	 * fetch config (highest bank bit at 18) and static control (swizzle and bank bit, no fast clear without alpha). */
++	wr(pipe, SSPP_FETCH_CONFIG, frame->ubwc ? 0x87u | ((14u - 13u) << 18) : direct_saved[14]);
++	if (frame->ubwc) {
++		wr(pipe, SSPP_UBWC_STATIC_CTRL, 6u | ((14u - 13u) << 4));
++	}
++	wr(pipe, SSPP_SRC_FORMAT, 0x236ffu | (frame->ubwc ? 2u << 30 : 0));
++	wr(pipe, SSPP_SRC_UNPACK_PATTERN, frame->order == 1 ? 0x03010002u : 0x03020001u);
++	wr(pipe, SSPP_SRC_OP_MODE, op);
++	if (frame->ubwc) {
++		wr(pipe, SSPP_UBWC_ERROR_STATUS, 1u << 31);
++	}
++	/*
++	 * The fetch's QoS as _dpu_plane_set_qos_lut and _dpu_plane_set_qos_ctrl set it for a real-time pipe, from sc7180_perf_data: the
++	 * linear or the macrotile (UBWC) row of danger_lut_tbl, safe_lut_tbl and qos_lut_tbl (one entry each, so the fill level does not
++	 * matter), an 8-level CREQ LUT (DPU 6.x) and danger/safe on. Client driven prefetch as dpu_setup_cdp with cdp_cfg's read enable:
++	 * preload 64 ahead, and for UBWC the flags plane and tile amortizing.
++	 */
++	const uint64_t creq = frame->ubwc ? 0x0011223344556677ull : 0x0011222222335777ull;
++	wr(pipe, SSPP_DANGER_LUT, frame->ubwc ? 0xffffu : 0xffu);
++	wr(pipe, SSPP_SAFE_LUT, frame->ubwc ? 0xff00u : 0xfff0u);
++	wr(pipe, SSPP_CREQ_LUT_0, (uint32_t)creq);
++	wr(pipe, SSPP_CREQ_LUT_1, (uint32_t)(creq >> 32));
++	wr(pipe, SSPP_QOS_CTRL, 1u);
++	wr(pipe, SSPP_CDP_CNTL, (1u << 3) | 1u | (frame->ubwc ? (1u << 1) | (1u << 2) : 0));
++	/* setup_rects and setup_sourceaddress: plane 0 the color, plane 2 the UBWC flags; strides of planes 0 and 2. */
++	wr(pipe, SSPP_SRC_SIZE, h << 16 | w);
++	wr(pipe, SSPP_SRC_XY, 0);
++	wr(pipe, SSPP_OUT_SIZE, direct_saved[2]);
++	wr(pipe, SSPP_OUT_XY, direct_saved[3]);
++	wr(pipe, SSPP_SRC0_ADDR, frame->color);
++	wr(pipe, SSPP_SRC1_ADDR, 0);
++	wr(pipe, SSPP_SRC2_ADDR, frame->ubwc ? frame->meta : 0);
++	wr(pipe, SSPP_SRC3_ADDR, 0);
++	wr(pipe, SSPP_SRC_YSTRIDE0, frame->color_pitch);
++	wr(pipe, SSPP_SRC_YSTRIDE1, frame->ubwc ? frame->meta_pitch : 0);
++	/* setup_pe_config: no extension, the requested pixels are the source's for every component. */
++	const uint32_t req = h << 16 | w;
++	wr(pipe, SSPP_PE_C0_LR, 0);
++	wr(pipe, SSPP_PE_C0_TB, 0);
++	wr(pipe, SSPP_PE_C0_REQ, req);
++	wr(pipe, SSPP_PE_C1C2_LR, 0);
++	wr(pipe, SSPP_PE_C1C2_TB, 0);
++	wr(pipe, SSPP_PE_C1C2_REQ, req);
++	wr(pipe, SSPP_PE_C3_LR, 0);
++	wr(pipe, SSPP_PE_C3_TB, 0);
++	wr(pipe, SSPP_PE_C3_REQ, req);
++	if (scaled) {
++		/* _dpu_plane_setup_scaler3: phase steps of 2^21 times source over destination, the same for the chroma planes of RGB. */
++		const uint32_t step_x = (uint32_t)(((uint64_t)w << 21) / dst_w), step_y = (uint32_t)(((uint64_t)h << 21) / dst_h);
++		wr(scaler, QSEED3_PHASE_INIT_Y_H, 0);
++		wr(scaler, QSEED3_PHASE_INIT_Y_V, 0);
++		wr(scaler, QSEED3_PHASE_INIT_UV_H, 0);
++		wr(scaler, QSEED3_PHASE_INIT_UV_V, 0);
++		wr(scaler, QSEED3_PHASE_STEP_Y_H, step_x & 0xffffffu);
++		wr(scaler, QSEED3_PHASE_STEP_Y_V, step_y & 0xffffffu);
++		wr(scaler, QSEED3_PHASE_STEP_UV_H, step_x & 0xffffffu);
++		wr(scaler, QSEED3_PHASE_STEP_UV_V, step_y & 0xffffffu);
++		wr(scaler, QSEED3_PRELOAD, 4u | 2u << 8 | 4u << 16 | 2u << 24);
++		wr(scaler, QSEED3_SRC_SIZE_Y_RGB_A, h << 16 | w);
++		wr(scaler, QSEED3_SRC_SIZE_UV, h << 16 | w);
++		wr(scaler, QSEED3_DST_SIZE, dst_h << 16 | dst_w);
++		/* enable, DPU_SCALE_BIL (3) for Y/RGB, blend, and not 10-bit (bit 14); no alpha filter without alpha */
++		wr(scaler, QSEED3_OP_MODE, 1u | 3u << 16 | 1u << 31 | 1u << 14);
++	} else {
++		wr(scaler, QSEED3_OP_MODE, 1u << 14);
++	}
++	direct_on = 1;
++	flip_away = 1;
++	wr(flip_mdp, flip_ctl + FLIP_CTL_FLUSH, 1u);
++	flip_requested = mach_absolute_time();
++	direct_pending = frame->tag;
++	flip_pending = 1;
++	++direct_count;
++	direct_ubwc_count += frame->ubwc ? 1 : 0;
++	direct_scaled_count += scaled ? 1 : 0;
++	if (direct_count <= 2) {
++		char row[256];
++		snprintf(row, sizeof(row), "COACHZ scanout: direct %u: %ux%u to %ux%u, %s order %u, color 0x%x pitch %u, flags 0x%x pitch %u, op 0x%x; "
++		    "firmware QoS danger 0x%x safe 0x%x ctrl 0x%x cdp 0x%x",
++		    direct_count, w, h, dst_w, dst_h, frame->ubwc ? "UBWC" : "linear", frame->order, frame->color, frame->color_pitch, frame->meta,
++		    frame->meta_pitch, op, direct_saved[25], direct_saved[26], direct_saved[27], direct_saved[30]);
++		printf("%s\n", row);
++	}
++	return 0;
++}
++
 +
 +/* What a later direct scanout has to change, read only: the pipe the firmware left scanning, the controller, the interface and the
 + * apps SMMU entries of the display's streams (Linux: iommus = <&apps_smmu 0x800 0x2>). */

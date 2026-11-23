@@ -10,7 +10,7 @@
  bsd/dev/unix_startup.c			standard
 --- a/bsd/dev/coachz_gpu.c
 +++ b/bsd/dev/coachz_gpu.c
-@@ -0,0 +1,267 @@
+@@ -0,0 +1,299 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/*
 + * Adreno 618 first stages on Coachz (coachz-gpu=1 inventory, =2 bounded CX + GMU clock window, =3 also the GMU firmware into
@@ -130,6 +130,10 @@
 +static uint32_t gpu_pm_image_bytes;
 +int coachz_gpu_pm_suspend(void);
 +int coachz_gpu_pm_resume(void);
++int coachz_gpu_pm_force_off(int collapse);
++/* The GPU SMMU as gpu_pm_force_off found it, and whether the next resume brings CX back first (gpu_pm_cx_on). */
++static struct gpu_smmu_state gpu_pm_smmu;
++static int gpu_pm_cx_voted_off;
 +
 +/* a6xx_gmu_shutdown for this legacy firmware (a6xx_gmu_notify_slumber's boot OOB), the CP stopped and the bus quiet first: the slumber
 + * the GPU reaches 66 ms after its last submission under Linux's runtime power management. CX stays on, so the SMMU keeps its tables. */
@@ -156,12 +160,40 @@
 +	r->error = NULL;
 +	r->core_registers_done = 0;
 +	r->fw_init_polls = 0;
++	if (gpu_pm_cx_voted_off) {
++		uint32_t polls[3];
++		const int restored = gpu_pm_cx_on(io, r, &gpu_pm_smmu, polls);
++		printf("COACHZ gpu recover: cx on polls %u cxo %u cx-gmu %u, smmu restored %d, gds 0x%x\n", polls[0], polls[1], polls[2], restored,
++		    gpu_r(io, GPU_CC, GPUCC_CX_GDS_HW_CTRL));
++		if (!restored) {
++			return -3;
++		}
++		gpu_pm_cx_voted_off = 0;
++	}
 +	r->gmu[0] = gpu_r(io, GPU_GMU, GMU_CM3_SYSRESET);
 +	gmu_start(io, gpu_pm_image, gpu_pm_image_bytes, r);
 +	if (r->error || !r->core_registers_done) {
 +		printf("COACHZ gpu pm: resume failed: %s, core registers %u\n", r->error ? r->error : "no error", r->core_registers_done);
 +		return -2;
 +	}
++	return 0;
++}
++
++/* a6xx_recover's power-off of a hung GPU (gpu_pm_force_off), the CX collapse with it where collapse is set; the CP already halted
++ * (CP_SQE_CNTL 3) and the GMU's interrupts masked by the caller. The next coachz_gpu_pm_resume starts from it. */
++int
++coachz_gpu_pm_force_off(int collapse)
++{
++	const struct coachz_gpu_io *io = gpu_pm_io;
++	struct coachz_gpu_report *r = gpu_pm_r;
++	if (!io || !r || r->stage != 8) {
++		return -1;
++	}
++	uint32_t polls[7];
++	gpu_pm_force_off(io, r, collapse, &gpu_pm_smmu, polls);
++	gpu_pm_cx_voted_off = collapse;
++	printf("COACHZ gpu recover: force off: sptp %u tcs %u halts %u %u %u, cx off %u (gds 0x%x), rsc %u\n", polls[0], polls[1], polls[2],
++	    polls[3], polls[4], polls[5], gpu_r(io, GPU_CC, GPUCC_CX_GDS_HW_CTRL), polls[6]);
 +	return 0;
 +}
 +
@@ -1427,7 +1459,7 @@
 +#endif
 --- a/bsd/dev/coachz_gpu_core.h
 +++ b/bsd/dev/coachz_gpu_core.h
-@@ -0,0 +1,455 @@
+@@ -0,0 +1,600 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/*
 + * Adreno 618 core and CP (coachz-gpu=8), inside the GPU_SET OOB of coachz_gpu_gmu.h: the lowest GPU frequency, a stage-1 bank for the
@@ -1881,6 +1913,151 @@
 +	gpu_w(io, GPU_CC, GPUCC_GX_GDSCR, r->cc_before[2]);
 +	printf("COACHZ gpu pm: slumber polls idle %u sptp %u oob %u busy %u rsc %u, power state 0x%x\n", idle, sptp, oob, quiet, rsc, state);
 +	return oob && state == 0xfu ? 0 : -2;
++}
++
++/* The GPU SMMU's registers as arm_smmu_device_reset writes them on the SMMU's runtime resume: sc7180.dtsi puts adreno_smmu in GPU_CC's
++ * CX_GDSC, so a CX collapse resets them, and arm-smmu keeps its own copy in software where this keeps the registers' values. */
++#define SMMU_SACR 0x010u
++#define SMMU_TLBIALLH 0x06cu
++#define SMMU_CB_ACTLR 0x04u
++#define SMMU_CB_TTBR1 0x28u
++#define SMMU_CB_CONTEXTIDR 0x34u
++#define GPU_FORCE_POLLS 50u                     /* of 100 us: each GBIF halt of a hung GPU waited for at most 5 ms */
++struct gpu_smmu_state {
++	uint32_t scr0, sacr, smr[SMMU_MAX_GROUPS], s2cr[SMMU_MAX_GROUPS], cbar[SMMU_MAX_BANKS], cba2r[SMMU_MAX_BANKS];
++	uint32_t sctlr[SMMU_MAX_BANKS], actlr[SMMU_MAX_BANKS], tcr2[SMMU_MAX_BANKS], tcr[SMMU_MAX_BANKS], contextidr[SMMU_MAX_BANKS];
++	uint32_t mair0[SMMU_MAX_BANKS], mair1[SMMU_MAX_BANKS];
++	uint64_t ttbr0[SMMU_MAX_BANKS], ttbr1[SMMU_MAX_BANKS];
++};
++static inline void gpu_smmu_save(const struct coachz_gpu_io *io, const struct coachz_gpu_report *r, struct gpu_smmu_state *s) {
++	s->scr0 = gpu_r(io, GPU_SMMU, SMMU_SCR0);
++	s->sacr = gpu_r(io, GPU_SMMU, SMMU_SACR);
++	for (uint32_t i = 0; i < r->smmu_groups; i++) {
++		s->smr[i] = gpu_r(io, GPU_SMMU, SMMU_SMR + 4u * i);
++		s->s2cr[i] = gpu_r(io, GPU_SMMU, SMMU_S2CR + 4u * i);
++	}
++	for (uint32_t i = 0; i < r->smmu_banks; i++) {
++		const uint32_t bank = r->smmu_bank_base + i * r->smmu_page;
++		s->cbar[i] = gpu_r(io, GPU_SMMU, r->smmu_page + 4u * i);
++		s->cba2r[i] = gpu_r(io, GPU_SMMU, r->smmu_page + SMMU_CBA2R + 4u * i);
++		s->sctlr[i] = gpu_r(io, GPU_SMMU, bank + SMMU_CB_SCTLR);
++		s->actlr[i] = gpu_r(io, GPU_SMMU, bank + SMMU_CB_ACTLR);
++		s->tcr2[i] = gpu_r(io, GPU_SMMU, bank + SMMU_CB_TCR2);
++		s->tcr[i] = gpu_r(io, GPU_SMMU, bank + SMMU_CB_TCR);
++		s->contextidr[i] = gpu_r(io, GPU_SMMU, bank + SMMU_CB_CONTEXTIDR);
++		s->ttbr0[i] = gpu_r64(io, GPU_SMMU, bank + SMMU_CB_TTBR0);
++		s->ttbr1[i] = gpu_r64(io, GPU_SMMU, bank + SMMU_CB_TTBR1);
++		s->mair0[i] = gpu_r(io, GPU_SMMU, bank + SMMU_CB_MAIR0);
++		s->mair1[i] = gpu_r(io, GPU_SMMU, bank + SMMU_CB_MAIR1);
++	}
++}
++/* arm_smmu_device_reset's order: the global fault cleared, each stream group (S2CR, then SMR), each bank disabled, its attributes
++ * (CBA2R, CBAR), translation registers and faults written and its SCTLR last (arm_smmu_write_context_bank), the TLB invalidated and
++ * synced, then sCR0. 1 once the sync finished. */
++static inline int gpu_smmu_restore(const struct coachz_gpu_io *io, const struct coachz_gpu_report *r, const struct gpu_smmu_state *s) {
++	gpu_w(io, GPU_SMMU, SMMU_SGFSR, gpu_r(io, GPU_SMMU, SMMU_SGFSR));
++	for (uint32_t i = 0; i < r->smmu_groups; i++) {
++		gpu_w(io, GPU_SMMU, SMMU_S2CR + 4u * i, s->s2cr[i]);
++		gpu_w(io, GPU_SMMU, SMMU_SMR + 4u * i, s->smr[i]);
++	}
++	for (uint32_t i = 0; i < r->smmu_banks; i++) {
++		const uint32_t bank = r->smmu_bank_base + i * r->smmu_page;
++		gpu_w(io, GPU_SMMU, bank + SMMU_CB_SCTLR, 0);
++		gpu_w(io, GPU_SMMU, r->smmu_page + SMMU_CBA2R + 4u * i, s->cba2r[i]);
++		gpu_w(io, GPU_SMMU, r->smmu_page + 4u * i, s->cbar[i]);
++		gpu_w(io, GPU_SMMU, bank + SMMU_CB_TCR2, s->tcr2[i]);
++		gpu_w(io, GPU_SMMU, bank + SMMU_CB_TCR, s->tcr[i]);
++		gpu_w(io, GPU_SMMU, bank + SMMU_CB_CONTEXTIDR, s->contextidr[i]);
++		gpu_w64(io, GPU_SMMU, bank + SMMU_CB_TTBR0, s->ttbr0[i]);
++		gpu_w64(io, GPU_SMMU, bank + SMMU_CB_TTBR1, s->ttbr1[i]);
++		gpu_w(io, GPU_SMMU, bank + SMMU_CB_MAIR0, s->mair0[i]);
++		gpu_w(io, GPU_SMMU, bank + SMMU_CB_MAIR1, s->mair1[i]);
++		gpu_w(io, GPU_SMMU, bank + SMMU_CB_ACTLR, s->actlr[i]);
++		gpu_w(io, GPU_SMMU, bank + SMMU_CB_FSR, ~0u);
++		gpu_w(io, GPU_SMMU, bank + SMMU_CB_SCTLR, s->sctlr[i]);
++	}
++	gpu_w(io, GPU_SMMU, SMMU_TLBIALLH, 0);
++	const int synced = gmu_tlb_sync(io);   /* TLBIALLNSNH and the global sync */
++	gpu_w(io, GPU_SMMU, SMMU_SACR, s->sacr);
++	gpu_w(io, GPU_SMMU, SMMU_SCR0, s->scr0);
++	return synced;
++}
++static inline uint32_t core_poll_short(const struct coachz_gpu_io *io, uint32_t reg, uint32_t mask, uint32_t want) {
++	for (uint32_t i = 1; i <= GPU_FORCE_POLLS; i++) {
++		if ((core_r(io, reg) & mask) == want) return i;
++		io->delay_us(io->cookie, 100);
++	}
++	return 0;
++}
++/* a6xx_recover's power-off of a hung GPU, in its order. a6xx_gmu_force_off: keepalive off, the HFI stopped (a6xx_hfi_stop; the start
++ * writes the queue headers again), SPTP off (a6xx_sptprac_disable), no RPMh vote in flight (a6xx_gmu_rpmh_off's four TCS), the AHB
++ * fence cleared and back in allow mode, the CM3 halted, the bus drained with GX going off (a6xx_bus_clear_pending_transactions) and the
++ * core reset (a6xx_gpu_sw_reset); then a6xx_gmu_stop's GX collapse, the GMU's clocks off and the CX collapse a6xx_recover waits for
++ * (dev_pm_genpd_synced_poweroff, "cx gdsc didn't collapse"), which resets the GBIF and the GPU SMMU. The caller masked the GMU's
++ * interrupts (a6xx_gmu_irq_disable). The SMMU's registers are kept first; the next resume writes them back.
++ * Differences: the reset is released after its 100 us, as the runtime slumber's core_stop does, because GX goes off right after it; each
++ * halt waits 5 ms, not spin_until's second; where CX stays on (a votable GDSC another master holds), the RSC is stopped as the slumber
++ * leaves it. k222: the slumber a hung GPU took instead waited 100 ms for a GBIF halt that never came, and the cold start after it
++ * stopped where the HFI queues start, the GMU's first reads of memory after the firmware's own init. polls: SPTP off, TCS idle (of 4),
++ * the three halts, CX off (0: still on), RSC stop. */
++static inline void gpu_pm_force_off(const struct coachz_gpu_io *io, struct coachz_gpu_report *r, int collapse, struct gpu_smmu_state *s,
++    uint32_t polls[7]) {
++	static const uint32_t tcs[4] = {RSCC(0x346u), RSCC(0x3eeu), RSCC(0x496u), RSCC(0x53eu)};
++	for (unsigned i = 0; i < 7u; i++) polls[i] = 0;
++	gpu_smmu_save(io, r, s);
++	gpu_w(io, GPU_GMU, GMU_PWR_COL_KEEPALIVE, 0);
++	gpu_w(io, GPU_GMU, GMU_HFI_CTRL_INIT, 0);
++	gpu_w(io, GPU_CC, GPUCC_GX_GDSCR, gpu_r(io, GPU_CC, GPUCC_GX_GDSCR) | (1u << 11));
++	gpu_w(io, GPU_GMU, GMU_GX_SPTPRAC_POWER_CONTROL, 0x778001u);
++	polls[0] = gmu_poll_long(io, GMU_SPTPRAC_PWR_CLK_STATUS, 4u, 4u);
++	for (unsigned i = 0; i < 4u; i++) {
++		if (gmu_poll_long(io, tcs[i], 1u, 1u)) polls[1]++;
++	}
++	gpu_w(io, GPU_GMU, GMU_AHB_FENCE_STATUS_CLR, 7u);
++	gpu_w(io, GPU_GMU, GMU_AO_AHB_FENCE_CTRL, 0);
++	gpu_w(io, GPU_GMU, GMU_CM3_SYSRESET, 1u);
++	core_w(io, RBBM_GBIF_HALT, 1u);
++	polls[2] = core_poll_short(io, RBBM_GBIF_HALT_ACK, 1u, 1u);
++	core_w(io, GBIF_HALT, 1u);
++	polls[3] = core_poll_short(io, GBIF_HALT_ACK, 1u, 1u);
++	core_w(io, GBIF_HALT, 2u);
++	polls[4] = core_poll_short(io, GBIF_HALT_ACK, 2u, 2u);
++	core_w(io, GBIF_HALT, 0);
++	core_w(io, RBBM_SW_RESET_CMD, 1u);
++	(void)core_r(io, RBBM_SW_RESET_CMD);
++	io->delay_us(io->cookie, 101);
++	core_w(io, RBBM_SW_RESET_CMD, 0);
++	(void)core_r(io, RBBM_SW_RESET_CMD);
++	io->delay_us(io->cookie, 1);
++	gpu_w(io, GPU_CC, GPUCC_GX_GDSCR, gpu_r(io, GPU_CC, GPUCC_GX_GDSCR) | GDSC_SW_COLLAPSE);
++	io->delay_us(io->cookie, 500);
++	/* The GX register as the slumber leaves it; before a CX collapse only once CX is back (gpu_pm_cx_on), GX staying off until then. */
++	if (!collapse) gpu_w(io, GPU_CC, GPUCC_GX_GDSCR, r->cc_before[2]);
++	if (collapse) {
++		(void)gpu_branch_off(io, GPU_CC, GPUCC_CX_GMU, 0);
++		(void)gpu_branch_off(io, GPU_CC, GPUCC_CXO, 0);
++		gpu_w(io, GPU_CC, GPUCC_CX_GDSCR, gpu_r(io, GPU_CC, GPUCC_CX_GDSCR) | GDSC_SW_COLLAPSE);
++		polls[5] = gpu_poll(io, GPU_CC, GPUCC_CX_GDS_HW_CTRL, GDSC_PWR_ON, 0);
++	}
++	if (!polls[5]) polls[6] = gmu_rsc_stop(io);
++}
++/* What the next resume does first after gpu_pm_force_off asked for a CX collapse: CX voted on again and waited for, the GX register as the
++ * slumber leaves it, the GMU's clocks on as the first start turned them on, the SMMU written back (arm_smmu_runtime_resume), the CM3 held
++ * in reset as a cold GMU starts. polls: CX on, cxo, cx-gmu. */
++static inline int gpu_pm_cx_on(const struct coachz_gpu_io *io, const struct coachz_gpu_report *r, const struct gpu_smmu_state *s,
++    uint32_t polls[3]) {
++	gpu_w(io, GPU_CC, GPUCC_CX_GDSCR, gpu_r(io, GPU_CC, GPUCC_CX_GDSCR) & ~GDSC_SW_COLLAPSE);
++	io->delay_us(io->cookie, 1);
++	polls[0] = gpu_poll(io, GPU_CC, GPUCC_CX_GDS_HW_CTRL, GDSC_PWR_ON, GDSC_PWR_ON);
++	gpu_w(io, GPU_CC, GPUCC_GX_GDSCR, r->cc_before[2]);
++	gpu_w(io, GPU_CC, GPUCC_CXO, gpu_r(io, GPU_CC, GPUCC_CXO) | CBCR_ENABLE);
++	polls[1] = gpu_poll(io, GPU_CC, GPUCC_CXO, CBCR_CLK_OFF, 0);
++	gpu_w(io, GPU_CC, GPUCC_CX_GMU, gpu_r(io, GPU_CC, GPUCC_CX_GMU) | CBCR_WAKE_SLEEP | CBCR_ENABLE);
++	polls[2] = gpu_poll(io, GPU_CC, GPUCC_CX_GMU, CBCR_CLK_OFF, 0);
++	if (!polls[0] || !polls[1] || !polls[2]) return 0;
++	const int synced = gpu_smmu_restore(io, r, s);
++	gpu_w(io, GPU_GMU, GMU_CM3_SYSRESET, 1u);
++	return synced;
 +}
 +#endif
 --- a/bsd/dev/coachz_sample.c

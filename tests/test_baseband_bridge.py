@@ -99,7 +99,7 @@ class BasebandBridgeTests(unittest.TestCase):
         self.assertEqual([line for line in context if line not in produced], [])
         series = [line for line in (PATCHES / 'series').read_text().splitlines() if line and not line.startswith('#')]
         # Only the video decoder's kern_exec.c hook (built on the baseband patch's result) follows it.
-        self.assertEqual(series[-3:], ['coachz-prelink-baseband.patch', 'coachz-prelink-video-decoder.patch', 'coachz-prelink-early-log.patch'])
+        self.assertEqual(series[-4:], ['coachz-prelink-baseband.patch', 'coachz-prelink-video-decoder.patch', 'coachz-prelink-early-log.patch', 'coachz-prelink-gpu-malloc.patch'])
 
     def test_in_the_build(self):
         self.assertIn("'pending/baseband', copy / 'baseband'", (ROOT / 'tools/kernel_source.py').read_text())

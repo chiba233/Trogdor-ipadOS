@@ -1,0 +1,41 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -6108,6 +6108,38 @@
+ 		}
+ 		if (coachz_oslog_match(name) && imgp->ip_argspace >= new_ptr_size) {
+ 			error = exec_add_user_string(imgp, CAST_USER_ADDR_T(mirror), UIO_SYSSPACE, TRUE);
++			if (error) {
++				goto bad;
++			}
++			imgp->ip_argspace -= new_ptr_size;
++			imgp->ip_envc++;
++		}
++	}
++
++	/*
++	 * coachz-gpu-malloc: the render server keeps tiny malloc chunks that keep emptying. libmalloc's xzone (libmalloc-521.120.7,
++	 * __xzm_free) madvises a tiny chunk that empties unless its slot emptied one less than MallocXzoneTinyThrashThreshold ms
++	 * before (1 by default, read from the environment in _xzm_main_malloc_zone_create); the render server empties one every few
++	 * ms, so on k221 its encoding thread spent about a third of its busy samples in that madvise. 1000 ms keeps a chunk that
++	 * empties again within a second. coachz-xzone-thrash=0 leaves the default.
++	 */
++	{
++		static const char thrash[] = "MallocXzoneTinyThrashThreshold=1000";
++		static int enabled = -1;
++		const char *name = imgp->ip_strings + strlen(EXECUTABLE_KEY);
++
++		if (enabled < 0) {
++			unsigned value = 1;
++			(void)PE_parse_boot_argn("coachz-xzone-thrash", &value, sizeof(value));
++			enabled = value != 0;
++		}
++		for (const char *scan = name; *scan; scan++) {
++			if (*scan == '/') {
++				name = scan + 1;
++			}
++		}
++		if (enabled == 1 && !strcmp(name, "backboardd") && imgp->ip_argspace >= new_ptr_size) {
++			error = exec_add_user_string(imgp, CAST_USER_ADDR_T(thrash), UIO_SYSSPACE, TRUE);
+ 			if (error) {
+ 				goto bad;
+ 			}
