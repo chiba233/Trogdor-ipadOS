@@ -1,0 +1,124 @@
+---
+name: enforce-rules-for-ai-tone
+description: Enforce this repository's rules against AI boilerplate in English and Chinese text. Use when you write or review README.md, documentation under docs/, a code comment, a commit message, a report to the owner, or a message to another session. Also use when a reader says that text sounds like AI, like a chatbot, or like a template.
+---
+
+# Enforce Rules Against AI Tone
+
+Readers recognize text that a model wrote on autopilot. They skip it, and they trust the result less. Each rule below names a pattern that readers take as AI-generated text.
+
+This skill covers AI boilerplate only. For Chinese grammar, word choice, sentence length, and terminology, obey [`simple-chinese`](../simple-chinese/SKILL.md). These rules describe patterns in text. Do not use them to claim that a person used AI.
+
+## Where the Rules Apply
+
+| Text | Language |
+|---|---|
+| `README.md` | Chinese |
+| `AGENTS.md`, `docs/`, code comments, commit messages | English |
+| Reports to the owner, messages between sessions, memory notes | Chinese |
+
+## Content
+
+- Delete a sentence that stays true when you change its subject.
+- Say each point once. Delete a sentence that repeats the previous sentence in other words.
+- Credit a claim to a named source: a mainline Linux file, a disassembly address, a log line, a boot. Do not write that experts, studies, or many users agree.
+- Do not invent a cause, a number, a function, an experience, or a test result.
+- Claim only what you checked. Keep source reading, host checks, and hardware results apart, as `AGENTS.md` asks. A build, a passing test suite, or a written image is not a hardware result.
+- Do not call a change stable, compatible, fixed, or complete without the check that shows it.
+
+## Leftovers From Development
+
+Text often carries what the development process needed. The reader of the result never needed it.
+
+- Write what the reader needs to use the result. Leave out what only the development needed.
+- Development text includes a distinction that the team had to clarify, a constraint, a build goal, and an implementation note.
+- To test a sentence, ask: does a reader who never saw the task hold the view that it corrects?
+- If not, delete the sentence, or move it to a code comment or the commit message.
+- The denial forms "not X, but Y", "not just X", "Y rather than X", "不是……而是……", and "并非" often carry such a distinction.
+- In `README.md`, explain a name from the code the first time you use it, or leave it out.
+- Do not leave generation residue, such as a placeholder, an opener like "Here is" or "好的，以下是", or a citation token.
+- Add a subtitle, a note, or helper text only when it adds a fact to the heading or the label.
+
+## Framing
+
+- Do not add a sentence that only reassures the reader that something stayed the same or is absent.
+- Do not narrate how you wrote or edited the text, such as the parts that you kept, skipped, or deleted.
+- If the reader asked about it or expects the opposite, you can state it.
+- Do not tie a fact to a larger theme, such as history, the future, an industry shift, or human nature.
+- When the reader needs a decision, give one. Do not list both sides only to avoid a position.
+
+## Openings and Endings
+
+- Start with the subject. Do not open with the era, the industry, or the importance of the topic.
+- Do not announce the next part, as in "Here is", "Let's dive in", "以下是", or "接下来让我们".
+- Stop when the facts end. Do not add a summary of a short text, a lesson, a hope, or a call to action.
+- Do not end with an offer of more help, a wish that the text helps, or a next-step question. A question that the owner must answer before work can go on is not such an ending.
+
+## Register
+
+- Do not praise the reader, the question, or the idea.
+- Do not open with comfort or empathy before the fact, as in "Don't worry", "别担心", or "我理解你的感受".
+- Do not stage honesty or seriousness, as in "honestly" or "说句实话".
+- Do not add cheer to a routine result, such as an exclamation mark or an excited word.
+- Do not add certainty words, such as "clearly", "undoubtedly", "毫无疑问", or "显而易见".
+- Do not use words of inflated weight, such as "pivotal", "transformative", "至关重要", or "革命性". State the effect.
+
+## Sentence Patterns
+
+- Count the real items. Do not force three items, three adjectives, or "首先、其次、最后".
+- Do not stack sentences of the same shape for rhythm. Do not chain "不仅……更……".
+- Do not ask a question and then answer it. Do not build suspense before a fact.
+- Do not end a paragraph with a slogan line or a one-word sentence for emphasis.
+- Do not name a false range or a false choice to sound complete, as in "from beginners to experts".
+- Write "is" or "是". Do not replace it with "serves as", "stands as", "作为……而存在", or "标志着".
+- Use a metaphor only when plain words cannot explain the point. Do not give feelings or intentions to software.
+
+## Punctuation and Format
+
+- Do not join two clauses with a dash: "—" in English, "——" or " - " in Chinese. Use a period or a comma.
+- Do not bold words inside a sentence.
+- Do not decorate headings, list items, comments, or commit messages with emoji or symbols, such as ✅, 🚀, or →.
+- Do not give every list item a bold label and a colon.
+- Do not put quotation marks around a word for emphasis.
+
+## Chinese
+
+- Use the verb itself. Do not write "进行" before a verb noun, "对……进行……", "通过……来……", or "被……所……".
+- Break a long attribute into a short sentence. Do not chain several "的" in one phrase.
+- Write in Chinese word order. Do not translate an English sentence word by word.
+- Do not open each sentence with a connective, such as "此外", "值得注意的是", "换句话说", or "本质上".
+- Do not use business jargon, such as "赋能", "闭环", "抓手", or "底层逻辑". Use the plain verb.
+- Do not use engineering slang as everyday verbs, such as "接住", "收口", "兜底", or "落盘".
+
+## Commit Messages and Comments
+
+- A commit message is one line, without a `Co-Authored-By` line. Its form is `area: what changed and what it did on hardware`, with more areas joined by "; ".
+- Explain why the change exists. Do not list the changed files or retell the diff line by line.
+- Name the change. Do not write "improve", "enhance", "update", or "optimize" alone.
+- Report only the checks that ran. Name a hardware result only when a boot showed it.
+- Public text states facts, not people: do not write who asked, who decided, or who made a mistake.
+- In a code comment, do not narrate the change history, the request, or the conversation.
+
+## Exceptions
+
+- Keep a contrast when readers really hold the wrong belief, for example a register that mainline reads but this kernel must not.
+- In a commit message, a removal is part of the change. Name it.
+- When a reader needs it to judge a change in behaviour, state the unchanged behaviour.
+- Do not change quoted text, code, identifiers, commands, log lines, or messages from other programs.
+
+## Refactor Progressively
+
+- In each string, comment, or document that you change, fix the patterns of this skill.
+- Do not edit other text only for this rule. List it as follow-up work.
+
+## Review Checklist
+
+- Does each sentence say something specific to its subject?
+- Is each sentence for the reader, or a leftover from development?
+- Does a sentence only reassure that something stayed the same?
+- Does the text start with the subject and stop when the facts end?
+- Is the text free of praise, comfort, staged honesty, cheer, and unchecked claims?
+- Does each hardware claim name the boot or log that shows it?
+- Are there dashes between clauses, bold words in sentences, or decorative emoji?
+- Does the Chinese text read as Chinese?
+- Does a commit explain why, and report only the checks that ran?

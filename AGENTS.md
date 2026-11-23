@@ -2,6 +2,7 @@
 
 - Target: native iPadOS on HP Chromebook x2 11 / Google Coachz (SC7180).
 - Read `docs/native-boot.md`, `docs/design.md`, and `docs/status.md` before changes.
+- Write all text by `.agents/skills/enforce-rules-for-ai-tone/SKILL.md`, and Chinese text (README.md, reports, messages between sessions) also by `.agents/skills/simple-chinese/SKILL.md`. `.claude/skills` points to the same directory.
 - Commit after a meaningful real-device result confirms a fix or milestone. Compilation, packaging, transfer, and write/read-back are prerequisites, not milestones. Keep debugging iterations uncommitted unless a snapshot is explicitly requested.
 - Preserve the factory Coreboot / TF-A / Depthcharge chain. The initial entry is a developer-mode signed FIT on removable media. A virtual machine is not the product target.
 - Keep source observations, host verification, and hardware observations explicitly separate. Hardware attempts are recorded in `docs/hardware-tests.md`; the Linux log receiver has captured entry EL2, probe EL1, stage=3, and handoff EL2 directly on hardware; the source-XNU pre-MMU entry checkpoint has also executed at EL1, verified boot_args, and returned to Linux. That earlier checkpoint alone does not establish later initialization or a full kernel/OS boot.
