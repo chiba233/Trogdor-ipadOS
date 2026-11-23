@@ -1,0 +1,23 @@
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -1134,6 +1134,20 @@
+ 		}
+ #endif
+ 		CleanPoU_DcacheRegion((vm_offset_t) cpu_data_ptr, sizeof(cpu_data_t));
++
++#if defined(ARM64_BOARD_CONFIG_BCM2837)
++		/*
++		 * Coachz: a non-boot core leaves powered off, as APPLEVIRTUALPLATFORM's arm64_prepare_for_sleep does: PSCI
++		 * CPU_OFF (SMC, as the device tree's /psci says). TF-A's pwr_domain_off cleans the core's caches and turns its GIC
++		 * CPU interface off; processor_start() later brings it back with CPU_ON at the reset vector, through
++		 * cpu_reset_handler (cpu_sleep set it to start_cpu). If the firmware refuses, the core falls through to the WFI
++		 * loop below as before.
++		 */
++		{
++			register uint64_t x0 __asm__("x0") = 0x84000002ULL;
++			__asm__ volatile ("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
++		}
++#endif /* ARM64_BOARD_CONFIG_BCM2837 */
+ 
+ 		/* Architectural debug state: <rdar://problem/12390433>:
+ 		 *      Grab debug lock EDLAR and clear bit 0 in EDPRCR,

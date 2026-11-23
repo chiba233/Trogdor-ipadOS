@@ -227,6 +227,8 @@ CommCenter 的 Internet 上下文通过显式启用的固定版本兼容副本�
 
 PDP 重建后的持续加载来自 XNU 协议挂接入口缺失。内核记录 `in_domifattach: proto_plumb returned 6 if=pdp_ip0`，DNS 记录 `Device not configured`，发送请求计数停止增长，DMA 没有积压。原驱动只在开机直接挂接协议，CommCenter 清理旧上下文后无法重新挂回。现按同一 XNU 的 `utun_attach_proto` 约定注册蜂窝接口的 IPv4／IPv6 plumbers，复用初始挂接回调，保留 `EEXIST` 语义。
 
+APN 编辑入口（21H461 读出）：CommCenter 按匹配到的运营商设置包里的 `APNEditabilityTypemask`（可编辑的 APN 类型位掩码）和 `AllowAttachAPNEditing` 决定设置页能否编辑；`Unknown.bundle` 是 49 和 true，`Default.bundle` 和不带这两个键的运营商包都是 0，页面只读。只读是该运营商包的策略，不是缺陷。
+
 修复后的实机记录中，plumber 注册成功，`ENXIO` 消失，发送请求及 TX／RX 继续增长。统一日志有 112 条经 `pdp_ip0` 的有效 DNS 回复，WebKit 有蜂窝路径和 HTTP 200 响应。该结果覆盖 IPv4 网页加载及初始化中的 PDP 重建，IPv6 数据连接、APN 编辑入口和长时间连接继续验收。
 
 ## Operating mode after a baseband boot

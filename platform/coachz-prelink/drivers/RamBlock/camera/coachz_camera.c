@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 /*
- * Coachz rear camera, step 1 (/chosen/coachz-camera): the OV8856 streams its colour bar through CSIPHY1, PPI1, CSID0 RDI0 and
- * VFE0 write master 0 into low DRAM for a few seconds; frames are counted and the bars checked, then everything is powered down.
- * Nothing reaches iPadOS yet.
+ * Coachz rear camera (/chosen/coachz-camera): the OV8856 streams its colour bar through CSIPHY1, PPI1, CSID0 RDI0 and VFE0 write
+ * master 0 into low DRAM for a few seconds; frames are counted and the bars checked, then everything is powered down. With 2 the
+ * CoachzCamera service (CoachzCamera.cpp) then powers the whole path up only while a client streams.
  *
  * Sources (docs/plans/camera.md):
  *   same-board ChromeOS kernel 3f8e1538 (sc7180-camera.dtsi, sc7180-trogdor-mipi-camera.dtsi): addresses, interrupts, clock
@@ -46,9 +46,9 @@ void coachz_camera_start(void);
 #define CAMCC_SIZE      0x10000u
 #define CPAS_PA         0x0ac40000u
 #define CCI0_PA         0x0ac4a000u
-#define CSIPHY1_PA      0x0ac66000u
+#define CSIPHY_PA(n)    (0x0ac65000u + 0x1000u * (n))
 #define PPI_PAGE_PA     0x0ace0000u
-#define PPI1_OFFSET     0x200u
+#define PPI_OFFSET(n)   (0x200u * (n))
 #define CSID0_PA        0x0acb3000u
 #define VFE0_PA         0x0acaf000u
 #define VFE0_SIZE       0x4000u
@@ -92,7 +92,9 @@ void coachz_camera_start(void);
 #define PLL_OUT_MASK    0x7u
 #define RCG_SLOW_AHB    0x6058u
 #define RCG_CCI0        0xb0d8u
+#define RCG_MCLK0       0x4004u
 #define RCG_MCLK1       0x4024u
+#define RCG_CSI0PHYTIMER 0x5004u
 #define RCG_CPHY_RX     0x9064u
 #define RCG_CSI1PHYTIMER 0x5028u
 #define RCG_IFE0_CSID   0x903cu
@@ -101,12 +103,15 @@ void coachz_camera_start(void);
 #define CBCR_CPAS_AHB   0xb11cu
 #define CBCR_CAMNOC_AXI 0xb124u
 #define CBCR_CCI0       0xb0f0u
+#define CBCR_CSI0PHYTIMER 0x501cu
+#define CBCR_CSIPHY0    0x5020u
 #define CBCR_CSIPHY1    0x5044u
 #define CBCR_CSI1PHYTIMER 0x5040u
 #define CBCR_IFE0       0x9028u
 #define CBCR_IFE0_CSID  0x9054u
 #define CBCR_IFE0_CPHY_RX 0x907cu
 #define CBCR_IFE0_AXI   0x9080u
+#define CBCR_MCLK0      0x401cu
 #define CBCR_MCLK1      0x403cu
 #define GDSC_TITAN      0xb134u
 #define GDSC_IFE0       0x9004u
@@ -281,9 +286,9 @@ void coachz_camera_start(void);
 /* MIPI RAW10 (five bytes carry four pixels), written by the frame-based RDI write master with the PLAIN128 packer, which ends each
  * line on a 16-byte word: mainline camss gives the SDM845 VFE 170 RDI (the same 0xff01 width and stride, packer 0, frame-based)
  * bytesperline = roundup(width * bpp / 8, 16) (camss-video.c video_mbus_to_pix_mp, camss-vfe.c vfe_bpl_align_rdi). */
-#define LINE_BYTES      ((OV8856_MODE_WIDTH * 10u + 7u) / 8u)
+#define LINE_BYTES      ((cam->width * 10u + 7u) / 8u)
 #define FRAME_STRIDE    ((LINE_BYTES + 15u) & ~15u)
-#define FRAME_BYTES     (FRAME_STRIDE * OV8856_MODE_HEIGHT)
+#define FRAME_BYTES     (FRAME_STRIDE * cam->height)
 #define FILL            0xa5u
 
 /* ---- TLMM (pinctrl-msm.c): pull 1:0, function 5:2, drive 8:6 ((mA / 2) - 1), output enable 9; IO output bit 1 ---- */
@@ -304,6 +309,55 @@ static struct cam_pin cam_pins[PIN_COUNT] = {
 	[PIN_SDA] = {.gpio = 19, .north = false, .cfg = TLMM_FUNC(1) | TLMM_DRIVE(2) | TLMM_PULL_UP, .base = NULL, .saved_cfg = 0, .saved_io = 0},
 	[PIN_SCL] = {.gpio = 20, .north = false, .cfg = TLMM_FUNC(1) | TLMM_DRIVE(2) | TLMM_PULL_UP, .base = NULL, .saved_cfg = 0, .saved_io = 0},
 };
+
+/* ---- OV5675, the front sensor (ov5675.c): the same OmniVision register layout for ID, stream, exposure, gain and VTS ---- */
+#define OV5675_CHIP_ID  0x005675u
+#define OV5675_REG_TEST_PATTERN 0x4503u
+#define OV5675_REG_FORMAT1 0x3820u
+#define OV5675_REG_FORMAT2 0x373du
+#define OV5675_REG_GROUP_ACCESS 0x3208u
+#define OV5675_REG_MWB_GAIN(c) ((uint16_t)(0x5019u + 2u * (c)))   /* R, G, B */
+#define OV5675_EXPOSURE_MAX_MARGIN 4u
+
+/* ---- the sensor this run drives: the rear OV8856, or with /chosen/coachz-camera bit 0x800 the front OV5675, from the table in
+ * docs/plans/camera.md (CCI0 master 0, CSIPHY0, MCLK0 on GPIO13, CAM_RESET0 on GPIO30, GPIO6 rails). Chosen once per boot. ---- */
+struct cam_desc {
+	const char *name, *where;
+	unsigned cci;                   /* CCI0 master */
+	uint8_t addrs[2];               /* the addresses its SID pin allows, the expected one first */
+	uint32_t chip_id;
+	unsigned phy;                   /* CSIPHY n, PPI n, CSID PHY select n */
+	uint32_t rcg_mclk, cbcr_mclk, rcg_phytimer, cbcr_phytimer, cbcr_csiphy;
+	uint32_t lane_mask;             /* CSIPHY lanes: data 0, clock, data 1, 2, 3 */
+	unsigned lanes;
+	uint32_t lane_cfg;              /* CSID lane_cfg: the physical lane of each logical lane, four bits each */
+	uint64_t link_hz;
+	uint32_t width, height, vts, vts_reg, exposure_margin, exposure_shift, test_pattern_reg;
+	uint32_t rail_to_reset_us, reset_to_bus_us;
+	uint32_t bayer;                 /* 0 RGGB, 1 GRBG, 2 GBRG, 3 BGGR */
+};
+static const struct cam_desc cam_rear = {
+	.name = "OV8856", .where = "rear", .cci = CCI_REAR, .addrs = {0x10, 0x36}, .chip_id = OV8856_CHIP_ID, .phy = 1,
+	.rcg_mclk = RCG_MCLK1, .cbcr_mclk = CBCR_MCLK1, .rcg_phytimer = RCG_CSI1PHYTIMER, .cbcr_phytimer = CBCR_CSI1PHYTIMER,
+	.cbcr_csiphy = CBCR_CSIPHY1, .lane_mask = CSIPHY_LANE_MASK, .lanes = 4, .lane_cfg = CSID_LANE_CFG, .link_hz = OV8856_LINK_HZ,
+	.width = OV8856_MODE_WIDTH, .height = OV8856_MODE_HEIGHT, .vts = OV8856_MODE_VTS, .vts_reg = OV8856_MODE_VTS,
+	.exposure_margin = OV8856_EXPOSURE_MAX_MARGIN, .exposure_shift = 4, .test_pattern_reg = OV8856_REG_TEST_PATTERN,
+	.rail_to_reset_us = 1000, .reset_to_bus_us = 1800, .bayer = 1,
+};
+/* ov5675.c: 2 lanes at 450 MHz (900 Mbit/s a lane) from a 19.2 MHz XVCLK, SBGGR10 whatever the flips; the exposure register holds
+ * half the exposure in its fixed point (val << 3), and V4L2_CID_VBLANK writes VTS as height + vblank + 10; power on as
+ * ov5675_power_on: clock, reset asserted, supplies, 2 ms, reset released, 1.5 ms. */
+static const struct cam_desc cam_front = {
+	.name = "OV5675", .where = "front", .cci = 0, .addrs = {0x36, 0x10}, .chip_id = OV5675_CHIP_ID, .phy = 0,
+	.rcg_mclk = RCG_MCLK0, .cbcr_mclk = CBCR_MCLK0, .rcg_phytimer = RCG_CSI0PHYTIMER, .cbcr_phytimer = CBCR_CSI0PHYTIMER,
+	.cbcr_csiphy = CBCR_CSIPHY0, .lane_mask = 0x7u, .lanes = 2, .lane_cfg = 0x10u, .link_hz = OV5675_LINK_HZ,
+	.width = OV5675_MODE_WIDTH, .height = OV5675_MODE_HEIGHT, .vts = OV5675_MODE_VTS, .vts_reg = OV5675_MODE_VTS + 10u,
+	.exposure_margin = OV5675_EXPOSURE_MAX_MARGIN, .exposure_shift = 3, .test_pattern_reg = OV5675_REG_TEST_PATTERN,
+	.rail_to_reset_us = 2000, .reset_to_bus_us = 1500, .bayer = 3,
+};
+static const struct cam_desc *cam = &cam_rear;
+static struct cam_pin front_pins[PIN_COUNT];
+static struct cam_pin *pins = cam_pins;
 
 /* The service side (CoachzCamera.cpp, /chosen/coachz-camera = 2): the thread keeps the camera powered after the self-test and streams
  * real images into the ring while a client asks for them. */
@@ -487,11 +541,16 @@ static int cci_write(unsigned m, uint8_t addr, const uint8_t *bytes, unsigned le
 
 /* cam_cci_read on queue 1: SET_PARAM, LOCK, WRITE_DISABLE_P with the 16-bit register address (no stop, so the read follows with a
  * repeated start), READ, UNLOCK; done is RD_DONE. READ_BUF_LEVEL is len / 4 + 1 words; the first word's low byte is not data. */
-static int cci_read(unsigned m, uint8_t addr, uint16_t reg, uint8_t *out, unsigned len)
+/* regbytes is the register address width: 2 for 16-bit register addresses, 1 for 8-bit ones (the address byte only), 0 for a plain
+ * read with no address written at all. */
+static int cci_read(unsigned m, uint8_t addr, uint16_t reg, unsigned regbytes, uint8_t *out, unsigned len)
 {
 	wr(cam_cci, CCI_LOAD(m, 1), cci_param(addr));
 	wr(cam_cci, CCI_LOAD(m, 1), CMD_LOCK);
-	wr(cam_cci, CCI_LOAD(m, 1), CMD_WRITE_DISABLE_P | (2u << 4) | ((uint32_t)(reg >> 8) << 8) | ((uint32_t)(reg & 0xff) << 16));
+	if (regbytes == 2)
+		wr(cam_cci, CCI_LOAD(m, 1), CMD_WRITE_DISABLE_P | (2u << 4) | ((uint32_t)(reg >> 8) << 8) | ((uint32_t)(reg & 0xff) << 16));
+	else if (regbytes == 1)
+		wr(cam_cci, CCI_LOAD(m, 1), CMD_WRITE_DISABLE_P | (1u << 4) | ((uint32_t)(reg & 0xff) << 8));
 	wr(cam_cci, CCI_LOAD(m, 1), CMD_READ | (len << 4));
 	wr(cam_cci, CCI_LOAD(m, 1), CMD_UNLOCK);
 	int e = cci_run(m, 1);
@@ -513,13 +572,13 @@ static int sensor_write(uint16_t reg, uint32_t value, unsigned bytes)
 {
 	uint8_t buf[5] = {(uint8_t)(reg >> 8), (uint8_t)reg, 0, 0, 0};
 	for (unsigned i = 0; i < bytes; i++) buf[2 + i] = (uint8_t)(value >> (8 * (bytes - 1 - i)));
-	return cci_write(CCI_REAR, cam_sensor_addr, buf, 2 + bytes);
+	return cci_write(cam->cci, cam_sensor_addr, buf, 2 + bytes);
 }
 
 static int sensor_read(uint8_t addr, uint16_t reg, uint32_t *value, unsigned bytes)
 {
 	uint8_t buf[4] = {0};
-	int e = cci_read(CCI_REAR, addr, reg, buf, bytes);
+	int e = cci_read(cam->cci, addr, reg, 2, buf, bytes);
 	*value = 0;
 	for (unsigned i = 0; !e && i < bytes; i++) *value = (*value << 8) | buf[i];
 	return e;
@@ -537,26 +596,46 @@ static bool sensor_list(const struct cam_sensor_reg *list, unsigned count, const
 	return true;
 }
 
-/* ov8856_identify_module at the two addresses its SID pin allows. */
+/* ov8856_identify_module / ov5675_identify_module (both 24 bits at 0x300a) at the two addresses the SID pin allows. */
 static bool sensor_identify(void)
 {
-	static const uint8_t addrs[] = {0x10, 0x36};
-	for (unsigned i = 0; i < sizeof(addrs); i++) {
+	for (unsigned i = 0; i < sizeof(cam->addrs); i++) {
 		uint32_t id = 0;
-		int e = sensor_read(addrs[i], OV8856_REG_CHIP_ID, &id, 3);
-		printf("COACHZ camera: address 0x%02x chip id %d 0x%06x (CCI status 0x%x)\n", addrs[i], e, id, cci_last_status);
-		if (!e && id == OV8856_CHIP_ID) {
-			cam_sensor_addr = addrs[i];
+		int e = sensor_read(cam->addrs[i], OV8856_REG_CHIP_ID, &id, 3);
+		printf("COACHZ camera: %s address 0x%02x chip id %d 0x%06x (CCI status 0x%x)\n", cam->where, cam->addrs[i], e, id, cci_last_status);
+		if (!e && id == cam->chip_id) {
+			cam_sensor_addr = cam->addrs[i];
 			return true;
 		}
 	}
 	return false;
 }
 
-/* ov8856_start_streaming: PLL list, mode list, Bayer order, the control defaults (__v4l2_ctrl_handler_setup), MODE_SELECT. */
-static bool sensor_stream(bool on)
+/* ov8856_start_streaming: PLL list, mode list, Bayer order, the control defaults (__v4l2_ctrl_handler_setup) with test pattern
+ * register value `pattern` (0 off), MODE_SELECT. */
+static bool sensor_stream(bool on, uint8_t pattern)
 {
 	if (!on) return sensor_write(OV8856_REG_MODE_SELECT, 0, 1) == 0;
+	if (cam == &cam_front) {
+		/* ov5675_start_streaming: the 900 Mbit/s list, the mode list, then __v4l2_ctrl_handler_setup in the controls' creation order
+		 * at their defaults (VBLANK, analogue gain, digital gain through the MWB gains under a group hold, exposure, test pattern,
+		 * HFLIP 0 setting 0x3820 bit 3, VFLIP 0 clearing 0x3820 bits 4-5 and 0x373d bit 1), then streaming. */
+		uint32_t f1 = 0, f2 = 0;
+		if (!sensor_list(ov5675_pll_900mbps, sizeof(ov5675_pll_900mbps) / sizeof(ov5675_pll_900mbps[0]), "PLL") ||
+		    !sensor_list(ov5675_mode_1296x972, sizeof(ov5675_mode_1296x972) / sizeof(ov5675_mode_1296x972[0]), "mode")) {
+			return false;
+		}
+		bool ok = sensor_write(OV8856_REG_VTS, cam->vts_reg, 2) == 0 && sensor_write(OV8856_REG_ANALOG_GAIN, OV8856_ANAL_GAIN_MIN, 2) == 0 &&
+		    sensor_write(OV5675_REG_GROUP_ACCESS, 0x00u, 1) == 0;
+		for (unsigned c = 0; ok && c < 3; c++) ok = sensor_write(OV5675_REG_MWB_GAIN(c), OV8856_DGTL_GAIN_DEFAULT, 2) == 0;
+		ok = ok && sensor_write(OV5675_REG_GROUP_ACCESS, 0x10u, 1) == 0 && sensor_write(OV5675_REG_GROUP_ACCESS, 0xa0u, 1) == 0 &&
+		    sensor_write(OV8856_REG_EXPOSURE, (cam->vts - cam->exposure_margin) << cam->exposure_shift, 3) == 0 &&
+		    sensor_write(OV5675_REG_TEST_PATTERN, pattern, 1) == 0 &&
+		    sensor_read(cam_sensor_addr, OV5675_REG_FORMAT1, &f1, 1) == 0 && sensor_write(OV5675_REG_FORMAT1, f1 | 0x08u, 1) == 0 &&
+		    sensor_read(cam_sensor_addr, OV5675_REG_FORMAT1, &f1, 1) == 0 && sensor_write(OV5675_REG_FORMAT1, f1 & ~0x30u, 1) == 0 &&
+		    sensor_read(cam_sensor_addr, OV5675_REG_FORMAT2, &f2, 1) == 0 && sensor_write(OV5675_REG_FORMAT2, f2 & ~0x02u, 1) == 0;
+		return ok && sensor_write(OV8856_REG_MODE_SELECT, 1, 1) == 0;
+	}
 	if (!sensor_list(ov8856_pll_360mbps, sizeof(ov8856_pll_360mbps) / sizeof(ov8856_pll_360mbps[0]), "PLL") ||
 	    !sensor_list(ov8856_mode_1640x1232, sizeof(ov8856_mode_1640x1232) / sizeof(ov8856_mode_1640x1232[0]), "mode") ||
 	    !sensor_list(ov8856_bayer_sgrbg10, sizeof(ov8856_bayer_sgrbg10) / sizeof(ov8856_bayer_sgrbg10[0]), "Bayer order")) {
@@ -566,7 +645,7 @@ static bool sensor_stream(bool on)
 	    sensor_write(OV8856_REG_DIGITAL_GAIN, OV8856_DGTL_GAIN_DEFAULT, 2) == 0 &&
 	    sensor_write(OV8856_REG_EXPOSURE, (OV8856_MODE_VTS - OV8856_EXPOSURE_MAX_MARGIN) << 4, 3) == 0 &&
 	    sensor_write(OV8856_REG_VTS, OV8856_MODE_VTS, 2) == 0 &&
-	    sensor_write(OV8856_REG_TEST_PATTERN, OV8856_COLOUR_BAR, 1) == 0 &&
+	    sensor_write(OV8856_REG_TEST_PATTERN, pattern, 1) == 0 &&
 	    sensor_write(OV8856_REG_MODE_SELECT, 1, 1) == 0;
 }
 
@@ -592,9 +671,9 @@ static uint32_t phy_lane_enable(void)
 	uint32_t enable = 0, mask = 1;
 	for (int i = 0; i < 4; i++, mask <<= 1) {
 		if (mask == 0x2) {
-			if (CSIPHY_LANE_MASK & mask) enable |= 0x80u;
+			if (cam->lane_mask & mask) enable |= 0x80u;
 			i--;
-		} else if (CSIPHY_LANE_MASK & mask) {
+		} else if (cam->lane_mask & mask) {
 			enable |= 1u << (i << 1);
 		}
 	}
@@ -604,7 +683,7 @@ static uint32_t phy_lane_enable(void)
 /* csiphy_settle_cnt_calc: t_hs_settle = 85 ns + 6 UI (the maximum T_HS-PREPARE), in timer periods, less 6. */
 static uint32_t phy_settle_count(void)
 {
-	uint64_t ui = 1000000000000ull / OV8856_LINK_HZ / 2, timer = 1000000000000ull / CSIPHY_TIMER_HZ;
+	uint64_t ui = 1000000000000ull / cam->link_hz / 2, timer = 1000000000000ull / CSIPHY_TIMER_HZ;
 	return (uint32_t)((85000ull + 6ull * ui) / timer - 6ull);
 }
 
@@ -614,10 +693,10 @@ static void phy_start(void)
 	phy_list(csiphy_reset, sizeof(csiphy_reset) / sizeof(csiphy_reset[0]), 0, 0);
 	phy_list(csiphy_common, sizeof(csiphy_common) / sizeof(csiphy_common[0]), enable, settle);
 	for (unsigned pos = 0; pos < 5; pos++) {
-		if (CSIPHY_LANE_MASK & (1u << pos)) phy_list(csiphy_2ph[pos], CSIPHY_2PH_SIZE, enable, settle);
+		if (cam->lane_mask & (1u << pos)) phy_list(csiphy_2ph[pos], CSIPHY_2PH_SIZE, enable, settle);
 	}
 	for (unsigned i = 0; i < sizeof(csiphy_irq) / sizeof(csiphy_irq[0]); i++) wr(cam_phy, csiphy_irq[i].addr, csiphy_irq[i].val);
-	printf("COACHZ camera: CSIPHY1 lane enable 0x%x settle count %u\n", enable, settle);
+	printf("COACHZ camera: CSIPHY%u lane enable 0x%x settle count %u\n", cam->phy, enable, settle);
 }
 
 static void phy_stop(void)
@@ -650,7 +729,7 @@ static bool ppi_reset(void)
 	bool done = poll(cam_ppi, PPI_IRQ_STATUS, 1u, 1u, 500000);
 	wr(cam_ppi, PPI_IRQ_CLEAR, 1);
 	wr(cam_ppi, PPI_IRQ_CMD, 1u << 0);
-	if (!done) printf("COACHZ camera: PPI1 reset not done: status 0x%x\n", rd(cam_ppi, PPI_IRQ_STATUS));
+	if (!done) printf("COACHZ camera: PPI%u reset not done: status 0x%x\n", cam->phy, rd(cam_ppi, PPI_IRQ_STATUS));
 	return done;
 }
 
@@ -662,9 +741,9 @@ static bool ppi_start(void)
 	wr(cam_ppi, PPI_IRQ_CMD, 1u << 0);
 	/* Lanes 0 and 1 of lane_cfg select DL0, lanes 2 and 3 DL1; D-PHY selects neither as C-PHY. */
 	uint32_t cfg = 0;
-	for (unsigned i = 0; i < 4; i++) cfg |= ((CSID_LANE_CFG >> (4 * i)) & 0x3u) < 2 ? PPI_DL_EN(0) : PPI_DL_EN(1);
+	for (unsigned i = 0; i < cam->lanes; i++) cfg |= ((cam->lane_cfg >> (4 * i)) & 0x3u) < 2 ? PPI_DL_EN(0) : PPI_DL_EN(1);
 	wr(cam_ppi, PPI_MODULE_CFG, cfg);
-	printf("COACHZ camera: PPI1 version 0x%x cfg 0x%x\n", rd(cam_ppi, 0), rd(cam_ppi, PPI_MODULE_CFG));
+	printf("COACHZ camera: PPI%u version 0x%x cfg 0x%x\n", cam->phy, rd(cam_ppi, 0), rd(cam_ppi, PPI_MODULE_CFG));
 	return true;
 }
 
@@ -708,7 +787,7 @@ static void csid_clear(uint32_t csi2, uint32_t rdi)
 
 static void csid_start(void)
 {
-	wr(cam_csid, CSID_RX_CFG0, (4u - 1u) | (CSID_LANE_CFG << 4) | (0u << 24) | ((CSID_PHY_SEL & 0x3u) << 20));
+	wr(cam_csid, CSID_RX_CFG0, (cam->lanes - 1u) | (cam->lane_cfg << 4) | (0u << 24) | ((cam->phy & 0x3u) << 20));
 	wr(cam_csid, CSID_RX_CFG1, (1u << 6) | 1u);
 	wr(cam_csid, CSID_CSI2_IRQ_MASK, CSID_CSI2_RST_DONE | CSID_CSI2_ERRORS);
 	wr(cam_csid, CSID_RDI_CFG0(0), (0u << 22) | (MIPI_DT_RAW10 << 16) | (0u << 27) | (CSID_DECODE_PAYLOAD << 12) | (1u << 2) | 3u);
@@ -750,13 +829,39 @@ static bool vfe_reset(void)
 	return done;
 }
 
-static void vfe_queue(uint64_t pa)
+/* The ring, as mainline camss-vfe-17x.c drives the VFE 170 RDI write master: the image address register queues addresses, two are
+ * queued before the stream starts (vfe_enable_output_v2: an address and a register update each), and each write-master done
+ * completes the older of the two (vfe_isr_wm_done: ready_buf = buf[0]) and queues the next address (vfe_wm_update: the address and
+ * frame increment only). So the buffer that is done is the one queued first, never the one queued at the frame's start; the earlier
+ * scheme, which queued at each start of frame and published RING_PA(frame) after it, published the buffer the next frame was being
+ * written into. ring_q holds the two queued ring numbers, oldest first. */
+static uint32_t ring_q[2], ring_next;
+
+static void vfe_wm_update(uint64_t pa)
 {
-	wr(cam_vfe, WM0_WIDTH, WM_RDI_DEFAULT);
 	wr(cam_vfe, WM0_IMAGE_ADDR, (uint32_t)pa);
 	wr(cam_vfe, WM0_FRAME_INC, FRAME_BYTES);
-	wr(cam_vfe, WM0_CFG, WM_EN_FRAME_BASED);
-	wr(cam_vfe, VFE_REG_UPDATE, VFE_RDI0_REG_UPDATE);
+}
+
+static void ring_start(uint32_t first)
+{
+	ring_q[0] = first;
+	ring_q[1] = first + 1u;
+	ring_next = first + 2u;
+	for (unsigned i = 0; i < 2; i++) {
+		vfe_wm_update(RING_PA(ring_q[i]));
+		wr(cam_vfe, VFE_REG_UPDATE, VFE_RDI0_REG_UPDATE);
+	}
+}
+
+/* A write-master done: the ring number now complete. */
+static uint32_t ring_done(void)
+{
+	const uint32_t ready = ring_q[0];
+	ring_q[0] = ring_q[1];
+	ring_q[1] = ring_next++;
+	vfe_wm_update(RING_PA(ring_q[1]));
+	return ready;
 }
 
 static void vfe_start(void)
@@ -780,7 +885,7 @@ static void vfe_start(void)
 	wr(cam_vfe, WM0_HEIGHT, 0);
 	wr(cam_vfe, WM0_PACKER, 0);
 	wr(cam_vfe, WM0_STRIDE, WM_RDI_DEFAULT);
-	vfe_queue(FRAME_PA0);
+	wr(cam_vfe, WM0_CFG, WM_EN_FRAME_BASED);
 }
 
 static void vfe_stop(void)
@@ -794,7 +899,7 @@ static void vfe_stop(void)
 /* ---- frames ---- */
 static uint32_t view_offset(unsigned which)
 {
-	return which == 0 ? 0 : which == 1 ? (OV8856_MODE_HEIGHT / 2) * FRAME_STRIDE : FRAME_BYTES - FRAME_STRIDE;
+	return which == 0 ? 0 : which == 1 ? (cam->height / 2) * FRAME_STRIDE : FRAME_BYTES - FRAME_STRIDE;
 }
 
 static bool map_views(void)
@@ -843,8 +948,8 @@ static void check_frame(unsigned b)
 	}
 	printf("COACHZ camera: buffer %u: line %u bytes, stride %u; rows 0/2 equal in %u at stride %u and %u at stride %u; rows 2/%u equal in %u, rows %u/%u in %u; %u fill bytes, %u levels\n",
 	    b, LINE_BYTES, FRAME_STRIDE, rows_equal(top, top + 2u * LINE_BYTES), LINE_BYTES, rows_equal(top, top + 2u * FRAME_STRIDE),
-	    FRAME_STRIDE, OV8856_MODE_HEIGHT / 2, rows_equal(top + 2u * FRAME_STRIDE, mid), OV8856_MODE_HEIGHT / 2,
-	    OV8856_MODE_HEIGHT / 2 + 1, rows_equal(mid, mid + FRAME_STRIDE), fill, levels);
+	    FRAME_STRIDE, cam->height / 2, rows_equal(top + 2u * FRAME_STRIDE, mid), cam->height / 2,
+	    cam->height / 2 + 1, rows_equal(mid, mid + FRAME_STRIDE), fill, levels);
 	char what[64];
 	for (unsigned r = 0; r < 4; r++) {
 		snprintf(what, sizeof(what), "buffer %u row %u:", b, r);
@@ -856,6 +961,21 @@ static void check_frame(unsigned b)
 	}
 	snprintf(what, sizeof(what), "buffer %u last row padding, then past the frame:", b);
 	print_bytes(what, last + FRAME_STRIDE - 8, 16);
+	/* The Bayer order on hardware: the high bytes of the 2x2 cell at the centre of each of the colour bar's eight bars, rows 0 and 1.
+	 * In SGRBG the two greens (row 0 first, row 1 second) match in every bar, and a bar without red or blue zeroes row 0's second
+	 * or row 1's first byte. */
+	uint8_t cell[8][4];
+	for (unsigned k = 0; k < 8; k++) {
+		const unsigned x = ((cam->width / 8u) * k + cam->width / 16u) & ~1u, at = (x / 4u) * 5u + (x % 4u);
+		cell[k][0] = top[at]; cell[k][1] = top[at + 1u];
+		cell[k][2] = top[FRAME_STRIDE + at]; cell[k][3] = top[FRAME_STRIDE + at + 1u];
+	}
+	for (unsigned half = 0; half < 2; half++) {
+		const uint8_t (*c)[4] = cell + 4u * half;
+		printf("COACHZ camera: buffer %u bars %u-%u cells: %02x %02x/%02x %02x, %02x %02x/%02x %02x, %02x %02x/%02x %02x, %02x %02x/%02x %02x\n",
+		    b, 4u * half, 4u * half + 3u, c[0][0], c[0][1], c[0][2], c[0][3], c[1][0], c[1][1], c[1][2], c[1][3], c[2][0], c[2][1],
+		    c[2][2], c[2][3], c[3][0], c[3][1], c[3][2], c[3][3]);
+	}
 }
 
 static void stream_and_count(void)
@@ -879,12 +999,11 @@ static void stream_and_count(void)
 		overflow += (rdi & CSID_RDI_FIFO_OVERFLOW) != 0;
 		eof += (rdi & CSID_RDI_EOF) != 0;
 		if (rdi & CSID_RDI_SOF) sof++;
-		if (top0 & VFE_IRQ0_RDI0_SOF) {
-			/* The next frame's buffer, latched at the following frame boundary by the RDI0 register update. */
-			vsof++;
-			vfe_queue(vsof & 1 ? FRAME_PA1 : FRAME_PA0);
+		if (top0 & VFE_IRQ0_RDI0_SOF) vsof++;
+		if (bus1 & 1u) {
+			done++;
+			(void)ring_done();
 		}
-		if (bus1 & 1u) done++;
 		delay(200);
 	}
 	phy_any = phy_status();
@@ -895,53 +1014,317 @@ static void stream_and_count(void)
 }
 
 uint64_t coachz_camera_frame_pa(uint32_t index) { return RING_PA(index); }
-/* 0 width, 1 height, 2 stride (MIPI RAW10 lines padded to 16 bytes), 3 frame bytes, 4 ring count; SGRBG10 Bayer order (ov8856.c 0x3813). */
+/* 0 width, 1 height, 2 stride (MIPI RAW10 lines padded to 16 bytes), 3 frame bytes, 4 ring count, 5 Bayer order (0 RGGB, 1 GRBG,
+ * 2 GBRG, 3 BGGR; the OV8856 is SGRBG10 by ov8856.c 0x3813, the OV5675 SBGGR10), 6 front (1) or rear (0). */
 uint32_t coachz_camera_geometry(uint32_t which)
 {
 	switch (which) {
-	case 0: return OV8856_MODE_WIDTH;
-	case 1: return OV8856_MODE_HEIGHT;
+	case 0: return cam->width;
+	case 1: return cam->height;
 	case 2: return FRAME_STRIDE;
 	case 3: return FRAME_BYTES;
 	case 4: return RING;
+	case 5: return cam->bayer;
+	case 6: return cam == &cam_front;
 	default: return 0;
 	}
 }
 
-/* The service loop: real images while the client wants them, the sensor in standby (MODE_SELECT 0, registers kept) otherwise. The
- * ring buffer for frame n + 1 is queued at frame n's start, so frame n lands in RING_PA(n); its write-master done publishes it. */
+/* ---- power: the whole path comes up for a client and goes down when it leaves, as camx's ISP and sensor managers do per session.
+ * The rear rails (GPIO7: pp1800_wf_cam, pp2800_wf_cam, which is also the VCM supply) are on only while a client streams. ---- */
+enum cam_stage { NONE, VOTES, PLLS, TITAN, IFE0, SENSOR, PIPE, STREAM };
+static enum cam_stage cam_reached;
+static bool gcc_axi_found;
+
+static void camera_down(void)
+{
+	const enum cam_stage reached = cam_reached;
+	if (reached >= STREAM) (void)sensor_stream(false, 0);
+	if (reached >= PIPE) {
+		csid_stop();
+		vfe_stop();
+		ppi_stop();
+		phy_stop();
+	}
+	if (reached >= SENSOR) {
+		/* ov8856_power_off / ov5675_power_off: reset asserted, supplies off, clock off. */
+		pin_set(&pins[PIN_RESET], pins[PIN_RESET].cfg, false);
+		delay(100);
+		pin_set(&pins[PIN_RAIL], pins[PIN_RAIL].cfg, false);
+		(void)branch(cam_cc, cam->cbcr_mclk, false, "mclk");
+	}
+	if (reached >= IFE0) {
+		(void)branch(cam_cc, CBCR_IFE0_CPHY_RX, false, "ife_0_cphy_rx");
+		(void)branch(cam_cc, CBCR_IFE0_CSID, false, "ife_0_csid");
+		(void)branch(cam_cc, CBCR_IFE0_AXI, false, "ife_0_axi");
+		(void)branch(cam_cc, CBCR_IFE0, false, "ife_0");
+		if (!gdsc(GDSC_IFE0, false, "ife_0_gdsc")) printf("COACHZ camera: ife_0_gdsc did not collapse\n");
+	}
+	if (reached >= TITAN) {
+		(void)branch(cam_cc, cam->cbcr_phytimer, false, "csiphytimer");
+		(void)branch(cam_cc, cam->cbcr_csiphy, false, "csiphy");
+		(void)branch(cam_cc, CBCR_CCI0, false, "cci_0");
+		(void)branch(cam_cc, CBCR_CAMNOC_AXI, false, "camnoc_axi");
+		(void)branch(cam_cc, CBCR_CPAS_AHB, false, "cpas_ahb");
+		(void)branch(cam_cc, CBCR_SOC_AHB, false, "soc_ahb");
+		if (!gdsc(GDSC_TITAN, false, "titan_top_gdsc")) printf("COACHZ camera: titan_top_gdsc did not collapse\n");
+	}
+	/* CAMCC answers only with GCC's camera AHB branch on (set from PLLS on); an unclocked read stalls the bus. */
+	const uint32_t titan = reached >= PLLS ? rd(cam_cc, GDSC_TITAN) : 0, ife0 = reached >= PLLS ? rd(cam_cc, GDSC_IFE0) : 0;
+	if (reached >= PLLS) {
+		pll_off(PLL3);
+		pll_off(PLL0);
+		if (!gcc_axi_found) (void)branch(cam_gcc, GCC_CAMERA_HF_AXI, false, "gcc_camera_hf_axi");
+	}
+	if (reached >= VOTES) {
+		(void)coachz_camera_bus_vote(0, 0);
+		(void)coachz_rpmh_cx_request(CX_CONSUMER_CAMERA, 0);
+	}
+	/* The rail and reset low as the regulator off and cam_sensor_rear_suspend (output-low) leave them; the clock and bus pins as
+	 * they were before the first power-up. */
+	for (unsigned i = 0; i < PIN_COUNT; i++) {
+		if (i == PIN_RAIL || i == PIN_RESET) {
+			pin_set(&pins[i], pins[i].cfg, false);
+			continue;
+		}
+		wr(pins[i].base, 4, pins[i].saved_io);
+		wr(pins[i].base, 0, pins[i].saved_cfg);
+	}
+	cam_reached = NONE;
+	if (reached >= PLLS) printf("COACHZ camera: powered down; TITAN GDSC 0x%x IFE0 GDSC 0x%x, GPIO%u out %d\n", titan, ife0,
+	    pins[PIN_RAIL].gpio, (rd(pins[PIN_RAIL].base, 4) & TLMM_OUT) != 0);
+	else printf("COACHZ camera: stopped before the camera clocks\n");
+}
+
+/* The part both sensors share: votes, GCC branches, PLL0 and PLL3, the RCGs, TITAN and its branches with the CCI. */
+static bool base_up(void)
+{
+	cam_reached = NONE;
+	{
+		int cx = coachz_rpmh_cx_request(CX_CONSUMER_CAMERA, CX_LEVEL_SVS), bus = coachz_camera_bus_vote(BUS_AVG_KBPS, BUS_PEAK_KBPS);
+		printf("COACHZ camera: cx svs vote %d, MM0 vote %d\n", cx, bus);
+		cam_reached = VOTES;
+		if (cx || bus < 0) return false;
+	}
+	set_bits(cam_gcc, GCC_CAMERA_AHB, 1u, 1u);
+	set_bits(cam_gcc, GCC_CAMERA_XO, 1u, 1u);
+	if (!branch(cam_gcc, GCC_CAMERA_HF_AXI, true, "gcc_camera_hf_axi")) return false;
+	/* camcc PLL0 (600 MHz; its even output feeds the PHY timer and slow AHB) and PLL3 (1080 MHz) as camcc-sc7180.c configures them. */
+	cam_reached = PLLS;
+	if (!pll_on(PLL0, 0x1f, 0x1u, "cam_cc_pll0") || !pll_on(PLL3, 0x38, 0, "cam_cc_pll3")) return false;
+	/* ChromeOS rates: slow AHB 80 MHz, CCI 37.5 MHz, cphy_rx and CSID 270 MHz (svs), PHY timer 300 MHz, IFE 360 MHz (svs);
+	 * MCLK 19.2 MHz from XO, the rate mainline's OV8856 tables are for. */
+	if (!rcg(RCG_SLOW_AHB, SRC_PLL0_EVEN, 14, false, "slow_ahb") || !rcg(RCG_CCI0, SRC_PLL0_EVEN, 31, true, "cci_0") ||
+	    !rcg(RCG_CPHY_RX, SRC_PLL3_MAIN, 7, false, "cphy_rx") || !rcg(cam->rcg_phytimer, SRC_PLL0_EVEN, 3, false, "csiphytimer") ||
+	    !rcg(RCG_IFE0_CSID, SRC_PLL3_MAIN, 7, false, "ife_0_csid") || !rcg(RCG_IFE0, SRC_PLL3_MAIN, 5, false, "ife_0") ||
+	    !rcg(cam->rcg_mclk, SRC_XO, 1, true, "mclk")) {
+		return false;
+	}
+	cam_reached = TITAN;
+	if (!gdsc(GDSC_TITAN, true, "titan_top_gdsc")) return false;
+	return branch(cam_cc, CBCR_SOC_AHB, true, "soc_ahb") && branch(cam_cc, CBCR_CPAS_AHB, true, "cpas_ahb") &&
+	    branch(cam_cc, CBCR_CAMNOC_AXI, true, "camnoc_axi") && branch(cam_cc, CBCR_CCI0, true, "cci_0") &&
+	    branch(cam_cc, cam->cbcr_csiphy, true, "csiphy") && branch(cam_cc, cam->cbcr_phytimer, true, "csiphytimer");
+}
+
+/* Up to a streaming sensor: votes, PLLs, TITAN and IFE0 clocks, __ov8856_power_on, the CCI, identification, then CSIPHY, PPI, CSID
+ * and VFE with the ring from `first`, and the sensor's stream with test pattern register value `pattern`. On failure it powers
+ * down again. */
+static bool camera_up(uint32_t first, uint8_t pattern)
+{
+	/* Reset asserted and the rail off before any clock runs. */
+	pin_set(&pins[PIN_RESET], pins[PIN_RESET].cfg, false);
+	pin_set(&pins[PIN_RAIL], pins[PIN_RAIL].cfg, false);
+	if (!base_up()) goto fail;
+	cam_reached = IFE0;
+	if (!gdsc(GDSC_IFE0, true, "ife_0_gdsc")) goto fail;
+	if (!branch(cam_cc, CBCR_IFE0, true, "ife_0") || !branch(cam_cc, CBCR_IFE0_AXI, true, "ife_0_axi") ||
+	    !branch(cam_cc, CBCR_IFE0_CSID, true, "ife_0_csid") || !branch(cam_cc, CBCR_IFE0_CPHY_RX, true, "ife_0_cphy_rx")) {
+		goto fail;
+	}
+	printf("COACHZ camera: CPAS 0x%x, CCI 0x%x, CSID 0x%x, VFE 0x%x, bus 0x%x\n", rd(cam_cpas, 0), rd(cam_cci, CCI_HW_VERSION),
+	    rd(cam_csid, CSID_HW_VERSION), rd(cam_vfe, VFE_HW_VERSION), rd(cam_vfe, BUS_HW_VERSION));
+	/* __ov8856_power_on / ov5675_power_on: clock, reset asserted, supplies (the rails' 1 ms ramp), the sensor's wait, reset
+	 * released, its wait before the first transfer. */
+	cam_reached = SENSOR;
+	if (!branch(cam_cc, cam->cbcr_mclk, true, "mclk")) goto fail;
+	pin_set(&pins[PIN_MCLK], pins[PIN_MCLK].cfg, false);
+	delay(2000);
+	pin_set(&pins[PIN_RAIL], pins[PIN_RAIL].cfg, true);
+	delay(cam->rail_to_reset_us);
+	pin_set(&pins[PIN_RESET], pins[PIN_RESET].cfg, true);
+	delay(cam->reset_to_bus_us);
+	/* Then the bus, as camx's camera_io_init follows cam_sensor_core_power_up: CCI pins active, controller reset and masks. */
+	pin_set(&pins[PIN_SDA], pins[PIN_SDA].cfg, false);
+	pin_set(&pins[PIN_SCL], pins[PIN_SCL].cfg, false);
+	if (!cci_reset()) goto fail;
+	if (!sensor_identify()) { printf("COACHZ camera: no %s on CCI0 master %u\n", cam->name, cam->cci); goto fail; }
+
+	/* The receive side first, as the ISP manager starts CSIPHY, CSID and IFE before the sensor streams. */
+	cam_reached = PIPE;
+	phy_start();
+	if (!ppi_start() || !csid_reset() || !vfe_reset()) goto fail;
+	vfe_start();
+	ring_start(first);
+	csid_start();
+	cam_reached = STREAM;
+	if (!sensor_stream(true, pattern)) { printf("COACHZ camera: %s at 0x%02x did not start streaming\n", cam->name, cam_sensor_addr); goto fail; }
+	return true;
+fail:
+	camera_down();
+	return false;
+}
+
+/* ---- the front sensor's identity (/chosen/coachz-camera bit 0x100): chip ID reads only, nothing written to the sensor ----
+ * Its model is in no public source: sc7180-trogdor-mipi-camera.dtsi names only qcom,cam-sensor on CCI0 master 0 (cci0_active: GPIO17
+ * and GPIO18, cci_i2c, pull-up, 2 mA) with MCLK0 on GPIO13 (cam_sensor_mclk0_active) and CAM_RESET0 on GPIO30
+ * (cam_sensor_front_active), and sc7180-trogdor.dtsi turns pp1800_uf_cam and pp2800_uf_cam on with GPIO6; its EEPROM at 0x50 is
+ * never addressed. The node asks for MCLK0 at 24 MHz, which camcc-sc7180.c makes from the Agera PLL2; the probe runs it at 19.2 MHz
+ * from XO, the same table's first entry, and leaves PLL2 to a front driver. Each address is read only with the register width of the
+ * candidates that sit there, so no address byte can land as a data write; the candidates are the 5 MP sensors with a mainline or
+ * ChromeOS driver, their addresses from the bindings' examples or a ChromeOS board, their ID registers and values from the drivers. */
+#define CCI_FRONT       0u
+static struct cam_pin front_pins[PIN_COUNT] = {
+	[PIN_RAIL] = {.gpio = 6, .north = true, .cfg = TLMM_DRIVE(2) | TLMM_OE, .base = NULL, .saved_cfg = 0, .saved_io = 0},
+	[PIN_RESET] = {.gpio = 30, .north = false, .cfg = TLMM_DRIVE(2) | TLMM_OE, .base = NULL, .saved_cfg = 0, .saved_io = 0},
+	[PIN_MCLK] = {.gpio = 13, .north = false, .cfg = TLMM_FUNC(1) | TLMM_DRIVE(2), .base = NULL, .saved_cfg = 0, .saved_io = 0},
+	[PIN_SDA] = {.gpio = 17, .north = false, .cfg = TLMM_FUNC(1) | TLMM_DRIVE(2) | TLMM_PULL_UP, .base = NULL, .saved_cfg = 0, .saved_io = 0},
+	[PIN_SCL] = {.gpio = 18, .north = false, .cfg = TLMM_FUNC(1) | TLMM_DRIVE(2) | TLMM_PULL_UP, .base = NULL, .saved_cfg = 0, .saved_io = 0},
+};
+struct front_read { uint8_t addr, regbytes, len; uint16_t reg; const char *what; };
+static const struct front_read front_reads[] = {
+	/* ov5647, ov5648, ov5670, ov5675, ov5693 bindings and ChromeOS kodama's ov5695: 0x36; 0x300a read as ov5670/ov5675/ov5695 do
+	 * (24 bits: 0x005670, 0x005675, 0x005695), its first two bytes as ov5647/ov5648/ov5693 do (0x5647, 0x5648, 0x5690). */
+	{0x36, 2, 3, 0x300a, "OmniVision 0x300a"},
+	{0x10, 2, 3, 0x300a, "OmniVision 0x300a at the other SID address"},
+	/* ov5640 and ov5645 bindings: 0x3c; 0x5640 and 0x5645 at 0x300a. */
+	{0x3c, 2, 3, 0x300a, "OmniVision 0x300a"},
+	/* hi556.c: 0x0556 at 0x0f16 (16-bit). Its address comes only from ACPI; 0x20 is the Hynix hi846 binding's example. */
+	{0x20, 2, 2, 0x0f16, "Hynix 0x0f16"},
+	/* ChromeOS kodama's gc5035 at 0x37: 8-bit registers, 0x50 at 0xf0 and 0x35 at 0xf1 (gc5035.c, chromeos-5.10). */
+	{0x37, 1, 1, 0x00f0, "GalaxyCore 0xf0"},
+	{0x37, 1, 1, 0x00f1, "GalaxyCore 0xf1"},
+};
+
+static void front_probe(void)
+{
+	struct cam_pin *p = front_pins;
+	uint8_t got[sizeof(front_reads) / sizeof(front_reads[0])][3];
+	int err[sizeof(front_reads) / sizeof(front_reads[0])];
+	const char *model = NULL;
+	uint8_t at = 0;
+
+	printf("COACHZ camera: front probe, read only; GPIO6 out %d before\n", (rd(p[PIN_RAIL].base, 4) & TLMM_OUT) != 0);
+	pin_set(&p[PIN_RESET], p[PIN_RESET].cfg, false);
+	pin_set(&p[PIN_RAIL], p[PIN_RAIL].cfg, false);
+	if (!base_up() || !rcg(RCG_MCLK0, SRC_XO, 1, true, "mclk0") || !branch(cam_cc, CBCR_MCLK0, true, "mclk0")) {
+		printf("COACHZ camera: front probe: clocks did not come up\n");
+		goto down;
+	}
+	/* The rear sensor's power order: clock, supplies after 2 ms, reset released 1 ms later; then 30 ms, longer than any candidate
+	 * driver waits after its reset (25 ms at most, ov5640 and ov5648); then the CCI pins and the controller. */
+	pin_set(&p[PIN_MCLK], p[PIN_MCLK].cfg, false);
+	delay(2000);
+	pin_set(&p[PIN_RAIL], p[PIN_RAIL].cfg, true);
+	delay(1000);
+	pin_set(&p[PIN_RESET], p[PIN_RESET].cfg, true);
+	delay(30000);
+	pin_set(&p[PIN_SDA], p[PIN_SDA].cfg, false);
+	pin_set(&p[PIN_SCL], p[PIN_SCL].cfg, false);
+	if (!cci_reset()) goto off;
+	for (unsigned i = 0; i < sizeof(front_reads) / sizeof(front_reads[0]); i++) {
+		const struct front_read *r = &front_reads[i];
+		got[i][0] = got[i][1] = got[i][2] = 0;
+		err[i] = cci_read(CCI_FRONT, r->addr, r->reg, r->regbytes, got[i], r->len);
+		if (err[i]) printf("COACHZ camera: front 0x%02x %s: error %d (CCI status 0x%x)\n", r->addr, r->what, err[i], cci_last_status);
+		else printf("COACHZ camera: front 0x%02x %s: %02x %02x %02x (%u bytes)\n", r->addr, r->what, got[i][0], got[i][1], got[i][2], r->len);
+		if (err[i] || model) continue;
+		const uint32_t v24 = (uint32_t)got[i][0] << 16 | (uint32_t)got[i][1] << 8 | got[i][2], v16 = v24 >> 8;
+		if (r->reg == 0x300a) {
+			model = v24 == 0x005670u ? "ov5670" : v24 == 0x005675u ? "ov5675" : v24 == 0x005695u ? "ov5695" :
+			    v16 == 0x5640u ? "ov5640" : v16 == 0x5645u ? "ov5645" : v16 == 0x5647u ? "ov5647" : v16 == 0x5648u ? "ov5648" :
+			    v16 == 0x5690u ? "ov5693" : NULL;
+		} else if (r->reg == 0x0f16 && v16 == 0x0556u) {
+			model = "hi556";
+		} else if (r->reg == 0x00f1 && i > 0 && !err[i - 1] && front_reads[i - 1].addr == r->addr && got[i - 1][0] == 0x50 && got[i][0] == 0x35) {
+			model = "gc5035";
+		}
+		if (model) at = r->addr;
+	}
+	if (model) printf("COACHZ camera: front sensor is %s at 0x%02x\n", model, at);
+	else printf("COACHZ camera: front sensor matched no candidate\n");
+off:
+	/* Powered off as the rear sensor is: reset asserted, supplies off, clock off; then every pin as it was. */
+	pin_set(&p[PIN_RESET], p[PIN_RESET].cfg, false);
+	delay(100);
+	pin_set(&p[PIN_RAIL], p[PIN_RAIL].cfg, false);
+	(void)branch(cam_cc, CBCR_MCLK0, false, "mclk0");
+down:
+	for (unsigned i = 0; i < PIN_COUNT; i++) {
+		if (i == PIN_RAIL || i == PIN_RESET) {
+			pin_set(&p[i], p[i].cfg, false);
+			continue;
+		}
+		wr(p[i].base, 4, p[i].saved_io);
+		wr(p[i].base, 0, p[i].saved_cfg);
+	}
+	camera_down();
+	printf("COACHZ camera: front probe done; GPIO6 out %d\n", (rd(p[PIN_RAIL].base, 4) & TLMM_OUT) != 0);
+}
+
+/* What the client's copies saw (CoachzCamera.cpp): copies, their total and longest time, and copies the ring overtook. */
+volatile uint32_t coachz_camera_copies, coachz_camera_copy_us_max, coachz_camera_overtaken;
+volatile uint64_t coachz_camera_copy_us;
+
+/* The service loop: the camera is powered down while no client streams. A client's start powers the whole path up (a few hundred
+ * milliseconds; the viewer shows "Waiting for frames" meanwhile) and its stop or close powers it down again, which turns the rear
+ * rails off. Each write-master done publishes the ring buffer it completed. */
 __attribute__((noreturn)) static void service_loop(void)
 {
-	uint32_t frame = 0, applied = ~0u, streaming = 0;
-	(void)sensor_write(OV8856_REG_TEST_PATTERN, 0, 1);
-	(void)sensor_stream(false);
+	uint32_t applied = ~0u, complete = 0;
+	bool streaming = false;
 	coachz_camera_state = 1;
 	coachz_camera_publish();
-	printf("COACHZ camera: service ready, ring of %u frames at 0x%llx\n", RING, (unsigned long long)RING_PA(0));
+	printf("COACHZ camera: service ready, ring of %u frames at 0x%llx, powered down until a client streams\n", RING,
+	    (unsigned long long)RING_PA(0));
 	for (;;) {
 		if (!streaming) {
 			if (!coachz_camera_want) { delay(20000); continue; }
-			vfe_queue(RING_PA(frame));
-			if (sensor_write(OV8856_REG_MODE_SELECT, 1, 1)) { delay(20000); continue; }
-			streaming = 1;
+			const uint64_t t0 = mach_absolute_time();
+			if (!camera_up(ring_next, 0)) {
+				coachz_camera_state = 3;
+				printf("COACHZ camera: power-up for a client failed; idle until it stops\n");
+				while (coachz_camera_want) delay(20000);
+				coachz_camera_state = 1;
+				continue;
+			}
+			uint64_t ns = 0;
+			absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+			streaming = true;
+			applied = ~0u;
+			complete = 0;
+			coachz_camera_copies = coachz_camera_copy_us_max = coachz_camera_overtaken = 0;
+			coachz_camera_copy_us = 0;
 			coachz_camera_state = 2;
-			printf("COACHZ camera: streaming for a client from frame %u\n", frame);
+			printf("COACHZ camera: powered up for a client in %llu ms, streaming from ring %u\n", ns / 1000000ull, ring_q[0]);
 		}
 		if (!coachz_camera_want) {
-			(void)sensor_write(OV8856_REG_MODE_SELECT, 0, 1);
-			streaming = 0;
 			coachz_camera_state = 1;
-			printf("COACHZ camera: client stopped at frame %u (%u complete)\n", frame, coachz_camera_seq);
+			camera_down();
+			streaming = false;
+			const uint32_t copies = coachz_camera_copies;
+			printf("COACHZ camera: client stopped after %u frames; %u copies mean %llu max %u us, %u overtaken\n", complete, copies,
+			    copies ? (unsigned long long)(coachz_camera_copy_us / copies) : 0ull, coachz_camera_copy_us_max, coachz_camera_overtaken);
 			continue;
 		}
 		if (applied != coachz_camera_settings) {
 			applied = coachz_camera_settings;
 			uint32_t e = coachz_camera_exposure, g = coachz_camera_gain;
 			if (e < 6u) e = 6u;
-			if (e > OV8856_MODE_VTS - OV8856_EXPOSURE_MAX_MARGIN) e = OV8856_MODE_VTS - OV8856_EXPOSURE_MAX_MARGIN;
+			if (e > cam->vts - cam->exposure_margin) e = cam->vts - cam->exposure_margin;
 			if (g < OV8856_ANAL_GAIN_MIN) g = OV8856_ANAL_GAIN_MIN;
 			if (g > 2047u) g = 2047u;
-			(void)sensor_write(OV8856_REG_EXPOSURE, e << 4, 3);
+			(void)sensor_write(OV8856_REG_EXPOSURE, e << cam->exposure_shift, 3);
 			(void)sensor_write(OV8856_REG_ANALOG_GAIN, g, 2);
 		}
 		uint32_t csi2 = rd(cam_csid, CSID_CSI2_IRQ_STATUS), rdi = rd(cam_csid, CSID_RDI_IRQ_STATUS(0));
@@ -954,12 +1337,9 @@ __attribute__((noreturn)) static void service_loop(void)
 			wr(cam_vfe, VFE_IRQ_GLOBAL_CLEAR, 1);
 		}
 		if (bus1 & 1u) {
-			coachz_camera_last = frame % RING;
+			coachz_camera_last = ring_done() % RING;
+			complete++;
 			__atomic_store_n(&coachz_camera_seq, coachz_camera_seq + 1u, __ATOMIC_RELEASE);
-		}
-		if (top0 & VFE_IRQ0_RDI0_SOF) {
-			frame++;
-			vfe_queue(RING_PA(frame));
 		}
 		delay(2000);
 	}
@@ -971,8 +1351,8 @@ static void map_all(void)
 	cam_cc = (volatile uint8_t *)ml_io_map(CAMCC_PA, CAMCC_SIZE);
 	cam_cpas = (volatile uint8_t *)ml_io_map(CPAS_PA, 0x1000u);
 	cam_cci = (volatile uint8_t *)ml_io_map(CCI0_PA, 0x1000u);
-	cam_phy = (volatile uint8_t *)ml_io_map(CSIPHY1_PA, 0x1000u);
-	cam_ppi = (volatile uint8_t *)ml_io_map(PPI_PAGE_PA, 0x1000u) + PPI1_OFFSET;
+	cam_phy = (volatile uint8_t *)ml_io_map(CSIPHY_PA(cam->phy), 0x1000u);
+	cam_ppi = (volatile uint8_t *)ml_io_map(PPI_PAGE_PA, 0x1000u) + PPI_OFFSET(cam->phy);
 	cam_csid = (volatile uint8_t *)ml_io_map(CSID0_PA, 0x1000u);
 	cam_vfe = (volatile uint8_t *)ml_io_map(VFE0_PA, VFE0_SIZE);
 	for (unsigned i = 0; i < PIN_COUNT; i++) {
@@ -981,132 +1361,50 @@ static void map_all(void)
 		p->saved_cfg = rd(p->base, 0);
 		p->saved_io = rd(p->base, 4);
 	}
+	for (unsigned i = 0; i < PIN_COUNT; i++) {
+		struct cam_pin *p = &front_pins[i];
+		p->base = (volatile uint8_t *)ml_io_map((p->north ? TLMM_NORTH_PA : TLMM_SOUTH_PA) + p->gpio * 0x1000u, 0x1000u);
+		p->saved_cfg = rd(p->base, 0);
+		p->saved_io = rd(p->base, 4);
+	}
+	/* Both camera enables as the firmware left them (GPIO6 UF_CAM_EN, GPIO7 WF_CAM_EN; sc7180-trogdor.dtsi): the board has no camera
+	 * LED node, so a lit camera LED follows one of these rails. */
+	printf("COACHZ camera: at start GPIO6 (UF_CAM_EN) cfg 0x%x out %d in %u, GPIO7 (WF_CAM_EN) cfg 0x%x out %d in %u\n",
+	    front_pins[PIN_RAIL].saved_cfg, (front_pins[PIN_RAIL].saved_io & TLMM_OUT) != 0, front_pins[PIN_RAIL].saved_io & 1u,
+	    cam_pins[PIN_RAIL].saved_cfg, (cam_pins[PIN_RAIL].saved_io & TLMM_OUT) != 0, cam_pins[PIN_RAIL].saved_io & 1u);
 }
 
 static void camera_thread(void *arg, wait_result_t result)
 {
 	(void)arg;
 	(void)result;
-	enum { NONE, VOTES, PLLS, TITAN, IFE0, SENSOR, PIPE, STREAM } reached = NONE;
-	bool gcc_axi_found = false;
 
+	if (cam_mode & 0x800u) {
+		cam = &cam_front;
+		pins = front_pins;
+	}
+	printf("COACHZ camera: this run drives the %s %s (CCI0 master %u, CSIPHY%u, %u lanes, %ux%u)\n", cam->where, cam->name, cam->cci,
+	    cam->phy, cam->lanes, cam->width, cam->height);
 	map_all();
 	if (!map_views()) { printf("COACHZ camera: frame buffer views not mapped\n"); goto out; }
 	gcc_axi_found = (rd(cam_gcc, GCC_CAMERA_HF_AXI) & 1u) != 0;
-	/* Reset asserted and the rail off before any clock runs. */
-	pin_set(&cam_pins[PIN_RESET], cam_pins[PIN_RESET].cfg, false);
-	pin_set(&cam_pins[PIN_RAIL], cam_pins[PIN_RAIL].cfg, false);
-
-	{
-		int cx = coachz_rpmh_cx_request(CX_CONSUMER_CAMERA, CX_LEVEL_SVS), bus = coachz_camera_bus_vote(BUS_AVG_KBPS, BUS_PEAK_KBPS);
-		printf("COACHZ camera: cx svs vote %d, MM0 vote %d\n", cx, bus);
-		reached = VOTES;
-		if (cx || bus < 0) goto down;
+	if (cam_mode & 0x100u) front_probe();
+	if (!(cam_mode & 0xffu)) goto out;
+	/* The self-test: the colour bar for four seconds, checked, then everything down again. */
+	if (!camera_up(0, OV8856_COLOUR_BAR)) goto out;
+	if ((cam_mode & 0x200u) && cam == &cam_rear) {
+		/* Only with bit 0x200 (off unless asked for). Read only: does anything answer at 0x0c on the rear bus? The rear VCM (actuator_rear in sc7180-trogdor-mipi-camera.dtsi,
+		 * CCI0 master 1, supplied by pp2800_wf_cam) has no address or model in any public source; ChromeOS kukui puts a dongwoon,dw9768
+		 * at 0x0c beside its OV8856 (mt8183-kukui-krane.dtsi), another board's module. A plain read writes no address byte. */
+		uint8_t b[1] = {0};
+		int e = cci_read(CCI_REAR, 0x0c, 0, 0, b, 1);
+		printf("COACHZ camera: rear 0x0c plain read: %d, %02x (CCI status 0x%x)\n", e, b[0], cci_last_status);
 	}
-	set_bits(cam_gcc, GCC_CAMERA_AHB, 1u, 1u);
-	set_bits(cam_gcc, GCC_CAMERA_XO, 1u, 1u);
-	if (!branch(cam_gcc, GCC_CAMERA_HF_AXI, true, "gcc_camera_hf_axi")) goto down;
-	/* camcc PLL0 (600 MHz; its even output feeds the PHY timer and slow AHB) and PLL3 (1080 MHz) as camcc-sc7180.c configures them. */
-	reached = PLLS;
-	if (!pll_on(PLL0, 0x1f, 0x1u, "cam_cc_pll0") || !pll_on(PLL3, 0x38, 0, "cam_cc_pll3")) goto down;
-	/* ChromeOS rates: slow AHB 80 MHz, CCI 37.5 MHz, cphy_rx and CSID 270 MHz (svs), PHY timer 300 MHz, IFE 360 MHz (svs);
-	 * MCLK 19.2 MHz from XO, the rate mainline's OV8856 tables are for. */
-	if (!rcg(RCG_SLOW_AHB, SRC_PLL0_EVEN, 14, false, "slow_ahb") || !rcg(RCG_CCI0, SRC_PLL0_EVEN, 31, true, "cci_0") ||
-	    !rcg(RCG_CPHY_RX, SRC_PLL3_MAIN, 7, false, "cphy_rx") || !rcg(RCG_CSI1PHYTIMER, SRC_PLL0_EVEN, 3, false, "csi1phytimer") ||
-	    !rcg(RCG_IFE0_CSID, SRC_PLL3_MAIN, 7, false, "ife_0_csid") || !rcg(RCG_IFE0, SRC_PLL3_MAIN, 5, false, "ife_0") ||
-	    !rcg(RCG_MCLK1, SRC_XO, 1, true, "mclk1")) {
-		goto down;
-	}
-	reached = TITAN;
-	if (!gdsc(GDSC_TITAN, true, "titan_top_gdsc")) goto down;
-	if (!branch(cam_cc, CBCR_SOC_AHB, true, "soc_ahb") || !branch(cam_cc, CBCR_CPAS_AHB, true, "cpas_ahb") ||
-	    !branch(cam_cc, CBCR_CAMNOC_AXI, true, "camnoc_axi") || !branch(cam_cc, CBCR_CCI0, true, "cci_0") ||
-	    !branch(cam_cc, CBCR_CSIPHY1, true, "csiphy1") || !branch(cam_cc, CBCR_CSI1PHYTIMER, true, "csi1phytimer")) {
-		goto down;
-	}
-	reached = IFE0;
-	if (!gdsc(GDSC_IFE0, true, "ife_0_gdsc")) goto down;
-	if (!branch(cam_cc, CBCR_IFE0, true, "ife_0") || !branch(cam_cc, CBCR_IFE0_AXI, true, "ife_0_axi") ||
-	    !branch(cam_cc, CBCR_IFE0_CSID, true, "ife_0_csid") || !branch(cam_cc, CBCR_IFE0_CPHY_RX, true, "ife_0_cphy_rx")) {
-		goto down;
-	}
-	printf("COACHZ camera: CPAS 0x%x, CCI 0x%x, CSID 0x%x, VFE 0x%x, bus 0x%x\n", rd(cam_cpas, 0), rd(cam_cci, CCI_HW_VERSION),
-	    rd(cam_csid, CSID_HW_VERSION), rd(cam_vfe, VFE_HW_VERSION), rd(cam_vfe, BUS_HW_VERSION));
-	/* __ov8856_power_on: clock, reset asserted 1-2 ms, supplies (the rails' 1 ms ramp), reset released, 1.5-1.8 ms. */
-	reached = SENSOR;
-	if (!branch(cam_cc, CBCR_MCLK1, true, "mclk1")) goto down;
-	pin_set(&cam_pins[PIN_MCLK], cam_pins[PIN_MCLK].cfg, false);
-	delay(2000);
-	pin_set(&cam_pins[PIN_RAIL], cam_pins[PIN_RAIL].cfg, true);
-	delay(1000);
-	pin_set(&cam_pins[PIN_RESET], cam_pins[PIN_RESET].cfg, true);
-	delay(1800);
-	/* Then the bus, as camx's camera_io_init follows cam_sensor_core_power_up: CCI pins active, controller reset and masks. */
-	pin_set(&cam_pins[PIN_SDA], cam_pins[PIN_SDA].cfg, false);
-	pin_set(&cam_pins[PIN_SCL], cam_pins[PIN_SCL].cfg, false);
-	if (!cci_reset()) goto down;
-	if (!sensor_identify()) { printf("COACHZ camera: no OV8856 on CCI0 master 1\n"); goto down; }
-
-	/* The receive side first, as the ISP manager starts CSIPHY, CSID and IFE before the sensor streams. */
-	reached = PIPE;
-	phy_start();
-	if (!ppi_start() || !csid_reset() || !vfe_reset()) goto down;
-	vfe_start();
-	csid_start();
-	reached = STREAM;
-	if (!sensor_stream(true)) { printf("COACHZ camera: OV8856 at 0x%02x did not start streaming\n", cam_sensor_addr); goto down; }
 	stream_and_count();
-	if (cam_mode == 2) {
+	camera_down();
+	if ((cam_mode & 0xffu) == 2) {
 		service_loop();   /* does not return */
 	}
-
-down:
-	if (reached >= STREAM) (void)sensor_stream(false);
-	if (reached >= PIPE) {
-		csid_stop();
-		vfe_stop();
-		ppi_stop();
-		phy_stop();
-	}
-	if (reached >= SENSOR) {
-		/* ov8856_power_off: reset asserted, supplies off, clock off. */
-		pin_set(&cam_pins[PIN_RESET], cam_pins[PIN_RESET].cfg, false);
-		delay(100);
-		pin_set(&cam_pins[PIN_RAIL], cam_pins[PIN_RAIL].cfg, false);
-		(void)branch(cam_cc, CBCR_MCLK1, false, "mclk1");
-	}
-	if (reached >= IFE0) {
-		(void)branch(cam_cc, CBCR_IFE0_CPHY_RX, false, "ife_0_cphy_rx");
-		(void)branch(cam_cc, CBCR_IFE0_CSID, false, "ife_0_csid");
-		(void)branch(cam_cc, CBCR_IFE0_AXI, false, "ife_0_axi");
-		(void)branch(cam_cc, CBCR_IFE0, false, "ife_0");
-		if (!gdsc(GDSC_IFE0, false, "ife_0_gdsc")) printf("COACHZ camera: ife_0_gdsc did not collapse\n");
-	}
-	if (reached >= TITAN) {
-		(void)branch(cam_cc, CBCR_CSI1PHYTIMER, false, "csi1phytimer");
-		(void)branch(cam_cc, CBCR_CSIPHY1, false, "csiphy1");
-		(void)branch(cam_cc, CBCR_CCI0, false, "cci_0");
-		(void)branch(cam_cc, CBCR_CAMNOC_AXI, false, "camnoc_axi");
-		(void)branch(cam_cc, CBCR_CPAS_AHB, false, "cpas_ahb");
-		(void)branch(cam_cc, CBCR_SOC_AHB, false, "soc_ahb");
-		if (!gdsc(GDSC_TITAN, false, "titan_top_gdsc")) printf("COACHZ camera: titan_top_gdsc did not collapse\n");
-	}
-	if (reached >= PLLS) {
-		pll_off(PLL3);
-		pll_off(PLL0);
-		if (!gcc_axi_found) (void)branch(cam_gcc, GCC_CAMERA_HF_AXI, false, "gcc_camera_hf_axi");
-	}
-	if (reached >= VOTES) {
-		(void)coachz_camera_bus_vote(0, 0);
-		(void)coachz_rpmh_cx_request(CX_CONSUMER_CAMERA, 0);
-	}
-	for (unsigned i = 0; i < PIN_COUNT; i++) {
-		wr(cam_pins[i].base, 4, cam_pins[i].saved_io);
-		wr(cam_pins[i].base, 0, cam_pins[i].saved_cfg);
-	}
-	/* CAMCC answers only with GCC's camera AHB branch on (set from PLLS on); an unclocked read stalls the bus. */
-	if (reached >= PLLS) printf("COACHZ camera: powered down; TITAN GDSC 0x%x IFE0 GDSC 0x%x\n", rd(cam_cc, GDSC_TITAN), rd(cam_cc, GDSC_IFE0));
-	else printf("COACHZ camera: stopped before the camera clocks\n");
 out:
 	(void)thread_terminate(current_thread());
 	thread_block(THREAD_CONTINUE_NULL);

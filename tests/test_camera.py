@@ -49,14 +49,24 @@ class CameraTests(unittest.TestCase):
         ui = 10 ** 12 // 180000000 // 2
         self.assertEqual((85000 + 6 * ui) // (10 ** 12 // 300000000) - 6, 24)
         self.assertIn('85000ull + 6ull * ui', self.source)
+        self.assertIn('ui = 1000000000000ull / cam->link_hz / 2', self.source)
+        # The front OV5675: data 0, clock and data 1 (0x85 enabled), 450 MHz link, CSID lanes 0 and 1.
+        self.assertIn('.lane_mask = 0x7u, .lanes = 2, .lane_cfg = 0x10u, .link_hz = OV5675_LINK_HZ', self.source)
+        ui = 10 ** 12 // 450000000 // 2
+        self.assertEqual((85000 + 6 * ui) // (10 ** 12 // 300000000) - 6, 21)
 
     def test_clock_rates_follow_camcc(self):
         # camcc-sc7180.c: PLL0 600 MHz (its even output undivided), PLL3 1080 MHz; RCG pre-divider fields are 2 * divider - 1.
         pll0, pll3, xo = 19.2e6 * (0x1f + 0x4000 / 65536), 19.2e6 * (0x38 + 0x4000 / 65536), 19.2e6
         sources = {'SRC_PLL0_EVEN': pll0, 'SRC_PLL3_MAIN': pll3, 'SRC_XO': xo}
-        wanted = {'RCG_SLOW_AHB': 80e6, 'RCG_CCI0': 37.5e6, 'RCG_CPHY_RX': 270e6, 'RCG_CSI1PHYTIMER': 300e6, 'RCG_IFE0_CSID': 270e6,
-                  'RCG_IFE0': 360e6, 'RCG_MCLK1': 19.2e6}
-        calls = re.findall(r'rcg\((RCG_\w+), (SRC_\w+), (\d+), (?:true|false), "\w+"\)', self.source)
+        wanted = {'RCG_SLOW_AHB': 80e6, 'RCG_CCI0': 37.5e6, 'RCG_CPHY_RX': 270e6, 'cam->rcg_phytimer': 300e6, 'RCG_IFE0_CSID': 270e6,
+                  'RCG_IFE0': 360e6, 'cam->rcg_mclk': 19.2e6, 'RCG_MCLK0': 19.2e6}
+        calls = re.findall(r'rcg\((RCG_\w+|cam->rcg_\w+), (SRC_\w+), (\d+), (?:true|false), "\w+"\)', self.source)
+        # The sensor descriptions behind cam->: camcc-sc7180.c csi0/csi1phytimer_clk_src 0x5004/0x5028, mclk0/1_clk_src 0x4004/0x4024.
+        self.assertIn('.rcg_mclk = RCG_MCLK1, .cbcr_mclk = CBCR_MCLK1, .rcg_phytimer = RCG_CSI1PHYTIMER', self.source)
+        self.assertIn('.rcg_mclk = RCG_MCLK0, .cbcr_mclk = CBCR_MCLK0, .rcg_phytimer = RCG_CSI0PHYTIMER', self.source)
+        self.assertEqual((define(self.source, 'RCG_CSI0PHYTIMER'), define(self.source, 'CBCR_CSI0PHYTIMER'),
+                          define(self.source, 'CBCR_CSIPHY0'), define(self.source, 'RCG_CSI1PHYTIMER')), (0x5004, 0x501c, 0x5020, 0x5028))
         self.assertEqual({name for name, _, _ in calls}, set(wanted))
         for name, source, field in calls:
             self.assertAlmostEqual(sources[source] / ((int(field) + 1) / 2), wanted[name], delta=1e3, msg=name)
@@ -117,8 +127,8 @@ class CameraTests(unittest.TestCase):
         service = (ROOT / 'platform/coachz-prelink/drivers/RamBlock/camera/CoachzCamera.cpp').read_text()
         self.assertIn('setProperty("NativeSandboxGrantProcess", "*")', service)
         self.assertIn('setProperty("IOUserClientClass", "CoachzCameraUserClient")', service)
-        self.assertIn('IOMemoryDescriptor::withPhysicalAddress(coachz_camera_frame_pa(coachz_camera_last)', service)
-        self.assertIn('if (cam_mode == 2) {', self.source)
+        self.assertIn('IOMemoryDescriptor::withPhysicalAddress(coachz_camera_frame_pa(index)', service)
+        self.assertIn('if ((cam_mode & 0xffu) == 2) {', self.source)
         # The ring: four 4 MiB buffers from 0x84000000, below mpss_mem at 0x86000000.
         self.assertIn('#define RING            4u', self.source)
         self.assertLess(0x84000000 + 4 * 0x400000, 0x86000000)
@@ -138,7 +148,7 @@ class CameraTests(unittest.TestCase):
         patch = (PATCHES / 'coachz-prelink-apps.patch').read_text()
         self.assertIn('"/var/jb/Applications/CoachzCamera.app/CoachzCamera"', patch)
         screen = (ROOT / 'tools/xnu_screen.py').read_text()
-        self.assertIn("camera=2 if a.camera_service else 1 if a.camera else 0", screen)
+        self.assertIn("camera=(2 if a.camera_service else 1 if a.camera else 0) | (0x100 if a.camera_front_probe else 0) | (0x200 if a.camera_vcm_probe else 0)", screen)
 
     def test_chosen_switch(self):
         screen = load('xnu_screen', ROOT / 'tools/xnu_screen.py')

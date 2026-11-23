@@ -8,7 +8,8 @@ The drivers follow the sources directly; there is no identification run.
   one. Mainline's OV8856 binding examples and the Snapdragon 845 mezzanine overlay put it at I2C address 0x10 with four data lanes;
   mainline's driver runs it from a 19.2 MHz clock, a camcc-sc7180.c MCLK rate. The ChromeOS node asks for 24 MHz for its own HAL;
   the mainline register tables are for 19.2 MHz, so 19.2 MHz is used.
-- Front camera: no source names its part; it follows once a source does.
+- Front camera: the read-only probe on k224b found an OmniVision OV5675 at 0x36 (chip ID 0x5675 at 0x300a), so mainline's
+  drivers/media/i2c/ov5675.c is its source.
 - Kernel: `platform/coachz-prelink/drivers/RamBlock/camera/coachz_camera.c`, built into `libCoachzUsb.a` and started from
   `coachz_thread.c` (`coachz-prelink-camera.patch`) when `/chosen/coachz-camera` is set (`tools/xnu_screen.py --camera`). The order
   and values follow ChromeOS's camx driver (CSIPHY 1.2.2, PPI 170, CSID 170, VFE 170 top, RDI and bus ver2), mainline's
@@ -144,6 +145,32 @@ Written and checked on the host (kernel flags, `-Werror` for the app, `tests/tes
 - The camera LED: no node in the ChromeOS or mainline device trees, so it is wired to a rail; the boot log prints both enables as the
   firmware left them.
 
+## Front camera (OV5675), planned
+
+Board side from the table above: CCI0 master 0, CSIPHY0, MCLK0 on GPIO13, reset GPIO30, rails on GPIO6. Mainline ov5675.c (v6.12):
+2 data lanes, 450 MHz link (900 Mbit/s a lane), 19.2 MHz XVCLK only (what the probe already gives MCLK0 from XO), SBGGR10 by the driver (GRBG in the buffer on hardware, below),
+modes 2592x1944 and 1296x972 at 30 fps (HTS 1500, VTS 0x7e4). Power on: XVCLK, reset asserted, rails, at least 2 ms, reset
+released, 1.5 ms before the first CCI transfer. The common register list, the 900 Mbit/s list and each mode's list follow; the
+same CSID0/VFE0 path as the rear, with CSIPHY0 and 2 lanes instead of CSIPHY1 and 4. Written (2026-11-18), host-built only:
+`tools/xnu_screen.py --camera-front` (`/chosen/coachz-camera` bit 0x800, with --camera or --camera-service) makes the whole run
+drive the OV5675; its register lists come from the pinned ov5675.c through tools/camera_tables.py like the OV8856's. The status
+selector returns two more values when asked for 12 (Bayer order, front), and the viewer and the capture plug-in move other Bayer orders onto
+their GRBG development by starting one row later; the capture formats' crops scale from 1640x1232 to the sensor's size.
+
+Implementation plan (coachz_camera.c is rear-only today: CSIPHY1, PPI1, CSID PHY select 1, MCLK1/GPIO14, GPIO7/GPIO29, CCI master 1,
+OV8856 tables and 1640x1232 geometry are constants):
+1. A sensor description chosen once per boot: CCI master and address, chip ID, pins (rail, reset, MCLK, SDA, SCL), MCLK RCG/CBCR,
+   CSIPHY index (PA 0x0ac65000 + 0x1000 * n; CAMCC csiphy CBCR 0x5020 / 0x5044, phytimer RCG 0x5004 / 0x5028 and CBCR 0x501c /
+   0x5040, checked against camcc-sc7180.c v6.12), PPI offset (0x200 * n), CSID PHY select n, lane count, link rate, width,
+   height, VTS, Bayer order and the stream-on sequence. Rear: OV8856 as today. Front: OV5675 1296x972 (1.5 MiB a frame fits the
+   4 MiB ring slots; 2592x1944 does not), GRBG as k225's colour bar shows.
+2. `/chosen/coachz-camera` bit 0x800 selects the front sensor for the whole run (self-test, service, viewer and capture), so the
+   first hardware test needs no switching between sensors at run time.
+3. Geometry already crosses to the service and clients through coachz_camera_geometry(); add the Bayer order there and make
+   CoachzCamera.cpp, the viewer and CoachzCapture.c take width, height and Bayer order from it instead of 1632x1224 / SGRBG.
+4. Hardware points: chip ID 0x5675 and CSIPHY0 lane enable for 2 lanes; frames written with CSI2 errors 0; the viewer and the
+   system camera show the front image.
+
 ## Next steps
 
 3. iPadOS's own camera stack (AVCapture). The external camera (UVC) path is not in this IPSW: the OS volume's
@@ -172,8 +199,58 @@ Written and checked on the host (kernel flags, `-Werror` for the app, `tests/tes
    | FigCaptureStream | base, version 1, storage 0x580 | Finalize, CopyProperty, SetProperty |
    | FigCaptureStream | class, version 2 | Start, Stop, AddAttachmentsToSampleBuffer |
 
-   The streams are handed out through the device's CopyProperty; which property keys CMCapture asks for, and how frames reach it, is
-   the next thing to read.
+   The stream's object table (`CMDerivedObjectCreate` with `FigCaptureStreamGetClassID()`) is `{0, base class, stream class}`; a
+   `CMBaseClass` is `{version, derivedStorageSize, equal, invalidate, finalize, copyDebugDescription, copyProperty, setProperty,
+   notificationBarrier, protocolTable}`; Start and Stop take only the stream.
+
+   Which plug-in: CMCapture's table is `{service, dylib, symbol}` for `AppleH16CamIn`, `AppleH13CamIn`, `AppleH10CamIn`, `AppleH9CamIn`,
+   `AppleH6CamIn` in that order, and the first service `IOServiceGetMatchingService(IOServiceMatching(name))` finds selects
+   `dlopen("/System/Library/MediaCapture/H<n>ISP.mediacapture")` and `dlsym("H<n>ISPCaptureDeviceCreate")`. The bundle path is a flat
+   dylib. The shared cache holds only `H9ISP.mediacapture`, and dyld takes a cached image over a file at the same path, so our plug-in is
+   `H10ISP.mediacapture` (not in the cache, read from disk) behind a kernel nub of class `AppleH10CamIn`, which CMCapture tries before
+   `AppleH9CamIn`. `/System/Library/MediaCapture` is on neither volume. The capture host is `mediaserverd`.
+
+   Properties the original answers (its static tables, filled by `__GLOBAL__sub_I_H9ISPCaptureDevice.cpp`, entries
+   `{key, type, setter, copier, flags}`): the device answers `SupportedPropertiesDictionary`, `Clock`, `StreamArray`,
+   `FirmwareVersion`, `MemoryPoolID` (set) and `SupportedSynchronizedStreamsGroups`; the stream 143 keys, of which the shape-giving ones
+   are `BufferQueue`, `StillImageBufferQueue`, `SupportedFormatsArray`, `FormatDescription`, `FormatIndex`, `Minimum`/`MaximumFrameRate`,
+   `PortType`, `ModuleInfo` (`SensorID`, `ModuleLensID`, `ModuleIntegratorID`, `ModuleActuatorID`, `ModuleFocusID`), `FocalLength`,
+   `PixelSize`, `LensFNumber`, `StillImageCaptureNow`, `TorchLevel` and `SupportedPropertiesDictionary`; the rest are 3A, metadata and
+   ISP-specific controls. Unknown keys return -12784. `SupportedFormatsArray` is a CFArray of `CMVideoFormatDescription('420v', w, h)`
+   (and `'yuvs'`) with no extensions.
+
+   Frames: each stream owns two `CMBufferQueue`s (`CMBufferQueueGetCallbacksForUnsortedSampleBuffers`, no capacity limit), handed out by
+   `BufferQueue` and `StillImageBufferQueue`. The frame callback wraps the ISP's `CVPixelBuffer` with
+   `CMVideoFormatDescriptionCreateForImageBuffer` and `CMSampleBufferCreateForImageBuffer` and calls `CMBufferQueueEnqueue`; no
+   frame notification is posted (CMCapture installs its own trigger on the queue). The only frame-path notification is
+   `FrameDroppedFromQueue` with the presentation time.
+
+   CMCapture's side (`BWFigVideoCaptureStream initWithCaptureStream:`) reads `ModuleInfo`, `FocalLength`, `PixelSize`, `LensFNumber`,
+   `SensorDimensions`, `CameraViewMatrix` and calibration radii, and looks the sensor up in `CMCapture.framework/J120/CameraSetup.plist`
+   (`DefaultSensorIDs`: back `0x0303`, front `0x0314`). Which of those it requires is decided on hardware: the plug-in reports every key
+   it is asked for and what it returned through the kernel log.
+
+   Implementation (built on the host; not run on hardware):
+   - `package/CoachzCapture.c` is `H10ISP.mediacapture`: one device with one rear stream, the original's object layout, CoreMedia
+     and CMCapture symbols resolved with `dlsym` in the capture host. Formats are 420v at 1632x1224 (the sensor less a 4-pixel border),
+     1280x720 (16:9 from the middle) and 640x480. Start opens the CoachzCamera user client (waiting while the service is not yet
+     published), and a thread copies each new RAW10 frame, develops it as the viewer does, fills an IOSurface-backed pixel buffer from
+     a pool of the selected format, wraps it in a sample buffer stamped with host time and enqueues it (at most six waiting);
+     `StillImageCaptureNow` also puts the next frame on the still queue. Sets of keys it does not implement succeed and change nothing.
+     Each (object, operation, key) is reported once as a `COACHZ capture:` line through user client selector 5, and every 300th frame
+     with exposure, gain, black level and white balance.
+   - `drivers/RamBlock/camera/CoachzCamera.cpp` adds selector 5 and the empty `AppleH10CamIn` nub.
+   - `coachz-prelink-capture.patch` (only with `/chosen/coachz-camera` bit 0x400, `tools/xnu_screen.py --camera-capture`, which needs
+     `--camera-service`) writes the plug-in to `/private/var/coachz/capture/system/MediaCapture`, the platform files to
+     `/private/var/coachz/capture/cmcapture/J120` and `J121`, mounts both read-only as bindfs unions over `/System/Library` and
+     `CMCapture.framework`, checks each new file through the union and one of the covered directory's own files
+     (`CoreServices/SystemVersion.plist`, `CMCapture.framework/Info.plist`), unmounts a union that fails either, and publishes the nub
+     last. It prints one line with the stage and status. The kernel parts pass a syntax check with the kernel's own compile record.
+   - `scripts/build-coachz-capture.py` signs the plug-in, writes its trust cache module (`build/coachz-capture/trustcache.bin`, passed with
+     `--root-trust-cache`) and derives `AVCaptureSession.plist` from the OS volume (`COACHZ_OS_ROOT`): the rear camera's
+     `FigCaptureStreamFormats` become the plug-in's three (`Photo`, `Video-BES-30`, `Video-4by3-Low-Resolution`), its device formats
+     `12MP`, `720p60` and `640x480` keep their names at the plug-in's sizes with HDR, stabilization, Live Photo and night mode removed,
+     Medium and Low move to 640x480, High to 1280x720, and presets on dropped formats go. J120 and J121 hold the same original.
 
 ## On hardware
 
@@ -187,3 +264,21 @@ Written and checked on the host (kernel flags, `-Werror` for the app, `tests/tes
   `cam_ife_csid_core.h`); the error mask is bits 11-13, 15-24 and 26.
 - The viewer installs on the home screen, but AMFI rejects its ad hoc signature ("unsuitable CT policy 0") although its cdhash is in
   the image's trust cache, so it exits at launch.
+
+## System camera on hardware (k225, k226)
+
+- k225: mediaserverd threw "-[__NSCFType objectForKeyedSubscript:]" at launch (csu_resolveFormatIndexForNamedStreamFormat reads each
+  SupportedFormatsArray entry as a dictionary). k226 sends dictionaries (FormatDescription, SensorWidth/Height, frame rates, field of
+  view, VideoIsBinned): mediaserverd stays up and Magnifier and Measure list the rear camera ("后置相机").
+- k226: "Fig assert: pixelFormatIsSupported" right after "Resolving formats for Back Camera", then "CaptureSource Back Camera is missing
+  formats (720p60, 640x480, 12MP)", and Magnifier cannot add the input ("does not support AVCaptureSessionPresetHigh"). The plug-in
+  never received a stream start.
+- What is missing: CMCapture drives an ISP stream by outputs. A format names its outputs (kFigCaptureStreamVideoFormatKey_SupportedOutputs:
+  kFigCaptureStreamVideoOutputID_PrimaryScaler, StillImage, Raw, ...) and each output's kFigCaptureStreamVideoOutputKey_SupportedPixelFormats;
+  the session then sends output configurations (kFigCaptureStreamVideoOutputConfigurationKey_Width/Height/PixelFormat/BufferPool...) and
+  receives frames through output handlers (kFigCaptureStreamVideoOutputHandlerKey_PixelBufferHandler ...), not through a buffer queue.
+  The plug-in implements none of that.
+- The viewer: AMFI refused it while nine trust cache modules were loaded (k224b, k225); with the audio, Venus and capture caches merged
+  into one (eight in all, k226) it runs. The front image was grey because the buffer is GRBG, not ov5675.c's SBGGR10 (k225's colour
+  bar); the fix is not yet on hardware.
+

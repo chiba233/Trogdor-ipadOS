@@ -45,6 +45,10 @@ coachz-prelink-launch-diagnostic.patch
 
 # SC7180: threads look for the A76 cores first; cores numbered in MPIDR Affinity1 (match both levels at the reset vector), eight CPUs in two clusters.
 coachz-prelink-smp.patch
+# Asymmetric scheduling: __ARM_AMP__ on this board, so Clutch runs with the Edge policy, one pset per cluster (A55s, A76s); without CLPC the FIXPRI/FG/IN buckets prefer the A76 cluster once ArmCpu reports all cores up (ml_cpu_init_completed), DF/UT/BG the A55s, and an idle A76 may steal from the A55s.
+coachz-prelink-amp.patch
+# Sleep stage 1 (docs/plans/sleep.md): a non-boot core that leaves through cpu_sleep powers off with PSCI CPU_OFF, so processor_start() can bring it back with CPU_ON; ArmCpu halts cores through processor_exit and restarts them (armcpu-offline-test=N exercises CPU5).
+coachz-prelink-cpu-off.patch
 
 # Per-core busy share and clock, frame copies and their source, block I/O, top CPU users, waiting threads by kernel stack; the console keeps to a band once frames are copied.
 coachz-prelink-measure.patch
@@ -127,6 +131,8 @@ coachz-prelink-bridge-depth.patch
 coachz-prelink-staged-apps.patch
 coachz-prelink-rotation.patch
 coachz-prelink-cluster-mhz.patch
+# Thermal protection as mainline's sc7180.dtsi zones under step_wise (coachz-thermal-clamp=1): per-zone passive trips with hysteresis and trend, cooling states as cpufreq-hw caps and the GPU level cap, PSCI SYSTEM_OFF at a critical trip; replaces the 80/70 C clamp over the hottest channel.
+coachz-prelink-thermal-zones.patch
 coachz-prelink-smart-cover.patch
 
 # The Wi-Fi registry derives from the original IONetworkingFamily: its own IONetworkStack personality is removed before IOBSD.

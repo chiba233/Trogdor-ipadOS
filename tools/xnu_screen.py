@@ -239,7 +239,7 @@ def smp_tree(root, count):
 
 def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=True, root_uuid=None, cpus=1,
                  full_screen=False, gmu_firmware_size=0, sqe_firmware_size=0, gpu_addon_size=0, motion_probe=False, wifi_mac=None, gestalt_cache=None, baseband=False, baseband_compat_hash=None, apps=False,
-                 venus_output2_coded=False, venus_runtime_pm=False, camera=False):
+                 venus_output2_coded=False, venus_runtime_pm=False, camera=False, cpu_offline_test=0, dpu_scanout=False, gpu_hang_test=0, venus_ssr_test=0, cpu_smp_skip=0):
     root = read_tree(adt)
     if cpus > 1:
         smp_tree(root, cpus)
@@ -262,16 +262,36 @@ def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=T
         root.child('chosen').set('coachz-owner-apps', struct.pack('<I', 1))
     # Opt-in comparison of OUTPUT2 FRAME_SIZE only; keep the mainline path by default, including when the input ADT came from a test.
     chosen = root.child('chosen')
-    chosen.props = [prop for prop in chosen.props if prop[0] not in ('coachz-venus-output2-coded', 'coachz-venus-runtime-pm', 'coachz-camera')]
+    chosen.props = [prop for prop in chosen.props if prop[0] not in ('coachz-venus-output2-coded', 'coachz-venus-runtime-pm', 'coachz-camera', 'armcpu-offline-test', 'armcpu-smp-skip',
+                                                                    'coachz-dpu-scanout', 'coachz-gpu-hang-test', 'coachz-venus-ssr-test')]
     if venus_output2_coded:
         chosen.set('coachz-venus-output2-coded', struct.pack('<I', 1))
     if venus_runtime_pm:
         chosen.set('coachz-venus-runtime-pm', struct.pack('<I', 1))
     # The rear camera's step-1 run (drivers/RamBlock/camera/coachz_camera.c): colour bar frames counted, then powered down. The
     # command line is full, so it is a /chosen property.
-    # 2 also keeps it powered after the run and publishes CoachzCamera for an app (drivers/RamBlock/camera/CoachzCamera.cpp).
+    # 2 also publishes CoachzCamera for an app (drivers/RamBlock/camera/CoachzCamera.cpp), which powers the camera only while it streams.
+    # 0x100 adds a read-only chip ID probe of the front sensor (CCI master 0) before the rear run; 0x200 one plain read at 0x0c on the
+    # rear bus (CCI master 1) during the rear run, to see whether the rear VCM answers there. Both are off unless asked for.
     if camera:
         chosen.set('coachz-camera', struct.pack('<I', int(camera)))
+    # Sleep stage 1 (docs/plans/sleep.md): N seconds after all cores are up ArmCpu takes CPU5 offline with PSCI CPU_OFF and brings it
+    # back, three times. In /chosen because the boot-argument field is full.
+    if cpu_offline_test:
+        chosen.set('armcpu-offline-test', struct.pack('<I', int(cpu_offline_test)))
+    # What ArmCpu's all-cores-up step leaves out (bit 0 ml_cpu_init_completed, bit 1 the PSCI queries), for an early stall.
+    if cpu_smp_skip:
+        chosen.set('armcpu-smp-skip', struct.pack('<I', int(cpu_smp_skip)))
+    # The display pipe scans the render server's frame where the GPU rendered it and scales it (CoachzGpu.cpp, bsd/dev/coachz_bridge.c).
+    # The command line is full, so it is a /chosen property.
+    if dpu_scanout:
+        chosen.set('coachz-dpu-scanout', struct.pack('<I', 1))
+    # One never-ending kernel GPU submission this many seconds after the GPU starts: a test of the restart (CoachzGpu.cpp hangTestThread).
+    if gpu_hang_test:
+        chosen.set('coachz-gpu-hang-test', struct.pack('<I', int(gpu_hang_test)))
+    # One firmware fatal error (HFI_CMD_SYS_TEST_SSR) after this many decoded frames: a test of the Venus recovery (CoachzVenus.cpp).
+    if venus_ssr_test:
+        chosen.set('coachz-venus-ssr-test', struct.pack('<I', int(venus_ssr_test)))
     if baseband:
         # Starts the cellular bridge (pending/baseband). A /chosen property, because the boot command line has no room left.
         root.child('chosen').set('coachz-baseband', struct.pack('<I', 1))
@@ -337,8 +357,8 @@ def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=T
 def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=False, root_cache=None, root_device=None,
          root_uuid=None, data_seed=None, data_uuid=None, display=False, cpus=1, gpu=0, gmu_firmware=None, sqe_firmware=None, gpu_addon=None,
          diagnostics=False, wifi_mac=None, root_emmc=False, gestalt_cache=None, baseband=False, baseband_commcenter=None, usb_host=False, apps=False,
-         venus_output2_coded=False, venus_runtime_pm=False, camera=False):
-    if (venus_output2_coded or venus_runtime_pm) and not prelinked:
+         venus_output2_coded=False, venus_runtime_pm=False, camera=False, cpu_offline_test=0, dpu_scanout=False, gpu_hang_test=0, venus_ssr_test=0, cpu_smp_skip=0):
+    if (venus_output2_coded or venus_runtime_pm or venus_ssr_test) and not prelinked:
         raise ValueError('the Venus options require the prelinked kernel')
     if camera and not prelinked:
         raise ValueError('the camera run requires the prelinked kernel')
@@ -495,7 +515,7 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         adt = prelink_tree(adt, window, tree, ramdisk, cache, environment, wifi_mac=wifi_mac, gestalt_cache=gestalt_cache, baseband=baseband,
                            baseband_compat_hash=hashlib.sha256(baseband_commcenter).digest() if baseband_commcenter is not None else None, apps=apps,
                            ram_root=not disk_root or bool(data_seed), venus_output2_coded=venus_output2_coded, venus_runtime_pm=venus_runtime_pm,
-                           camera=camera, root_uuid=root_uuid, cpus=cpus, full_screen=display,
+                           camera=camera, cpu_offline_test=cpu_offline_test, dpu_scanout=dpu_scanout, gpu_hang_test=gpu_hang_test, venus_ssr_test=venus_ssr_test, cpu_smp_skip=cpu_smp_skip, root_uuid=root_uuid, cpus=cpus, full_screen=display,
                            gmu_firmware_size=len(gmu_firmware) if gmu_firmware else 0, sqe_firmware_size=len(sqe_firmware) if sqe_firmware else 0, gpu_addon_size=len(gpu_addon) if gpu_addon else 0, motion_probe=diagnostics)
         ramdisk = ramdisk + cache + bytes(-len(cache) % 4096)
         if gmu_firmware:
@@ -543,7 +563,20 @@ def main():
     p.add_argument('--venus-output2-coded', action='store_true', help='prelinked: compare Venus OUTPUT2 coded FRAME_SIZE; allocations and scanlines stay aligned')
     p.add_argument('--venus-runtime-pm', action='store_true', help='prelinked: idle Venus firmware power collapse and resume')
     p.add_argument('--camera', action='store_true', help='prelinked: the rear camera streams its colour bar for 4 s after boot, then powers down')
-    p.add_argument('--camera-service', action='store_true', help='prelinked: after that run the camera stays powered and CoachzCamera serves real images to an app')
+    p.add_argument('--camera-service', action='store_true', help='prelinked: after that run CoachzCamera serves real images to an app, powering the camera only while it streams')
+    p.add_argument('--camera-front-probe', action='store_true', help='prelinked: a read-only chip ID probe of the front camera sensor before the rear run')
+    p.add_argument('--camera-vcm-probe', action='store_true', help='prelinked: one plain read at 0x0c on the rear camera bus during the rear run (does the VCM answer)')
+    p.add_argument('--camera-front', action='store_true', help='prelinked, with --camera or --camera-service: drive the front OV5675 (CCI0 master 0, CSIPHY0, 2 lanes, 1296x972) instead of the rear OV8856 for the whole run (/chosen/coachz-camera bit 0x800)')
+    p.add_argument('--camera-capture', action='store_true', help='prelinked, with --camera-service: the capture plug-in H10ISP.mediacapture and its AppleH10CamIn nub, so AVCapture sees the rear camera (its trust cache module comes with --root-trust-cache, build-coachz-capture.py)')
+    p.add_argument('--dpu-scanout', action='store_true',
+                   help='prelinked, --gpu 9 display route: the display pipe scans the native frame itself and scales it (default off)')
+    p.add_argument('--gpu-hang-test', type=int, default=0, metavar='SECONDS',
+                   help='prelinked, --gpu 9: one never-ending kernel submission SECONDS after the GPU starts, to test the restart (default off)')
+    p.add_argument('--venus-ssr-test', type=int, default=0, metavar='FRAMES',
+                   help='prelinked: once, after FRAMES decoded frames, ask the Venus firmware for a fatal error to test recovery (default off)')
+    p.add_argument('--cpu-smp-skip', type=int, default=0, metavar='BITS',
+                   help='prelinked: leave out of the all-cores-up step: 1 ml_cpu_init_completed, 2 the PSCI queries (/chosen/armcpu-smp-skip)')
+    p.add_argument('--cpu-offline-test', type=int, default=0, metavar='SECONDS', help='prelinked: SECONDS after all cores are up, take CPU5 offline (PSCI CPU_OFF) and back, three times (/chosen/armcpu-offline-test)')
     p.add_argument('--smp', type=int, default=1, help='main OS: start CPU0..N-1 (up to 8) through PSCI')
     p.add_argument('--gpu', type=int, default=0, help='prelinked: Adreno 618 bring-up stage 1 to 8, or 9 for the driver (docs/plans/gpu.md)')
     p.add_argument('--root-emmc', action='store_true', help='the system, Data and the log ring on the eMMC partitions')
@@ -567,6 +600,10 @@ def main():
             p.error('--root-device or --root-uuid takes --root-trust-cache and --prelinked, and no --root-image')
     elif bool(a.root_image) != bool(a.root_trust_cache) or (a.root_image and not a.prelinked) or len(a.root_trust_cache) > 1:
         p.error('--root-image and one --root-trust-cache go together and need --prelinked')
+    if a.camera_front and not (a.camera or a.camera_service):
+        p.error('--camera-front selects the sensor of the camera run: it needs --camera or --camera-service')
+    if a.camera_capture and not a.camera_service:
+        p.error('--camera-capture serves the camera service: it needs --camera-service')
     payload = pack(a.kernel.read_bytes(), a.adt.read_bytes(), a.window, a.memory, prelinked=a.prelinked,
                    ramdisk=a.root_image.read_bytes() if a.root_image else None,
                    root_cache=[cache.read_bytes() for cache in a.root_trust_cache] or None, root_device=a.root_device,
@@ -576,8 +613,8 @@ def main():
                    gpu_addon=a.gpu_addon.read_bytes() if a.gpu_addon else None, diagnostics=a.diagnostics,
                    wifi_mac=a.wifi_mac.read_text().strip() if a.wifi_mac else None, root_emmc=a.root_emmc, usb_host=a.usb_host, apps=a.apps,
                    gestalt_cache=a.gestalt_cache.read_bytes() if a.gestalt_cache else None, baseband=a.baseband, venus_output2_coded=a.venus_output2_coded,
-                   venus_runtime_pm=a.venus_runtime_pm, camera=2 if a.camera_service else 1 if a.camera else 0,
-                   baseband_commcenter=a.baseband_commcenter.read_bytes() if a.baseband_commcenter else None)
+                   venus_runtime_pm=a.venus_runtime_pm, camera=(2 if a.camera_service else 1 if a.camera else 0) | (0x100 if a.camera_front_probe else 0) | (0x200 if a.camera_vcm_probe else 0) | (0x800 if a.camera_front else 0) | (0x400 if a.camera_capture else 0),
+                   cpu_offline_test=a.cpu_offline_test, dpu_scanout=a.dpu_scanout, gpu_hang_test=a.gpu_hang_test, venus_ssr_test=a.venus_ssr_test, cpu_smp_skip=a.cpu_smp_skip, baseband_commcenter=a.baseband_commcenter.read_bytes() if a.baseband_commcenter else None)
     a.output.parent.mkdir(parents=True, exist_ok=True)
     a.output.write_bytes(payload)
     print('Built screen-output XNU payload', hashlib.sha256(payload).hexdigest())

@@ -66,7 +66,8 @@
       "commit": "adc218676eef25575469234709c2d87185ca223a",
       "license": "GPL-2.0",
       "files": {
-        "drivers/media/i2c/ov8856.c": "3b94338f55ed39fc1ea3dbb21840cf580b4cee97"
+        "drivers/media/i2c/ov8856.c": "3b94338f55ed39fc1ea3dbb21840cf580b4cee97",
+        "drivers/media/i2c/ov5675.c": "2833b14ee139dc5167f9a7598f6aac4b7b4d998c"
       }
     },
     "chromiumos-camx": {

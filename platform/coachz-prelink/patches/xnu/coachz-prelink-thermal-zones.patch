@@ -1,0 +1,467 @@
+--- a/bsd/dev/coachz_thermal.c
++++ b/bsd/dev/coachz_thermal.c
+@@ -10,6 +10,8 @@
+ #include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
+ #include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
+ #include "coachz_tsens.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -33,78 +35,386 @@
+ }
+ 
+ /*
+- * Thermal protection, first version (coachz-thermal-clamp=1): above 80 C on the hottest valid channel both CPU domains drop to a
+- * lower cpufreq-hw state (A55 row 6, 1516 MHz; A76 row 9, 1996 MHz, from the tables the K38 line reads) and the GPU is capped at
+- * level 6, 650 MHz (CoachzGpu.cpp's governor reads coachz_gpu_level_cap); below 70 C the states saved at the clamp return. Mainline's
+- * sc7180 trip points are higher (passive at 95 C). The third poll (about 30 s) applies the clamp for two seconds and reads it back.
++ * Thermal protection (coachz-thermal-clamp=1): mainline's sc7180.dtsi thermal zones under the step_wise governor (drivers/thermal,
++ * v6.12: handle_thermal_trip in thermal_core.c, gov_step_wise.c, __thermal_cdev_update in thermal_helpers.c), over the TSENS
++ * channels this file reads.
++ *   cpu0..cpu5   tsens0 1-6   passive 90 and 95 C (hysteresis 2 C), critical 110 C   cooling the A55 domain (CPU0-5)
++ *   cpu6..cpu9   tsens0 9-12  the same                                                cooling the A76 domain (CPU6-7)
++ *   gpuss0, 1    tsens0 13-14 passive 95 C, critical 110 C                            cooling the GPU
++ *   aoss0, cpuss0/1 (tsens0 0, 7, 8) and the ten tsens1 zones: hot 90 C (nothing is bound to it), critical 110 C.
++ * A cooling state s caps a CPU domain at cpufreq-hw state top - s (A55 9 to 0, A76 13 to 0: coachz_cpu_state_cap, which the
++ * governor in osfmk/arm64/coachz_cpufreq.c obeys, or the state register itself without it) and the GPU at level 7 - s (to 1, 180
++ * MHz; CoachzGpu.cpp's governor reads coachz_gpu_level_cap). Each zone's threshold drops to trip - hysteresis once crossed; while a
++ * zone is past a passive trip and rising its devices go one state deeper, and once below the threshold and falling the zone releases
++ * its devices; a device takes the deepest state any zone asks for. A critical trip powers the machine off through PSCI SYSTEM_OFF
++ * (mainline: hw_protection_shutdown, an orderly power-off forced after a delay; nothing here takes the system down in order).
++ * Mainline polls only while a passive trip is active (250 ms) and otherwise waits for TSENS threshold interrupts, which this
++ * read-only sampler does not program, so the zones are read every second, and every 250 ms while any passive trip is active.
++ * The board's two PMIC thermistor zones are read through the PM6150 ADC directly (pmic_adc_read below): skin-temp (passive 42 and
++ * 45 C, hysteresis 1 C, on CPU6-7; critical 60 C) and charger (critical 125 C). Mainline reads them through the ADC_TM5 monitor's
++ * thresholds; here the ADC's own conversion is polled like the TSENS channels.
+  */
+ volatile uint32_t coachz_gpu_level_cap = 7;
+ static vm_offset_t thermal_cpufreq;
++
++enum { CD_A55, CD_A76, CD_GPU, CD_COUNT, CD_NONE = -1 };
++static const uint32_t cd_top[CD_COUNT] = {9, 13, 7}, cd_max_state[CD_COUNT] = {9, 13, 6};
++static const char *const cd_name[CD_COUNT] = {"A55", "A76", "GPU"};
++#define TZ_NO_TARGET (-1)
++#define TZ_TEMP_INIT INT32_MIN
++
++struct tz_zone {
++    const char *name;
++    uint8_t bank, sensor;       /* bank 0, 1: TSENS; TZ_PMIC: the PM6150 ADC channel in sensor */
++    int8_t device;
++    int32_t passive[2];         /* 0: no such trip */
++    int32_t critical;
++    int32_t hysteresis;         /* of the passive trips */
++};
++#define TZ_PMIC 2
++static const struct tz_zone tz_zones[] = {
++    {"cpu0", 0, 1, CD_A55, {90000, 95000}, 110000, 2000}, {"cpu1", 0, 2, CD_A55, {90000, 95000}, 110000, 2000},
++    {"cpu2", 0, 3, CD_A55, {90000, 95000}, 110000, 2000}, {"cpu3", 0, 4, CD_A55, {90000, 95000}, 110000, 2000},
++    {"cpu4", 0, 5, CD_A55, {90000, 95000}, 110000, 2000}, {"cpu5", 0, 6, CD_A55, {90000, 95000}, 110000, 2000},
++    {"cpu6", 0, 9, CD_A76, {90000, 95000}, 110000, 2000}, {"cpu7", 0, 10, CD_A76, {90000, 95000}, 110000, 2000},
++    {"cpu8", 0, 11, CD_A76, {90000, 95000}, 110000, 2000}, {"cpu9", 0, 12, CD_A76, {90000, 95000}, 110000, 2000},
++    {"gpuss0", 0, 13, CD_GPU, {95000, 0}, 110000, 2000}, {"gpuss1", 0, 14, CD_GPU, {95000, 0}, 110000, 2000},
++    {"aoss0", 0, 0, CD_NONE, {0, 0}, 110000, 2000}, {"cpuss0", 0, 7, CD_NONE, {0, 0}, 110000, 2000}, {"cpuss1", 0, 8, CD_NONE, {0, 0}, 110000, 2000},
++    {"aoss1", 1, 0, CD_NONE, {0, 0}, 110000, 2000}, {"cwlan", 1, 1, CD_NONE, {0, 0}, 110000, 2000}, {"audio", 1, 2, CD_NONE, {0, 0}, 110000, 2000},
++    {"ddr", 1, 3, CD_NONE, {0, 0}, 110000, 2000}, {"q6-hvx", 1, 4, CD_NONE, {0, 0}, 110000, 2000}, {"camera", 1, 5, CD_NONE, {0, 0}, 110000, 2000},
++    {"mdm-core", 1, 6, CD_NONE, {0, 0}, 110000, 2000}, {"mdm-dsp", 1, 7, CD_NONE, {0, 0}, 110000, 2000}, {"npu", 1, 8, CD_NONE, {0, 0}, 110000, 2000},
++    {"video", 1, 9, CD_NONE, {0, 0}, 110000, 2000},
++    /* sc7180-trogdor-coachz.dtsi skin-temp-thermal: pm6150_adc_tm 1, ADC5_AMUX_THM2_100K_PU, on CPU6-7; sc7180-trogdor.dtsi
++     * charger-thermal: pm6150_adc_tm 0, ADC5_AMUX_THM3_100K_PU, critical only. */
++    {"skin-temp", TZ_PMIC, 0x4e, CD_A76, {42000, 45000}, 60000, 1000}, {"charger", TZ_PMIC, 0x4f, CD_NONE, {0, 0}, 125000, 1000},
++};
++#define TZ_COUNT (sizeof(tz_zones) / sizeof(tz_zones[0]))
++
++struct tz_state {
++    int32_t temperature, last_temperature;
++    int32_t threshold[2];
++    int32_t target[2];
++    uint8_t initialized[2];
++    int passive;
++};
++static struct tz_state tz_state[TZ_COUNT];
++static uint32_t cd_state[CD_COUNT];
+ static uint32_t thermal_saved[2];
+-static int thermal_clamped, thermal_polls;
+-extern void coachz_cluster_mhz(const char *why);
++static int thermal_any_passive;
+ 
+ static void
+-thermal_clamp(int on)
++thermal_apply(void)
+ {
+-    static const uint32_t clamp_state[2] = {6, 9};
+-    if (!thermal_cpufreq) thermal_cpufreq = ml_io_map(0x18323000, 0x4000);
+-    if (!thermal_cpufreq || on == thermal_clamped) return;
+     extern volatile uint32_t coachz_cpu_state_cap[2], coachz_cpufreq_active;
+-    if (coachz_cpufreq_active) {
+-        /* The governor (osfmk/arm64/coachz_cpufreq.c) owns the state registers; the clamp bounds it within one 16 ms window. */
+-        coachz_cpu_state_cap[0] = on ? clamp_state[0] : 9;
+-        coachz_cpu_state_cap[1] = on ? clamp_state[1] : 13;
+-    } else {
+-        for (unsigned domain = 0; domain < 2; domain++) {
++    if (!thermal_cpufreq) thermal_cpufreq = ml_io_map(0x18323000, 0x4000);
++    for (unsigned domain = 0; domain < 2; domain++) {
++        const uint32_t cap = cd_top[domain] - cd_state[domain];
++        if (coachz_cpufreq_active) {
++            coachz_cpu_state_cap[domain] = cap;
++        } else if (thermal_cpufreq) {
++            /* Without the governor the state register is ours: lower it while capped and give back the one it had. */
+             volatile uint32_t *state = (volatile uint32_t *)(thermal_cpufreq + domain * 0x2800 + 0x920);
+-            if (on) {
+-                thermal_saved[domain] = *state;
+-                if (thermal_saved[domain] > clamp_state[domain]) *state = clamp_state[domain];
+-            } else {
+-                *state = thermal_saved[domain];
++            if (cd_state[domain]) {
++                if (!thermal_saved[domain]) thermal_saved[domain] = *state + 1;
++                if (*state > cap) *state = cap;
++            } else if (thermal_saved[domain]) {
++                *state = thermal_saved[domain] - 1;
++                thermal_saved[domain] = 0;
+             }
+         }
+     }
+     __asm__ volatile ("dsb sy" ::: "memory");
+-    coachz_gpu_level_cap = on ? 6 : 7;
+-    thermal_clamped = on;
++    coachz_gpu_level_cap = cd_top[CD_GPU] - cd_state[CD_GPU];
+ }
+ 
++/* __thermal_cdev_update: the deepest target of every zone bound to the device. */
+ static void
+-thermal_clamp_report(const char *why)
++thermal_cdev_update(int device, const char *why)
+ {
+-    if (!thermal_cpufreq) return;
+-    const volatile uint32_t *a55 = (const volatile uint32_t *)thermal_cpufreq, *a76 = (const volatile uint32_t *)(thermal_cpufreq + 0x2800);
+-    printf("COACHZ thermal clamp %s: A55 state %u vote %u MHz, A76 state %u vote %u MHz, gpu cap %u\n", why, a55[0x920 / 4],
+-        (a55[0x704 / 4] & 0x3ff) * 192 / 10, a76[0x920 / 4], (a76[0x704 / 4] & 0x3ff) * 192 / 10, coachz_gpu_level_cap);
++    int32_t target = 0;
++    for (unsigned z = 0; z < TZ_COUNT; z++) {
++        if (tz_zones[z].device != device) continue;
++        for (unsigned t = 0; t < 2; t++)
++            if (tz_zones[z].passive[t] && tz_state[z].target[t] != TZ_NO_TARGET && tz_state[z].target[t] > target) target = tz_state[z].target[t];
++    }
++    if ((uint32_t)target == cd_state[device]) return;
++    cd_state[device] = (uint32_t)target;
++    thermal_apply();
++    printf("COACHZ thermal zone %s: %s state %u cap %u\n", why, cd_name[device], cd_state[device], cd_top[device] - cd_state[device]);
+ }
+ 
++/* gov_step_wise.c get_target_state, with THERMAL_NO_LIMIT bounds (lower 0, upper the device's last state). */
++static int32_t
++thermal_target(const struct tz_zone *zone, struct tz_state *st, unsigned trip, int trend, int throttle)
++{
++    const int32_t cur = (int32_t)cd_state[zone->device], upper = (int32_t)cd_max_state[zone->device];
++    if (!st->initialized[trip]) return throttle ? (cur + 1 > upper ? upper : cur + 1) : TZ_NO_TARGET;
++    if (throttle) {
++        if (trend > 0) return cur + 1 > upper ? upper : cur + 1;
++    } else if (trend < 0) {
++        return cur <= 0 ? TZ_NO_TARGET : 0;
++    }
++    return st->target[trip];
++}
++
++static void __attribute__((noreturn))
++thermal_critical(const struct tz_zone *zone, int32_t temperature)
++{
++    printf("COACHZ thermal zone %s: critical temperature reached (%d mC), PSCI SYSTEM_OFF\n", zone->name, temperature);
++    delay(100000);
++    register uint64_t x0 __asm__("x0") = 0x84000008ull;   /* PSCI SYSTEM_OFF, smc as the device tree's /psci says */
++    __asm__ volatile ("smc #0" : "+r"(x0) :: "x1", "x2", "x3", "memory");
++    panic("COACHZ thermal: %s at %d mC and SYSTEM_OFF returned %lld", zone->name, temperature, (long long)x0);
++}
++
++/* One zone with a new reading: handle_thermal_trip for every trip, then step_wise for the passive ones. */
+ static void
+-thermal_policy(int32_t peak)
++thermal_zone_update(unsigned z, int32_t temperature)
+ {
+-    unsigned mode = 0;
+-    if (!PE_parse_boot_argn("coachz-thermal-clamp", &mode, sizeof(mode)) || mode != 1) return;
+-    if (++thermal_polls == 3 && !thermal_clamped) {
+-        thermal_clamp(1);
+-        delay(20000);
+-        thermal_clamp_report("test on");
+-        coachz_cluster_mhz("clamp on");
+-        delay(2000000);
+-        thermal_clamp(0);
+-        delay(20000);
+-        thermal_clamp_report("test off");
+-        coachz_cluster_mhz("clamp off");
++    const struct tz_zone *zone = &tz_zones[z];
++    struct tz_state *st = &tz_state[z];
++    st->last_temperature = st->temperature;
++    st->temperature = temperature;
++    if (temperature >= zone->critical && st->last_temperature >= zone->critical) thermal_critical(zone, temperature);
++    if (zone->device == CD_NONE) return;
++    const int trend = st->last_temperature == TZ_TEMP_INIT ? 0 :
++        temperature > st->last_temperature ? 1 : temperature < st->last_temperature ? -1 : 0;
++    for (unsigned t = 0; t < 2; t++) {
++        const int32_t trip = zone->passive[t];
++        if (!trip) continue;
++        const int32_t old_threshold = st->threshold[t];
++        st->threshold[t] = trip;
++        if (st->last_temperature != TZ_TEMP_INIT && st->last_temperature >= old_threshold) {
++            if (temperature < trip - zone->hysteresis) {
++                st->passive--;
++                printf("COACHZ thermal zone %s: %d mC below trip %d mC\n", zone->name, temperature, trip - zone->hysteresis);
++            } else {
++                st->threshold[t] -= zone->hysteresis;
++            }
++        } else if (temperature >= trip) {
++            st->threshold[t] -= zone->hysteresis;
++            st->passive++;
++            printf("COACHZ thermal zone %s: %d mC crossed trip %d mC\n", zone->name, temperature, trip);
++        }
++        const int throttle = temperature >= st->threshold[t];
++        const int32_t old_target = st->target[t];
++        st->target[t] = thermal_target(zone, st, t, trend, throttle);
++        if (st->initialized[t] && old_target == st->target[t]) continue;
++        st->initialized[t] = 1;
++        thermal_cdev_update(zone->device, zone->name);
+     }
+-    if (!thermal_clamped && peak > 80000) {
+-        thermal_clamp(1);
+-        thermal_clamp_report("on");
+-    } else if (thermal_clamped && peak < 70000) {
+-        thermal_clamp(0);
+-        thermal_clamp_report("off");
++}
++
++/*
++ * The board's thermistors behind the PM6150 ADC (USID 0, peripheral 0x31 at 0x3100), read over the SPMI PMIC arbiter v5 as mainline
++ * does (drivers/spmi/spmi-pmic-arb.c: the APID map at core 0x900 + 4n, the owner EE at cnfg 0x700 + 4n, reads through the observer
++ * channel at obsrvr + 0x80 * apid, writes through chnls + 0x10000 * apid, command (opc << 27) | (addr & 0xff) << 4 | (bytes - 1),
++ * STATUS bit 0 done with bits 1-3 failure, denied, dropped; sc7180.dtsi spmi@c440000, qcom,ee 0) and converted as
++ * drivers/iio/adc/qcom-spmi-adc5.c's adc5_do_conversion does for a ratiometric channel (registers 0x42-0x47 read, decimation 840
++ * (index 2), one sample, hw settle 200 us (index 2), calibration ratiometric with the timer value, channel, enable, request; then
++ * STATUS1 polled for EOC, DATA0/1). qcom-vadc-common.c's qcom_vadc_scale_hw_calib_therm turns the code into mV (1875 mV over full
++ * scale 0x70e4) and maps it through the NTCG104EF104 100k pull-up table. The only SPMI writes this file can make are those six
++ * registers of that peripheral, and only through an APID this EE owns.
++ */
++#define SPMI_CORE_PA  0x0c440000ull
++#define SPMI_CHNLS_PA 0x0c600000ull
++#define SPMI_OBSRVR_PA 0x0e600000ull
++#define SPMI_CNFG_PA  0x0c40a000ull
++#define ADC_PPID      0x031u
++static vm_offset_t spmi_core, spmi_obs, spmi_cnfg, spmi_chnl;
++static uint16_t adc_apid;
++static int pmic_state;          /* 0 untried, 1 ready, -1 unavailable */
++
++static const struct { int16_t mv; int32_t mc; } ntc_100k_1875[] = {
++    {1831, -40000}, {1814, -35000}, {1791, -30000}, {1761, -25000}, {1723, -20000}, {1675, -15000}, {1616, -10000}, {1545, -5000},
++    {1463, 0}, {1370, 5000}, {1268, 10000}, {1160, 15000}, {1049, 20000}, {937, 25000}, {828, 30000}, {726, 35000}, {630, 40000},
++    {544, 45000}, {467, 50000}, {399, 55000}, {340, 60000}, {290, 65000}, {247, 70000}, {209, 75000}, {179, 80000}, {153, 85000},
++    {130, 90000}, {112, 95000}, {96, 100000}, {82, 105000}, {71, 110000}, {62, 115000}, {53, 120000}, {46, 125000},
++};
++
++static inline uint32_t mmio_r(vm_offset_t base, uint32_t off) { uint32_t v = *(volatile uint32_t *)(base + off); __asm__ volatile ("dmb oshld" ::: "memory"); return v; }
++static inline void mmio_w(vm_offset_t base, uint32_t off, uint32_t v) { __asm__ volatile ("dmb oshst" ::: "memory"); *(volatile uint32_t *)(base + off) = v; }
++
++static int
++spmi_wait(vm_offset_t base, uint32_t off)
++{
++    for (unsigned i = 0; i < 1000; i++) {
++        const uint32_t status = mmio_r(base, off + 0x08);
++        if (status & 1u) return (status & 0xeu) ? -(int)status : 0;
++        delay(1);
+     }
++    return -1;
+ }
+ 
++static int
++spmi_read(uint16_t addr, uint8_t *buf, unsigned len)
++{
++    const uint32_t off = 0x80u * adc_apid;
++    if ((addr >> 8) != (ADC_PPID & 0xff) || !len || len > 8) return -1;
++    mmio_w(spmi_obs, off, (1u << 27) | ((addr & 0xffu) << 4) | (len - 1));   /* EXT_READL */
++    const int e = spmi_wait(spmi_obs, off);
++    if (e) return e;
++    const uint32_t d0 = mmio_r(spmi_obs, off + 0x18), d1 = len > 4 ? mmio_r(spmi_obs, off + 0x1c) : 0;
++    for (unsigned i = 0; i < len; i++) buf[i] = (uint8_t)((i < 4 ? d0 >> (8 * i) : d1 >> (8 * (i - 4))) & 0xffu);
++    return 0;
++}
++
++static int
++spmi_write_adc_config(const uint8_t buf[6])
++{
++    /* EXT_WRITEL of 0x3142-0x3147 only. */
++    uint32_t d0 = 0, d1 = 0;
++    for (unsigned i = 0; i < 4; i++) d0 |= (uint32_t)buf[i] << (8 * i);
++    d1 = (uint32_t)buf[4] | (uint32_t)buf[5] << 8;
++    mmio_w(spmi_chnl, 0x10, d0);
++    mmio_w(spmi_chnl, 0x14, d1);
++    mmio_w(spmi_chnl, 0x00, (0u << 27) | (0x42u << 4) | 5u);
++    return spmi_wait(spmi_chnl, 0);
++}
++
++static int
++pmic_adc_init(void)
++{
++    spmi_core = ml_io_map(SPMI_CORE_PA, 0x2000);
++    spmi_cnfg = ml_io_map(SPMI_CNFG_PA, 0x1000);
++    spmi_obs = ml_io_map(SPMI_OBSRVR_PA, 0x10000);
++    if (!spmi_core || !spmi_cnfg || !spmi_obs) return -1;
++    const uint32_t arb_version = mmio_r(spmi_core, 0), count = mmio_r(spmi_core, 0x4) & 0x7ffu;
++    if (arb_version < 0x50000000u || arb_version >= 0x70000000u) { printf("COACHZ thermal pmic: arbiter version 0x%x is not v5\n", arb_version); return -1; }
++    int found = -1;
++    unsigned owner = 0xff;
++    for (unsigned n = 0; n < count && 0x900u + 4u * n < 0x1100u; n++) {
++        const uint32_t map = mmio_r(spmi_core, 0x900u + 4u * n);
++        if (!map || ((map >> 8) & 0xfffu) != ADC_PPID) continue;
++        const unsigned ee = mmio_r(spmi_cnfg, 0x700u + 4u * n) & 7u;
++        /* pmic_arb_read_apid_map_v5: the first mapping, or the one this EE (0) owns. */
++        if (found < 0 || ee == 0) { found = (int)n; owner = ee; }
++    }
++    if (found < 0 || owner != 0) { printf("COACHZ thermal pmic: ADC ppid 0x%x apid %d owner %u, not ours\n", ADC_PPID, found, owner); return -1; }
++    adc_apid = (uint16_t)found;
++    spmi_chnl = ml_io_map(SPMI_CHNLS_PA + 0x10000ull * adc_apid, 0x1000);
++    if (!spmi_chnl) return -1;
++    uint8_t rev[2] = {0};
++    const int e = spmi_read(0x3100, rev, 2);
++    printf("COACHZ thermal pmic: arbiter 0x%x, %u apids, ADC apid %u, revision %u.%u (%d)\n", arb_version, count, adc_apid, rev[1], rev[0], e);
++    return e;
++}
++
++/* adc5_do_conversion for one ratiometric 100k pull-up thermistor channel, then qcom_vadc_scale_hw_calib_therm. */
++static int
++pmic_adc_read(uint8_t channel, int32_t *milli_c)
++{
++    uint8_t cfg[6], st = 0, lo = 0, hi = 0;
++    int e = spmi_read(0x3142, cfg, 6);
++    if (e) return e;
++    cfg[0] = (uint8_t)((cfg[0] & ~0x7cu) | (1u << 4) | (2u << 2));   /* cal_val timer (0), cal_sel ratiometric (1), decimation 2 */
++    cfg[1] = (uint8_t)(cfg[1] & ~0x07u);                              /* one sample */
++    cfg[2] = channel;
++    cfg[3] = (uint8_t)((cfg[3] & ~0x0fu) | 2u);                       /* 200 us */
++    cfg[4] |= 0x80u;
++    cfg[5] |= 0x80u;
++    if ((e = spmi_write_adc_config(cfg))) return e;
++    unsigned tries = 0;
++    for (; tries < 400; tries++) {
++        if ((e = spmi_read(0x3108, &st, 1))) return e;
++        if ((st & 3u) == 1u) break;
++        delay(264);
++    }
++    if (tries == 400) return -2;
++    if ((e = spmi_read(0x3150, &lo, 1)) || (e = spmi_read(0x3151, &hi, 1))) return e;
++    uint32_t code = (uint32_t)hi << 8 | lo;
++    if (code == 0x8000u) return -3;
++    if (code > 0x7fffu) code = 0;
++    const int32_t mv = (int32_t)((uint64_t)code * 1875u * 1000u / 0x70e4u / 1000u);
++    const unsigned n = sizeof(ntc_100k_1875) / sizeof(ntc_100k_1875[0]);
++    unsigned i = 0;
++    while (i < n && ntc_100k_1875[i].mv > mv) i++;
++    if (i == 0) *milli_c = ntc_100k_1875[0].mc;
++    else if (i == n) *milli_c = ntc_100k_1875[n - 1].mc;
++    else {
++        const int32_t x0 = ntc_100k_1875[i - 1].mv, y0 = ntc_100k_1875[i - 1].mc, x1 = ntc_100k_1875[i].mv, y1 = ntc_100k_1875[i].mc;
++        *milli_c = (y0 == y1 || mv == x0) ? y0 : (x1 == x0 || mv == x1) ? y1 : y0 + (y1 - y0) * (mv - x0) / (x1 - x0);
++    }
++    return 0;
++}
++
++static void
++thermal_zones_poll(void)
++{
++    struct ct_sample sample[CT_BANKS];
++    for (unsigned bank = 0; bank < CT_BANKS; ++bank) {
++        const struct ct_reader reader = {&mappings[bank], thermal_read};
++        ct_collect(mappings[bank].srot && mappings[bank].tm ? &reader : NULL, ct_banks[bank].mask, &sample[bank]);
++    }
++    int passive = 0;
++    for (unsigned z = 0; z < TZ_COUNT; z++) {
++        const struct tz_zone *zone = &tz_zones[z];
++        /* A channel without a valid reading keeps its last state; a reading never comes from it. */
++        if (zone->bank == TZ_PMIC) {
++            int32_t mc = 0;
++            if (pmic_state > 0 && pmic_adc_read(zone->sensor, &mc) == 0) {
++                /* A thermistor reading outside -30..100 C at the first read means a wrong channel or scale: the PMIC zones stop. */
++                if (tz_state[z].temperature == TZ_TEMP_INIT && (mc < -30000 || mc > 100000)) {
++                    printf("COACHZ thermal zone %s: first reading %d mC implausible, PMIC zones off\n", zone->name, mc);
++                    pmic_state = -1;
++                } else {
++                    thermal_zone_update(z, mc);
++                }
++            }
++        } else if (sample[zone->bank].status[zone->sensor] == CT_OK) {
++            thermal_zone_update(z, sample[zone->bank].milli_c[zone->sensor]);
++        }
++        passive += tz_state[z].passive;
++    }
++    thermal_any_passive = passive;
++}
++
++static void __attribute__((noreturn))
++thermal_zones_thread(void *arg, wait_result_t result)
++{
++    (void)arg;
++    (void)result;
++    for (;;) {
++        thermal_zones_poll();
++        uint64_t deadline = 0;
++        clock_interval_to_deadline(thermal_any_passive ? 250 : 1000, NSEC_PER_MSEC, &deadline);
++        (void)assert_wait_deadline((event_t)&tz_state, THREAD_UNINT, deadline);
++        thread_block(THREAD_CONTINUE_NULL);
++    }
++}
++
++static void
++thermal_zones_start(void)
++{
++    unsigned mode = 0;
++    thread_t thread;
++    if (!PE_parse_boot_argn("coachz-thermal-clamp", &mode, sizeof(mode)) || mode != 1) return;
++    for (unsigned z = 0; z < TZ_COUNT; z++) {
++        tz_state[z].temperature = tz_state[z].last_temperature = TZ_TEMP_INIT;
++        tz_state[z].threshold[0] = tz_state[z].threshold[1] = INT32_MAX;
++        tz_state[z].target[0] = tz_state[z].target[1] = TZ_NO_TARGET;
++    }
++    pmic_state = pmic_adc_init() == 0 ? 1 : -1;
++    if (kernel_thread_start(thermal_zones_thread, NULL, &thread) == KERN_SUCCESS) {
++        thread_deallocate(thread);
++        printf("COACHZ thermal zones: %u zones from sc7180.dtsi and the board, step_wise, polled every 1000/250 ms, PMIC thermistors %s\n", (unsigned)TZ_COUNT, pmic_state > 0 ? "on" : "off");
++    } else {
++        printf("COACHZ thermal zones: no thread, no protection\n");
++    }
++}
++
++static void
++thermal_zones_report(void)
++{
++    int32_t hottest = INT32_MIN;
++    unsigned at = 0;
++    for (unsigned z = 0; z < TZ_COUNT; z++)
++        if (tz_state[z].temperature != TZ_TEMP_INIT && tz_state[z].temperature > hottest) { hottest = tz_state[z].temperature; at = z; }
++    if (hottest == INT32_MIN) return;
++    printf("COACHZ thermal zones: hottest %s %d mC, passive %d, A55 state %u, A76 state %u, GPU state %u\n", tz_zones[at].name, hottest,
++        thermal_any_passive, cd_state[CD_A55], cd_state[CD_A76], cd_state[CD_GPU]);
++}
++
+ /* The last good reading of each channel, for the system's thermal service (NativeHidInput.cpp), and how often it has asked. */
+ volatile int32_t coachz_tsens_mc[CT_BANKS][CT_SENSORS];
+ volatile uint32_t coachz_temperature_reads;
+@@ -144,10 +454,11 @@
+         }
+     }
+     printf("COACHZ thermal: system service read the temperatures %u times\n", coachz_temperature_reads);
+-    thermal_policy(hottest);
++    (void)hottest;
++    thermal_zones_report();
+ }
+ 
+-/* Both entry points run only on coachz_sample_thread, with no second thread. */
++/* Both entry points run on coachz_sample_thread; the zones have their own thread (thermal_zones_start), and both only read TSENS. */
+ void
+ coachz_thermal_start(void)
+ {
+@@ -187,6 +498,7 @@
+      */
+     active = 1;
+     thermal_report(1);
++    thermal_zones_start();
+ }
+ 
+ void

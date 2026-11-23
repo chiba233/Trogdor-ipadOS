@@ -1,0 +1,171 @@
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -1496,12 +1496,11 @@
+ #endif /* HAS_CLUSTER */
+ 	lck_mtx_lock(&pset_create_lock);
+ 	/*
+-	 * Coachz has no __AMP__, so its scheduler is the single-cluster Clutch, which assumes one pset:
+-	 * a second pset enables stealing, and sched_clutch_steal_thread() returns with the pset lock
+-	 * still held, so thread_select() takes it again and panics. All cores share pset 0; the E and
+-	 * P clusters stay in the topology.
++	 * Coachz: with __ARM_AMP__ each cluster has its own pset (the A55s pset 0 on pset_node0, the A76s on
++	 * pset_node1) and the Edge policy moves work between them. Without it the single-cluster Clutch
++	 * needed one pset for all eight cores.
+ 	 */
+-	pset = pset_find(0, NULL);
++	pset = pset_find(in_processor_info->cluster_id, NULL);
+ 	kprintf("[%d]%s>pset_find(cluster_id=%d) returned pset %d\n", current_processor()->cpu_id, __FUNCTION__, in_processor_info->cluster_id, pset ? pset->pset_id : -1);
+ 	if (pset == NULL) {
+ #if __AMP__
+--- a/osfmk/kern/sched_clutch.c
++++ b/osfmk/kern/sched_clutch.c
+@@ -1112,7 +1112,35 @@
+ 	queue_init(&clutch_bucket->scb_thread_timeshare_queue);
+ }
+ 
++#if CONFIG_SCHED_EDGE
+ /*
++ * Coachz: no CLPC runs here to recommend clusters, and with every thread group left on pset0 (the A55s) the
++ * default edges would never let it reach the A76s (E->P migration is off). Once all clusters are up
++ * (sched_edge_cpu_init_completed) the fixed-priority, foreground and user-initiated buckets prefer the P
++ * cluster and default, utility and background the E cluster; the P->E edge spills work back when the two
++ * A76s are busy. Before that every bucket stays on the boot cluster, whose pset is the only one sure to exist.
++ */
++static bool sched_edge_coachz_recommend;
++static uint32_t sched_edge_coachz_p_cluster;
++
++static uint32_t
++sched_edge_coachz_bucket_cluster(sched_bucket_t bucket)
++{
++	if (!os_atomic_load(&sched_edge_coachz_recommend, acquire)) {
++		return pset0.pset_cluster_id;
++	}
++	switch (bucket) {
++	case TH_BUCKET_FIXPRI:
++	case TH_BUCKET_SHARE_FG:
++	case TH_BUCKET_SHARE_IN:
++		return sched_edge_coachz_p_cluster;
++	default:
++		return pset0.pset_cluster_id;
++	}
++}
++#endif /* CONFIG_SCHED_EDGE */
++
++/*
+  * sched_clutch_bucket_group_init()
+  *
+  * Initializer for clutch bucket groups.
+@@ -1135,7 +1163,11 @@
+ 
+ 	os_atomic_store(&clutch_bucket_group->scbg_timeshare_tick, 0, relaxed);
+ 	os_atomic_store(&clutch_bucket_group->scbg_pri_shift, INT8_MAX, relaxed);
++#if CONFIG_SCHED_EDGE
++	os_atomic_store(&clutch_bucket_group->scbg_preferred_cluster, sched_edge_coachz_bucket_cluster(bucket), relaxed);
++#else /* CONFIG_SCHED_EDGE */
+ 	os_atomic_store(&clutch_bucket_group->scbg_preferred_cluster, pset0.pset_cluster_id, relaxed);
++#endif /* CONFIG_SCHED_EDGE */
+ 	/*
+ 	 * All thread groups should be initialized to be interactive; this allows the newly launched
+ 	 * thread groups to fairly compete with already running thread groups.
+@@ -4839,6 +4871,38 @@
+ 	}
+ }
+ 
++/* Coachz: the fixed recommendation above for one thread group (thread_group_coachz_foreach). */
++static void
++sched_edge_coachz_recommend_tg(struct thread_group *tg)
++{
++	uint32_t preferred[TH_BUCKET_SCHED_MAX];
++	for (sched_bucket_t bucket = TH_BUCKET_FIXPRI; bucket < TH_BUCKET_SCHED_MAX; bucket++) {
++		preferred[bucket] = sched_edge_coachz_bucket_cluster(bucket);
++	}
++	sched_edge_tg_preferred_cluster_change(tg, preferred, 0);
++}
++
++static void
++sched_edge_coachz_recommend_all(void)
++{
++	uint32_t p_cluster = UINT32_MAX;
++	for (int cluster_id = 0; cluster_id < sched_edge_max_clusters; cluster_id++) {
++		if (pset_array[cluster_id] != PROCESSOR_SET_NULL && pset_array[cluster_id]->pset_type == CLUSTER_TYPE_P) {
++			p_cluster = (uint32_t)cluster_id;
++			break;
++		}
++	}
++	if (p_cluster == UINT32_MAX) {
++		printf("COACHZ sched: no P cluster, every bucket stays on cluster %u\n", pset0.pset_cluster_id);
++		return;
++	}
++	sched_edge_coachz_p_cluster = p_cluster;
++	os_atomic_store(&sched_edge_coachz_recommend, true, release);
++	thread_group_coachz_foreach(sched_edge_coachz_recommend_tg);
++	printf("COACHZ sched: Edge, %d clusters, FIXPRI/FG/IN prefer P cluster %u, DF/UT/BG cluster %u\n",
++	    sched_edge_max_clusters, p_cluster, pset0.pset_cluster_id);
++}
++
+ /*
+  * sched_edge_cpu_init_completed()
+  *
+@@ -4873,7 +4937,8 @@
+ 				/* E->P edge config */
+ 				bitmap_set(src_pset->foreign_psets, dst_cluster_id);
+ 				bitmap_clear(src_pset->native_psets, dst_cluster_id);
+-				sched_edge_config_set(src_cluster_id, dst_cluster_id, (sched_clutch_edge){.sce_migration_weight = 0, .sce_migration_allowed = 0, .sce_steal_allowed = 0});
++				/* Coachz: without CLPC an idle A76 may still steal runnable work from the A55s. */
++				sched_edge_config_set(src_cluster_id, dst_cluster_id, (sched_clutch_edge){.sce_migration_weight = 0, .sce_migration_allowed = 0, .sce_steal_allowed = 1});
+ 			}
+ 			bool clusters_local = (ml_get_die_id(src_cluster_id) == ml_get_die_id(dst_cluster_id));
+ 			if (clusters_local) {
+@@ -4888,6 +4953,7 @@
+ 		pset_unlock(src_pset);
+ 	}
+ 	splx(s);
++	sched_edge_coachz_recommend_all();
+ }
+ 
+ static bool
+--- a/osfmk/kern/thread_group.c
++++ b/osfmk/kern/thread_group.c
+@@ -229,6 +229,21 @@
+ }
+ 
+ /*
++ * Coachz: every existing thread group, under tg_lock (sched_clutch.c's recommendation once all clusters are up).
++ */
++void
++thread_group_coachz_foreach(void (*fn)(struct thread_group *))
++{
++	struct thread_group *tg;
++
++	lck_mtx_lock(&tg_lock);
++	qe_foreach_element(tg, &tg_queue, tg_queue_chain) {
++		fn(tg);
++	}
++	lck_mtx_unlock(&tg_lock);
++}
++
++/*
+  * Inform platform code about already existing thread groups
+  * or ask it to free state for all thread groups
+  */
+--- a/osfmk/kern/thread_group.h
++++ b/osfmk/kern/thread_group.h
+@@ -102,6 +102,7 @@
+ 
+ void            thread_group_init(void);
+ void            thread_group_resync(boolean_t create);
++void            thread_group_coachz_foreach(void (*fn)(struct thread_group *));
+ struct thread_group *thread_group_create_and_retain(uint32_t flags);
+ void            thread_group_init_thread(thread_t t, task_t task);
+ void            thread_group_set_name(struct thread_group *tg, const char *name);
+--- a/pexpert/pexpert/arm64/board_config.h
++++ b/pexpert/pexpert/arm64/board_config.h
+@@ -137,6 +137,8 @@
+ /* Coachz: SC7180 has eight cores in two clusters, six A55 (E) and two A76 (P). */
+ #define MAX_CPUS                       8
+ #define MAX_CPU_CLUSTERS               2
++/* Coachz: the two clusters are asymmetric, so the scheduler is Clutch with the Edge policy (osfmk/kern/sched.h). */
++#define __ARM_AMP__                    1
+ 
+ #define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
+ #endif  /* ARM64_BOARD_CONFIG_BCM2837 */

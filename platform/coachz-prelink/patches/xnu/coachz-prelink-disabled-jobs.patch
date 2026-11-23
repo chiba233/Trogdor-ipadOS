@@ -5,7 +5,7 @@
      vfs_context_t context)
  {
 -	static const char *const keys[] = {"<key>com.apple.watchdogd</key>", "<key>com.apple.bluetoothd</key>"};
-+	static const char *const keys[] = {"<key>com.apple.watchdogd</key>", "<key>com.apple.fairplayd.A2</key>", "<key>com.apple.accessoryupdaterd</key>", "<key>com.apple.identityservicesd</key>", "<key>com.apple.CommCenter</key>"};
++	static const char *const keys[] = {"<key>com.apple.watchdogd</key>", "<key>com.apple.bluetoothd</key>", "<key>com.apple.fairplayd.A2</key>", "<key>com.apple.accessoryupdaterd</key>", "<key>com.apple.identityservicesd</key>", "<key>com.apple.CommCenter</key>"};
  	uint64_t size = found->va_data_size;
  	char *data, *at;
  	bool accepted = false;
@@ -27,15 +27,18 @@
  
  	if (length < 0 || length > (int)sizeof(contents)) return EINVAL;
  
-@@ -8919,7 +8919,10 @@
+@@ -8919,7 +8919,13 @@
  coachz_watchdog_policy_prepare(void)
  {
  	const char policy[] = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
 -	    "<plist version=\"1.0\"><dict><key>com.apple.watchdogd</key><true/><key>com.apple.bluetoothd</key><true/></dict></plist>\n";
 +	    /* As Droid-VM on this same OS build. fairplayd exits at once without FairPlayIOKit while its MachServices stay
 +	     * registered, so its first caller waits forever; identityservicesd and CommCenter are UniXNU's first-boot XPC wait
-+	     * cycle; accessoryupdaterd keeps trustd checking certificates. A disabled job's clients get no answer at once. */
-+	    "<plist version=\"1.0\"><dict><key>com.apple.watchdogd</key><true/><key>com.apple.fairplayd.A2</key><true/><key>com.apple.accessoryupdaterd</key><true/><key>com.apple.identityservicesd</key><true/><key>com.apple.CommCenter</key><true/></dict></plist>\n";
++	     * cycle; accessoryupdaterd keeps trustd checking certificates. A disabled job's clients get no answer at once.
++	     * bluetoothd stays disabled as in 3ba20ad, unlike Droid-VM: this engineering sample has no working Bluetooth, so
++	     * bluetoothd exits at once and is respawned every 10 s while its MachServices stay registered, and every caller
++	     * waits; Settings' Wi-Fi password sheet waited 10 s on sharingd's Bluetooth check. */
++	    "<plist version=\"1.0\"><dict><key>com.apple.watchdogd</key><true/><key>com.apple.bluetoothd</key><true/><key>com.apple.fairplayd.A2</key><true/><key>com.apple.accessoryupdaterd</key><true/><key>com.apple.identityservicesd</key><true/><key>com.apple.CommCenter</key><true/></dict></plist>\n";
  	int disable = 0;
  	int error;
  
