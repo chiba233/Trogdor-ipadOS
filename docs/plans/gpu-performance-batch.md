@@ -1009,3 +1009,9 @@ hang（fence 4104，DeviceLost）：
 - 转向帧的 native 版本直接从 native 纹理导出到页面，canonical 纹理只在有东西读写它时才发布（开机参数 `czl=0` 关掉）。1488x2266 的发布 pass 每秒 1.2 次，加上前一项之前是 6.6 次。不算相机画面那种整帧 compute，晚到帧提交的 GPU 时间是 13.2 ms，之前是 15.4 ms。
 - Turnip 释放 BO 时，在 retire 锁里先清零表项，再回收或排队释放句柄。两轮都没有 DeviceLost。
 - 经页面读转向帧的只读绑定，在 flush 时改绑到这一帧的 native 纹理（开机参数 `czr=0` 关掉）。native 不可用、有 plain 写入在途，或者这个编码器正在画这一帧时，照旧读页面。一次 161 s 的运行里，924 次这类读取有 647 次改读 native；读者触发的 flush 占全部 flush 的 25%，之前是 59%；晚到帧提交的导出是 1.81 ms，之前是 2.04 ms。
+
+## 懒页面和 deadline 提频的实机结果（k229）
+
+- 懒页面：提交时懒发布的转向帧把页面也留到以后（开机参数 `czp=0` 关掉）。一次 424 s 的运行里懒发布 870 次，808 次一直没人读页面、不用导出，16 次后来导出，没有目标和显示 native 纹理的都是 0。晚到帧提交的导出 1.40 ms，之前 1.81 ms；按时完成的 0.68 ms，之前 1.14 ms。
+- deadline 提频，照主线 `msm_fence_set_deadline`、`deadline_work` 和 `msm_devfreq_boost`：每个交给显示的帧以下一个 vblank 为 deadline，提前 3 ms 还没完成就把下限提到当前频率的两倍，保持 50 ms（`coachz-gpu-deadline=0` 关掉）。2472 个 deadline 里 2187 个在检查前已完成，提频 255 次，其中 60 次真的升了档。GPU 忙 30% 以上的秒平均 770 MHz，k228 是 733 MHz。帧命令缓冲从提交到完成的中位数 4.8 ms，超过 16.7 ms 的占 19%，k228 是 19.3 ms 和 54%。150 s 以后屏上是一个 10 Hz 的动画，每 100 ms 才交一帧，所以整轮的单 vblank 间隔占比（56%）不能和 k228 的 77% 直接比；120 s 以前是 98%。两轮的负载不同。
+- 约 234 s 时 GPU 挂起一次（fence 3979），恢复时关掉 CX 再打开以后 GMU 的 SMMU 没能恢复（`smmu restored 0`，resume 返回 -3），backboardd 收到 DeviceLost 后退出、重启。这次挂起在睡眠测试后约 20 s，两者有没有关系还没查。

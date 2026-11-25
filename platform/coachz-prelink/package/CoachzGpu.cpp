@@ -12,6 +12,7 @@
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <kern/clock.h>
 #include <kern/thread.h>
+#include <kern/thread_call.h>
 #include <libkern/c++/OSMetaClass.h>
 #include <libkern/OSKextLib.h>
 #include <string.h>
@@ -1005,19 +1006,117 @@ void dcvsTest() {
     }
 }
 
-// The governor (coachz-gpu-dcvs=1), sheng's rules from UniXNU porting/power: every 100 ms the GMU's XO busy count picks the lowest level that
-// keeps the GPU about half busy, never below level 3; within 1 s of a touch report the top level; work resuming from an idle window at least
-// level 5 (565 MHz; sheng doubles to at least 578 MHz); up at once, down after four windows that all ask for less; within the thermal cap.
+// The governor (coachz-gpu-dcvs=1) follows mainline's msm_gpu_devfreq under devfreq's simple_ondemand (upthreshold 50, downdifferential 10)
+// on the GMU's XO busy count every 50 ms: over 50 % busy the top level, from 40 % to 50 % the level stays, below that the lowest level whose
+// clock covers busy x clock / 45 %, and a window that starts work after an idle one at least twice the clock (msm_devfreq_active's boost).
+// A GPU that stalls on vblank looks half idle, so a half-busy target keeps it slow: mainline throttles up at 50 % for that reason. Kept
+// from UniXNU porting/power: the top level within 1 s of a touch report, never below level 3, within the thermal cap.
 // Level clocks as the DCVS test measured them on hardware: 3 355, 4 430, 5 565, 6 650, 7 800 MHz.
 extern "C" volatile uint32_t coachz_touch_reports;   // bsd/dev/coachz_touch.c
 const unsigned kLevelMHz[8] = {0, 180, 267, 355, 430, 565, 650, 800};
+// The lowest governed level whose clock is at least mhz (the opp ceiling devfreq_recommended_opp takes).
+unsigned governorLevelFor(uint64_t mhz) {
+    unsigned target = 3;
+    while (target < 7 && kLevelMHz[target] < mhz) target++;
+    return target;
+}
 unsigned governorTarget(unsigned level, uint64_t dBusy, uint64_t dAlways, bool touched, bool resumed) {
     if (touched) return 7;
-    const uint64_t demand = dAlways ? dBusy * kLevelMHz[level] * 2 / dAlways : 0;   // the clock at which it would be half busy
-    unsigned target = 3;
-    while (target < 7 && kLevelMHz[target] < demand) target++;
-    if (resumed && target < 5) target = 5;
+    unsigned target = level;
+    if (dAlways && dBusy * 100 > dAlways * 50) target = 7;
+    else if (dAlways && dBusy * 100 <= dAlways * 40) target = governorLevelFor(dBusy * kLevelMHz[level] * 100 / (dAlways * 45));
+    if (resumed) {
+        const unsigned boosted = governorLevelFor(2ull * kLevelMHz[level]);
+        if (boosted > target) target = boosted;
+    }
     return target;
+}
+
+// The deadline boost of mainline's msm_fence.c and msm_gpu_devfreq.c (v6.12). A display commit gives the frame's fence a deadline, the
+// next vblank start (drm_atomic_helper's set_fence_deadline). msm_fence_set_deadline takes it when the stored deadline has passed or the
+// new one is earlier, keeps the newest fence that has it, and 3 ms before it deadline_work boosts the GPU unless that fence completed.
+// msm_devfreq_boost(gpu, 2) is a minimum clock of twice the current one, held for one polling period (50 ms).
+// Here the commit is the presenter handing out a frame: waitSwap calls coachz_gpu_scanout_idle once per frame, after the last flip
+// latched. The frame is the presenter's offer number. It stops waiting for the GPU when the pipe takes it (coachz_gpu_scanout_direct)
+// or its swap ends (completed, failed or abandoned). While the ring is idle it counts as done too, because then only the CPU is behind it.
+// The next vblank comes from the panel's vsync interrupt (coachz_vsync.c): with none in the last four frames the panel is off and no
+// deadline is set. coachz-gpu-deadline=0 turns the boost off.
+extern "C" uint64_t coachz_hw_vsync_stamp(void);
+IOLock *gGovLock;                                   // the governor's level and the boost floor; taken before the publisher lock
+unsigned gGovLevel = 7, gGovChanges, gBoostFloor;
+uint64_t gBoostUntil;
+volatile uint32_t gGovReady;                        // the governor runs (coachz-gpu-dcvs=1, after the DCVS test)
+uint64_t gTicks50Ms, gTicks3Ms, gFrameTicks;
+IOLock *gDeadlineLock;
+thread_call_t gDeadlineCall;
+uint64_t gNextDeadline, gDeadlineFrame;
+volatile uint64_t gFrameTaken;                      // the last frame the pipe took
+// Deadlines taken, of them already inside 3 ms, checks run, frames found done, boosts, boosts that raised the clock.
+volatile uint64_t gDeadlineStats[6];
+// Under gGovLock: the target within the boost floor while it holds and within the thermal cap.
+void governorApply(unsigned target, uint64_t now) {
+    if (now < gBoostUntil && gBoostFloor > target) target = gBoostFloor;
+    if (target > coachz_gpu_level_cap) target = coachz_gpu_level_cap;
+    uint32_t result = 0;
+    if (target != gGovLevel && dcvsSet(target, &result)) {
+        gGovLevel = target;
+        gGovChanges++;
+    }
+}
+// msm_devfreq_boost: dev_pm_qos_update_request replaces the floor with factor x the current clock, and the floor ends 50 ms later.
+void devfreqBoost(unsigned factor) {
+    IOLockLock(gGovLock);
+    if (__atomic_load_n(&gGovReady, __ATOMIC_ACQUIRE)) {
+        const uint64_t now = mach_absolute_time();
+        const unsigned before = gGovLevel;
+        gBoostFloor = governorLevelFor(uint64_t(factor) * kLevelMHz[before]);
+        gBoostUntil = now + gTicks50Ms;
+        governorApply(before, now);
+        gDeadlineStats[4] = gDeadlineStats[4] + 1;
+        if (gGovLevel > before) gDeadlineStats[5] = gDeadlineStats[5] + 1;
+    }
+    IOLockUnlock(gGovLock);
+}
+bool frameWaiting(uint64_t frame) {
+    if (__atomic_load_n(&gFrameTaken, __ATOMIC_ACQUIRE) >= frame) return false;
+    if (native_gop_gpu_completions + native_gop_gpu_failures + native_gop_gpu_abandoned >= frame) return false;
+    return gRing.completedFence() != gRing.lastSubmitted();
+}
+// deadline_work.
+void deadlineWork(thread_call_param_t, thread_call_param_t) {
+    IOLockLock(gDeadlineLock);
+    const uint64_t frame = gDeadlineFrame;
+    IOLockUnlock(gDeadlineLock);
+    gDeadlineStats[2] = gDeadlineStats[2] + 1;
+    if (!frameWaiting(frame)) {
+        gDeadlineStats[3] = gDeadlineStats[3] + 1;
+        return;
+    }
+    devfreqBoost(2);
+}
+// msm_fence_set_deadline for the frame the presenter has just handed out.
+void deadlineSet() {
+    if (!gDeadlineCall || !__atomic_load_n(&gGovReady, __ATOMIC_ACQUIRE)) return;
+    const uint64_t vsync = coachz_hw_vsync_stamp();
+    const uint64_t now = mach_absolute_time();
+    if (!vsync || vsync > now || now - vsync > 4 * gFrameTicks) return;
+    // drm_crtc_next_vblank_start: the most recent vblank plus one frame.
+    const uint64_t deadline = vsync + ((now - vsync) / gFrameTicks + 1) * gFrameTicks;
+    const uint64_t frame = native_gop_gpu_offers;
+    IOLockLock(gDeadlineLock);
+    if (now > gNextDeadline || deadline < gNextDeadline) {
+        gNextDeadline = deadline;
+        if (frame > gDeadlineFrame) gDeadlineFrame = frame;
+        gDeadlineStats[0] = gDeadlineStats[0] + 1;
+        const uint64_t boostAt = deadline - gTicks3Ms;
+        if (now > boostAt) {
+            gDeadlineStats[1] = gDeadlineStats[1] + 1;
+            thread_call_enter(gDeadlineCall);
+        } else {
+            thread_call_enter_delayed_with_leeway(gDeadlineCall, nullptr, boostAt, 0, THREAD_CALL_DELAY_SYS_CRITICAL);
+        }
+    }
+    IOLockUnlock(gDeadlineLock);
 }
 
 // Runtime power for A618 (no IFPC): 66 ms after the last work retires the GMU slumbers, and the next submission
@@ -1185,8 +1284,10 @@ void pmThread(void *, wait_result_t) {
 
 void rateThread(void *, wait_result_t) {
     uint64_t busy=0,always=0;
-    unsigned governed = 0, level = 7, changes = 0, lower = 0;
+    unsigned governed = 0;
     PE_parse_boot_argn("coachz-gpu-dcvs", &governed, sizeof(governed));
+    if (!gGovLock) governed = 0;
+    uint64_t boostsShown = 0;
     native_adreno_publisher_lock(1);
     if (!__atomic_load_n(&gPmAsleep, __ATOMIC_SEQ_CST)) profileSetup();
     native_adreno_publisher_lock(0);
@@ -1197,8 +1298,9 @@ void rateThread(void *, wait_result_t) {
     uint32_t touches = coachz_touch_reports;
     bool idle = true;
     for (unsigned seconds = 0;; seconds++) {
-        for (unsigned tick = 0; tick < 10; tick++, ticks++) {
-            IOSleep(100);
+        if (governed && seconds > 20) __atomic_store_n(&gGovReady, 1u, __ATOMIC_RELEASE);
+        for (unsigned tick = 0; tick < 20; tick++, ticks++) {
+            IOSleep(50);
             if (!governed || seconds <= 20) continue;
             native_adreno_publisher_lock(1);
             const bool active=!__atomic_load_n(&gPmAsleep,__ATOMIC_SEQ_CST);
@@ -1212,21 +1314,22 @@ void rateThread(void *, wait_result_t) {
             windowBusy = nowBusy;
             windowAlways = nowAlways;
             const uint32_t reports = coachz_touch_reports;
-            if (reports != touches) boostUntil = ticks + 10;
+            if (reports != touches) boostUntil = ticks + 20;
             touches = reports;
             const bool working = wAlways && wBusy * 50 >= wAlways;   // at least 2 % busy
-            unsigned target = governorTarget(level, wBusy, wAlways, ticks < boostUntil, working && idle);
+            IOLockLock(gGovLock);
+            governorApply(governorTarget(gGovLevel, wBusy, wAlways, ticks < boostUntil, working && idle), mach_absolute_time());
+            IOLockUnlock(gGovLock);
             idle = !working;
-            if (target > coachz_gpu_level_cap) target = coachz_gpu_level_cap;
-            lower = target < level ? lower + 1 : 0;
-            uint32_t result = 0;
-            if ((target > level || (target < level && (lower >= 4 || level > coachz_gpu_level_cap))) && dcvsSet(target, &result)) {
-                level = target;
-                changes++;
-                lower = 0;
-            }
         }
         if (seconds == 20) dcvsTest();
+        if (!(seconds % 10) && gDeadlineStats[0] != boostsShown) {
+            boostsShown = gDeadlineStats[0];
+            char row[200];
+            snprintf(row, sizeof row, "COACHZ gpu boost: deadlines %llu (%llu inside 3 ms), checked %llu, done %llu, boosts %llu raised %llu, level %u",
+                gDeadlineStats[0], gDeadlineStats[1], gDeadlineStats[2], gDeadlineStats[3], gDeadlineStats[4], gDeadlineStats[5], gGovLevel);
+            printf("%s\n", row);
+        }
         ProfileSample current{};
         if (!profileSample(current)) {havePrevious = false; continue;}
         if (!havePrevious || current.epoch != previous.epoch) {
@@ -1243,7 +1346,7 @@ void rateThread(void *, wait_result_t) {
         auto pct = [dCycles](uint64_t value) {return static_cast<unsigned long long>(value * 100 / dCycles);};
         // The CP counter counts every core cycle, idle ones too, so the second number is the clock itself.
         printf("COACHZ gpu rate: busy %llu%%, %llu MHz over the second, level %u (%u changes)\n",
-            static_cast<unsigned long long>(dBusy * 100 / dAlways), static_cast<unsigned long long>(dCycles * 192 / dAlways / 10), level, changes);
+            static_cast<unsigned long long>(dBusy * 100 / dAlways), static_cast<unsigned long long>(dCycles * 192 / dAlways / 10), gGovLevel, gGovChanges);
         printf("COACHZ gpu prof: sp %llu alu %llu st tp %llu uche %llu rb %llu ne %llu | tp %llu st %llu l1 %lluk miss %llu%% | uche %llu arb %llu lat %llu"
             " | rb %llu starve sp %llu ccu %llu c r %lluk w %lluk | gbif r %lluk %lluk w %lluk %lluk\n",
             pct(d[0]), pct(d[1]), pct(d[2]), pct(d[3]), pct(d[4]), pct(d[5]), pct(d[6]), pct(d[7]), static_cast<unsigned long long>(d[8] / 1000),
@@ -1922,6 +2025,7 @@ extern "C" IOReturn coachz_gpu_scanout_direct(task_t task, const void *request, 
             coachz_gpu_direct[4] = 0x100 | uint32_t(shown);
             status = kIOReturnError;
         } else {
+            __atomic_store_n(&gFrameTaken, native_gop_gpu_offers, __ATOMIC_RELEASE);
             coachz_scanout_flip_wait();
             const uint64_t us = directNowUs() - began;
             coachz_gpu_direct[0] = coachz_gpu_direct[0] + 1;
@@ -1955,8 +2059,10 @@ extern "C" IOReturn coachz_gpu_scanout_direct(task_t task, const void *request, 
     }
     return status;
 }
-// Before the presenter draws into a flip buffer (waitSwap, after the latch): frames the pipe no longer fetches are let go.
+// Before the presenter draws into a flip buffer (waitSwap, after the latch), once for each frame it hands out: the frame's deadline is
+// set, and frames the pipe no longer fetches are let go.
 extern "C" void coachz_gpu_scanout_idle(void) {
+    deadlineSet();
     if (!gDirectEnabled || !gDirectLock || coachz_gpu_direct[5] != 1) return;
     IOLockLock(gDirectLock);
     directReleaseIdle();
@@ -2036,6 +2142,17 @@ extern "C" int coachz_gpu_driver_start(volatile uint8_t *core, volatile uint8_t 
     if (kernel_thread_start(reportThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
     speedBinReport();
     cacheSetup();
+    gGovLock = IOLockAlloc();
+    gDeadlineLock = IOLockAlloc();
+    nanoseconds_to_absolutetime(50000000, &gTicks50Ms);
+    nanoseconds_to_absolutetime(3000000, &gTicks3Ms);
+    nanoseconds_to_absolutetime(16666667, &gFrameTicks);   // the panel's 60 Hz mode
+    unsigned deadlineBoost = 1, governed = 0;
+    PE_parse_boot_argn("coachz-gpu-deadline", &deadlineBoost, sizeof(deadlineBoost));
+    PE_parse_boot_argn("coachz-gpu-dcvs", &governed, sizeof(governed));   // without the governor the clock stays at the top level
+    if (deadlineBoost && governed && gGovLock && gDeadlineLock)
+        gDeadlineCall = thread_call_allocate_with_priority(deadlineWork, nullptr, THREAD_CALL_PRIORITY_KERNEL_HIGH);
+    printf("COACHZ gpu boost: deadline %s\n", gDeadlineCall ? "on, 3 ms before the next vblank, x2 for 50 ms" : "off");
     if (kernel_thread_start(rateThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
     native_adreno_power_get = pmGet;
     native_adreno_set_restart(gpuRestart, nullptr);

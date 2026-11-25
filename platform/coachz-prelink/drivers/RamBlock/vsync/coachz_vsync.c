@@ -20,6 +20,7 @@ extern int armcpu_spi_attach(uint32_t, bool, void (*)(void *), void *, uint32_t 
 
 int coachz_hw_vsync_register(void (*callback)(void *, uint64_t), void *context);
 uint64_t coachz_hw_vsync_count(void);
+uint64_t coachz_hw_vsync_stamp(void);
 
 #define MDSS_PA          0x0ae00000u
 #define MDSS_HW_INTR_STATUS 0x0010u
@@ -41,6 +42,8 @@ static uint32_t rd(volatile uint8_t *b, uint32_t o) { return *(volatile uint32_t
 static void wr(volatile uint8_t *b, uint32_t o, uint32_t v) { *(volatile uint32_t *)(uintptr_t)(b + o) = v; __asm__ volatile ("dsb sy" ::: "memory"); }
 
 uint64_t coachz_hw_vsync_count(void) { return vs_count; }
+/* mach_absolute_time of the last vsync interrupt, 0 before the first: the GPU's deadline boost (CoachzGpu.cpp) aims at the next one. */
+uint64_t coachz_hw_vsync_stamp(void) { return __atomic_load_n(&vs_last, __ATOMIC_ACQUIRE); }
 
 /* Thread context: the display driver's work. One delivery per pending vsync is enough; the driver stamps it with the interrupt's time. */
 static void vs_deliver(thread_call_param_t p0, thread_call_param_t p1)
