@@ -6531,7 +6531,7 @@ diff --git a/scripts/build-turnip-darwin.py b/scripts/build-turnip-darwin.py
 diff --git a/scripts/data/adreno-compiler-inputs.json b/scripts/data/adreno-compiler-inputs.json
 --- a/scripts/data/adreno-compiler-inputs.json
 +++ b/scripts/data/adreno-compiler-inputs.json
-@@ -56,7 +56,30 @@
+@@ -56,7 +56,31 @@
      "patches/mesa/turnip-host-import-images.patch",
      "patches/mesa/turnip-render-mode-for-attachment-memory.patch",
      "patches/mesa/turnip-gmem-mutable-swap.patch",
@@ -6559,7 +6559,8 @@ diff --git a/scripts/data/adreno-compiler-inputs.json b/scripts/data/adreno-comp
 +    "patches/mesa/coachz-turnip-unaccessed-single-draw-sysmem.patch",
 +    "patches/mesa/coachz-turnip-draw-trace-sampling.patch",
 +    "patches/mesa/coachz-turnip-scanout-export.patch",
-+    "patches/mesa/coachz-turnip-raster-order-readers.patch"
++    "patches/mesa/coachz-turnip-raster-order-readers.patch",
++    "patches/mesa/coachz-turnip-bo-finish-clears-under-lock.patch"
    ],
    "integer_fma_reference": {
      "repository": "https://github.com/ucb-bar/berkeley-softfloat-3",
@@ -7113,3 +7114,47 @@ new file mode 100644
 +             commits_handed_off: counters.commits_handed_off.load(Ordering::Relaxed),
 +             images_started_on_the_host: counters.images_started_on_the_host.load(Ordering::Relaxed),
 +             host_texel_copies: counters.host_texel_copies.load(Ordering::Relaxed),
+diff --git a/patches/mesa/coachz-turnip-bo-finish-clears-under-lock.patch b/patches/mesa/coachz-turnip-bo-finish-clears-under-lock.patch
+new file mode 100644
+--- /dev/null
++++ b/patches/mesa/coachz-turnip-bo-finish-clears-under-lock.patch
+@@ -0,0 +1,39 @@
++diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
++index 2bb9a05..9cdf02f 100644
++--- a/src/freedreno/vulkan/tu_knl_darwin.cc
+++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
++@@ -1413,6 +1413,13 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
++ 
++    struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
++    pthread_mutex_lock(&retire->lock);
+++   /* The BO structs live in a sparse array indexed by the handle, so the entry is zeroed here, before the handle can be handed on.
+++    * The reap below may put this BO in the BO cache, where another thread's darwin_bo_init takes it once retire->lock goes, or queue
+++    * it for darwin_release_queued, after which the kernel may return the same handle to any thread. Zeroed later, the entry could
+++    * already be that live BO, and its command stream would send the GPU to address 0 plus an offset. tu_bo_make_zombie in
+++    * tu_knl_drm.cc clears its entry under the VMA mutex for the same reason. */
+++   const struct tu_bo gone = *bo;
+++   memset(bo, 0, sizeof(*bo));
++    darwin_reap_locked(dev, retire);
++    if (retire->count == retire->capacity && retire->failure == VK_SUCCESS) {
++       /* The ring grows, its records in order from the head. */
++@@ -1432,8 +1439,8 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
++       uint32_t fence = dw.last_fence;
++       pthread_mutex_unlock(&dw.lock);
++       unsigned slot = (retire->head + retire->count) % retire->capacity;
++-      retire->entries[slot] = {bo->darwin_handle, bo->iova, bo->darwin_alloc_size ? bo->darwin_alloc_size : bo->size, bo->map,
++-                               bo->darwin_token, fence, bo->darwin_alloc_size != 0, bo->darwin_read_only};
+++      retire->entries[slot] = {gone.darwin_handle, gone.iova, gone.darwin_alloc_size ? gone.darwin_alloc_size : gone.size, gone.map,
+++                               gone.darwin_token, fence, gone.darwin_alloc_size != 0, gone.darwin_read_only};
++       ++retire->count;
++       ++retire->enqueued;
++       darwin_reap_locked(dev, retire);
++@@ -1445,9 +1452,6 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
++    pthread_mutex_unlock(&retire->lock);
++    darwin_release_queued(dev, retire);
++ 
++-   /* The BO structs live in a sparse array: zero the entry to mark it free. */
++-   memset(bo, 0, sizeof(*bo));
++-
++    u_rwlock_rdunlock(&dev->dma_bo_lock);
++ }
++ 

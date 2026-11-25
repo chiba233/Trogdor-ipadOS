@@ -75,7 +75,7 @@ def gpu_stack_overlay():
     # and BOs released to the kernel outside the retirement lock; command stream chunks written again only once the GPU passed their
     # last submission's fence, attachments the runtime names as touched by no draw left out of tile memory, and a pass of one draw
     # with such an attachment let into system memory; then rasterization order kept only for pipelines whose fragment shader reads an
-    # input attachment.
+    # input attachment, and a finished BO's array entry zeroed before its handle can be handed on.
     mesa_patches = [UNIXNU / 'patches/mesa' / name for name in ('turnip-transient-attachments-in-gmem.patch',
                                                                  'turnip-gmem-memory-side-swap.patch', 'turnip-coachz-diagnostics.patch',
                                                                  'coachz-port-ir3-fragment-consts.patch', 'coachz-port-turnip-one-va.patch',
@@ -91,7 +91,8 @@ def gpu_stack_overlay():
                                                                  'coachz-turnip-unaccessed-single-draw-sysmem.patch',
                                                                  'coachz-turnip-draw-trace-sampling.patch',
                                                                  'coachz-turnip-scanout-export.patch',
-                                                                 'coachz-turnip-raster-order-readers.patch')]
+                                                                 'coachz-turnip-raster-order-readers.patch',
+                                                                 'coachz-turnip-bo-finish-clears-under-lock.patch')]
     # The overlay's runtime patches, which the bridge builder applies after its recorded ones: the copy profile, the compile thread at the
     # asking thread's priority, two-plane pictures up to the plug-in's size kept as images, and the runtime's command buffer threads at the
     # fixed priority of the thread that starts them, and twice the spare descriptor pools with 64 sets in a command buffer's first;
