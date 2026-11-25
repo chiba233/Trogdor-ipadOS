@@ -28,12 +28,18 @@ static int installCameraApp(void)
     NSString *from=[base stringByAppendingPathComponent:@"CoachzCamera.app"], *to=@"/var/jb/Applications/CoachzCamera.app";
     if(![fm fileExistsAtPath:[from stringByAppendingPathComponent:@"CoachzCamera"]])return ENOENT;
     NSString *staging=[to stringByAppendingString:@".coachz-new"];
+    NSError *error=nil;
     [fm removeItemAtPath:staging error:nil];
-    if(![fm copyItemAtPath:from toPath:staging error:nil])return EIO;
+    if(![fm copyItemAtPath:from toPath:staging error:&error]) {
+        fprintf(stderr,"COACHZ apps: camera copy failed: %s\n",error.description.UTF8String?:"-");return EIO;
+    }
     [fm setAttributes:@{NSFilePosixPermissions:@0755,NSFileOwnerAccountID:@0,NSFileGroupOwnerAccountID:@0} ofItemAtPath:staging error:nil];
     [fm setAttributes:@{NSFilePosixPermissions:@0755} ofItemAtPath:[staging stringByAppendingPathComponent:@"CoachzCamera"] error:nil];
     [fm removeItemAtPath:to error:nil];
-    return [fm moveItemAtPath:staging toPath:to error:nil]?0:EIO;
+    if(![fm moveItemAtPath:staging toPath:to error:&error]) {
+        fprintf(stderr,"COACHZ apps: camera move failed: %s\n",error.description.UTF8String?:"-");return EIO;
+    }
+    return 0;
 }
 static NSMutableSet<NSData *> *records;
 
@@ -94,6 +100,27 @@ static BOOL applicationRegistered(NSString *identifier,NSString *path)
 static uint32_t be32(const void *p) { uint32_t x; memcpy(&x,p,4); return OSSwapBigToHostInt32(x); }
 static uint32_t le32(const void *p) { uint32_t x; memcpy(&x,p,4); return OSSwapLittleToHostInt32(x); }
 
+/* One record per CodeDirectory in a signature superblob, alternate hashes included. */
+static BOOL signatureRecords(const uint8_t *s, size_t bytes)
+{
+    uint32_t total=be32(s+4), entries=be32(s+8);
+    if (be32(s)!=0xfade0cc0 || total>bytes || total<12 || entries>(total-12)/8) return NO;
+    BOOL found=NO;
+    for (unsigned j=0;j<entries;j++) {
+        uint32_t cd=be32(s+16+j*8);
+        if (cd>total || total-cd<44 || be32(s+cd)!=0xfade0c02) continue;
+        uint32_t size=be32(s+cd+4); uint8_t type=s[cd+37], hash[CC_SHA512_DIGEST_LENGTH]={0}, record[22]={0};
+        if (size<44 || size>total-cd) return NO;
+        if (type==1) CC_SHA1(s+cd,size,hash);
+        else if (type==2 || type==3) CC_SHA256(s+cd,size,hash);
+        else if (type==4) CC_SHA384(s+cd,size,hash);
+        else continue;
+        memcpy(record,hash,20); record[20]=type;
+        [records addObject:[NSData dataWithBytes:record length:22]]; found=YES;
+    }
+    return found;
+}
+
 /* Parse each CodeDirectory, including alternate hashes, within its own Mach-O slice. */
 static BOOL hashes(NSData *data, unsigned level)
 {
@@ -123,22 +150,53 @@ static BOOL hashes(NSData *data, unsigned level)
         if (cmd==LC_CODE_SIGNATURE && len>=16) {
             size_t off=le32(b+at+8), bytes=le32(b+at+12);
             if (off>n || bytes>n-off || bytes<12) return NO;
-            const uint8_t *s=b+off; uint32_t total=be32(s+4), entries=be32(s+8);
-            if (be32(s)!=0xfade0cc0 || total>bytes || total<12 || entries>(total-12)/8) return NO;
-            BOOL found=NO;
-            for (unsigned j=0;j<entries;j++) {
-                uint32_t cd=be32(s+16+j*8);
-                if (cd>total || total-cd<44 || be32(s+cd)!=0xfade0c02) continue;
-                uint32_t size=be32(s+cd+4); uint8_t type=s[cd+37], hash[CC_SHA512_DIGEST_LENGTH]={0}, record[22]={0};
-                if (size<44 || size>total-cd) return NO;
-                if (type==1) CC_SHA1(s+cd,size,hash);
-                else if (type==2 || type==3) CC_SHA256(s+cd,size,hash);
-                else if (type==4) CC_SHA384(s+cd,size,hash);
-                else continue;
-                memcpy(record,hash,20); record[20]=type;
-                [records addObject:[NSData dataWithBytes:record length:22]]; found=YES;
-            }
-            return found;
+            return signatureRecords(b+off,bytes);
+        }
+        at+=len;
+    }
+    return NO;
+}
+
+/*
+ * The same records from a file on disk, reading only the headers, load commands and signature with pread. A signed file
+ * is never mapped (a mapped page the kernel rejects kills this process), and a large binary costs a few KiB, not its size.
+ */
+static BOOL hashesFile(int fd, uint64_t base, uint64_t length, unsigned level)
+{
+    uint8_t head[32];
+    if (level > 2 || length < sizeof(head) || pread(fd,head,sizeof(head),(off_t)base)!=(ssize_t)sizeof(head)) return NO;
+    if (be32(head) == FAT_MAGIC || be32(head) == FAT_MAGIC_64) {
+        BOOL wide = be32(head) == FAT_MAGIC_64; uint32_t count = be32(head+4);
+        size_t stride = wide ? 32 : 20;
+        if (!count || count > 64 || 8+stride*count > length) return NO;
+        NSMutableData *table=[NSMutableData dataWithLength:stride*count];
+        if (pread(fd,table.mutableBytes,table.length,(off_t)(base+8))!=(ssize_t)table.length) return NO;
+        BOOL found = NO;
+        for (unsigned i=0;i<count;i++) {
+            const uint8_t *a=(const uint8_t *)table.bytes+stride*i;
+            uint64_t off=be32(a+8), bytes=be32(a+12);
+            if (wide) {off=(off<<32)|bytes; bytes=((uint64_t)be32(a+16)<<32)|be32(a+20);}
+            if (off>length || bytes>length-off) return NO;
+            if (be32(a) == CPU_TYPE_ARM64) found |= hashesFile(fd,base+off,bytes,level+1);
+        }
+        return found;
+    }
+    if (le32(head)!=MH_MAGIC_64) return NO;
+    uint32_t count=le32(head+16), commands=le32(head+20);
+    if (commands>length-32 || commands>(1u<<20) || count>commands/8) return NO;
+    NSMutableData *loads=[NSMutableData dataWithLength:commands];
+    if (pread(fd,loads.mutableBytes,commands,(off_t)(base+32))!=(ssize_t)commands) return NO;
+    const uint8_t *b=loads.bytes; size_t at=0;
+    for (unsigned i=0;i<count;i++) {
+        if (at+8>commands) return NO;
+        uint32_t cmd=le32(b+at), len=le32(b+at+4);
+        if (len<8 || len>commands-at) return NO;
+        if (cmd==LC_CODE_SIGNATURE && len>=16) {
+            uint64_t off=le32(b+at+8), bytes=le32(b+at+12);
+            if (off>length || bytes>length-off || bytes<12 || bytes>(64u<<20)) return NO;
+            NSMutableData *blob=[NSMutableData dataWithLength:(NSUInteger)bytes];
+            if (pread(fd,blob.mutableBytes,blob.length,(off_t)(base+off))!=(ssize_t)blob.length) return NO;
+            return signatureRecords(blob.bytes,blob.length);
         }
         at+=len;
     }
@@ -151,17 +209,10 @@ static void trustTree(NSString *root)
     if (lstat(root.fileSystemRepresentation,&st)) return;
     if (S_ISREG(st.st_mode)) {
         if (st.st_size>=32 && st.st_size<512*1024*1024) {
-            /* Resource files need no mapping or signature scan. Release each image promptly. */
-            uint32_t magic=0;
             int fd=open(root.fileSystemRepresentation,O_RDONLY|O_CLOEXEC);
-            ssize_t n=fd<0?-1:pread(fd,&magic,sizeof(magic),0);
-            if(fd>=0)close(fd);
-            if(n!=sizeof(magic) || (le32(&magic)!=MH_MAGIC_64 &&
-               be32(&magic)!=FAT_MAGIC && be32(&magic)!=FAT_MAGIC_64))return;
-            @autoreleasepool {
-                NSData *d=[NSData dataWithContentsOfFile:root options:NSDataReadingMappedIfSafe error:nil];
-                if (d) (void)hashes(d,0);
-            }
+            if(fd<0)return;
+            @autoreleasepool { (void)hashesFile(fd,0,(uint64_t)st.st_size,0); }
+            close(fd);
         }
         return;
     }
@@ -290,6 +341,8 @@ static int bootstrap(void)
      * the copy came at 16:45:59, after enableSystemAppVisibility's preferences sync). */
     int camera=installCameraApp();
     fprintf(stderr,"COACHZ apps: camera app %d at %ld\n",camera,(long)time(NULL));
+    /* A boot that ends without a clean shutdown keeps only what was synced: k228's lines never reached the Data volume. */
+    fsync(STDERR_FILENO);
     BOOL visibilityChanged=NO;
     int r=enableSystemAppVisibility(&visibilityChanged);if(r)return r;
     NSString *uiMarker=@"/private/var/db/coachz-apps-ui-ready";
@@ -325,11 +378,12 @@ static int bootstrap(void)
     }
     /* Restore additional installed code after the statically trusted UI repair. */
     if(!fresh) {
-        fprintf(stderr,"COACHZ apps: installed code scan starting\n");
+        fprintf(stderr,"COACHZ apps: installed code scan starting at %ld\n",(long)time(NULL));
         trustTree(@"/var/jb"); trustTree(@"/var/containers/Bundle/Application");
-        r=loadRecords();if(r)return r;
+        r=loadRecords();fsync(STDERR_FILENO);if(r)return r;
     }
-    fprintf(stderr,"COACHZ apps: bootstrap ready\n");
+    fprintf(stderr,"COACHZ apps: bootstrap ready at %ld\n",(long)time(NULL));
+    fsync(STDERR_FILENO);
     return 0;
 }
 

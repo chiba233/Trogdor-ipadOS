@@ -63,6 +63,42 @@ failure.
   `CPU_OFF` and `SYSTEM_SUSPEND`: `COACHZ SMP: PSCI version ..., features ...`. That line decides whether stage 2 can use
   `SYSTEM_SUSPEND` on the factory TF-A.
 
+## Stage 2 (enters and resumes on hardware, wakes at once)
+
+On hardware with `--system-suspend-test 180`: the firmware took SYSTEM_SUSPEND and the boot core came back through our entry
+(`cpu 0 processor_exit 0 after 4 ms, state 3, PSCI 1, 7 cores off`), the seven other cores came back online and the system ran
+on with no panic. It woke after 4 ms: after the EC events were read the EC line read 1, so a wake source was still pending; which
+one is not yet known.
+
+
+Off by default; `tools/xnu_screen.py --system-suspend` sets `/chosen/coachz-system-suspend`, and `--system-suspend-test N` also
+sets `/chosen/coachz-system-suspend-test` = N. With neither, the boot core's `haltCPU` returns as in stage 1.
+
+- Down: `IOCPUSleepKernel` halts the other cores (stage 1), then the boot core's `haltCPU` reads the EC's pending events
+  (`EC_CMD_GET_NEXT_EVENT` until none are left, so `EC_AP_INT_L` is released) and calls `processor_exit` on the boot processor
+  (allowed while quiescing, `REASON_SYSTEM`). `cpu_sleep` ends in `quiesceCPU` on the boot core, which runs the platform's quiesce
+  actions (`IOCPURunPlatformQuiesceActions`, as `IOCPUSleepKernel` expects from the boot CPU driver), saves the GIC
+  (`GICD_CTLR` and each `armcpu_spi_attach` SPI's group, enable, trigger, priority and route), arms PDC pin 84 for the EC
+  (level low and enabled, `qcom-pdc.c`; the TLMM needs nothing on SC7180) and sets the PSCI entry: the reset vector's physical
+  address, through the EL2 stub with `armcpu-el2-entry=1`. `coachz-prelink-system-suspend.patch` then, in `ml_arm_sleep`'s boot
+  branch, waits until every other core's `AFFINITY_INFO` reads OFF (as `psci_cpu_kill`) and calls SMC64 `SYSTEM_SUSPEND`.
+- Refused: if `SYSTEM_SUSPEND` returns, the boot core takes the exception and interrupt stacks as `start_cpu` does and enters
+  `arm_init_cpu`, the same path a wake takes, so the system comes back instead of stopping; the log shows the PSCI error.
+- Up: the warm boot comes through `LowResetVectorBase`, `start_cpu` and `arm_init_cpu` to `initCPU(false)` on CPU0, which writes
+  the distributor back in gic_dist_init's order (groups off, ARE, all SPIs disabled, each saved SPI, its enable, `GICD_CTLR`),
+  wakes CPU0's redistributor, sets the CPU interface, SGI/PPI enables and the timer, restores the PDC pin and runs the active
+  actions. `processor_exit` then returns on the boot core and `IOCPUSleepKernel` restarts the other cores (stage 1).
+- Test: N seconds after all cores are up, `EC_CMD_RTC_SET_ALARM` 10 s (rtc-cros-ec.c), then `IOCPUSleepKernel` bound to the boot
+  core; the RTC alarm or the power button should wake it through the EC's interrupt. Devices are not suspended (stage 3).
+- Log lines: `COACHZ SLEEP: system suspend enabled`, `system suspend: EC line ...`, `cpu 0 entering SYSTEM_SUSPEND`,
+  `cpu 0 resumed, PSCI ..., N cores off before it, ... ms by the counter, GIC N SPIs restored (... kept ...)`,
+  `COACHZ SMP: cpu N back online`, `COACHZ SLEEP: test: awake, ... s asleep by the RTC, N of 8 secondary cores running`.
+  PSCI 1 means the firmware resumed through the entry point; a negative value is its refusal.
+- Not done: the RPMh sleep and wake sets (rpmh-rsc.c's `rpmh_flush` on the last core down). Without them the AOP keeps the active
+  votes, so the SoC suspends without lowering the rails. The EC host sleep event (`EC_CMD_HOST_SLEEP_EVENT`, cros_ec.c) is not
+  sent either. Whether the EC raises its interrupt for an RTC alarm while the AP is in SYSTEM_SUSPEND without it is not known;
+  if no alarm wakes the board, the power button is the wake source. The GIC SPI of the EC's PDC pin (564) stays disabled.
+
 ## Stage 2 notes (source reading)
 
 - The boot core wakes through `LowResetVectorBase`: start.s finds its `cpu_data` by MPIDR and jumps to `cpu_reset_handler`,

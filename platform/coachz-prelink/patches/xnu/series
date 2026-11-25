@@ -49,6 +49,8 @@ coachz-prelink-smp.patch
 coachz-prelink-amp.patch
 # Sleep stage 1 (docs/plans/sleep.md): a non-boot core that leaves through cpu_sleep powers off with PSCI CPU_OFF, so processor_start() can bring it back with CPU_ON; ArmCpu halts cores through processor_exit and restarts them (armcpu-offline-test=N exercises CPU5).
 coachz-prelink-cpu-off.patch
+# Sleep stage 2 (docs/plans/sleep.md): with /chosen/coachz-system-suspend the boot core's ml_arm_sleep waits for the other cores to be OFF (PSCI AFFINITY_INFO) and calls PSCI SYSTEM_SUSPEND at the entry ArmCpu sets; a refused call resumes through arm_init_cpu as a wake does.
+coachz-prelink-system-suspend.patch
 
 # Per-core busy share and clock, frame copies and their source, block I/O, top CPU users, waiting threads by kernel stack; the console keeps to a band once frames are copied.
 coachz-prelink-measure.patch
@@ -175,6 +177,8 @@ coachz-prelink-bus-aggregate.patch
 coachz-prelink-wifi-caps.patch
 # The joined access point's signal as mac80211 averages it (EWMA 10/8 of ath10k's per-PPDU rssi_comb and the BSS's beacons), reported by nw_wifi_status_get to the RSSI request and RSSI_CHANGED.
 coachz-prelink-wifi-rssi.patch
+# A 16 KiB-hash code signature on this 4 KiB kernel covers the 4 KiB pages up to codeLimit only, so reading the signature through a mapping no longer taints the page and kills the reader.
+coachz-prelink-cs-tail.patch
 # /chosen/coachz-baseband: the cellular bridge (pending/baseband): QRTR hooks in the Wi-Fi thread, its firmware on the Data volume, CommCenter running.
 coachz-prelink-baseband.patch
 # The VideoToolbox decoder for the video codec (package/CoachzVideoDecoder.c) on the Data volume, shown in /System/Library/VideoDecoders through a bindfs union.

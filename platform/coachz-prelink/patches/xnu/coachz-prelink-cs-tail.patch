@@ -1,0 +1,20 @@
+--- a/bsd/kern/ubc_subr.c
++++ b/bsd/kern/ubc_subr.c
+@@ -4078,6 +4078,17 @@
+ 		blob->csb_hash_firstlevel_pageshift = 0;
+ 		blob->csb_flags = (ntohl(cd->flags) & CS_ALLOWED_MACHO) | CS_VALID;
+ 		blob->csb_end_offset = (((vm_offset_t)ntohl(cd->codeLimit) + hash_pagemask) & ~hash_pagemask);
++#if defined(XNU_NATIVE_CS_HASH_CACHE) && XNU_NATIVE_CS_HASH_CACHE
++		/*
++		 * Coachz: the derived 4 KiB hashes stop at the 4 KiB page that holds codeLimit, and cs_validate_hash taints any
++		 * page past it. With the blob ending at the 16 KiB page, a read-only mapping that touched a 4 KiB page of the
++		 * signature itself killed its process (dpkg: page 0x12000, codeLimit 0x11d90). Ending the blob with the table,
++		 * as a 4 KiB CodeDirectory does, leaves those pages unsigned instead.
++		 */
++		if (PAGE_SHIFT == 12 && cd->pageSize == 14) {
++			blob->csb_end_offset = ((vm_offset_t)ntohl(cd->codeLimit) + PAGE_MASK) & ~(vm_offset_t)PAGE_MASK;
++		}
++#endif
+ 		if ((ntohl(cd->version) >= CS_SUPPORTSSCATTER) && (ntohl(cd->scatterOffset))) {
+ 			const SC_Scatter *scatter = (const SC_Scatter*)
+ 			    ((const char*)cd + ntohl(cd->scatterOffset));

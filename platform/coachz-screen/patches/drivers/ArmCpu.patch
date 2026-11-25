@@ -1,6 +1,15 @@
 --- a/ArmCpu.cpp
 +++ b/ArmCpu.cpp
-@@ -13,7 +13,58 @@
+@@ -2,6 +2,8 @@
+ #include <IOKit/IOCPU.h>
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOMemoryDescriptor.h>
++#include <IOKit/pwr_mgt/IOPMPrivate.h>
++#include <IOKit/pwr_mgt/RootDomain.h>
+ #include <libkern/c++/OSData.h>
+ #include <libkern/c++/OSSymbol.h>
+ #include <machine/machine_routines.h>
+@@ -13,11 +15,78 @@
  // Kernel-internal entries used for secondary CPU startup (Darwin 23 osfmk).
  extern "C" vm_offset_t ml_static_vtop (vm_offset_t);
  extern "C" char LowResetVectorBase[], LowResetVectorEnd[], ResetHandlerData[], const_boot_args[];
@@ -59,7 +68,27 @@
  extern "C" kern_return_t kernel_thread_start (void (*) (void *, wait_result_t), void *, thread_t *);
  extern "C" void thread_deallocate (thread_t);
  extern "C" thread_t current_thread (void);
-@@ -87,9 +138,12 @@
+ extern "C" kern_return_t thread_terminate (thread_t);
++// Coachz: system suspend (docs/plans/sleep.md, stage 2).
++void IOCPUSleepKernel (void);
++extern "C" kern_return_t IOCPURunPlatformQuiesceActions (void);
++extern "C" kern_return_t IOCPURunPlatformActiveActions (void);
++extern "C" processor_t thread_bind (processor_t);
++extern "C" wait_result_t thread_block (void (*) (void *, wait_result_t));
++extern "C" {
++// Read by ml_arm_sleep on the boot core (coachz-prelink-system-suspend.patch): the PSCI SYSTEM_SUSPEND entry point and context
++// id; 0 keeps the boot core in its WFI loop as before. ml_arm_sleep sets coachz_suspend_result to 1 before the call and to the
++// PSCI error if the call returns, so after a wake through the entry point it still reads 1.
++volatile uint64_t coachz_suspend_entry = 0, coachz_suspend_context = 0;
++volatile int64_t coachz_suspend_result = 0;
++volatile uint32_t coachz_suspend_off = 0;   // the other cores whose AFFINITY_INFO read OFF before the call
++// The Chrome EC transport (bsd/dev/coachz_ec.c, prelinked kernels only); this weak stand-in answers on other kernels.
++__attribute__ ((weak)) int coachz_ec_command (uint16_t, uint8_t, const void *, uint32_t, void *, uint32_t, uint32_t *) { return -1; }
++}
+ 
+ extern "C" {
+ volatile uint32_t armcpu_registered = 0;
+@@ -87,9 +156,12 @@
  OSDefineMetaClassAndStructors (ArmCpu, IOCPU)
  
  // Redistributor ISENABLER0: SGIs 0..15 (only SGI 0 is used by the kernel; the others let the self-SGI probe tell which INTIDs the GIC accepts) and PPI 27.
@@ -74,15 +103,15 @@
  
  static uint32_t read32 (uintptr_t base, unsigned offset)
  {
-@@ -125,8 +179,57 @@
+@@ -125,10 +197,59 @@
  static uint64_t counter (void)
  {
    uint64_t value;
 -  __asm__ volatile ("isb; mrs %0, cntvct_el0" : "=r" (value));
 +  __asm__ volatile ("isb\nmrs %0, cntvct_el0" : "=r" (value));
    return value;
-+}
-+
+ }
+ 
 +// SC7180 frequency domains, addresses from the device tree Linux runs with: A55, A76 and L3. Each has a table of states and
 +// a state register (the interface of Linux's qcom-cpufreq-hw and osm-l3); the hardware sets the voltage itself. Nothing else
 +// here votes, so the firmware's low state would stay. armcpu_freq[domain]: enabled, state before, state chosen, state read
@@ -130,19 +159,23 @@
 +  write32 (base, 0x920, best);
 +  __asm__ volatile ("dsb sy" ::: "memory");
 +  report[3] = read32 (base, 0x920);
- }
- 
++}
++
  static bool waitClear (uintptr_t base, unsigned offset, uint32_t mask)
-@@ -155,6 +258,8 @@
+ {
+   uint64_t frequency;
+@@ -155,6 +276,10 @@
  // Secondary nubs never wait for the boot CPU (IOSleep needs the timer that only the boot nub enables): they queue here and
  // the boot nub, or a late secondary once the boot CPU is registered, finishes them.
  static class ArmCpu *volatile gPending[ARMCPU_SMP_SLOTS];
 +// Coachz: each core's nub by logical id, for the offline test (armcpu-offline-test).
 +static class ArmCpu *gCpuByLogical[ARMCPU_SMP_SLOTS];
++// The boot core's nub, whose processor the system suspend test binds to (master_processor is a per-CPU macro, not a symbol).
++static class ArmCpu *gBootCpu;
  static volatile uint32_t gBootRegistered = 0;
  static bool gRemoteGic = false; // sheng-smp-gic=1: the boot CPU prepares a new core's redistributor before CPU_ON
  
-@@ -162,7 +267,8 @@
+@@ -162,7 +287,8 @@
  // Group 1 non-secure, priority 0xa0, the given trigger and routed to the boot CPU (GICD_IROUTER, affinity routing is on),
  // then enabled. The handler runs in the primary interrupt context, before the EOI, and must clear a level source.
  // An SPI without a handler is counted and disabled instead of being acknowledged forever.
@@ -152,16 +185,164 @@
  struct ArmCpuSpi {uint32_t id; void (*handler) (void *); void *context; volatile uint64_t count;};
  static ArmCpuSpi gSpi[ARMCPU_SPI_SLOTS];
  static volatile uint32_t gSpiUsed = 0;
-@@ -170,6 +276,8 @@
+@@ -170,8 +296,156 @@
  extern "C" {
  volatile uint64_t armcpu_spi_unhandled = 0;
  volatile uint32_t armcpu_spi_unhandled_id = 0;
 +volatile uint64_t armcpu_sgi_stray = 0;      // SGIs 1-15 taken: this kernel signals only with SGI 0
 +volatile uint32_t armcpu_sgi_stray_id = 0;
++}
++
++// Coachz: system suspend state (/chosen/coachz-system-suspend). Whether the distributor keeps its state across SYSTEM_SUSPEND
++// on this SoC is not public (qtiseclib is closed), so every attached SPI is saved before and written back after; the wake log
++// says how many of them still held their values.
++struct ArmCpuSpiState {uint8_t group, enabled, edge, priority; uint64_t router;};
++static ArmCpuSpiState gSpiSaved[ARMCPU_SPI_SLOTS];
++static uint32_t gSpiSavedCount = 0, gDistCtlrSaved = 0;
++static bool gSystemSuspend = false;
++// PDC (sc7180.dtsi pdc@b220000, qcom-pdc.c) and the TLMM GPIO94 register (EC_AP_INT_L, sc7180-trogdor.dtsi cros_ec).
++static uintptr_t gPdc = 0, gEcIntGpio = 0;
++static uint32_t gPdcVersion = 0, gPdcCfgSaved = 0, gPdcEnableSaved = 0;
++static uint64_t gSuspendCounter = 0;
++static unsigned armcpuChosen (const char *name);
++static void cleanToMemory (const void *start, size_t length);
++
++// sc7180: GPIO94 is PDC pin 84 (pinctrl-sc7180.c sc7180_pdc_map), GIC SPI 480 + 84 by qcom,pdc-ranges <0 480 94>.
++static const uint32_t kPdcBase = 0x0b220000, kPdcEcPin = 84;
++static const uint64_t kEcIntGpioPage = 0x03d00000 + 94 * 0x1000;   // SOUTH tile (pinctrl-sc7180.c PINGROUP(94, SOUTH, ...))
++
++static uintptr_t armcpuMap (uint64_t physical, uint64_t length)
++{
++  IOMemoryDescriptor *memory = IOMemoryDescriptor::withPhysicalAddress (physical, length, kIODirectionInOut);
++  IOMemoryMap *map = memory != nullptr ? memory->map (kIOMapAnywhere | kIOMapInhibitCache) : nullptr;
++  // Kept for the life of the kernel, like the frequency domains.
++  return map != nullptr ? static_cast<uintptr_t> (map->getVirtualAddress ()) : 0;
++}
++
++static uint64_t physicalCounter (void)
++{
++  uint64_t value;
++  __asm__ volatile ("isb\nmrs %0, cntpct_el0" : "=r" (value));
++  return value;
++}
++
++static uint64_t counterMilliseconds (uint64_t ticks)
++{
++  uint64_t frequency;
++  __asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (frequency));
++  return frequency != 0 ? ticks / (frequency / 1000) : 0;
  }
  
++// GPIO_IN_OUT bit 0 (pinctrl-msm.c io_reg 0x4): EC_AP_INT_L, low while the EC has events for the AP.
++static int ecLineLevel (void)
++{
++  return gEcIntGpio != 0 ? static_cast<int> (read32 (gEcIntGpio, 4) & 1U) : -1;
++}
++
++// Every attached SPI's group, enable, trigger, priority and route, and GICD_CTLR, as they are now.
++static void saveGic (void)
++{
++  const uint32_t used = __atomic_load_n (&gSpiUsed, __ATOMIC_ACQUIRE);
++  for (uint32_t slot = 0; slot < used; slot++) {
++    const uint32_t intid = gSpi[slot].id, word = (intid / 32) * 4, bit = 1U << (intid % 32);
++    const unsigned cfg = 0xc00 + (intid / 16) * 4, shift = (intid % 16) * 2 + 1;
++    gSpiSaved[slot].group = (read32 (gDist, 0x80 + word) & bit) ? 1 : 0;
++    gSpiSaved[slot].enabled = (read32 (gDist, 0x100 + word) & bit) ? 1 : 0;
++    gSpiSaved[slot].edge = static_cast<uint8_t> ((read32 (gDist, cfg) >> shift) & 1U);
++    gSpiSaved[slot].priority = *reinterpret_cast<volatile uint8_t *> (gDist + 0x400 + intid);
++    gSpiSaved[slot].router = *reinterpret_cast<volatile uint64_t *> (gDist + 0x6000 + 8 * intid);
++  }
++  gSpiSavedCount = used;
++  gDistCtlrSaved = read32 (gDist, 0);
++}
++
++// The distributor as gic_dist_init orders it: groups off, affinity routing on, every SPI disabled; then each saved SPI's group,
++// priority, trigger and route, and its enable; then GICD_CTLR as it was. *kept counts the saved SPIs whose values were still
++// there before the rewrite.
++static uint32_t restoreGic (uint32_t *kept, uint32_t *ctlrFound)
++{
++  *kept = 0;
++  *ctlrFound = read32 (gDist, 0);
++  for (uint32_t slot = 0; slot < gSpiSavedCount; slot++) {
++    const uint32_t intid = gSpi[slot].id, word = (intid / 32) * 4, bit = 1U << (intid % 32);
++    const unsigned cfg = 0xc00 + (intid / 16) * 4, shift = (intid % 16) * 2 + 1;
++    const ArmCpuSpiState &saved = gSpiSaved[slot];
++    if (((read32 (gDist, 0x100 + word) & bit) ? 1 : 0) == saved.enabled &&
++        *reinterpret_cast<volatile uint8_t *> (gDist + 0x400 + intid) == saved.priority &&
++        ((read32 (gDist, cfg) >> shift) & 1U) == saved.edge &&
++        *reinterpret_cast<volatile uint64_t *> (gDist + 0x6000 + 8 * intid) == saved.router) {
++      *kept += 1;
++    }
++  }
++  write32 (gDist, 0, *ctlrFound & ~3U);
++  waitClear (gDist, 0, 1U << 31);
++  write32 (gDist, 0, (*ctlrFound & ~3U) | 16U);
++  waitClear (gDist, 0, 1U << 31);
++  const unsigned interrupts = ((read32 (gDist, 4) & 31) + 1) * 32;
++  for (unsigned id = 32; id < interrupts && id < 1020; id += 32) { write32 (gDist, 0x180 + id / 8, 0xffffffff); }
++  waitClear (gDist, 0, 1U << 31);
++  uint32_t enabled = 0;
++  for (uint32_t slot = 0; slot < gSpiSavedCount; slot++) {
++    const uint32_t intid = gSpi[slot].id, word = (intid / 32) * 4, bit = 1U << (intid % 32);
++    const unsigned cfg = 0xc00 + (intid / 16) * 4, shift = (intid % 16) * 2 + 1;
++    const ArmCpuSpiState &saved = gSpiSaved[slot];
++    write32 (gDist, 0x80 + word, (read32 (gDist, 0x80 + word) & ~bit) | (saved.group ? bit : 0U));
++    *reinterpret_cast<volatile uint8_t *> (gDist + 0x400 + intid) = saved.priority;
++    write32 (gDist, cfg, (read32 (gDist, cfg) & ~(1U << shift)) | (static_cast<uint32_t> (saved.edge) << shift));
++    *reinterpret_cast<volatile uint64_t *> (gDist + 0x6000 + 8 * intid) = saved.router;
++  }
++  __asm__ volatile ("dsb sy" ::: "memory");
++  for (uint32_t slot = 0; slot < gSpiSavedCount; slot++) {
++    if (!gSpiSaved[slot].enabled) { continue; }
++    const uint32_t intid = gSpi[slot].id;
++    write32 (gDist, 0x100 + (intid / 32) * 4, 1U << (intid % 32));
++    enabled++;
++  }
++  write32 (gDist, 0, gDistCtlrSaved);
++  waitClear (gDist, 0, 1U << 31);
++  return enabled;
++}
++
++// qcom-pdc.c for the EC's pin: level low (PDC_LEVEL_LOW, 0b000 in IRQ_i_CFG bits 2:0) and enabled, in IRQ_ENABLE_BANK before
++// PDC 3.2 and in bit 3 of IRQ_i_CFG from 3.2. The pin's GIC SPI stays as it is: nothing here handles the EC's interrupt.
++static void pdcArm (void)
++{
++  if (gPdc == 0) { return; }
++  const unsigned cfg = 0x110 + 4 * kPdcEcPin, bank = 0x10 + 4 * (kPdcEcPin / 32);
++  const uint32_t bit = 1U << (kPdcEcPin % 32);
++  gPdcVersion = read32 (gPdc, 0x1000);
++  gPdcCfgSaved = read32 (gPdc, cfg);
++  const bool v32 = gPdcVersion >= 0x030200;
++  gPdcEnableSaved = v32 ? 0 : read32 (gPdc, bank);
++  write32 (gPdc, cfg, (gPdcCfgSaved & ~7U) | (v32 ? 8U : 0U));
++  if (!v32) { write32 (gPdc, bank, gPdcEnableSaved | bit); }
++}
++
++static void pdcRestore (void)
++{
++  if (gPdc == 0) { return; }
++  write32 (gPdc, 0x110 + 4 * kPdcEcPin, gPdcCfgSaved);
++  if (gPdcVersion < 0x030200) { write32 (gPdc, 0x10 + 4 * (kPdcEcPin / 32), gPdcEnableSaved); }
++}
++
++// EC_CMD_GET_NEXT_EVENT until the EC has none left (EC_RES_UNAVAILABLE), so EC_AP_INT_L is released before the suspend and only a
++// new event (the power button, an RTC alarm) pulls it low again. Nothing in this kernel reads EC events otherwise: the buttons and
++// switches come from EC_CMD_MKBP_INFO's current state, which this does not change.
++static unsigned drainEcEvents (void)
++{
++  unsigned drained = 0;
++  for (; drained < 32; drained++) {
++    uint8_t reply[32];
++    uint32_t length = 0;
++    if (coachz_ec_command (0x0067, 0, nullptr, 0, reply, sizeof (reply), &length) != 0) { break; }
++  }
++  return drained;
++}
++
  IOService *ArmCpu::probe (IOService *provider, SInt32 *score)
-@@ -321,7 +429,7 @@
+ {
+   OSData *type = OSDynamicCast (OSData, provider->getProperty ("device_type"));
+@@ -321,7 +595,7 @@
    uint64_t value;
    __asm__ volatile ("mrs %0, icc_sre_el1" : "=r" (value));
    value |= 1;
@@ -170,7 +351,7 @@
    __asm__ volatile ("mrs %0, icc_sre_el1" : "=r" (value));
    if ((value & 1) == 0) { panic ("ArmCpu: GICv3 system register interface unavailable"); }
    __asm__ volatile ("mrs %0, icc_ctlr_el1" : "=r" (value));
-@@ -337,7 +445,7 @@
+@@ -337,7 +611,7 @@
      write32 (dist, 0, read32 (dist, 0) | 0x12U);
    }
    value = 1;
@@ -179,7 +360,7 @@
    if (!secondary) {
      uint64_t pmr, ig, sre;
      __asm__ volatile ("mrs %0, icc_pmr_el1" : "=r" (pmr));
-@@ -347,12 +455,21 @@
+@@ -347,12 +621,21 @@
      armcpu_gic_boot[1] = read32 (redist + 0x10000, 0x100);
      armcpu_gic_boot[2] = read32 (dist, 0);
      armcpu_gic_boot[3] = read32 (dist, 4);
@@ -201,7 +382,7 @@
  }
  
  
-@@ -367,6 +484,9 @@
+@@ -367,6 +650,9 @@
    unsigned spiIpi = 0;
    PE_parse_boot_argn ("armcpu-spi-ipi", &spiIpi, sizeof (spiIpi));
    gSpiIpi = spiIpi == 1;
@@ -211,7 +392,7 @@
    unsigned diagnostic = 0;
    PE_parse_boot_argn("armcpu-diagnostics", &diagnostic, sizeof(diagnostic));
    diagnosePower=diagnostic==1;
-@@ -387,10 +507,19 @@
+@@ -387,10 +673,26 @@
      if (gBootRegistered != 0) { drainPending (); }
      return true;
    } else {
@@ -224,6 +405,13 @@
 +    armcpu_boot_sys[0] = static_cast<uint32_t> (el);
 +    armcpu_boot_sys[4] = static_cast<uint32_t> (midr);
      if ((!skipGic && !prepareGic ()) || !IOCPU::start (provider)) { return false; }
++    gSystemSuspend = !skipGic && armcpuChosen ("coachz-system-suspend") != 0;
++    if (gSystemSuspend) {
++      gPdc = armcpuMap (kPdcBase, 0x2000);
++      gEcIntGpio = armcpuMap (kEcIntGpioPage, 0x1000);
++      kprintf ("COACHZ SLEEP: system suspend enabled, PDC %s version 0x%x, EC line %d\n", gPdc ? "mapped" : "not mapped",
++               gPdc ? read32 (gPdc, 0x1000) : 0U, ecLineLevel ());
++    }
 +    if (gMaxFreq) {
 +      mapFrequencyDomains ();
 +      raiseFrequency (2);
@@ -232,7 +420,15 @@
    }
    cpuName = OSSymbol::withCStringNoCopy ("ARM architectural boot CPU");
    if (cpuName == nullptr) { return false; }
-@@ -449,11 +578,15 @@
+@@ -404,6 +706,7 @@
+   kern_return_t status = ml_processor_register (&info, &machProcessor, &ipi_handler, &pmi);
+   if (status != KERN_SUCCESS) { panic ("ArmCpu: CPU %u registration failed: %d", logicalId, status); }
+   setCPUNumber (info.log_id);
++  gBootCpu = this;
+   armcpu_registered = 1;
+   unsigned smp = 0;
+   PE_parse_boot_argn ("sheng-smp", &smp, sizeof (smp));
+@@ -449,11 +752,15 @@
    info.phys_id = static_cast<uint32_t> (affinity);
    info.log_id = logicalId;
    info.cluster_id = static_cast<uint32_t> (ml_get_cluster_number (static_cast<uint32_t> (affinity)));
@@ -249,12 +445,10 @@
    armcpu_smp_step[logicalId] = 2;
    setCPUState (kIOCPUStateUninitalized);
    registerService ();
-@@ -489,14 +622,65 @@
-     __asm__ volatile ("smc #0" : "+r" (x0) : "r" (x1), "r" (x2), "r" (x3) : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
-   }
+@@ -491,12 +798,68 @@
    return static_cast<int64_t> (x0);
-+}
-+
+ }
+ 
 +// Coachz: a 32-bit /chosen property (the boot-argument field is full), 0 when absent.
 +static unsigned armcpuChosen (const char *name)
 +{
@@ -266,17 +460,18 @@
 +    chosen->release ();
 +  }
 +  return number;
- }
++}
 +// /chosen/armcpu-offline-test: seconds.
 +static unsigned armcpuOfflineTestSeconds (void) { return armcpuChosen ("armcpu-offline-test"); }
 +// /chosen/armcpu-smp-skip: what the all-cores-up step leaves out, to tell an early stall apart without a rebuild:
 +// bit 0 ml_cpu_init_completed, bit 1 the PSCI queries.
 +static unsigned armcpuSmpSkip (void) { return armcpuChosen ("armcpu-smp-skip"); }
- 
++
 +// Coachz: secondaries that have reached the scheduler. When every CPU of the topology runs, ml_cpu_init_completed()
 +// tells the scheduler (the Edge policy sets its cluster edges then; AppleARMSMP makes the same call on Apple SoCs).
 +static volatile uint32_t gSecondariesStarted;
 +static void armcpu_offline_test (void *argument, wait_result_t);
++static void armcpu_suspend_test (void *argument, wait_result_t);
 +
  void ArmCpu::startThread (void *argument, wait_result_t)
  {
@@ -311,16 +506,18 @@
 +        gCpuByLogical[5] != nullptr && kernel_thread_start (&armcpu_offline_test, gCpuByLogical[5], &thread) == KERN_SUCCESS) {
 +      thread_deallocate (thread);
 +    }
++    if (gSystemSuspend && armcpuChosen ("coachz-system-suspend-test") != 0 &&
++        kernel_thread_start (&armcpu_suspend_test, nullptr, &thread) == KERN_SUCCESS) {
++      thread_deallocate (thread);
++    }
 +  }
    thread_terminate (current_thread ());
  }
  
-@@ -508,16 +692,37 @@
-     return;
-   }
+@@ -510,14 +873,35 @@
    thread_deallocate (thread);
-+}
-+
+ }
+ 
 +// Coachz: XNU starts every core with SIGPdisabled in cpu_signal and clears it the first time that core runs
 +// cpu_signal_handler(); until then cpu_signal() and cpu_xcall() to it fail (osfmk/arm/cpu_common.c). The self-IPI used to
 +// provoke that (armcpu-self-ipi=1) left the boot-argument field to make room for the USB host switch, so CPU0 stayed
@@ -332,8 +529,8 @@
 +  const boolean_t enabled = ml_set_interrupts_enabled (FALSE);
 +  cpu_signal_handler ();
 +  ml_set_interrupts_enabled (enabled);
- }
- 
++}
++
  void ArmCpu::initCPU (bool boot)
  {
    if (secondary) {
@@ -355,7 +552,7 @@
      // A failure is recorded and the core parked (rather than a panic that hides the other cores' state).
      if ((mpidr & 0xffff) != (affinity & 0xffff)) { armcpu_smp_fail[logicalId] = 1; for (;;) { __asm__ volatile ("wfe"); } }
      if (!gRemoteGic && !wakeRedistributor (true)) { armcpu_smp_fail[logicalId] = 2; for (;;) { __asm__ volatile ("wfe"); } }
-@@ -526,14 +731,28 @@
+@@ -526,17 +910,58 @@
      if (gSpiIpi) { spiIpiConfigure (gDist, logicalId, affinity); }
      // The shared IOCPUInterruptController blocks registrations until every core is enabled, so the secondary cores
      // install their handler directly. ml_install_interrupt_handler() records it in the calling core's cpu_data.
@@ -386,8 +583,39 @@
 +    if (gSelfIpi) { signalCPU (this); } else { armcpuEnableSignals (); }
      return;
    }
-   if (!boot) { panic ("ArmCpu: secondary/resume CPU startup is unsupported"); }
-@@ -547,7 +766,7 @@
+-  if (!boot) { panic ("ArmCpu: secondary/resume CPU startup is unsupported"); }
++  if (!boot) {
++    // Coachz: the boot core back from SYSTEM_SUSPEND (arm_init_cpu, cpu_machine_init), or from a SYSTEM_SUSPEND the firmware
++    // refused, which ml_arm_sleep resumes through the same path. As gic-v3's resume orders it: the distributor from the state
++    // saved in quiesceCPU, this core's redistributor and CPU interface, then the timer; the platform's active actions last, as
++    // IOCPUSleepKernel expects from the boot core's initCPU.
++    if (!gSystemSuspend) { panic ("ArmCpu: secondary/resume CPU startup is unsupported"); }
++    const uint64_t woke = physicalCounter ();
++    const int64_t result = coachz_suspend_result;
++    kprintf ("COACHZ SLEEP: cpu 0 resume branch, PSCI %lld\n", static_cast<long long> (result));
++    coachz_suspend_entry = 0;
++    uint32_t kept = 0, ctlrFound = 0;
++    const uint32_t enabled = restoreGic (&kept, &ctlrFound);
++    const bool redistributor = wakeRedistributor (true);
++    enableGic ();
++    if (gSpiIpi) { spiIpiConfigure (gDist, logicalId, affinity); }
++    enableCPUTimeBase (true);
++    pdcRestore ();
++    setCPUState (kIOCPUStateRunning);
++    IOCPURunPlatformActiveActions ();
++    char line[200];
++    snprintf (line, sizeof (line), "COACHZ SLEEP: cpu 0 resumed, PSCI %lld, %u cores off before it, %llu ms by the counter, GIC %u SPIs restored "
++              "(%u enabled, %u kept, GICD_CTLR 0x%x found, 0x%x written), redistributor %s, EC line %d", static_cast<long long> (result),
++              coachz_suspend_off, static_cast<unsigned long long> (counterMilliseconds (woke - gSuspendCounter)), gSpiSavedCount, enabled,
++              kept, ctlrFound, gDistCtlrSaved, redistributor ? "awake" : "did not wake", ecLineLevel ());
++    kprintf ("%s\n", line);
++    if (gSelfIpi) { signalCPU (this); } else { armcpuEnableSignals (); }
++    return;
++  }
+   if (skipGic) {
+     // Explicit A/B hardware diagnostic: do not touch GIC MMIO or enable an
+     // interrupt source. CPU registration still happens; the timer is left off.
+@@ -547,7 +972,7 @@
    if (gSpiIpi) { spiIpiConfigure (gDist, logicalId, affinity); }
    enableCPUTimeBase (true);
    setCPUState (kIOCPUStateRunning);
@@ -396,7 +624,7 @@
  }
  
  void ArmCpu::dispatch (void *target, void *, void *, int)
-@@ -565,7 +784,8 @@
+@@ -565,7 +990,8 @@
      armcpu_irq_id=static_cast<uint32_t>(id & 0xffffff);
      if ((id & 0xffffff) >= 1020) { armcpu_irq_phase=0;break; }
      if(diagnosePower && ++drained>128)panic("ArmCpu: IRQ drain exceeds 128 id=%llx timer=%llu IPI=%llu",id,armcpu_timer_interrupts,armcpu_ipi_interrupts);
@@ -406,7 +634,7 @@
        armcpu_timer_interrupts = armcpu_timer_interrupts + 1;
        armcpu_core_timer[logicalId & 7] = armcpu_core_timer[logicalId & 7] + 1;
        armcpu_irq_phase=2;
-@@ -598,12 +818,17 @@
+@@ -598,12 +1024,17 @@
          armcpu_spi_unhandled = armcpu_spi_unhandled + 1;
          armcpu_spi_unhandled_id = intid;
          write32 (gDist, 0x180 + (intid / 32) * 4, 1U << (intid % 32));
@@ -425,7 +653,7 @@
    }
  }
  
-@@ -618,7 +843,7 @@
+@@ -618,7 +1049,7 @@
                   ((aff & 0xff00) << 8) | (1ULL << (aff & 0xff));
    armcpu_ipi_sent = armcpu_ipi_sent + 1;
    if (gSpiIpi) { spiIpiSend (gDist, peer->logicalId & 7); return; }
@@ -434,7 +662,7 @@
  }
  
  // Diagnostic: sends SGI 0 to the core whose MPIDR affinity is aff (the DT "reg" value, e.g. 0x100 for core 1) exactly as signalCPU
-@@ -660,11 +885,46 @@
+@@ -660,11 +1091,46 @@
  // MMIO). With IRQs masked, SGIs 0..15 are sent one at a time to this core's own MPIDR affinity through ICC_SGI1R_EL1 (Group 1) and, when that
  // shows nothing, through ICC_SGI0R_EL1 (Group 0); ICC_HPPIR1_EL1 / ICC_HPPIR0_EL1 is polled and a pending SGI is acknowledged and ended here so the
  // kernel never sees it. out[8], out[9]: CNTVCT ticks of one ICC_SGI1R_EL1 write and of one ICC_PMR_EL1 read (a trapped write costs far more). out: 0 MPIDR, 1 INTIDs pending as Group 1, 2 INTIDs pending as Group 0, 3 ICC_PMR, 4 ICC_IGRPEN1, 5 ICC_SRE, 6 ICC_CTLR, 7 ICC_RPR.
@@ -482,7 +710,7 @@
    for (unsigned i = 0; i < 10; i++) { out[i] = 0; }
    out[0] = mpidr;
    __asm__ volatile ("mrs %0, icc_pmr_el1" : "=r" (v)); out[3] = v;
-@@ -677,8 +937,8 @@
+@@ -677,8 +1143,8 @@
      for (uint64_t intid = 0; intid < 16; intid++) {
        const uint64_t sgi = base | (intid << 24);
        uint64_t h = 1023, ta, tb;
@@ -493,7 +721,7 @@
        if (intid == 0) { out[8] = tb - ta; }
        for (unsigned polls = 0; polls < 400; polls++) {
          __asm__ volatile ("mrs %0, icc_hppir1_el1" : "=r" (h));
-@@ -688,10 +948,10 @@
+@@ -688,10 +1154,10 @@
        if ((h & 0xffffff) == intid) {
          out[1] |= 1ULL << intid;
          __asm__ volatile ("mrs %0, icc_iar1_el1" : "=r" (v));
@@ -506,7 +734,7 @@
        for (unsigned polls = 0; polls < 400; polls++) {
          __asm__ volatile ("mrs %0, icc_hppir0_el1" : "=r" (h));
          if ((h & 0xffffff) == intid) { break; }
-@@ -700,16 +960,16 @@
+@@ -700,16 +1166,16 @@
        if ((h & 0xffffff) == intid) {
          out[2] |= 1ULL << intid;
          __asm__ volatile ("mrs %0, icc_iar0_el1" : "=r" (v));
@@ -526,7 +754,7 @@
  }
  
  extern "C" void armcpu_ipi_selftest (uint64_t aff)
-@@ -717,13 +977,13 @@
+@@ -717,13 +1183,13 @@
    uint64_t sgi = ((aff & 0xff00000000ULL) << 16) | ((aff & 0xff0000) << 16) | ((aff & 0xff00) << 8) | (1ULL << (aff & 0xff));
    armcpu_ipi_selftest_sent = armcpu_ipi_selftest_sent + 1;
    if (gSpiIpi) { spiIpiSend (gDist, static_cast<uint32_t> ((aff >> 8) & 7)); return; }
@@ -542,7 +770,7 @@
  }
  
  void ArmCpu::quiesceCPU (void)
-@@ -732,18 +992,52 @@
+@@ -732,18 +1198,137 @@
    if(diagnosePower)panic("ArmCpu: unsupported quiesce requested before timer/GIC disable caller=%p halt=%u timer=%llu phase=%u",__builtin_return_address(0),armcpu_halt_calls,armcpu_timer_interrupts,armcpu_irq_phase);
    enableCPUTimeBase (false);
    uint64_t value = 0;
@@ -553,6 +781,33 @@
 +    // on this board, powers it off with PSCI CPU_OFF (coachz-prelink-cpu-off.patch); a later processor_start() brings it
 +    // back through startCPU and initCPU(false).
 +    setCPUState (kIOCPUStateStopped);
++    ml_arm_sleep ();
++  }
++  if (gSystemSuspend) {
++    // Coachz: the boot core leaves last (IOCPUSleepKernel's haltCPU, processor_exit, cpu_sleep). The platform's quiesce actions
++    // run here, as IOCPUSleepKernel expects from the boot core; then the GIC state and the PDC wake pin, and ml_arm_sleep() calls
++    // PSCI SYSTEM_SUSPEND (coachz-prelink-system-suspend.patch). The warm boot enters at the reset vector, through the EL2 stub
++    // when armcpu-el2-entry=1 (TF-A enters at EL2, as for CPU_ON), and arm_init_cpu() reaches initCPU(false) above.
++    IOCPURunPlatformQuiesceActions ();
++    saveGic ();
++    pdcArm ();
++    uint64_t entry = static_cast<uint64_t> (ml_static_vtop (reinterpret_cast<vm_offset_t> (LowResetVectorBase))), context = 0;
++    cleanToMemory (LowResetVectorBase, 0x10000);
++    cleanToMemory (ResetHandlerData, 0x1000);
++    cleanToMemory (const_boot_args, 0x1000);
++    unsigned el2 = 0;
++    PE_parse_boot_argn ("armcpu-el2-entry", &el2, sizeof (el2));
++    if (el2 == 1) {
++      cleanToMemory (armcpu_el2_entry, static_cast<size_t> (armcpu_el2_entry_end - armcpu_el2_entry));
++      context = entry;
++      entry = static_cast<uint64_t> (ml_static_vtop (reinterpret_cast<vm_offset_t> (armcpu_el2_entry)));
++    }
++    kprintf ("COACHZ SLEEP: cpu 0 entering SYSTEM_SUSPEND, entry 0x%llx via %s, %u SPIs saved, PDC 0x%x pin %u armed\n",
++             static_cast<unsigned long long> (entry), el2 == 1 ? "EL2 stub" : "reset vector", gSpiSavedCount, gPdcVersion, kPdcEcPin);
++    setCPUState (kIOCPUStateStopped);
++    coachz_suspend_context = context;
++    coachz_suspend_entry = entry;
++    gSuspendCounter = physicalCounter ();
 +    ml_arm_sleep ();
 +  }
  }
@@ -573,7 +828,23 @@
 +    kprintf ("COACHZ SMP: cpu %u processor_exit %d, state %d\n", logicalId, result, static_cast<int> (getCPUState ()));
 +    return;
 +  }
-+  kprintf ("COACHZ SMP: system suspend not implemented, cpu %u stays up\n", logicalId);
++  if (!gSystemSuspend) {
++    kprintf ("COACHZ SMP: system suspend not implemented, cpu %u stays up\n", logicalId);
++    return;
++  }
++  // Coachz: the boot core suspends the system (/chosen/coachz-system-suspend). The EC's pending events are read first so that
++  // EC_AP_INT_L is released and only a new event wakes the board through the PDC. processor_exit() returns on the boot core
++  // after the wake, once arm_init_cpu has brought it back; IOCPUSleepKernel then restarts the other cores.
++  const int before = ecLineLevel ();
++  const unsigned drained = drainEcEvents ();
++  kprintf ("COACHZ SLEEP: system suspend: EC line %d, %u EC events read, EC line %d\n", before, drained, ecLineLevel ());
++  const uint64_t start = physicalCounter ();
++  const kern_return_t result = processor_exit (machProcessor);
++  char line[160];
++  snprintf (line, sizeof (line), "COACHZ SLEEP: cpu 0 processor_exit %d after %llu ms, state %d, PSCI %lld, %u cores off", result,
++            static_cast<unsigned long long> (counterMilliseconds (physicalCounter () - start)), static_cast<int> (getCPUState ()),
++            static_cast<long long> (coachz_suspend_result), coachz_suspend_off);
++  kprintf ("%s\n", line);
  }
  
 +// Coachz: /chosen/armcpu-offline-test = N (seconds after all cores are up): CPU5, an A55, goes offline the way system sleep takes it
@@ -597,10 +868,52 @@
 +  thread_terminate (current_thread ());
 +}
 +
++// Coachz: /chosen/coachz-system-suspend-test = N (seconds after all cores are up): one system sleep through IOCPUSleepKernel, as
++// IOPlatformExpert::sleepKernel runs it, woken 10 s later by the EC's RTC alarm (rtc-cros-ec.c: EC_CMD_RTC_SET_ALARM takes the
++// seconds from now, 0 clears it) or earlier by the power button. Devices are not suspended (stage 3).
++static void armcpu_suspend_test (void *, wait_result_t)
++{
++  IOSleep (armcpuChosen ("coachz-system-suspend-test") * 1000u);
++  uint32_t before = 0, after = 0, alarm = 10, length = 0;
++  const int read0 = coachz_ec_command (0x0044, 0, nullptr, 0, &before, sizeof (before), &length);
++  const int armed = coachz_ec_command (0x0047, 0, &alarm, sizeof (alarm), nullptr, 0, &length);
++  kprintf ("COACHZ SLEEP: test: RTC %u (%d), alarm in %u s: %d, sleeping\n", before, read0, alarm, armed);
++  if (gBootCpu == nullptr || gBootCpu->getMachProcessor () == nullptr) {
++    kprintf ("COACHZ SLEEP: test: no boot processor\n");
++    thread_terminate (current_thread ());
++  }
++  const processor_t previous = thread_bind (gBootCpu->getMachProcessor ());
++  thread_block (nullptr);
++  IOCPUSleepKernel ();
++  thread_bind (previous);
++  // IOCPUSleepKernel restarts rootDomain's sleep/wake watchdog when the boot core returns. A sleep that IOPMrootDomain starts
++  // stops it when the wake completes and resets the trace point (IOServicePM kIOPM_Finished, IOPMrootDomain tracePoint). This
++  // test calls IOCPUSleepKernel itself, so it does both; otherwise the watchdog panics with "Sleep/Wake hang detected".
++  IOPMrootDomain *root = IOService::getPMRootDomain ();
++  if (root != nullptr) {
++    root->stop_watchdog_timer ();
++    root->tracePoint (kIOPMTracePointSystemUp);
++  }
++  const int read1 = coachz_ec_command (0x0044, 0, nullptr, 0, &after, sizeof (after), &length);
++  alarm = 0;
++  const int cleared = coachz_ec_command (0x0047, 0, &alarm, sizeof (alarm), nullptr, 0, &length);
++  unsigned running = 0, cores = 0;
++  for (unsigned id = 0; id < ARMCPU_SMP_SLOTS; id++) {
++    if (gCpuByLogical[id] == nullptr) { continue; }
++    cores++;
++    if (gCpuByLogical[id]->getCPUState () == kIOCPUStateRunning) { running++; }
++  }
++  char line[200];
++  snprintf (line, sizeof (line), "COACHZ SLEEP: test: awake, RTC %u (%d), %d s asleep by the RTC, alarm cleared %d, %u of %u secondary cores running",
++            after, read1, read0 == 0 && read1 == 0 ? static_cast<int> (after - before) : -1, cleared, running, cores);
++  kprintf ("%s\n", line);
++  thread_terminate (current_thread ());
++}
++
  // The new core runs with its MMU and caches off until start_cpu enables them, so it reads the reset vector, ResetHandlerData
  // and the boot arguments from memory. Write those lines back to the point of coherency first: on this SoC the boot CPU's
  // dirty cache lines are not guaranteed to be visible to a core with caches off (XNU only flushes the per-CPU data).
-@@ -754,7 +1048,7 @@
+@@ -754,7 +1339,7 @@
    uintptr_t line = static_cast<uintptr_t> (4) << ((ctr >> 16) & 15);
    uintptr_t address = reinterpret_cast<uintptr_t> (start) & ~(line - 1), end = reinterpret_cast<uintptr_t> (start) + length;
    for (; address < end; address += line) { __asm__ volatile ("dc civac, %0" :: "r" (address) : "memory"); }
@@ -609,7 +922,7 @@
  }
  
  kern_return_t ArmCpu::startCPU (vm_offset_t, vm_offset_t)
-@@ -769,9 +1063,20 @@
+@@ -769,9 +1354,20 @@
    cleanToMemory (LowResetVectorBase, 0x10000);   // reset vector, start_cpu and the code up to the MMU enable
    cleanToMemory (ResetHandlerData, 0x1000);
    cleanToMemory (const_boot_args, 0x1000);
@@ -631,7 +944,7 @@
    return result == 0 ? KERN_SUCCESS : KERN_FAILURE;
  }
  
-@@ -780,13 +1085,42 @@
+@@ -780,13 +1376,42 @@
    return cpuName;
  }
  

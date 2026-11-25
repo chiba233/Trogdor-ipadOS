@@ -1,0 +1,107 @@
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -79,6 +79,91 @@
+ 
+ extern boolean_t        idle_enable;
+ extern uint64_t         wake_abstime;
++
++#if defined(ARM64_BOARD_CONFIG_BCM2837)
++/*
++ * Coachz: system suspend (docs/plans/sleep.md, stage 2). ArmCpu sets the PSCI SYSTEM_SUSPEND entry point and context id while
++ * the boot core quiesces (/chosen/coachz-system-suspend); without them the boot core stays in arm64_prepare_for_sleep's WFI loop
++ * as before. coachz_suspend_result is 1 while the call is outstanding and the PSCI error if the firmware refused it;
++ * coachz_suspend_off counts the other cores whose AFFINITY_INFO read OFF first.
++ */
++extern volatile uint64_t coachz_suspend_entry, coachz_suspend_context;
++extern volatile int64_t coachz_suspend_result;
++extern volatile uint32_t coachz_suspend_off;
++
++/*
++ * What start_cpu does before arm_init_cpu, with the MMU still on: the exception stack on SP_EL1, the interrupt stack on SP_EL0,
++ * then arm_init_cpu(cpu_data), which ends in slave_main and returns to processor_offline as a warm boot does.
++ */
++static void __attribute__((noreturn))
++coachz_resume_in_place(cpu_data_t *cdp)
++{
++	register uint64_t x0 __asm__("x0") = (uint64_t)cdp;
++	__asm__ volatile (
++		"msr SPSel, #1\n"
++		"mov sp, %1\n"
++		"msr SPSel, #0\n"
++		"mov sp, %2\n"
++		"b _arm_init_cpu\n"
++		: : "r"(x0), "r"((uint64_t)cdp->excepstack_top), "r"((uint64_t)cdp->intstack_top) : "memory");
++	__builtin_unreachable();
++}
++
++/*
++ * As psci.c suspends the system once the other cores are dead (psci_cpu_kill polls AFFINITY_INFO until OFF): SYSTEM_SUSPEND is
++ * DENIED while another core is on, so each one's AFFINITY_INFO (SMC64, lowest affinity level 0) has to read OFF (1) first; the
++ * cores that left through CPU_OFF set their sleep token just before the call. Then SMC64 SYSTEM_SUSPEND with the entry point and
++ * context id. It comes back only when refused, and the boot core then resumes through arm_init_cpu as if it had woken, rather
++ * than stopping.
++ */
++static void __attribute__((noreturn))
++coachz_system_suspend(cpu_data_t *cdp)
++{
++	uint32_t off = 0;
++	for (int cpu = 0; cpu <= ml_get_max_cpu_number(); cpu++) {
++		cpu_data_t *target = (cpu_data_t *)CpuDataEntries[cpu].cpu_data_vaddr;
++		if ((target == NULL) || (target == cdp)) {
++			continue;
++		}
++		for (uint32_t tries = 0; tries < 100000; tries++) {
++			register uint64_t x0 __asm__("x0") = 0xc4000004ULL;
++			register uint64_t x1 __asm__("x1") = target->cpu_phys_id;
++			register uint64_t x2 __asm__("x2") = 0;
++			__asm__ volatile ("smc #0" : "+r"(x0) : "r"(x1), "r"(x2) : "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12",
++			    "x13", "x14", "x15", "x16", "x17", "memory");
++			if (x0 == 1) {
++				off++;
++				break;
++			}
++		}
++	}
++	coachz_suspend_off = off;
++	coachz_suspend_result = 1;
++	CleanPoC_Dcache();
++	/*
++	 * TF-A's psci_cpu_suspend_start skips the power-down when ISR_EL1 is not zero, and SYSTEM_SUSPEND then returns 0
++	 * (lib/psci/psci_suspend.c). These two show what was pending at the call.
++	 */
++	uint64_t isr, hppir;
++	__asm__ volatile ("mrs %0, isr_el1" : "=r"(isr));
++	__asm__ volatile ("mrs %0, S3_0_C12_C12_2" : "=r"(hppir));
++	{
++		register uint64_t x0 __asm__("x0") = 0xc400000eULL;
++		register uint64_t x1 __asm__("x1") = coachz_suspend_entry;
++		register uint64_t x2 __asm__("x2") = coachz_suspend_context;
++		__asm__ volatile ("smc #0" : "+r"(x0) : "r"(x1), "r"(x2) : "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12",
++		    "x13", "x14", "x15", "x16", "x17", "memory");
++		coachz_suspend_result = (int64_t)x0;
++	}
++	{
++		char line[128];
++		snprintf(line, sizeof(line), "COACHZ SLEEP: SYSTEM_SUSPEND returned %lld, %u cores off, ISR_EL1 0x%llx, HPPIR1 %llu",
++		    (long long)coachz_suspend_result, off, (unsigned long long)isr, (unsigned long long)(hppir & 0xffffff));
++		kprintf("%s\n", line);
++	}
++	coachz_resume_in_place(cdp);
++}
++#endif /* ARM64_BOARD_CONFIG_BCM2837 */
+ 
+ #if WITH_CLASSIC_S2R
+ void sleep_token_buffer_init(void);
+@@ -1110,6 +1195,12 @@
+ #if CONFIG_CPU_COUNTERS
+ 		mt_sleep();
+ #endif /* CONFIG_CPU_COUNTERS */
++#if defined(ARM64_BOARD_CONFIG_BCM2837)
++		/* Coachz: the system suspends here when ArmCpu has set an entry point (coachz_system_suspend above). */
++		if (coachz_suspend_entry != 0) {
++			coachz_system_suspend(cpu_data_ptr);
++		}
++#endif /* ARM64_BOARD_CONFIG_BCM2837 */
+ 		/* ARM64-specific preparation */
+ #if APPLEVIRTUALPLATFORM
+ 		arm64_prepare_for_sleep(true, cpu_data_ptr->cpu_number, ml_vtophys((vm_offset_t)&LowResetVectorBase));

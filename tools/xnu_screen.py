@@ -239,7 +239,7 @@ def smp_tree(root, count):
 
 def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=True, root_uuid=None, cpus=1,
                  full_screen=False, gmu_firmware_size=0, sqe_firmware_size=0, gpu_addon_size=0, motion_probe=False, wifi_mac=None, gestalt_cache=None, baseband=False, baseband_compat_hash=None, apps=False,
-                 venus_output2_coded=False, venus_runtime_pm=False, camera=False, cpu_offline_test=0, dpu_scanout=False, gpu_hang_test=0, venus_ssr_test=0, cpu_smp_skip=0):
+                 venus_output2_coded=False, venus_runtime_pm=False, camera=False, cpu_offline_test=0, system_suspend=False, system_suspend_test=0, dpu_scanout=False, gpu_hang_test=0, venus_ssr_test=0, cpu_smp_skip=0):
     root = read_tree(adt)
     if cpus > 1:
         smp_tree(root, cpus)
@@ -262,7 +262,7 @@ def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=T
         root.child('chosen').set('coachz-owner-apps', struct.pack('<I', 1))
     # Opt-in comparison of OUTPUT2 FRAME_SIZE only; keep the mainline path by default, including when the input ADT came from a test.
     chosen = root.child('chosen')
-    chosen.props = [prop for prop in chosen.props if prop[0] not in ('coachz-venus-output2-coded', 'coachz-venus-runtime-pm', 'coachz-camera', 'armcpu-offline-test', 'armcpu-smp-skip',
+    chosen.props = [prop for prop in chosen.props if prop[0] not in ('coachz-venus-output2-coded', 'coachz-venus-runtime-pm', 'coachz-camera', 'armcpu-offline-test', 'coachz-system-suspend', 'coachz-system-suspend-test', 'armcpu-smp-skip',
                                                                     'coachz-dpu-scanout', 'coachz-gpu-hang-test', 'coachz-venus-ssr-test')]
     if venus_output2_coded:
         chosen.set('coachz-venus-output2-coded', struct.pack('<I', 1))
@@ -279,6 +279,13 @@ def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=T
     # back, three times. In /chosen because the boot-argument field is full.
     if cpu_offline_test:
         chosen.set('armcpu-offline-test', struct.pack('<I', int(cpu_offline_test)))
+    # Sleep stage 2 (docs/plans/sleep.md): the boot core's sleep path calls PSCI SYSTEM_SUSPEND and ArmCpu restores the GIC on
+    # wake; with the test value, N seconds after all cores are up the kernel sleeps once and the EC's RTC alarm wakes it 10 s
+    # later. Off, the boot core's sleep returns at once as before. In /chosen because the boot-argument field is full.
+    if system_suspend or system_suspend_test:
+        chosen.set('coachz-system-suspend', struct.pack('<I', 1))
+    if system_suspend_test:
+        chosen.set('coachz-system-suspend-test', struct.pack('<I', int(system_suspend_test)))
     # What ArmCpu's all-cores-up step leaves out (bit 0 ml_cpu_init_completed, bit 1 the PSCI queries), for an early stall.
     if cpu_smp_skip:
         chosen.set('armcpu-smp-skip', struct.pack('<I', int(cpu_smp_skip)))
@@ -357,9 +364,11 @@ def prelink_tree(adt, window, tree, ramdisk, cache, environment=None, ram_root=T
 def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=False, root_cache=None, root_device=None,
          root_uuid=None, data_seed=None, data_uuid=None, display=False, cpus=1, gpu=0, gmu_firmware=None, sqe_firmware=None, gpu_addon=None,
          diagnostics=False, wifi_mac=None, root_emmc=False, gestalt_cache=None, baseband=False, baseband_commcenter=None, usb_host=False, apps=False,
-         venus_output2_coded=False, venus_runtime_pm=False, camera=False, cpu_offline_test=0, dpu_scanout=False, gpu_hang_test=0, venus_ssr_test=0, cpu_smp_skip=0):
+         venus_output2_coded=False, venus_runtime_pm=False, camera=False, cpu_offline_test=0, system_suspend=False, system_suspend_test=0, dpu_scanout=False, gpu_hang_test=0, venus_ssr_test=0, cpu_smp_skip=0):
     if (venus_output2_coded or venus_runtime_pm or venus_ssr_test) and not prelinked:
         raise ValueError('the Venus options require the prelinked kernel')
+    if (system_suspend or system_suspend_test) and not prelinked:
+        raise ValueError('system suspend requires the prelinked kernel (coachz-prelink-system-suspend.patch)')
     if camera and not prelinked:
         raise ValueError('the camera run requires the prelinked kernel')
     if apps and (not prelinked or not root_emmc or gpu != 9 or gpu_addon is None):
@@ -515,7 +524,7 @@ def pack(data, adt, window, memory, command_line=None, ramdisk=None, prelinked=F
         adt = prelink_tree(adt, window, tree, ramdisk, cache, environment, wifi_mac=wifi_mac, gestalt_cache=gestalt_cache, baseband=baseband,
                            baseband_compat_hash=hashlib.sha256(baseband_commcenter).digest() if baseband_commcenter is not None else None, apps=apps,
                            ram_root=not disk_root or bool(data_seed), venus_output2_coded=venus_output2_coded, venus_runtime_pm=venus_runtime_pm,
-                           camera=camera, cpu_offline_test=cpu_offline_test, dpu_scanout=dpu_scanout, gpu_hang_test=gpu_hang_test, venus_ssr_test=venus_ssr_test, cpu_smp_skip=cpu_smp_skip, root_uuid=root_uuid, cpus=cpus, full_screen=display,
+                           camera=camera, cpu_offline_test=cpu_offline_test, system_suspend=system_suspend, system_suspend_test=system_suspend_test, dpu_scanout=dpu_scanout, gpu_hang_test=gpu_hang_test, venus_ssr_test=venus_ssr_test, cpu_smp_skip=cpu_smp_skip, root_uuid=root_uuid, cpus=cpus, full_screen=display,
                            gmu_firmware_size=len(gmu_firmware) if gmu_firmware else 0, sqe_firmware_size=len(sqe_firmware) if sqe_firmware else 0, gpu_addon_size=len(gpu_addon) if gpu_addon else 0, motion_probe=diagnostics)
         ramdisk = ramdisk + cache + bytes(-len(cache) % 4096)
         if gmu_firmware:
@@ -577,6 +586,8 @@ def main():
     p.add_argument('--cpu-smp-skip', type=int, default=0, metavar='BITS',
                    help='prelinked: leave out of the all-cores-up step: 1 ml_cpu_init_completed, 2 the PSCI queries (/chosen/armcpu-smp-skip)')
     p.add_argument('--cpu-offline-test', type=int, default=0, metavar='SECONDS', help='prelinked: SECONDS after all cores are up, take CPU5 offline (PSCI CPU_OFF) and back, three times (/chosen/armcpu-offline-test)')
+    p.add_argument('--system-suspend', action='store_true', help='prelinked: system sleep calls PSCI SYSTEM_SUSPEND and resumes the boot core (/chosen/coachz-system-suspend; default off)')
+    p.add_argument('--system-suspend-test', type=int, default=0, metavar='SECONDS', help='prelinked: implies --system-suspend; SECONDS after all cores are up, sleep once and wake by the EC RTC alarm 10 s later (/chosen/coachz-system-suspend-test)')
     p.add_argument('--smp', type=int, default=1, help='main OS: start CPU0..N-1 (up to 8) through PSCI')
     p.add_argument('--gpu', type=int, default=0, help='prelinked: Adreno 618 bring-up stage 1 to 8, or 9 for the driver (docs/plans/gpu.md)')
     p.add_argument('--root-emmc', action='store_true', help='the system, Data and the log ring on the eMMC partitions')
@@ -614,7 +625,7 @@ def main():
                    wifi_mac=a.wifi_mac.read_text().strip() if a.wifi_mac else None, root_emmc=a.root_emmc, usb_host=a.usb_host, apps=a.apps,
                    gestalt_cache=a.gestalt_cache.read_bytes() if a.gestalt_cache else None, baseband=a.baseband, venus_output2_coded=a.venus_output2_coded,
                    venus_runtime_pm=a.venus_runtime_pm, camera=(2 if a.camera_service else 1 if a.camera else 0) | (0x100 if a.camera_front_probe else 0) | (0x200 if a.camera_vcm_probe else 0) | (0x800 if a.camera_front else 0) | (0x400 if a.camera_capture else 0),
-                   cpu_offline_test=a.cpu_offline_test, dpu_scanout=a.dpu_scanout, gpu_hang_test=a.gpu_hang_test, venus_ssr_test=a.venus_ssr_test, cpu_smp_skip=a.cpu_smp_skip, baseband_commcenter=a.baseband_commcenter.read_bytes() if a.baseband_commcenter else None)
+                   cpu_offline_test=a.cpu_offline_test, system_suspend=a.system_suspend, system_suspend_test=a.system_suspend_test, dpu_scanout=a.dpu_scanout, gpu_hang_test=a.gpu_hang_test, venus_ssr_test=a.venus_ssr_test, cpu_smp_skip=a.cpu_smp_skip, baseband_commcenter=a.baseband_commcenter.read_bytes() if a.baseband_commcenter else None)
     a.output.parent.mkdir(parents=True, exist_ok=True)
     a.output.write_bytes(payload)
     print('Built screen-output XNU payload', hashlib.sha256(payload).hexdigest())
